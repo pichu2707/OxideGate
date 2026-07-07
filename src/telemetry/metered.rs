@@ -114,7 +114,10 @@ impl UsageScanner {
         let usage = value
             .get("usage")
             .or_else(|| value.get("message").and_then(|m| m.get("usage")))
-            .or_else(|| value.get("usageMetadata"));
+            .or_else(|| value.get("usageMetadata"))
+            // OpenAI Responses API (Codex): `usage` anidado bajo `response` en el
+            // evento `response.completed`.
+            .or_else(|| value.get("response").and_then(|r| r.get("usage")));
         let Some(usage) = usage else {
             return;
         };

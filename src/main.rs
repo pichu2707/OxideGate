@@ -54,6 +54,11 @@ async fn main() {
             "/v1/messages",
             post(middleware::proxy::handle_anthropic_route),
         )
+        // OpenAI Responses API (clientes modernos: Codex, SDKs nuevos).
+        .route(
+            "/v1/responses",
+            post(middleware::proxy::handle_openai_responses),
+        )
         // Ruta comodín de Gemini: captura `/v1beta/models/{model}:{método}`.
         .route(
             "/v1beta/*rest",

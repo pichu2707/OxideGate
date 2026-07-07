@@ -1,8 +1,8 @@
 # Nivel 1 — Telemetría de OxideGate
 
-> Estado: Anthropic ✅ y Gemini ✅ validados en vivo; OpenAI codificado, pendiente
-> de validación en vivo. Cubre qué medimos en el primer paso, para qué sirve y
-> qué es cada dato.
+> Estado: los 3 proveedores (Anthropic, Gemini, OpenAI) validados en vivo con
+> tokens/coste reales. Cubre qué medimos en el primer paso, para qué sirve y qué
+> es cada dato.
 
 ---
 
@@ -147,7 +147,8 @@ consecuencia de diseño es directa:
 | Proveedor | Ruta | Framing | Campos `usage` | Estado |
 |---|---|---|---|---|
 | Anthropic | `/v1/messages` | SSE `data:` | `message_start.usage.input_tokens`, `message_delta.usage.output_tokens` | ✅ validado en vivo |
-| OpenAI | `/v1/chat/completions` | SSE `data:` | `usage.prompt_tokens`, `usage.completion_tokens` | 🟡 codificado, sin validar en vivo |
+| OpenAI (Responses) | `/v1/responses` | SSE `data:` | `response.usage.input_tokens`, `output_tokens` | ✅ validado en vivo |
+| OpenAI (Chat) | `/v1/chat/completions` | SSE `data:` | `usage.prompt_tokens`, `usage.completion_tokens` | 🟡 codificado, sin validar en vivo |
 | Gemini | `/v1beta/*` (comodín) | SSE `data:` (`?alt=sse`) | `usageMetadata.promptTokenCount`, `candidatesTokenCount` | ✅ validado en vivo |
 
 ### Detalles por proveedor
@@ -155,12 +156,21 @@ consecuencia de diseño es directa:
 - **Anthropic** manda el `usage` en el stream **por defecto**: `input_tokens` en
   el evento `message_start`, y `output_tokens` (acumulado) en el `message_delta`
   final. Modelo y `stream` van en el **body** JSON.
-- **OpenAI** **no** manda `usage` en streaming salvo que el request traiga
-  `stream_options.include_usage = true`. Como somos un proxy transparente y el
-  cliente no lo pone, **OxideGate lo inyecta** en la petición saliente a OpenAI.
-  Es la única mutación que hacemos al request; la respuesta se reenvía intacta.
-  Modelo y `stream` van en el **body** JSON. Nota: los clientes modernos pueden
-  usar la Responses API (`/v1/responses`), que **aún no está ruteada**.
+- **OpenAI** tiene dos superficies:
+  - **Responses API** (`/v1/responses`, la que usan los clientes modernos):
+    reporta `usage` **por defecto**, anidado bajo `response` en el evento
+    `response.completed`. Modelo y `stream` van en el body; no se inyecta nada.
+    **Validado en vivo** con API key real (`api.openai.com`).
+  - **Chat Completions** (`/v1/chat/completions`): **no** manda `usage` en
+    streaming salvo que el request traiga `stream_options.include_usage = true`;
+    como el cliente no lo pone, **OxideGate lo inyecta** (única mutación). Sigue
+    codificado pero **sin validar en vivo**.
+- **Codex (login ChatGPT) — callejón cerrado.** Codex autenticado con cuenta
+  ChatGPT (`auth_mode: "chatgpt"`, sin API key) pega al **backend interno de
+  ChatGPT** (`chatgpt.com/backend-api/...`), NO a `api.openai.com`, e **ignora
+  `OPENAI_BASE_URL`**: no se puede redirigir por OxideGate (haría falta un MITM
+  con CA propio, fuera de alcance). Para medir OpenAI se usa la **API pública con
+  API key**, no el Codex con login de cuenta.
 - **Gemini** rompe varios supuestos y por eso necesitó ruta y parser propios:
   - **El modelo va en la URL**, no en el body:
     `/v1beta/models/{model}:{método}`. `streamGenerateContent` ⇒ streaming;

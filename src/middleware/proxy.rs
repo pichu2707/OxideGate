@@ -33,6 +33,35 @@ pub async fn handle_anthropic_route(state: State<Arc<AppState>>, req: Request) -
     forward(state, req, "/v1/messages", "anthropic", url).await
 }
 
+/// `POST /v1/responses` → OpenAI Responses API (la que usan clientes modernos).
+///
+/// Modelo y `stream` van en el body (como chat/completions), pero NO inyectamos
+/// `include_usage`: la Responses API ya reporta `usage` en el evento
+/// `response.completed`. Por eso no reusa `forward`, que sí inyecta para OpenAI.
+pub async fn handle_openai_responses(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let start = Instant::now();
+    let (parts, body) = req.into_parts();
+    let url = format!("{}/responses", state.config.target_openai_url);
+
+    let raw = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(b) => b.to_vec(),
+        Err(e) => return plain_error(StatusCode::BAD_REQUEST, format!("body inválido: {e}")),
+    };
+    let (model, stream) = model_and_stream_from_body(&raw);
+
+    let out = Outgoing {
+        url,
+        route: "/v1/responses".to_string(),
+        upstream: "openai",
+        model,
+        stream,
+        prompt_hash: fingerprint(&raw),
+        prompt_bytes: raw.len(),
+        body: raw,
+    };
+    send_and_meter(state, &parts.headers, out, start).await
+}
+
 /// `POST /v1beta/models/{model}:{método}` → proveedor Google Gemini.
 ///
 /// A diferencia de Anthropic/OpenAI, aquí el modelo y el método viven en la URL
@@ -165,6 +194,18 @@ fn fingerprint(bytes: &[u8]) -> String {
     let mut hasher = DefaultHasher::new();
     bytes.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+/// Lee `model` y `stream` de un body JSON (formato chat/completions y Responses).
+/// Si el body no es JSON válido, devuelve `(None, false)`.
+fn model_and_stream_from_body(raw: &[u8]) -> (Option<String>, bool) {
+    match serde_json::from_slice::<serde_json::Value>(raw) {
+        Ok(v) => (
+            v.get("model").and_then(|m| m.as_str()).map(str::to_string),
+            v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false),
+        ),
+        Err(_) => (None, false),
+    }
 }
 
 /// Ruta de Anthropic/OpenAI: lee el body, lo prepara y delega en `send_and_meter`.
