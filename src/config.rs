@@ -6,6 +6,9 @@ pub struct AppConfig {
     pub local_port: u16,
     pub target_openai_url: String,
     pub target_anthropic_url: String,
+    /// Host raíz de Gemini (sin path). El path `/v1beta/models/...` lo preserva
+    /// el proxy tal cual llega del cliente, así que aquí va solo el origen.
+    pub target_gemini_url: String,
     pub storage_dir: PathBuf,
 }
 
@@ -26,6 +29,10 @@ impl AppConfig {
                 .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
             target_anthropic_url: env::var("ANTHROPIC_API_BASE")
                 .unwrap_or_else(|_| "https://api.anthropic.com/v1".to_string()),
+            // Solo el host: el cliente Gemini pega a `/v1beta/models/{model}:...`
+            // y ese path se reenvía sin tocar.
+            target_gemini_url: env::var("GEMINI_API_BASE")
+                .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string()),
             storage_dir,
         }
     }

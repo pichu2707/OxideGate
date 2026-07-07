@@ -38,6 +38,25 @@ pub fn price_per_mtok(model: &str) -> Option<(f64, f64)> {
         return Some((10.0, 30.0));
     }
 
+    // Google (Gemini). El output que facturamos aquí es `candidatesTokenCount`;
+    // los tokens de "thinking" (`thoughtsTokenCount`) y de caché
+    // (`cachedContentTokenCount`) aún no se itemizan — ver deuda documentada.
+    if m.contains("gemini") {
+        if m.contains("2.5-pro") {
+            return Some((1.25, 10.0));
+        }
+        if m.contains("2.5-flash") {
+            return Some((0.30, 2.50));
+        }
+        if m.contains("1.5-pro") || m.contains("pro") {
+            return Some((1.25, 5.0));
+        }
+        // Familia flash (2.0-flash y genéricos): la opción barata por defecto.
+        if m.contains("flash") {
+            return Some((0.10, 0.40));
+        }
+    }
+
     None
 }
 

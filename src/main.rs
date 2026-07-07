@@ -54,6 +54,11 @@ async fn main() {
             "/v1/messages",
             post(middleware::proxy::handle_anthropic_route),
         )
+        // Ruta comodín de Gemini: captura `/v1beta/models/{model}:{método}`.
+        .route(
+            "/v1beta/*rest",
+            post(middleware::proxy::handle_gemini_route),
+        )
         .with_state(Arc::new(state));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));

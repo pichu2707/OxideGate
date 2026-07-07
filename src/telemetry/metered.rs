@@ -102,34 +102,41 @@ impl UsageScanner {
         }
     }
 
-    /// Busca un objeto `usage` en un valor JSON y actualiza los contadores.
+    /// Busca un objeto de `usage` en un valor JSON y actualiza los contadores.
     ///
-    /// Cubre las dos formas de los proveedores:
+    /// Cubre las tres formas de los proveedores:
     ///   - OpenAI / Anthropic `message_delta`: `usage` en la raíz.
     ///   - Anthropic `message_start`: `usage` anidado bajo `message`.
+    ///   - Gemini: `usageMetadata` en la raíz, con otros nombres de campo.
     ///
-    /// El output es acumulativo/final en Anthropic, así que "último gana".
+    /// El output es acumulativo/final (Anthropic y Gemini), así que "último gana".
     fn extract_usage(&mut self, value: &Value) {
         let usage = value
             .get("usage")
-            .or_else(|| value.get("message").and_then(|m| m.get("usage")));
+            .or_else(|| value.get("message").and_then(|m| m.get("usage")))
+            .or_else(|| value.get("usageMetadata"));
         let Some(usage) = usage else {
             return;
         };
 
-        // Entrada: `input_tokens` (Anthropic) o `prompt_tokens` (OpenAI).
+        // Entrada: `input_tokens` (Anthropic), `prompt_tokens` (OpenAI) o
+        // `promptTokenCount` (Gemini).
         if let Some(v) = usage
             .get("input_tokens")
             .or_else(|| usage.get("prompt_tokens"))
+            .or_else(|| usage.get("promptTokenCount"))
             .and_then(Value::as_u64)
         {
             self.input_tokens = Some(v);
         }
 
-        // Salida: `output_tokens` (Anthropic) o `completion_tokens` (OpenAI).
+        // Salida: `output_tokens` (Anthropic), `completion_tokens` (OpenAI) o
+        // `candidatesTokenCount` (Gemini). Nota: en Gemini los tokens de
+        // "thinking" (`thoughtsTokenCount`) van aparte y aún no se suman aquí.
         if let Some(v) = usage
             .get("output_tokens")
             .or_else(|| usage.get("completion_tokens"))
+            .or_else(|| usage.get("candidatesTokenCount"))
             .and_then(Value::as_u64)
         {
             self.output_tokens = Some(v);
@@ -192,9 +199,11 @@ impl MeteredBody {
         );
 
         // Velocidad de generación = tokens de salida / tramo de generación
-        // (total − TTFT). Solo si tenemos tokens y el tramo es positivo.
-        let tokens_per_sec = match (self.scanner.output_tokens, self.ttft_ms) {
-            (Some(out), Some(ttft)) if total_ms > ttft => {
+        // (total − TTFT). Solo tiene sentido en STREAMING: en una respuesta
+        // no-streaming todo llega de golpe (ttft ≈ total) y el tramo tiende a
+        // cero, disparando un número absurdo. Fuera de streaming la anulamos.
+        let tokens_per_sec = match (self.base.stream, self.scanner.output_tokens, self.ttft_ms) {
+            (true, Some(out), Some(ttft)) if total_ms > ttft => {
                 Some(out as f64 / ((total_ms - ttft) / 1000.0))
             }
             _ => None,
@@ -298,6 +307,18 @@ mod tests {
         scanner.finish();
 
         assert_eq!(scanner.output_tokens, Some(7));
+    }
+
+    /// Gemini (`alt=sse`) manda `usageMetadata` con otros nombres de campo, y el
+    /// conteo es acumulativo en el chunk final. El scanner debe mapearlo.
+    #[test]
+    fn extracts_gemini_usage_from_sse() {
+        let mut scanner = UsageScanner::new(true);
+        scanner.feed(b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hola\"}]}}],\"usageMetadata\":{\"promptTokenCount\":11,\"candidatesTokenCount\":3,\"totalTokenCount\":14}}\n\n");
+        scanner.finish();
+
+        assert_eq!(scanner.input_tokens, Some(11));
+        assert_eq!(scanner.output_tokens, Some(3));
     }
 
     /// Respuesta no-streaming: el `usage` vive en el JSON completo, que se parsea

@@ -1,7 +1,8 @@
 # Nivel 1 — Telemetría de OxideGate
 
-> Estado: implementado y verificado (Anthropic + OpenAI). Gemini pendiente.
-> Cubre qué medimos en el primer paso, para qué sirve y qué es cada dato.
+> Estado: Anthropic ✅ y Gemini ✅ validados en vivo; OpenAI codificado, pendiente
+> de validación en vivo. Cubre qué medimos en el primer paso, para qué sirve y
+> qué es cada dato.
 
 ---
 
@@ -112,7 +113,7 @@ forma legítima — preferimos un hueco honesto a un cero falso.
 | `status` | Código HTTP devuelto al cliente | Distinguir éxitos de fallos |
 | `ttft_ms` | **Time To First Token**: ms hasta el primer chunk | La latencia que de verdad siente el usuario en streaming |
 | `total_ms` | ms desde la petición hasta cerrar el stream | Latencia total |
-| `tokens_per_sec` | Tokens de salida / tramo de generación (`total − ttft`) | Velocidad de generación del modelo |
+| `tokens_per_sec` | Tokens de salida / tramo de generación (`total − ttft`) | Velocidad de generación del modelo. **Solo en streaming**: en no-streaming todo llega de golpe (`ttft ≈ total`) y el número se dispara, así que se anula a `null` |
 
 ---
 
@@ -145,26 +146,43 @@ consecuencia de diseño es directa:
 
 | Proveedor | Ruta | Framing | Campos `usage` | Estado |
 |---|---|---|---|---|
-| Anthropic | `/v1/messages` | SSE `data:` | `message_start.usage.input_tokens`, `message_delta.usage.output_tokens` | ✅ implementado |
-| OpenAI | `/v1/chat/completions` | SSE `data:` | `usage.prompt_tokens`, `usage.completion_tokens` | ✅ implementado |
-| Gemini | *(sin ruta)* | array JSON / `:streamGenerateContent` | `usageMetadata.promptTokenCount`, `candidatesTokenCount` | ⛔ pendiente |
+| Anthropic | `/v1/messages` | SSE `data:` | `message_start.usage.input_tokens`, `message_delta.usage.output_tokens` | ✅ validado en vivo |
+| OpenAI | `/v1/chat/completions` | SSE `data:` | `usage.prompt_tokens`, `usage.completion_tokens` | 🟡 codificado, sin validar en vivo |
+| Gemini | `/v1beta/*` (comodín) | SSE `data:` (`?alt=sse`) | `usageMetadata.promptTokenCount`, `candidatesTokenCount` | ✅ validado en vivo |
 
 ### Detalles por proveedor
 
 - **Anthropic** manda el `usage` en el stream **por defecto**: `input_tokens` en
   el evento `message_start`, y `output_tokens` (acumulado) en el `message_delta`
-  final.
+  final. Modelo y `stream` van en el **body** JSON.
 - **OpenAI** **no** manda `usage` en streaming salvo que el request traiga
   `stream_options.include_usage = true`. Como somos un proxy transparente y el
   cliente no lo pone, **OxideGate lo inyecta** en la petición saliente a OpenAI.
   Es la única mutación que hacemos al request; la respuesta se reenvía intacta.
-- **Gemini** es **otra API**: endpoint distinto, framing de stream distinto
-  (puede ser array JSON, no `data:` puro) y nombres de campo distintos. Requiere
-  su propia ruta y su propio parser. Es el punto de extensión natural.
+  Modelo y `stream` van en el **body** JSON. Nota: los clientes modernos pueden
+  usar la Responses API (`/v1/responses`), que **aún no está ruteada**.
+- **Gemini** rompe varios supuestos y por eso necesitó ruta y parser propios:
+  - **El modelo va en la URL**, no en el body:
+    `/v1beta/models/{model}:{método}`. `streamGenerateContent` ⇒ streaming;
+    `generateContent` ⇒ no-streaming. Se extrae con `parse_gemini_path`.
+  - **Ruta comodín** `/v1beta/*` que **preserva path + query** al reenviar (la
+    query lleva `alt=sse` y a veces la API key). El destino es solo el host
+    (`generativelanguage.googleapis.com`), configurable con `GEMINI_API_BASE`.
+  - **Framing SSE**: el CLI de Gemini pide `?alt=sse`, así que la respuesta son
+    líneas `data:` como los otros dos — el mismo escáner sirve.
+  - **Campos**: `usageMetadata.promptTokenCount` (input) y `candidatesTokenCount`
+    (output).
+  - **Auth**: por header `x-goog-api-key` o query `?key=` (se preservan ambos).
+
+> **Validación contra ground-truth:** los tokens medidos para Gemini se cruzaron
+> contra el resumen "Model Usage" que el propio CLI imprime al cerrar sesión, y
+> coincidieron **exactamente** (input y output, en streaming y no-streaming,
+> sobre 3 requests y 2 modelos). La extracción está confirmada contra la fuente.
 
 > **Hacia dónde tiende esto:** un **adaptador por proveedor** que declare su
-> endpoint, su framing de stream y su mapeo de campos `usage`. Hoy hay 2
-> proveedores incrustados; el adaptador es el refactor natural cuando entre el 3º.
+> endpoint, su framing de stream y su mapeo de campos `usage`. Hoy los 3
+> proveedores están incrustados en `proxy.rs` (Gemini entró como *bolt-on*); el
+> adaptador es el refactor limpio ya acordado como siguiente paso.
 
 ---
 
@@ -177,10 +195,24 @@ consecuencia de diseño es directa:
 - **Precios editables, no oficiales.** `src/telemetry/pricing.rs` trae valores
   por defecto aproximados. Hay que mantenerlos sincronizados con la tarifa real.
   Modelo desconocido ⇒ `cost_estimate_usd = null` (nunca un número inventado).
-- **Tokens de caché de Anthropic sin contar.** Claude reporta
-  `cache_creation_input_tokens` y `cache_read_input_tokens` (los cacheados se
-  facturan más barato). Aún no los leemos, así que en peticiones con *prompt
-  caching* el coste sale **inflado**. Deuda, no bug.
+- **Tokens de caché sin itemizar (transversal, cuantificado en vivo).** Los
+  proveedores reportan aparte los tokens servidos desde caché, que se facturan
+  mucho más barato (~0.25×):
+  - Anthropic: `cache_read_input_tokens` / `cache_creation_input_tokens`.
+  - Gemini: `cachedContentTokenCount`.
+
+  Hoy `input_tokens` incluye esos tokens pero los precia a tarifa full, así que
+  `cost_estimate_usd` **sobreestima**. No es teórico: en una prueba real de
+  `gemini-3.5-flash`, **24.433 de 63.531 tokens de input (~38%) fueron lecturas
+  de caché**. `input_tokens` sigue siendo exacto (coincide con el CLI); lo que
+  falla es el precio. Fix pendiente: capturar los campos de caché como métricas
+  aparte y preciarlos a tarifa reducida (natural de meter en el refactor del
+  adaptador).
+- **Tokens de "thinking" de Gemini sin sumar.** `thoughtsTokenCount` se factura
+  (a tarifa de output) y hoy no se contempla. Mismo bucket de deuda de coste.
+- **Precio de Gemini flash-lite genérico.** `gemini-*-flash-lite` cae en el
+  precio de la familia `flash` (más caro que el *lite* real): coste levemente
+  sobreestimado hasta afinar la tabla.
 - **API key en claro.** Pasa por las cabeceras. En `localhost` el riesgo es bajo,
   pero al escalar fuera de la máquina local hay que blindarlo. Nunca loguear ni
   persistir la key.
@@ -191,10 +223,30 @@ consecuencia de diseño es directa:
 
 | Archivo | Responsabilidad |
 |---|---|
+| `src/config.rs` | URLs destino por proveedor (`target_*_url`), puerto, carpeta de datos |
 | `src/telemetry/logger.rs` | `RequestMetric` (los datos) + `TelemetrySink` (escritura async fuera del camino crítico) |
-| `src/telemetry/metered.rs` | `MeteredBody` — envuelve el stream, mide TTFT, escanea `usage`, emite la métrica |
+| `src/telemetry/metered.rs` | `MeteredBody` — envuelve el stream, mide TTFT, escanea `usage` (3 formatos), emite la métrica |
 | `src/telemetry/pricing.rs` | Tabla de precios por modelo y cálculo de `cost_estimate_usd` |
-| `src/middleware/proxy.rs` | Parsea el request, inyecta `include_usage`, envuelve la respuesta |
+| `src/middleware/proxy.rs` | Handlers por ruta + `send_and_meter` compartido (descarta `Accept-Encoding`, envuelve la respuesta); para Gemini, ruta comodín + `parse_gemini_path` |
 
 La salida se escribe en `~/.config/oxidegate/telemetry.jsonl`, una fila JSON por
 petición.
+
+---
+
+## 8. Cableado: cómo enrutar cada cliente por OxideGate
+
+OxideGate solo mide lo que **pasa por él**. Cada cliente se redirige apuntando su
+base-URL del proveedor al puerto local (por defecto `8080`; si está ocupado,
+`OXIDEGATE_PORT=8899`). El proxy reenvía al proveedor real de forma transparente,
+así que la autenticación (API key u OAuth) viaja intacta y funciona igual.
+
+| Proveedor / cliente | Variable de entorno | Valor |
+|---|---|---|
+| Anthropic (Claude Code, incl. Claude Max/OAuth) | `ANTHROPIC_BASE_URL` | `http://localhost:8899` |
+| Gemini (`@google/gemini-cli`, API key) | `GOOGLE_GEMINI_BASE_URL` | `http://localhost:8899` |
+| OpenAI (clientes con override) | `OPENAI_BASE_URL` / `OPENAI_API_BASE` | `http://localhost:8899/v1` |
+
+Verificado en vivo: Claude Max (OAuth) **respeta** `ANTHROPIC_BASE_URL`, y el CLI
+de Gemini respeta `GOOGLE_GEMINI_BASE_URL`. Levantar dos sesiones de Claude Max a
+la vez dispara `429` por límite de concurrencia de la suscripción.
