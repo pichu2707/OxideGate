@@ -66,30 +66,37 @@ Variables (todas opcionales salvo al menos una key):
 El harness dispara la barrida, espera el flush de telemetría, y lee
 `~/.config/oxidegate/telemetry.jsonl` para imprimir la tabla comparativa.
 
-## 4. Anthropic (Claude Max) — a mano
+## 4. Anthropic / Claude Code — por qué NO entra en la barrida limpia
 
 El benchmark automático solo cubre proveedores con **API key** (Gemini, OpenAI).
 Anthropic con **Claude Max** usa OAuth de suscripción, que no se scriptea con
-key. Se alimenta con tráfico real vía `claude -p` (headless) redirigido — una
-petición por invocación, uso legítimo de Claude Code por el proxy:
+key; la única vía es tráfico real vía `claude -p` (headless) redirigido por el
+proxy. Lo probamos, y el resultado dejó claro que **no sirve como barrida
+comparable** — pero reveló algo más importante (ver §5.1).
 
-```bash
-export ANTHROPIC_BASE_URL=http://localhost:8899
-for size in 0 1000 5000 20000 50000; do
-  for run in 1 2 3; do
-    filler=$(yes 'lorem ipsum dolor sit amet consectetur adipiscing elit ' \
-      | tr -d '\n' | head -c "$size")
-    claude -p "$run-$RANDOM Responde únicamente con: ok. $filler" >/dev/null 2>&1
-    sleep 2
-  done
-done
+Una sola llamada `ANTHROPIC_BASE_URL=http://localhost:8899 claude -p "Responde
+solo: ok"` produjo:
+
+```
+model=claude-opus-4-8   prompt_bytes=166 328   input_tokens=7 368   output=4
 ```
 
-Sus filas caen en la misma telemetría; el analizador las agrupa por
-`input_tokens` medidos. **Caveats**: Claude Code añade su system prompt (el piso
-de tokens sube), el *prompt caching* puede deflactar repeticiones (variá el
-relleno), y correr esto junto a otra sesión de Max puede dar `429` por
-concurrencia (se filtran por `status:200`).
+Es decir: un prompt de 3 palabras se volvió un request de **166 KB / 7 368
+tokens** sobre **opus**. Claude Code inyecta su system prompt + tools + contexto
+en CADA petición. Consecuencias para el benchmark:
+
+- **Piso de ~7 000 tokens**: Anthropic nunca alcanza el extremo chico del barrido
+  (18-750 tokens de Gemini/OpenAI). No es apples-to-apples.
+- **Modelo distinto de tier**: usa `opus` (buque insignia), no un modelo barato
+  como `gpt-4o-mini` / `gemini-flash`.
+
+Por eso la comparativa de proveedores se cierra con **Gemini + OpenAI** (misma
+metodología, tiers comparables). Lo que Claude Code SÍ nos da es otra medición,
+igual de valiosa: el **coste real de usar Claude Code** (§5.1).
+
+> Nota operativa: un `claude -p` suelto anda bien, pero un **loop** de muchos
+> (15 procesos Claude Code seguidos) tumba la terminal por acumulación de
+> recursos. Si se quiere una serie, hacerla de a poco y con `sleep` amplio.
 
 ## 5. Primeros hallazgos
 
@@ -124,7 +131,27 @@ Lectura:
    este relleno (lorem ipsum), NO una regla; con texto real divergen.
 
 **Caveats de esta corrida**: precios son placeholders editables (el 2× depende
-de ellos); output chico a propósito; n=3 (ruido en TTFT); falta Anthropic.
+de ellos); output chico a propósito; n=3 (ruido en TTFT); Anthropic queda fuera
+a propósito (ver §4 y §5.1).
+
+### 5.1 El coste real de Claude Code (harness overhead)
+
+El intento de medir Anthropic reveló el insight central del proyecto. La MISMA
+tarea trivial ("Responde ok"), medida de dos formas:
+
+| Vía | Modelo | input_tok | TTFT | Coste aprox. |
+|---|---|---|---|---|
+| Claude Code (`claude -p`) | opus-4-8 | 7 368 | 4 634 ms | **~$0.111** |
+| API cruda | gpt-4o-mini | 20 | 321 ms | **~$0.000005** |
+
+La misma tarea cuesta **~20 000× más** por Claude Code. Y NO es (solo) por el
+modelo: es el **overhead del harness** — 7 368 tokens de system prompt + tools +
+contexto que el agente arrastra en CADA llamada, más el uso de `opus`.
+
+> **La conclusión que importa para optimizar coste de agentes:** lo que domina
+> el coste no es el prompt del usuario, es el **contexto que el agente arrastra
+> por llamada**. Optimizar ahí (contexto más chico, modelo más barato para
+> tareas simples, caché) rinde mucho más que optimizar el prompt.
 
 ## 6. Gotchas (aprendidos en vivo)
 
@@ -145,5 +172,7 @@ de ellos); output chico a propósito; n=3 (ruido en TTFT); falta Anthropic.
 
 - **Segunda barrida: output largo** (throughput de generación + coste de salida).
 - **Verificar precios reales** por modelo (hoy son defaults editables).
-- **Anthropic** integrado en la comparativa (vía el loop de la sección 4).
+- **Anthropic vía API key** (no Max/OAuth): recién ahí entra en la barrida limpia
+  y comparable con Gemini/OpenAI. El track de "coste real de Claude Code" (§5.1)
+  es aparte y complementario.
 - Endurecer OxideGate para reabrir el archivo de telemetría si se rota/borra.
