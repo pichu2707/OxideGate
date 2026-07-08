@@ -53,9 +53,11 @@ Tipos de apoyo:
 - `Outgoing { url, route, upstream, model, stream, prompt_hash, prompt_bytes, body }`
   — la petición ya resuelta y lista para reenviar, con todo lo que la métrica
   necesita saber de antemano.
-- `Usage { input_tokens, output_tokens }` — acumulador de tokens. Diseñado para
-  crecer con los tokens de caché (`cache_read` / `cachedContent`) sin tocar la
-  capa de medición.
+- `Usage { input_tokens, output_tokens, cache_read_tokens, cache_write_tokens }`
+  — acumulador de tokens. Los campos de caché se guardan CRUDOS, tal como los
+  reporta cada proveedor (sin normalizar ni restar de `input_tokens`); quién
+  sabe si la caché es subconjunto del input o va aparte es `telemetry/pricing.rs`,
+  no este struct ni la capa de medición.
 
 ---
 
@@ -93,15 +95,26 @@ stream fluye.
 
 ---
 
-## 4. Por qué importa para lo que viene
+## 4. Por qué importó para lo que vino después
 
-Este corte no es cosmético: **desbloquea el siguiente paso**. Capturar los tokens
-de caché — hoy no itemizados, lo que sobreestima el coste — se vuelve un cambio
-local a cada proveedor:
+Este corte no fue cosmético: **desbloqueó la itemización de caché**, ya
+resuelta. Capturar los tokens de caché — antes no itemizados, lo que
+sobreestimaba el coste — resultó ser un cambio local a cada proveedor:
 
-- Anthropic suma `cache_read_input_tokens` / `cache_creation_input_tokens`.
-- Gemini suma `cachedContentTokenCount`.
+- Anthropic suma `cache_read_input_tokens` → `cache_read_tokens` y
+  `cache_creation_input_tokens` → `cache_write_tokens`, APARTE de
+  `input_tokens` (así los reporta la API).
+- Gemini suma `cachedContentTokenCount` → `cache_read_tokens`, SUBCONJUNTO de
+  `promptTokenCount` (no se resta: `input_tokens` queda crudo).
+- OpenAI (Chat y Responses) suma `*_tokens_details.cached_tokens` →
+  `cache_read_tokens`, también SUBCONJUNTO del input.
 
-Cada uno lo hace dentro de su propio `extract_usage`, ampliando `Usage`. Ni
-`proxy.rs` ni `metered.rs` se enteran. Ese es el retorno de haber puesto el
-dialecto donde corresponde.
+Cada proveedor extrae estos campos crudos dentro de su propio `extract_usage`,
+ampliando `Usage` (ver sección 2). Ni `proxy.rs` ni `metered.rs` se enteran:
+solo reenvían los cuatro contadores hacia `telemetry::pricing`. Ahí — y
+únicamente ahí — vive el conocimiento de si la caché de una familia es
+subconjunto del input (Gemini, OpenAI) o va aparte (Anthropic), evitando el
+doble conteo al calcular `estimate_cost_usd`. Ese es el retorno de haber
+puesto el dialecto donde corresponde: la itemización de caché no tocó ni el
+transporte genérico ni la mecánica de medición, solo los adaptadores y la
+tabla de precios.

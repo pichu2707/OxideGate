@@ -205,19 +205,21 @@ consecuencia de diseño es directa:
 - **Precios editables, no oficiales.** `src/telemetry/pricing.rs` trae valores
   por defecto aproximados. Hay que mantenerlos sincronizados con la tarifa real.
   Modelo desconocido ⇒ `cost_estimate_usd = null` (nunca un número inventado).
-- **Tokens de caché sin itemizar (transversal, cuantificado en vivo).** Los
-  proveedores reportan aparte los tokens servidos desde caché, que se facturan
-  mucho más barato (~0.25×):
-  - Anthropic: `cache_read_input_tokens` / `cache_creation_input_tokens`.
-  - Gemini: `cachedContentTokenCount`.
+- **Tokens de caché sin itemizar — RESUELTO.** Detectado en una prueba real de
+  `gemini-3.5-flash` (**24.433 de 63.531 tokens de input, ~38%, fueron lecturas
+  de caché**), donde `input_tokens` (exacto, coincide con el CLI) se preciaba
+  entero a tarifa full y `cost_estimate_usd` sobreestimaba. Cada adaptador
+  extrae ahora los campos crudos de caché (`Usage.cache_read_tokens` /
+  `cache_write_tokens`, ver `docs/provider-adapters.md` §4):
+  - Anthropic: `cache_read_input_tokens` / `cache_creation_input_tokens`
+    (APARTE del input).
+  - Gemini: `cachedContentTokenCount` (SUBCONJUNTO del input).
+  - OpenAI: `prompt_tokens_details.cached_tokens` /
+    `input_tokens_details.cached_tokens` (SUBCONJUNTO del input).
 
-  Hoy `input_tokens` incluye esos tokens pero los precia a tarifa full, así que
-  `cost_estimate_usd` **sobreestima**. No es teórico: en una prueba real de
-  `gemini-3.5-flash`, **24.433 de 63.531 tokens de input (~38%) fueron lecturas
-  de caché**. `input_tokens` sigue siendo exacto (coincide con el CLI); lo que
-  falla es el precio. Fix pendiente: capturar los campos de caché como métricas
-  aparte y preciarlos a tarifa reducida (natural de meter en el refactor del
-  adaptador).
+  `telemetry::pricing::estimate_cost_usd` es el único que conoce si la caché
+  de una familia es subconjunto del input o va aparte, y precia cada porción
+  a su tarifa reducida sin doble contar.
 - **Tokens de "thinking" de Gemini sin sumar.** `thoughtsTokenCount` se factura
   (a tarifa de output) y hoy no se contempla. Mismo bucket de deuda de coste.
 - **Precio de Gemini flash-lite genérico.** `gemini-*-flash-lite` cae en el
