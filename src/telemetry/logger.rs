@@ -1,10 +1,15 @@
 //! Escritor de telemetría fuera del camino crítico.
 //!
 //! El handler solo hace `sink.record(...)` (un `send` a un canal, no bloquea).
-//! Una task en background serializa a JSONL y escribe a disco. Así el I/O de
-//! log NUNCA se suma a la latencia que le devolvemos a gentle-ai.
+//! Una task en background serializa a JSONL y escribe a disco, y de paso
+//! alimenta el [`StatsRegistry`](crate::telemetry::stats::StatsRegistry)
+//! compartido para que `/stats` pueda leer la agregación en vivo sin tocar el
+//! JSONL. Así el I/O de log NUNCA se suma a la latencia que le devolvemos a
+//! gentle-ai.
+use crate::telemetry::StatsRegistry;
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 
@@ -72,12 +77,18 @@ pub struct RequestMetric {
 #[derive(Clone)]
 pub struct TelemetrySink {
     tx: mpsc::UnboundedSender<RequestMetric>,
+    /// Agregación en vivo por `(upstream, model)`, alimentada por la misma
+    /// task de drenaje que escribe el JSONL. Se comparte con el handler de
+    /// `/stats` vía `stats()`.
+    stats: Arc<RwLock<StatsRegistry>>,
 }
 
 impl TelemetrySink {
     /// Arranca la task escritora y devuelve el handle para emitir métricas.
     pub fn spawn(storage_dir: PathBuf) -> Self {
         let (tx, mut rx) = mpsc::unbounded_channel::<RequestMetric>();
+        let stats = Arc::new(RwLock::new(StatsRegistry::default()));
+        let stats_writer = Arc::clone(&stats);
 
         let mut path = storage_dir;
         path.push("telemetry.jsonl");
@@ -97,6 +108,22 @@ impl TelemetrySink {
             };
 
             while let Some(metric) = rx.recv().await {
+                // Lock breve y SIN `.await` dentro: tomamos, actualizamos y
+                // soltamos antes de tocar el archivo (I/O async). Nunca debe
+                // sostenerse un lock a través de un punto de suspensión.
+                //
+                // Ante un lock envenenado (un panic previo mientras estaba
+                // tomado) recuperamos el guard con `into_inner` en vez de
+                // ignorarlo: así el escritor sigue alimentando `/stats`, igual
+                // que el lector, y no dejamos las estadísticas congeladas para
+                // siempre por un único panic.
+                {
+                    let mut registry = stats_writer
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    registry.ingest(&metric);
+                }
+
                 if let Ok(mut line) = serde_json::to_string(&metric) {
                     line.push('\n');
                     if let Err(e) = file.write_all(line.as_bytes()).await {
@@ -106,11 +133,17 @@ impl TelemetrySink {
             }
         });
 
-        Self { tx }
+        Self { tx, stats }
     }
 
     /// No bloquea: si el canal se cerró, descartamos la métrica en silencio.
     pub fn record(&self, metric: RequestMetric) {
         let _ = self.tx.send(metric);
+    }
+
+    /// Handle compartido a la agregación en vivo, para que el handler de
+    /// `/stats` lea un snapshot sin pasar por el canal ni por disco.
+    pub fn stats(&self) -> Arc<RwLock<StatsRegistry>> {
+        Arc::clone(&self.stats)
     }
 }

@@ -6,7 +6,10 @@ mod provider;
 mod state;
 mod telemetry;
 
-use axum::{routing::post, Router};
+use axum::{
+    routing::{get, post},
+    Router,
+};
 use config::AppConfig;
 use state::AppState;
 use std::net::SocketAddr;
@@ -65,11 +68,14 @@ async fn main() {
             "/v1beta/*rest",
             post(middleware::proxy::handle_gemini_route),
         )
+        // Agregación en vivo por (proveedor, modelo): qué optimizar ahora.
+        .route("/stats", get(middleware::stats::handle_stats))
         .with_state(Arc::new(state));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
 
     println!("🛰️  Escuchando en http://{addr}");
+    println!("📊 Estadísticas en vivo por modelo en http://{addr}/stats");
     axum::serve(listener, app).await.unwrap();
 }
