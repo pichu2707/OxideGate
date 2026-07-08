@@ -165,10 +165,16 @@ impl ModelAccumulator {
             avg_ttft_ms: safe_div(self.ttft_ms_sum, self.ttft_ms_count as f64),
             min_ttft_ms: self.ttft_ms_min,
             max_ttft_ms: self.ttft_ms_max,
+            ttft_ms_sum: self.ttft_ms_sum,
+            ttft_ms_count: self.ttft_ms_count,
             avg_total_ms: safe_div(self.total_ms_sum, requests_f),
+            total_ms_sum: self.total_ms_sum,
             avg_tokens_per_sec: safe_div(self.tokens_per_sec_sum, self.tokens_per_sec_count as f64),
+            tokens_per_sec_sum: self.tokens_per_sec_sum,
+            tokens_per_sec_count: self.tokens_per_sec_count,
 
             error_rate: safe_div(self.errors as f64, requests_f),
+            errors: self.errors,
 
             distinct_prompts,
             redundant_requests,
@@ -219,10 +225,28 @@ pub struct ModelStatsRow {
     pub avg_ttft_ms: f64,
     pub min_ttft_ms: Option<f64>,
     pub max_ttft_ms: Option<f64>,
+    /// Suma cruda de `ttft_ms` acumulada (no promedio). Expuesta para que un
+    /// cliente externo (p. ej. el monitor TUI) pueda derivar el `avg_ttft_ms`
+    /// de una VENTANA de tiempo (Δsuma / Δcount) sin tener que reconstruirla
+    /// a partir de dos promedios, lo cual sería matemáticamente incorrecto.
+    pub ttft_ms_sum: f64,
+    /// Cantidad de requests que aportaron a `ttft_ms_sum` (puede ser menor a
+    /// `requests`: no todas las respuestas exponen TTFT, p. ej. no-streaming).
+    pub ttft_ms_count: u64,
     pub avg_total_ms: f64,
+    /// Suma cruda de `total_ms` acumulada. El count coincide con `requests`
+    /// (todo request mide `total_ms`), así que no hace falta un campo aparte.
+    pub total_ms_sum: f64,
     pub avg_tokens_per_sec: f64,
+    /// Suma cruda de `tokens_per_sec` acumulada (no promedio).
+    pub tokens_per_sec_sum: f64,
+    /// Cantidad de requests que aportaron a `tokens_per_sec_sum`.
+    pub tokens_per_sec_count: u64,
 
     pub error_rate: f64,
+    /// Cantidad cruda de requests con `status >= 400` (numerador de
+    /// `error_rate`, expuesto para poder derivar la tasa de una ventana).
+    pub errors: u64,
 
     /// Huellas de prompt distintas vistas (acotado por el cap de memoria).
     pub distinct_prompts: u64,
@@ -329,6 +353,13 @@ mod tests {
         assert_eq!(row.avg_output_tokens, 5.0);
         assert!((row.avg_cost_usd - 0.01).abs() < 1e-9);
         assert!((row.avg_ttft_ms - 50.0).abs() < 1e-9);
+        // Sumas/counts crudas: deben coincidir con lo que promedian arriba.
+        assert!((row.ttft_ms_sum - 150.0).abs() < 1e-9);
+        assert_eq!(row.ttft_ms_count, 3);
+        assert!((row.total_ms_sum - 300.0).abs() < 1e-9);
+        assert!((row.tokens_per_sec_sum - 60.0).abs() < 1e-9);
+        assert_eq!(row.tokens_per_sec_count, 3);
+        assert_eq!(row.errors, 0);
     }
 
     /// Contador auxiliar para generar huellas distintas entre llamadas dentro
