@@ -59,6 +59,12 @@ pub struct Outgoing {
     /// Body que efectivamente se reenvía al proveedor (puede diferir del
     /// original si el proveedor necesitó mutarlo, p. ej. OpenAI streaming).
     pub body: Vec<u8>,
+    /// `true` si `prepare` inyectó un breakpoint de `cache_control` a nivel
+    /// raíz del body (palanca A del optimizador, solo Anthropic). Viaja hasta
+    /// la métrica para correlacionar la inyección con los
+    /// `cache_read_tokens` resultantes. `false` en el resto de los
+    /// proveedores y en cualquier caso donde Anthropic no haya mutado nada.
+    pub cache_control_forced: bool,
 }
 
 /// Acumulador de tokens medidos desde la respuesta del proveedor.

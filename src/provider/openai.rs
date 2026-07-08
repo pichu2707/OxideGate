@@ -49,6 +49,9 @@ impl Provider for OpenAiChat {
             prompt_hash,
             prompt_bytes,
             body,
+            // OpenAI cachea el prefijo estable de forma automática (no hace
+            // falta ningún breakpoint explícito): esta palanca no aplica acá.
+            cache_control_forced: false,
         }
     }
 
@@ -79,6 +82,8 @@ impl Provider for OpenAiResponses {
             prompt_hash,
             prompt_bytes,
             body: incoming.body,
+            // Ídem: caché automática del lado de OpenAI, no aplica.
+            cache_control_forced: false,
         }
     }
 

@@ -1,7 +1,14 @@
 //! Proveedor Anthropic (Claude): ruta fija, modelo y `stream` en el body.
 //!
 //! A diferencia de OpenAI, Anthropic ya manda `usage` con cada evento SSE
-//! por defecto: no hace falta pedir nada extra ni mutar el body saliente.
+//! por defecto: no hace falta pedir nada extra para leer tokens exactos.
+//!
+//! Sí existe una mutación OPCIONAL del body: la palanca A del optimizador
+//! (`AppConfig::force_prompt_cache`). Cuando está prendida y el cliente no
+//! gestiona su propio prompt caching, `prepare` inyecta un breakpoint de
+//! `cache_control` a nivel raíz para que Anthropic cachee el prefijo estable
+//! (`tools` + `system`) y las llamadas repetidas paguen `cache_read` (0.1x)
+//! en vez de tarifa plena. Ver `docs/optimizer-prompt-cache.md`.
 use super::{fingerprint, model_and_stream_from_body, Incoming, Outgoing, Provider, Usage};
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -18,19 +25,30 @@ impl Provider for Anthropic {
         "anthropic"
     }
 
-    /// Arma el request hacia `{anthropic}/messages`. No muta el body: solo
-    /// lee `model`/`stream` para la métrica.
+    /// Arma el request hacia `{anthropic}/messages`. Lee `model`/`stream` para
+    /// la métrica y, si `cfg.force_prompt_cache` está activo, intenta inyectar
+    /// un breakpoint de `cache_control` (ver [`force_cache_control`]).
     fn prepare(&self, incoming: Incoming, cfg: &AppConfig) -> Outgoing {
         let (model, stream) = model_and_stream_from_body(&incoming.body);
+        let prompt_hash = fingerprint(&incoming.body);
+        let prompt_bytes = incoming.body.len();
+
+        let (body, cache_control_forced) = if cfg.force_prompt_cache {
+            force_cache_control(incoming.body)
+        } else {
+            (incoming.body, false)
+        };
+
         Outgoing {
             url: format!("{}/messages", cfg.target_anthropic_url),
             route: "/v1/messages".to_string(),
             upstream: self.name(),
             model,
             stream,
-            prompt_hash: fingerprint(&incoming.body),
-            prompt_bytes: incoming.body.len(),
-            body: incoming.body,
+            prompt_hash,
+            prompt_bytes,
+            body,
+            cache_control_forced,
         }
     }
 
@@ -64,6 +82,52 @@ impl Provider for Anthropic {
         {
             usage.cache_write_tokens = Some(v);
         }
+    }
+}
+
+/// Palanca A del optimizador: si el body es JSON válido y NO trae ya ningún
+/// `cache_control`, inyecta uno a nivel raíz (`{"type": "ephemeral"}`).
+///
+/// Anthropic hace *prefix match*: un `cache_control` en la raíz del request
+/// se auto-coloca en el último bloque cacheable, cubriendo `tools` + `system`
+/// sin que haga falta localizar el bloque a mano. No hace falta pedirlo si el
+/// cliente YA gestiona su propio caching (evita pisar sus breakpoints y
+/// superar el máximo de 4 por request, que Anthropic responde con `400`).
+///
+/// Devuelve `(body, forced)`: `body` reenviable tal cual (mutado o no) y
+/// `forced` para que la métrica sepa si esta petición llevó la inyección.
+/// Si el body no es JSON válido —o es JSON válido pero no un objeto (array,
+/// string, número…), que no es indexable— se reenvía intacto y
+/// `forced = false` (preferimos no medir/mutar a romper el request).
+fn force_cache_control(raw: Vec<u8>) -> (Vec<u8>, bool) {
+    let Ok(mut value) = serde_json::from_slice::<Value>(&raw) else {
+        return (raw, false);
+    };
+
+    // Solo los objetos JSON son indexables por clave: inyectar en un array o
+    // escalar entraría en pánico. Además, si el cliente ya cachea, no tocamos.
+    if !value.is_object() || has_cache_control(&value) {
+        return (raw, false);
+    }
+
+    value["cache_control"] = serde_json::json!({"type": "ephemeral"});
+    match serde_json::to_vec(&value) {
+        Ok(body) => (body, true),
+        Err(_) => (raw, false),
+    }
+}
+
+/// Detecta recursivamente si la clave `cache_control` aparece en cualquier
+/// nivel del `Value` (raíz, `system`, `tools`, `messages`, o anidado dentro
+/// de esos). Basta con UN hallazgo para respetar el caching que ya gestiona
+/// el cliente y no forzar nada encima.
+fn has_cache_control(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            map.contains_key("cache_control") || map.values().any(has_cache_control)
+        }
+        Value::Array(items) => items.iter().any(has_cache_control),
+        _ => false,
     }
 }
 
@@ -124,5 +188,107 @@ mod tests {
         assert_eq!(usage.output_tokens, Some(8));
         assert_eq!(usage.cache_read_tokens, Some(100));
         assert_eq!(usage.cache_write_tokens, Some(20));
+    }
+
+    /// Construye un `AppConfig` mínimo para los tests de `prepare`, sin pasar
+    /// por `AppConfig::load()` (que lee variables de entorno del proceso).
+    fn test_config(force_prompt_cache: bool) -> AppConfig {
+        AppConfig {
+            local_port: 8080,
+            target_openai_url: "https://api.openai.com/v1".to_string(),
+            target_anthropic_url: "https://api.anthropic.com/v1".to_string(),
+            target_gemini_url: "https://generativelanguage.googleapis.com".to_string(),
+            storage_dir: std::path::PathBuf::from("/tmp/oxidegate-test"),
+            force_prompt_cache,
+        }
+    }
+
+    fn incoming_with_body(body: &str) -> Incoming {
+        Incoming {
+            path: "/v1/messages".to_string(),
+            query: None,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    /// Con la palanca prendida y un body SIN `cache_control`, `prepare` debe
+    /// inyectar el breakpoint a nivel raíz y marcar `cache_control_forced`.
+    #[test]
+    fn injects_cache_control_when_forced_and_absent() {
+        let cfg = test_config(true);
+        let incoming = incoming_with_body(
+            r#"{"model":"claude-3-5-sonnet","system":"eres un asistente","messages":[]}"#,
+        );
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert!(out.cache_control_forced);
+        let body: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(body["cache_control"]["type"], "ephemeral");
+    }
+
+    /// Con la palanca prendida pero el body YA trae un `cache_control` (p.
+    /// ej. el cliente cachea su propio bloque `system`), `prepare` no debe
+    /// tocar nada: se respeta el caching del cliente y no se arriesga a
+    /// superar el máximo de 4 breakpoints.
+    #[test]
+    fn does_not_inject_when_cache_control_already_present() {
+        let cfg = test_config(true);
+        let incoming = incoming_with_body(
+            r#"{"model":"claude-3-5-sonnet","system":[{"type":"text","text":"eres un asistente","cache_control":{"type":"ephemeral"}}],"messages":[]}"#,
+        );
+        let original_body = incoming.body.clone();
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert!(!out.cache_control_forced);
+        assert_eq!(out.body, original_body);
+    }
+
+    /// Con la palanca apagada (default), no se inyecta nada aunque el body
+    /// no traiga ningún `cache_control`.
+    #[test]
+    fn does_not_inject_when_flag_disabled() {
+        let cfg = test_config(false);
+        let incoming = incoming_with_body(
+            r#"{"model":"claude-3-5-sonnet","system":"eres un asistente","messages":[]}"#,
+        );
+        let original_body = incoming.body.clone();
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert!(!out.cache_control_forced);
+        assert_eq!(out.body, original_body);
+    }
+
+    /// Body no-JSON: `prepare` no debe romper, solo reenviar intacto y
+    /// marcar `cache_control_forced = false`.
+    #[test]
+    fn does_not_inject_on_invalid_json_body() {
+        let cfg = test_config(true);
+        let incoming = incoming_with_body("esto no es JSON");
+        let original_body = incoming.body.clone();
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert!(!out.cache_control_forced);
+        assert_eq!(out.body, original_body);
+    }
+
+    /// Body JSON VÁLIDO pero no-objeto (array/escalar): no es indexable por
+    /// clave, así que `prepare` debe reenviarlo intacto en vez de entrar en
+    /// pánico. Antes rompía la petición; ahora se comporta como el no-JSON.
+    #[test]
+    fn does_not_inject_on_non_object_json_body() {
+        let cfg = test_config(true);
+        for body in [r#"[1,2,3]"#, r#""solo un string""#, r#"42"#, r#"true"#] {
+            let incoming = incoming_with_body(body);
+            let original_body = incoming.body.clone();
+
+            let out = ANTHROPIC.prepare(incoming, &cfg);
+
+            assert!(!out.cache_control_forced, "body {body} no debe forzar caché");
+            assert_eq!(out.body, original_body, "body {body} debe reenviarse intacto");
+        }
     }
 }

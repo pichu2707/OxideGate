@@ -10,6 +10,15 @@ pub struct AppConfig {
     /// el proxy tal cual llega del cliente, así que aquí va solo el origen.
     pub target_gemini_url: String,
     pub storage_dir: PathBuf,
+    /// Palanca A del optimizador: fuerza un breakpoint de `cache_control` en
+    /// las peticiones a Anthropic que no gestionan su propio prompt caching.
+    ///
+    /// OxideGate es ANTE TODO un medidor transparente: por defecto no muta
+    /// ningún request. Este flag es la única excepción deliberada — activa una
+    /// mutación real del body saliente (ver `provider/anthropic.rs`), por eso
+    /// arranca APAGADO y hay que prenderlo a propósito con
+    /// `OXIDEGATE_FORCE_CACHE=true`.
+    pub force_prompt_cache: bool,
 }
 
 impl AppConfig {
@@ -34,6 +43,9 @@ impl AppConfig {
             target_gemini_url: env::var("GEMINI_API_BASE")
                 .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string()),
             storage_dir,
+            force_prompt_cache: env::var("OXIDEGATE_FORCE_CACHE")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
         }
     }
 

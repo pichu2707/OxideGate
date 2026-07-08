@@ -38,6 +38,9 @@ impl Provider for Gemini {
             prompt_hash: fingerprint(&incoming.body),
             prompt_bytes: incoming.body.len(),
             body: incoming.body,
+            // La caché de Gemini se gestiona aparte (implícita o explícita
+            // vía `cachedContent`), no con esta palanca: no aplica acá.
+            cache_control_forced: false,
         }
     }
 

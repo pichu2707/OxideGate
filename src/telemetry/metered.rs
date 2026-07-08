@@ -35,6 +35,10 @@ pub struct MetricBase {
     pub stream: bool,
     pub prompt_bytes: usize,
     pub status: u16,
+    /// `true` si `provider.prepare` inyectó un breakpoint de `cache_control`
+    /// en el body saliente (palanca A del optimizador). Nace en `Outgoing` y
+    /// viaja intacto hasta la métrica final.
+    pub cache_control_forced: bool,
     /// Proveedor dueño del dialecto de esta respuesta: la extracción del
     /// `usage` se delega íntegramente en él, así este módulo no necesita
     /// saber nada de ningún proveedor concreto.
@@ -198,6 +202,7 @@ impl MeteredBody {
             cache_read_tokens: self.scanner.usage.cache_read_tokens,
             cache_write_tokens: self.scanner.usage.cache_write_tokens,
             cost_estimate_usd,
+            cache_control_forced: self.base.cache_control_forced,
             status: self.base.status,
             ttft_ms: self.ttft_ms,
             total_ms,

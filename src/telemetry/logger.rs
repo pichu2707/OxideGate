@@ -48,6 +48,12 @@ pub struct RequestMetric {
     pub cache_write_tokens: Option<u64>,
     /// Coste estimado en USD según la tabla de precios. `None` si no calculable.
     pub cost_estimate_usd: Option<f64>,
+    /// `true` si OxideGate inyectó el breakpoint de `cache_control` en este
+    /// request (palanca A del optimizador, solo Anthropic). Permite
+    /// correlacionar la inyección con los `cache_read_tokens` resultantes de
+    /// las llamadas repetidas. `false` si la palanca estaba apagada, el
+    /// cliente ya gestionaba su propio caching, o el proveedor no aplica.
+    pub cache_control_forced: bool,
 
     // --- Latencia ---
     /// Código de estado HTTP devuelto al cliente.

@@ -120,6 +120,7 @@ async fn send_and_meter(
                 cache_read_tokens: None,
                 cache_write_tokens: None,
                 cost_estimate_usd: None,
+                cache_control_forced: out.cache_control_forced,
                 status: StatusCode::BAD_GATEWAY.as_u16(),
                 ttft_ms: None,
                 total_ms: start.elapsed().as_secs_f64() * 1000.0,
@@ -144,6 +145,7 @@ async fn send_and_meter(
         stream: out.stream,
         prompt_bytes: out.prompt_bytes,
         status: status.as_u16(),
+        cache_control_forced: out.cache_control_forced,
         provider: prov,
     };
 
