@@ -118,6 +118,7 @@ por función con su contrato) y **responsabilidad única estricta** por módulo.
 | [`docs/telemetry-level-1.md`](docs/telemetry-level-1.md) | Qué mide el Nivel 1 y por qué; la trampa del token entre proveedores |
 | [`docs/provider-adapters.md`](docs/provider-adapters.md) | El trait `Provider` y el corte por proveedor |
 | [`docs/optimizer-prompt-cache.md`](docs/optimizer-prompt-cache.md) | Palanca A: forzado de prompt caching de Anthropic |
+| [`docs/optimizer-dedup.md`](docs/optimizer-dedup.md) | Palanca B: dedup de respuestas por `prompt_hash` (diseño) |
 | [`docs/telemetry-by-model.md`](docs/telemetry-by-model.md) | El endpoint `GET /stats` y qué señala cada métrica |
 | [`docs/monitor-tui.md`](docs/monitor-tui.md) | El monitor de terminal en tiempo real |
 | [`docs/benchmark.md`](docs/benchmark.md) | El harness de benchmark (`bench`) |
@@ -129,12 +130,15 @@ por función con su contrato) y **responsabilidad única estricta** por módulo.
 **Hecho** ✅ — telemetría Nivel 1, adaptadores por proveedor, coste cache-aware,
 Palanca A (forzado de caché), agregación por modelo (`/stats`), monitor TUI.
 
-**Pendiente**
+**En diseño** 📐
 - **Palanca B — dedup por `prompt_hash`.** Servir respuesta cacheada ante
   peticiones idénticas (0 tokens, ~0 latencia). El `redundancy_rate` del monitor
-  chiva dónde conviene. Requiere una exploración de corrección antes de codear:
-  cachear salidas de un LLM es semánticamente delicado (no-determinismo,
-  staleness, corrección de agentes).
+  chiva dónde conviene. El corte seguro del primer slice ya está diseñado en
+  [`docs/optimizer-dedup.md`](docs/optimizer-dedup.md) (opt-in, solo
+  no-streaming, solo `temperature: 0`, con TTL) — listo para implementar tras
+  confirmar que hay redundancia real en el tráfico.
+
+**Pendiente**
 - **Segunda barrida de benchmark** con output largo (throughput de generación).
 - **Endurecer `telemetry.jsonl`** para reabrirlo si se rota o se borra.
 - **Precios reales por modelo** — deuda archivada: los ratios de caché ya son
