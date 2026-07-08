@@ -4,11 +4,15 @@
 //! desentendía. Aquí interponemos [`MeteredBody`]: reenvía cada chunk SIN
 //! modificarlo (no bufferiza, no rompe el SSE) pero de paso:
 //!   1. marca el TTFT en el primer chunk,
-//!   2. va escaneando los eventos SSE en busca del `usage` del proveedor,
+//!   2. va escaneando los eventos SSE en busca del `usage` del proveedor
+//!      (delegando la forma exacta en `Provider::extract_usage`),
 //!   3. al cerrarse el stream calcula coste/velocidad y emite la métrica.
 //!
 //! La métrica se emite UNA sola vez, tanto si el stream termina limpio como si
-//! el cliente se desconecta a media respuesta (vía `Drop`).
+//! el cliente se desconecta a media respuesta (vía `Drop`). Este módulo es
+//! mecánica PURA de medición: no conoce el dialecto de ningún proveedor
+//! concreto, solo el trait [`Provider`].
+use crate::provider::{Provider, Usage};
 use crate::telemetry::pricing;
 use crate::telemetry::{RequestMetric, TelemetrySink};
 use bytes::Bytes;
@@ -31,10 +35,15 @@ pub struct MetricBase {
     pub stream: bool,
     pub prompt_bytes: usize,
     pub status: u16,
+    /// Proveedor dueño del dialecto de esta respuesta: la extracción del
+    /// `usage` se delega íntegramente en él, así este módulo no necesita
+    /// saber nada de ningún proveedor concreto.
+    pub provider: &'static dyn Provider,
 }
 
 /// Acumulador incremental que extrae `input/output_tokens` del cuerpo de la
-/// respuesta, sea SSE (streaming) o un único JSON (no-streaming).
+/// respuesta, sea SSE (streaming) o un único JSON (no-streaming). La forma
+/// exacta del `usage` la conoce el `provider`, no este escáner.
 struct UsageScanner {
     /// `true` si la respuesta es SSE; decide la estrategia de parseo.
     is_stream: bool,
@@ -42,18 +51,19 @@ struct UsageScanner {
     line_buf: Vec<u8>,
     /// Cuerpo completo acumulado, solo en modo no-streaming (un JSON suelto).
     full_body: Vec<u8>,
-    input_tokens: Option<u64>,
-    output_tokens: Option<u64>,
+    /// Proveedor al que se delega la extracción del `usage` de cada valor JSON.
+    provider: &'static dyn Provider,
+    usage: Usage,
 }
 
 impl UsageScanner {
-    fn new(is_stream: bool) -> Self {
+    fn new(is_stream: bool, provider: &'static dyn Provider) -> Self {
         Self {
             is_stream,
             line_buf: Vec::new(),
             full_body: Vec::new(),
-            input_tokens: None,
-            output_tokens: None,
+            provider,
+            usage: Usage::default(),
         }
     }
 
@@ -88,7 +98,7 @@ impl UsageScanner {
             return;
         }
         if let Ok(value) = serde_json::from_str::<Value>(payload) {
-            self.extract_usage(&value);
+            self.provider.extract_usage(&value, &mut self.usage);
         }
     }
 
@@ -98,51 +108,7 @@ impl UsageScanner {
             return;
         }
         if let Ok(value) = serde_json::from_slice::<Value>(&self.full_body) {
-            self.extract_usage(&value);
-        }
-    }
-
-    /// Busca un objeto de `usage` en un valor JSON y actualiza los contadores.
-    ///
-    /// Cubre las tres formas de los proveedores:
-    ///   - OpenAI / Anthropic `message_delta`: `usage` en la raíz.
-    ///   - Anthropic `message_start`: `usage` anidado bajo `message`.
-    ///   - Gemini: `usageMetadata` en la raíz, con otros nombres de campo.
-    ///
-    /// El output es acumulativo/final (Anthropic y Gemini), así que "último gana".
-    fn extract_usage(&mut self, value: &Value) {
-        let usage = value
-            .get("usage")
-            .or_else(|| value.get("message").and_then(|m| m.get("usage")))
-            .or_else(|| value.get("usageMetadata"))
-            // OpenAI Responses API (Codex): `usage` anidado bajo `response` en el
-            // evento `response.completed`.
-            .or_else(|| value.get("response").and_then(|r| r.get("usage")));
-        let Some(usage) = usage else {
-            return;
-        };
-
-        // Entrada: `input_tokens` (Anthropic), `prompt_tokens` (OpenAI) o
-        // `promptTokenCount` (Gemini).
-        if let Some(v) = usage
-            .get("input_tokens")
-            .or_else(|| usage.get("prompt_tokens"))
-            .or_else(|| usage.get("promptTokenCount"))
-            .and_then(Value::as_u64)
-        {
-            self.input_tokens = Some(v);
-        }
-
-        // Salida: `output_tokens` (Anthropic), `completion_tokens` (OpenAI) o
-        // `candidatesTokenCount` (Gemini). Nota: en Gemini los tokens de
-        // "thinking" (`thoughtsTokenCount`) van aparte y aún no se suman aquí.
-        if let Some(v) = usage
-            .get("output_tokens")
-            .or_else(|| usage.get("completion_tokens"))
-            .or_else(|| usage.get("candidatesTokenCount"))
-            .and_then(Value::as_u64)
-        {
-            self.output_tokens = Some(v);
+            self.provider.extract_usage(&value, &mut self.usage);
         }
     }
 }
@@ -175,13 +141,14 @@ impl MeteredBody {
         start: Instant,
     ) -> Self {
         let is_stream = base.stream;
+        let provider = base.provider;
         Self {
             inner: Box::pin(inner),
             sink,
             base,
             start,
             ttft_ms: None,
-            scanner: UsageScanner::new(is_stream),
+            scanner: UsageScanner::new(is_stream, provider),
             emitted: false,
         }
     }
@@ -197,15 +164,19 @@ impl MeteredBody {
         let total_ms = self.start.elapsed().as_secs_f64() * 1000.0;
         let cost_estimate_usd = pricing::estimate_cost_usd(
             self.base.model.as_deref(),
-            self.scanner.input_tokens,
-            self.scanner.output_tokens,
+            self.scanner.usage.input_tokens,
+            self.scanner.usage.output_tokens,
         );
 
         // Velocidad de generación = tokens de salida / tramo de generación
         // (total − TTFT). Solo tiene sentido en STREAMING: en una respuesta
         // no-streaming todo llega de golpe (ttft ≈ total) y el tramo tiende a
         // cero, disparando un número absurdo. Fuera de streaming la anulamos.
-        let tokens_per_sec = match (self.base.stream, self.scanner.output_tokens, self.ttft_ms) {
+        let tokens_per_sec = match (
+            self.base.stream,
+            self.scanner.usage.output_tokens,
+            self.ttft_ms,
+        ) {
             (true, Some(out), Some(ttft)) if total_ms > ttft => {
                 Some(out as f64 / ((total_ms - ttft) / 1000.0))
             }
@@ -220,8 +191,8 @@ impl MeteredBody {
             prompt_hash: self.base.prompt_hash.clone(),
             stream: self.base.stream,
             prompt_bytes: self.base.prompt_bytes,
-            input_tokens: self.scanner.input_tokens,
-            output_tokens: self.scanner.output_tokens,
+            input_tokens: self.scanner.usage.input_tokens,
+            output_tokens: self.scanner.usage.output_tokens,
             cost_estimate_usd,
             status: self.base.status,
             ttft_ms: self.ttft_ms,
@@ -270,70 +241,19 @@ impl Drop for MeteredBody {
 #[cfg(test)]
 mod tests {
     use super::UsageScanner;
+    use crate::provider::ANTHROPIC;
 
-    /// Anthropic manda el input en `message_start` y el output acumulado en
-    /// `message_delta`. El scanner debe quedarse con ambos.
-    #[test]
-    fn extracts_anthropic_usage_from_sse() {
-        let mut scanner = UsageScanner::new(true);
-        scanner.feed(b"event: message_start\n");
-        scanner.feed(b"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":42,\"output_tokens\":1}}}\n\n");
-        scanner.feed(b"event: message_delta\n");
-        scanner.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":99}}\n\n");
-        scanner.finish();
-
-        assert_eq!(scanner.input_tokens, Some(42));
-        assert_eq!(scanner.output_tokens, Some(99));
-    }
-
-    /// OpenAI (con include_usage) manda el `usage` en el chunk final, con
-    /// `prompt_tokens`/`completion_tokens` y `choices` vacío.
-    #[test]
-    fn extracts_openai_usage_from_sse() {
-        let mut scanner = UsageScanner::new(true);
-        scanner.feed(b"data: {\"choices\":[{\"delta\":{\"content\":\"hola\"}}]}\n\n");
-        scanner.feed(b"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30}}\n\n");
-        scanner.feed(b"data: [DONE]\n\n");
-        scanner.finish();
-
-        assert_eq!(scanner.input_tokens, Some(10));
-        assert_eq!(scanner.output_tokens, Some(20));
-    }
-
-    /// El caso feo: un evento SSE partido entre dos chunks. El buffer de línea
-    /// debe recomponerlo antes de parsear.
+    /// El caso feo: un evento SSE partido entre dos chunks. El buffer de
+    /// línea debe recomponerlo antes de parsear, delegando en el proveedor
+    /// la extracción del `usage` ya reconstituido. Esto ejercita la mecánica
+    /// pura del escáner (split de líneas), no la forma de ningún proveedor.
     #[test]
     fn reassembles_event_split_across_chunks() {
-        let mut scanner = UsageScanner::new(true);
+        let mut scanner = UsageScanner::new(true, &ANTHROPIC);
         scanner.feed(b"data: {\"type\":\"message_delta\",\"usa");
         scanner.feed(b"ge\":{\"output_tokens\":7}}\n\n");
         scanner.finish();
 
-        assert_eq!(scanner.output_tokens, Some(7));
-    }
-
-    /// Gemini (`alt=sse`) manda `usageMetadata` con otros nombres de campo, y el
-    /// conteo es acumulativo en el chunk final. El scanner debe mapearlo.
-    #[test]
-    fn extracts_gemini_usage_from_sse() {
-        let mut scanner = UsageScanner::new(true);
-        scanner.feed(b"data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hola\"}]}}],\"usageMetadata\":{\"promptTokenCount\":11,\"candidatesTokenCount\":3,\"totalTokenCount\":14}}\n\n");
-        scanner.finish();
-
-        assert_eq!(scanner.input_tokens, Some(11));
-        assert_eq!(scanner.output_tokens, Some(3));
-    }
-
-    /// Respuesta no-streaming: el `usage` vive en el JSON completo, que se parsea
-    /// al cerrar el stream, no por líneas SSE.
-    #[test]
-    fn extracts_usage_from_non_stream_body() {
-        let mut scanner = UsageScanner::new(false);
-        scanner.feed(b"{\"model\":\"claude\",\"usage\":{\"input_tokens\":5,");
-        scanner.feed(b"\"output_tokens\":8}}");
-        scanner.finish();
-
-        assert_eq!(scanner.input_tokens, Some(5));
-        assert_eq!(scanner.output_tokens, Some(8));
+        assert_eq!(scanner.usage.output_tokens, Some(7));
     }
 }

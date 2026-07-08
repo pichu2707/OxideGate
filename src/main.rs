@@ -2,6 +2,7 @@
 mod config;
 mod middleware;
 mod optimizer;
+mod provider;
 mod state;
 mod telemetry;
 
