@@ -166,6 +166,8 @@ impl MeteredBody {
             self.base.model.as_deref(),
             self.scanner.usage.input_tokens,
             self.scanner.usage.output_tokens,
+            self.scanner.usage.cache_read_tokens,
+            self.scanner.usage.cache_write_tokens,
         );
 
         // Velocidad de generación = tokens de salida / tramo de generación
@@ -193,6 +195,8 @@ impl MeteredBody {
             prompt_bytes: self.base.prompt_bytes,
             input_tokens: self.scanner.usage.input_tokens,
             output_tokens: self.scanner.usage.output_tokens,
+            cache_read_tokens: self.scanner.usage.cache_read_tokens,
+            cache_write_tokens: self.scanner.usage.cache_write_tokens,
             cost_estimate_usd,
             status: self.base.status,
             ttft_ms: self.ttft_ms,

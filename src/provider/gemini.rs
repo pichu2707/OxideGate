@@ -44,6 +44,11 @@ impl Provider for Gemini {
     /// `usageMetadata` en la raíz, con `promptTokenCount`/`candidatesTokenCount`.
     /// Nota: los tokens de "thinking" (`thoughtsTokenCount`) van aparte y aún
     /// no se suman acá.
+    ///
+    /// `cachedContentTokenCount` es SUBCONJUNTO de `promptTokenCount` (no se
+    /// resta acá: `input_tokens` se queda crudo, tal como lo valida el
+    /// ground-truth del CLI). Gemini no reporta cache-write en
+    /// `generateContent`.
     fn extract_usage(&self, value: &Value, usage: &mut Usage) {
         let Some(u) = value.get("usageMetadata") else {
             return;
@@ -54,6 +59,9 @@ impl Provider for Gemini {
         }
         if let Some(v) = u.get("candidatesTokenCount").and_then(Value::as_u64) {
             usage.output_tokens = Some(v);
+        }
+        if let Some(v) = u.get("cachedContentTokenCount").and_then(Value::as_u64) {
+            usage.cache_read_tokens = Some(v);
         }
     }
 }
@@ -92,6 +100,23 @@ mod tests {
 
         assert_eq!(usage.input_tokens, Some(11));
         assert_eq!(usage.output_tokens, Some(3));
+    }
+
+    /// `cachedContentTokenCount` es subconjunto de `promptTokenCount`: se
+    /// captura crudo en `cache_read_tokens` sin restarlo de `input_tokens`.
+    #[test]
+    fn extracts_gemini_cache_read_tokens() {
+        let mut usage = Usage::default();
+        let value: Value = serde_json::from_str(
+            r#"{"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":20,"cachedContentTokenCount":80}}"#,
+        )
+        .unwrap();
+
+        GEMINI.extract_usage(&value, &mut usage);
+
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.cache_read_tokens, Some(80));
     }
 
     /// El método `streamGenerateContent` en la URL indica streaming; el

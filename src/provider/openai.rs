@@ -101,6 +101,12 @@ fn inject_include_usage(raw: Vec<u8>) -> Vec<u8> {
 /// Extractor compartido por ambas variantes de OpenAI: `usage` en la raíz
 /// (Chat Completions) o anidado bajo `response` (Responses API, evento
 /// `response.completed`). Campos: `prompt_tokens`/`completion_tokens`.
+///
+/// Los tokens de caché son SUBCONJUNTO del prompt/input (no se restan acá,
+/// `input_tokens` se queda crudo). El nombre del campo anidado difiere por
+/// variante: Chat Completions manda `prompt_tokens_details.cached_tokens`,
+/// Responses manda `input_tokens_details.cached_tokens`; probamos ambos ya
+/// que esta función es compartida. No hay cache-write en ninguna variante.
 fn extract_openai_usage(value: &Value, usage: &mut Usage) {
     let Some(u) = value
         .get("usage")
@@ -114,6 +120,14 @@ fn extract_openai_usage(value: &Value, usage: &mut Usage) {
     }
     if let Some(v) = u.get("completion_tokens").and_then(Value::as_u64) {
         usage.output_tokens = Some(v);
+    }
+    if let Some(v) = u
+        .get("prompt_tokens_details")
+        .or_else(|| u.get("input_tokens_details"))
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+    {
+        usage.cache_read_tokens = Some(v);
     }
 }
 
@@ -151,5 +165,37 @@ mod tests {
 
         assert_eq!(usage.input_tokens, Some(4));
         assert_eq!(usage.output_tokens, Some(6));
+    }
+
+    /// Chat Completions reporta la caché como subconjunto de `prompt_tokens`
+    /// bajo `prompt_tokens_details.cached_tokens`.
+    #[test]
+    fn extracts_openai_chat_cache_read_tokens() {
+        let mut usage = Usage::default();
+        let value: Value = serde_json::from_str(
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":60}}}"#,
+        )
+        .unwrap();
+
+        OPENAI_CHAT.extract_usage(&value, &mut usage);
+
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.cache_read_tokens, Some(60));
+    }
+
+    /// Responses API reporta la caché bajo `input_tokens_details.cached_tokens`,
+    /// también subconjunto del prompt/input.
+    #[test]
+    fn extracts_openai_responses_cache_read_tokens() {
+        let mut usage = Usage::default();
+        let value: Value = serde_json::from_str(
+            r#"{"type":"response.completed","response":{"usage":{"prompt_tokens":50,"completion_tokens":10,"input_tokens_details":{"cached_tokens":30}}}}"#,
+        )
+        .unwrap();
+
+        OPENAI_RESPONSES.extract_usage(&value, &mut usage);
+
+        assert_eq!(usage.input_tokens, Some(50));
+        assert_eq!(usage.cache_read_tokens, Some(30));
     }
 }

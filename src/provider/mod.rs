@@ -68,12 +68,23 @@ pub struct Outgoing {
 /// que sí trae el valor JSON dado, y deja el resto como estaban ("último
 /// gana" para proveedores que reportan `usage` acumulativo).
 ///
-/// Deliberadamente no incluye todavía tokens de caché: cuando se sumen,
-/// alcanza con agregar un campo más acá sin tocar el resto de la forma.
+/// Los campos de caché se guardan CRUDOS, tal como los reporta cada
+/// proveedor, sin normalizar ni restar de `input_tokens`. Cada familia
+/// contabiliza la caché distinto (subconjunto del input vs. aparte); ese
+/// conocimiento vive enteramente en `telemetry::pricing`, no acá.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Usage {
+    /// Tokens de entrada, exactos y crudos tal como los reporta el proveedor
+    /// (puede incluir los de caché, según la familia: ver `pricing`).
     pub input_tokens: Option<u64>,
+    /// Tokens de salida, exactos y crudos tal como los reporta el proveedor.
     pub output_tokens: Option<u64>,
+    /// Tokens servidos desde caché (lectura, tarifa reducida). Crudo: cada
+    /// familia decide si es subconjunto de `input_tokens` o va aparte.
+    pub cache_read_tokens: Option<u64>,
+    /// Tokens escritos a caché (creación, sobreprecio). Solo lo reportan
+    /// algunos proveedores (p. ej. Anthropic); el resto lo deja en `None`.
+    pub cache_write_tokens: Option<u64>,
 }
 
 /// Contrato que debe cumplir cada proveedor: dueño de ambas puntas del

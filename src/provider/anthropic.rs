@@ -37,6 +37,10 @@ impl Provider for Anthropic {
     /// `usage` vive en la raíz (evento `message_delta`) o anidado bajo
     /// `message` (evento `message_start`). El conteo de salida es
     /// acumulativo entre eventos: "último gana".
+    ///
+    /// Anthropic reporta la caché APARTE de `input_tokens`:
+    /// `cache_read_input_tokens` (lectura) y `cache_creation_input_tokens`
+    /// (escritura) se guardan crudos, sin tocar `input_tokens`.
     fn extract_usage(&self, value: &Value, usage: &mut Usage) {
         let Some(u) = value
             .get("usage")
@@ -50,6 +54,15 @@ impl Provider for Anthropic {
         }
         if let Some(v) = u.get("output_tokens").and_then(Value::as_u64) {
             usage.output_tokens = Some(v);
+        }
+        if let Some(v) = u.get("cache_read_input_tokens").and_then(Value::as_u64) {
+            usage.cache_read_tokens = Some(v);
+        }
+        if let Some(v) = u
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+        {
+            usage.cache_write_tokens = Some(v);
         }
     }
 }
@@ -92,5 +105,24 @@ mod tests {
 
         assert_eq!(usage.input_tokens, Some(5));
         assert_eq!(usage.output_tokens, Some(8));
+    }
+
+    /// La caché de Anthropic va APARTE del input: `cache_read_input_tokens`
+    /// y `cache_creation_input_tokens` deben quedar en sus propios campos,
+    /// sin alterar `input_tokens`.
+    #[test]
+    fn extracts_anthropic_cache_tokens() {
+        let mut usage = Usage::default();
+        let value: Value = serde_json::from_str(
+            r#"{"model":"claude","usage":{"input_tokens":5,"output_tokens":8,"cache_read_input_tokens":100,"cache_creation_input_tokens":20}}"#,
+        )
+        .unwrap();
+
+        ANTHROPIC.extract_usage(&value, &mut usage);
+
+        assert_eq!(usage.input_tokens, Some(5));
+        assert_eq!(usage.output_tokens, Some(8));
+        assert_eq!(usage.cache_read_tokens, Some(100));
+        assert_eq!(usage.cache_write_tokens, Some(20));
     }
 }

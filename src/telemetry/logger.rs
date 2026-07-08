@@ -39,6 +39,13 @@ pub struct RequestMetric {
     pub input_tokens: Option<u64>,
     /// Tokens de salida exactos, tal como los reporta el proveedor en `usage`.
     pub output_tokens: Option<u64>,
+    /// Tokens servidos desde caché (lectura, tarifa reducida), crudos tal
+    /// como los reporta el proveedor. `None` si no se midió o el proveedor
+    /// no reportó caché en este request.
+    pub cache_read_tokens: Option<u64>,
+    /// Tokens escritos a caché (creación, sobreprecio), crudos. Solo lo
+    /// reportan algunos proveedores (p. ej. Anthropic); `None` en el resto.
+    pub cache_write_tokens: Option<u64>,
     /// Coste estimado en USD según la tabla de precios. `None` si no calculable.
     pub cost_estimate_usd: Option<f64>,
 

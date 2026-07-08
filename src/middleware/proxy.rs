@@ -117,6 +117,8 @@ async fn send_and_meter(
                 prompt_bytes: out.prompt_bytes,
                 input_tokens: None,
                 output_tokens: None,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
                 cost_estimate_usd: None,
                 status: StatusCode::BAD_GATEWAY.as_u16(),
                 ttft_ms: None,
