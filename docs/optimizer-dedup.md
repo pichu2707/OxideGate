@@ -1,9 +1,45 @@
 # Optimizador · Palanca B — dedup de respuestas por `prompt_hash`
 
-> Estado: **diseño** (aún NO implementado). Este documento fija el corte SEGURO
-> del primer slice para poder implementarlo sin re-litigar la corrección. La
-> Palanca A (`docs/optimizer-prompt-cache.md`) ya está en producción; ésta es
-> el siguiente escalón del optimizador.
+> Estado: **descartada para tráfico conversacional/de agente** (Claude Code y
+> similares), con evidencia medida — ver §0. El diseño de más abajo **no se
+> borra**: queda como registro del razonamiento y sigue siendo válido para
+> otras formas de tráfico (ver §0, último punto). La Palanca A
+> (`docs/optimizer-prompt-cache.md`) sigue en producción y no se ve afectada
+> por este descarte.
+
+---
+
+## 0. Por qué se descarta para tráfico conversacional (medido, no predicho)
+
+Este diseño se escribió antes de medir tráfico real de agente contra
+`claude-opus-4-8`. Con datos en mano (ver `docs/context-tax.md`), las tres
+razones que en su momento eran hipótesis ahora son hechos:
+
+- **`redundancy_rate` es 0.0 por construcción, no por accidente.** El
+  `prompt_hash` se calcula con `fingerprint()` sobre el `incoming.body`
+  COMPLETO (`src/provider/mod.rs`), y cada proveedor lo llama con el body
+  entero (ver `provider/anthropic.rs`, `provider/openai.rs`,
+  `provider/gemini.rs`). En una conversación el array `messages` crece en
+  cada turno — el body de un turno nunca es byte-idéntico al de otro. Dos
+  requests de la misma conversación **nunca** producen el mismo
+  `prompt_hash`. No es que no haya habido suerte: la clave de dedup está
+  definida sobre algo que por diseño cambia todos los turnos.
+- **El techo teórico es minúsculo.** El input fresco (lo único que un dedup
+  exacto podría evitar volver a pagar) es el **3.0%** del costo medido de la
+  sesión (`docs/context-tax.md` §2). Un dedup perfecto ahorraría, en el
+  mejor caso teórico, 3 centavos por dólar — y en la práctica, cero, porque
+  ningún hash se repite.
+- **El corte v1 exigía `stream = false`, y Claude Code siempre streamea.**
+  El 100% del tráfico de agente medido usa `stream: true`. Aunque el
+  `redundancy_rate` no fuera cero, el v1 tal como está diseñado abajo
+  quedaría inelegible para el 100% de ese tráfico de todas formas.
+
+**Dónde SÍ podría pagar esta palanca:** tráfico que repite requests
+idénticos, no-streaming — reintentos, corridas de CI, clasificación o
+scoring en batch, y fan-out de subagentes que comparten un prompt idéntico.
+En esos escenarios el body no crece turno a turno (no hay "turno"), así que
+la premisa que mata el caso conversacional no aplica. Si esa forma de
+tráfico aparece, este diseño sigue siendo el punto de partida correcto.
 
 ---
 

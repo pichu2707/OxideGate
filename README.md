@@ -121,7 +121,8 @@ por función con su contrato) y **responsabilidad única estricta** por módulo.
 | [`docs/telemetry-level-1.md`](docs/telemetry-level-1.md) | Qué mide el Nivel 1 y por qué; la trampa del token entre proveedores |
 | [`docs/provider-adapters.md`](docs/provider-adapters.md) | El trait `Provider` y el corte por proveedor |
 | [`docs/optimizer-prompt-cache.md`](docs/optimizer-prompt-cache.md) | Palanca A: forzado de prompt caching de Anthropic |
-| [`docs/optimizer-dedup.md`](docs/optimizer-dedup.md) | Palanca B: dedup de respuestas por `prompt_hash` (diseño) |
+| [`docs/optimizer-dedup.md`](docs/optimizer-dedup.md) | Palanca B: dedup de respuestas por `prompt_hash` (descartada para tráfico conversacional, con evidencia) |
+| [`docs/context-tax.md`](docs/context-tax.md) | El impuesto de contexto: descomposición medida de costo y latencia de una sesión real de agente, y el piso del harness |
 | [`docs/telemetry-by-model.md`](docs/telemetry-by-model.md) | El endpoint `GET /stats` y qué señala cada métrica |
 | [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) | El endpoint `GET /requests`: detalle en vivo por petición, la invariante de privacidad y el límite de 200 filas |
 | [`docs/monitor-tui.md`](docs/monitor-tui.md) | El monitor de terminal en tiempo real |
@@ -134,15 +135,21 @@ por función con su contrato) y **responsabilidad única estricta** por módulo.
 **Hecho** ✅ — telemetría Nivel 1, adaptadores por proveedor, coste cache-aware,
 Palanca A (forzado de caché), agregación por modelo (`/stats`), monitor TUI.
 
-**En diseño** 📐
-- **Palanca B — dedup por `prompt_hash`.** Servir respuesta cacheada ante
-  peticiones idénticas (0 tokens, ~0 latencia). El `redundancy_rate` del monitor
-  chiva dónde conviene. El corte seguro del primer slice ya está diseñado en
-  [`docs/optimizer-dedup.md`](docs/optimizer-dedup.md) (opt-in, solo
-  no-streaming, solo `temperature: 0`, con TTL) — listo para implementar tras
-  confirmar que hay redundancia real en el tráfico.
+**Descartado** ⛔ (con evidencia, para tráfico conversacional)
+- **Palanca B — dedup por `prompt_hash`.** Medido contra tráfico real de
+  agente: `redundancy_rate` es 0.0 por construcción (el hash se calcula
+  sobre el body completo, y `messages` crece en cada turno), el input fresco
+  que podría ahorrarse es solo 3.0% del costo, y Claude Code siempre
+  streamea (el v1 exigía `stream=false`). Detalle completo en
+  [`docs/optimizer-dedup.md`](docs/optimizer-dedup.md) §0. El diseño queda
+  vigente para otra forma de tráfico: requests idénticos no-streaming
+  (reintentos, CI, batch, fan-out de subagentes).
 
 **Pendiente**
+- **Decomponer `prompt_bytes` por componente** (`system` / `tools` /
+  historial / turno actual) en vez de un número plano — es el paso que falta
+  para responder "de lo que pago, cuánto es trabajo y cuánto es ceremonia".
+  Ver [`docs/context-tax.md`](docs/context-tax.md) §8.
 - **Segunda barrida de benchmark** con output largo (throughput de generación).
 - **Endurecer `telemetry.jsonl`** para reabrirlo si se rota o se borra.
 - **Precios reales por modelo** — deuda archivada: los ratios de caché ya son
