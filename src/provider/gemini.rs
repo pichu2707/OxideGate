@@ -3,6 +3,10 @@
 //! A diferencia de Anthropic/OpenAI, la ruta es comodín (`/v1beta/*`) y hay
 //! que preservar path + query originales (que llevan `alt=sse` y a veces la
 //! API key) al reenviar hacia el host de Gemini.
+//!
+//! `Outgoing::requested_effort`/`requested_speed` quedan siempre en `None`:
+//! son dialecto exclusivo de Anthropic (`output_config.effort` y `speed` a
+//! nivel raíz) sin equivalente hoy en Gemini.
 use super::{
     array_field, fingerprint, measure_key, measure_other, parse_body, split_history_and_last_turn,
     tools_overhead_bytes, ContextBreakdown, Incoming, Outgoing, Provider, Usage,
@@ -71,6 +75,12 @@ impl Provider for Gemini {
             context,
             tools_by_server: by_server,
             tools_overhead_bytes: overhead,
+            // `output_config.effort` y `speed` (raíz) son dialecto exclusivo
+            // de Anthropic: Gemini no tiene un equivalente hoy. `None` a
+            // propósito, no un hueco por omisión (ver la nota en
+            // `Outgoing::requested_effort`/`requested_speed`).
+            requested_effort: None,
+            requested_speed: None,
         }
     }
 

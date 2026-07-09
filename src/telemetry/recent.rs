@@ -23,6 +23,12 @@
 //!
 //! Es PURO: no conoce axum ni ningún framework HTTP, solo `RequestMetric`. El
 //! handler que lo expone por HTTP vive en `middleware::requests`.
+//!
+//! Desde este slice también expone el par PEDIDO/SERVIDO de velocidad
+//! (`requested_effort`, `requested_speed`, `served_speed`): son etiquetas
+//! cortas de un enum documentado por el proveedor (`"low"`, `"fast"`…),
+//! nunca contenido de prompt — no comprometen la invariante de privacidad de
+//! arriba.
 use crate::provider::ToolServerBytes;
 use crate::telemetry::logger::RequestMetric;
 use serde::Serialize;
@@ -71,6 +77,21 @@ pub struct RecentRequest {
     pub cost_estimate_usd: Option<f64>,
     /// `true` si OxideGate inyectó el breakpoint de `cache_control` en este request.
     pub cache_control_forced: bool,
+    /// Nivel de esfuerzo de razonamiento PEDIDO por el cliente
+    /// (`output_config.effort`). Dialecto exclusivo de Anthropic: `None` en
+    /// OpenAI/Gemini o si el campo estaba ausente/no era un string. Ver
+    /// `telemetry::logger::RequestMetric::requested_effort`.
+    pub requested_effort: Option<String>,
+    /// Modo de velocidad PEDIDO por el cliente (`speed` a nivel raíz).
+    /// SEPARADO a propósito de `served_speed`: el modo `fast` de Anthropic
+    /// tiene su propio rate limit, así que puede pedirse `"fast"` y servirse
+    /// `"standard"`. Ver `telemetry::logger::RequestMetric::requested_speed`.
+    pub requested_speed: Option<String>,
+    /// Velocidad con la que el proveedor SIRVIÓ REALMENTE la respuesta
+    /// (`usage.speed`). DOCUMENTADA por Anthropic, NO OBSERVADA todavía en
+    /// tráfico real: `None` significa "no reportada", nunca "estándar". Ver
+    /// `telemetry::logger::RequestMetric::served_speed`.
+    pub served_speed: Option<String>,
     /// Time To First Token en ms. `None` si no aplica (p. ej. sin streaming).
     pub ttft_ms: Option<f64>,
     /// Latencia total en ms, desde el request hasta el cierre de la respuesta.
@@ -141,6 +162,9 @@ impl From<&RequestMetric> for RecentRequest {
             cache_write_tokens: m.cache_write_tokens,
             cost_estimate_usd: m.cost_estimate_usd,
             cache_control_forced: m.cache_control_forced,
+            requested_effort: m.requested_effort.clone(),
+            requested_speed: m.requested_speed.clone(),
+            served_speed: m.served_speed.clone(),
             ttft_ms: m.ttft_ms,
             total_ms: m.total_ms,
             context_system_bytes: m.context_system_bytes,
@@ -213,6 +237,9 @@ mod tests {
             cache_write_tokens: None,
             cost_estimate_usd: Some(0.01),
             cache_control_forced: false,
+            requested_effort: Some("high".to_string()),
+            requested_speed: None,
+            served_speed: None,
             status: 200,
             ttft_ms: Some(50.0),
             total_ms: 100.0,
@@ -399,6 +426,50 @@ mod tests {
         assert_eq!(parsed["tools_by_server"][0]["server"], "claude_ai_Gmail");
         assert_eq!(parsed["tools_by_server"][0]["kind"], "mcp");
         assert_eq!(parsed["tools_overhead_bytes"], 4);
+    }
+
+    /// Con los tres campos de esfuerzo/velocidad presentes (`Some`), tanto
+    /// `RequestMetric` como su proyección `RecentRequest` deben serializarlos
+    /// con sus valores exactos — round-trip vía `serde_json::to_string` +
+    /// reparseo a `Value`, mismo patrón que
+    /// `round_trip_serde_con_tools_by_server_presente`.
+    #[test]
+    fn round_trip_serde_con_effort_y_speed_presentes() {
+        let mut m = base_metric("t1");
+        m.requested_effort = Some("xhigh".to_string());
+        m.requested_speed = Some("fast".to_string());
+        m.served_speed = Some("fast".to_string());
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+        let row = &recent.snapshot()[0];
+        let json = serde_json::to_string(row).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["requested_effort"], "xhigh");
+        assert_eq!(parsed["requested_speed"], "fast");
+        assert_eq!(parsed["served_speed"], "fast");
+    }
+
+    /// Con los tres campos ausentes (`None`, el caso hoy más común: todavía
+    /// no se observó tráfico con `fast` ni con `effort` explícito), deben
+    /// serializar a `null`, nunca desaparecer del JSON ni fallar.
+    #[test]
+    fn round_trip_serde_con_effort_y_speed_none() {
+        let mut m = base_metric("t1");
+        m.requested_effort = None;
+        m.requested_speed = None;
+        m.served_speed = None;
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+        let row = &recent.snapshot()[0];
+        let json = serde_json::to_string(row).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert!(parsed["requested_effort"].is_null());
+        assert!(parsed["requested_speed"].is_null());
+        assert!(parsed["served_speed"].is_null());
     }
 
     /// Mismo round-trip, con el campo en `None`: debe serializar a `null`,

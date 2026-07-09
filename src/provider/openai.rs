@@ -8,6 +8,11 @@
 //! - [`OpenAiResponses`] cubre `/v1/responses` (Responses API, la que usan
 //!   clientes modernos como Codex). Ya reporta `usage` en el evento
 //!   `response.completed` sin pedir nada: no inyecta.
+//!
+//! Ninguna de las dos variantes lee `Outgoing::requested_effort` ni
+//! `Outgoing::requested_speed`: ambos son dialecto exclusivo de Anthropic
+//! (`output_config.effort` y `speed` a nivel raíz), así que acá quedan
+//! siempre en `None` a propósito (ver la nota en cada `prepare`).
 use super::{
     array_field, fingerprint, measure_key, measure_other, measure_value, model_and_stream_from_value,
     parse_body, split_history_and_last_turn, tools_overhead_bytes, ContextBreakdown, Incoming,
@@ -82,6 +87,13 @@ impl Provider for OpenAiChat {
             context,
             tools_by_server: by_server,
             tools_overhead_bytes: overhead,
+            // `output_config.effort` y `speed` (raíz) son dialecto EXCLUSIVO
+            // de Anthropic: Chat Completions no tiene un equivalente hoy. Se
+            // deja `None` a propósito, en vez de heredar en silencio un
+            // default, para que un futuro campo equivalente de OpenAI se
+            // decida conscientemente acá y no se cuele por accidente.
+            requested_effort: None,
+            requested_speed: None,
         }
     }
 
@@ -221,6 +233,11 @@ impl Provider for OpenAiResponses {
             context,
             tools_by_server: by_server,
             tools_overhead_bytes: overhead,
+            // Ídem Chat Completions: `effort`/`speed` son dialecto exclusivo
+            // de Anthropic, no aplica acá (ver esa nota para el contrato
+            // completo).
+            requested_effort: None,
+            requested_speed: None,
         }
     }
 

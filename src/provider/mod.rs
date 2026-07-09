@@ -90,6 +90,30 @@ pub struct Outgoing {
     /// mismos casos donde `tools_by_server` queda vacío (nada que restar, o
     /// no hay `context` del que sacar `tools_bytes`).
     pub tools_overhead_bytes: usize,
+    /// Nivel de esfuerzo de razonamiento pedido por el cliente
+    /// (`output_config.effort`: `"low"` | `"medium"` | `"high"` | `"xhigh"` |
+    /// `"max"`), leído del MISMO `Value` ya parseado en `prepare` (nunca un
+    /// segundo parseo). Es una palanca de VELOCIDAD, no de coste: menos
+    /// tokens de "thinking" ⇒ menos tiempo de generación, que es el 82% del
+    /// tiempo ocupado medido en tráfico real (ver `docs/`). `None` si
+    /// `output_config` está ausente, si `effort` está ausente dentro de él, o
+    /// si `effort` no es un string (p. ej. un número) — nunca se inventa un
+    /// valor a partir de un tipo inesperado.
+    ///
+    /// Dialecto de Anthropic únicamente: OpenAI y Gemini devuelven siempre
+    /// `None` acá (ver la nota en sus respectivos `prepare`).
+    pub requested_effort: Option<String>,
+    /// Modo de velocidad pedido por el cliente: campo `speed` a nivel RAÍZ
+    /// del body (no anidado, a diferencia de `effort`), valor `"fast"` en el
+    /// beta de Anthropic (Opus 4.8 / 4.7). Hasta ~2.5x tokens de salida por
+    /// segundo, a tarifa premium. `None` si `speed` está ausente en la raíz o
+    /// no es un string.
+    ///
+    /// Dialecto de Anthropic únicamente: OpenAI y Gemini devuelven siempre
+    /// `None` acá. Ver [`Usage::speed`] para el campo COMPLEMENTARIO del lado
+    /// de la respuesta (qué velocidad sirvió REALMENTE el proveedor, que
+    /// puede diferir de esta si el modo `fast` está rate-limiteado).
+    pub requested_speed: Option<String>,
 }
 
 /// Acumulador de tokens medidos desde la respuesta del proveedor.
@@ -103,7 +127,7 @@ pub struct Outgoing {
 /// proveedor, sin normalizar ni restar de `input_tokens`. Cada familia
 /// contabiliza la caché distinto (subconjunto del input vs. aparte); ese
 /// conocimiento vive enteramente en `telemetry::pricing`, no acá.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct Usage {
     /// Tokens de entrada, exactos y crudos tal como los reporta el proveedor
     /// (puede incluir los de caché, según la familia: ver `pricing`).
@@ -116,6 +140,23 @@ pub struct Usage {
     /// Tokens escritos a caché (creación, sobreprecio). Solo lo reportan
     /// algunos proveedores (p. ej. Anthropic); el resto lo deja en `None`.
     pub cache_write_tokens: Option<u64>,
+    /// Velocidad con la que el proveedor SIRVIÓ REALMENTE la respuesta
+    /// (`usage.speed`, string), leída con la misma semántica "último gana"
+    /// que el resto de los campos de `Usage`. Complementa a
+    /// [`Outgoing::requested_speed`]: el modo `fast` de Anthropic tiene su
+    /// propio rate limit, así que un request puede PEDIR `"fast"` y ser
+    /// servido a velocidad `"standard"` — este campo es la única forma de
+    /// saberlo.
+    ///
+    /// ESTADO: Anthropic DOCUMENTA este campo en `usage.speed`, pero a la
+    /// fecha de este slice NUNCA se observó en tráfico real de este proyecto
+    /// (el modo `fast` no se ejercitó todavía). `None` acá significa "el
+    /// proveedor no lo reportó", NUNCA "sirvió a velocidad estándar": no hay
+    /// forma de distinguir "campo ausente porque el proveedor no manda esta
+    /// beta" de "campo ausente porque de verdad sirvió estándar" hasta que se
+    /// observe el campo presente al menos una vez. Solo Anthropic lo llena;
+    /// OpenAI y Gemini lo dejan siempre en `None`.
+    pub speed: Option<String>,
 }
 
 /// Descomposición del body de un request por componente, medida en BYTES.

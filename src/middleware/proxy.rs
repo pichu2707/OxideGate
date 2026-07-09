@@ -161,6 +161,9 @@ async fn send_and_meter(
                 tools_by_server,
                 tools_overhead_bytes,
                 prepare_us,
+                requested_effort: out.requested_effort,
+                requested_speed: out.requested_speed,
+                served_speed: None,
             });
             return plain_error(
                 StatusCode::BAD_GATEWAY,
@@ -186,6 +189,8 @@ async fn send_and_meter(
         tools_by_server: out.tools_by_server,
         tools_overhead_bytes: out.tools_overhead_bytes,
         prepare_us,
+        requested_effort: out.requested_effort,
+        requested_speed: out.requested_speed,
         provider: prov,
     };
 

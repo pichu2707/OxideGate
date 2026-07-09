@@ -12,6 +12,12 @@
 //! el cliente se desconecta a media respuesta (vía `Drop`). Este módulo es
 //! mecánica PURA de medición: no conoce el dialecto de ningún proveedor
 //! concreto, solo el trait [`Provider`].
+//!
+//! Desde este slice también transporta el par PEDIDO/SERVIDO de velocidad:
+//! `MetricBase::requested_effort`/`requested_speed` nacen en `Outgoing` (se
+//! conocen ANTES de la respuesta); `served_speed` sale de `Usage::speed`, que
+//! el escáner de `usage` recién conoce al leer la respuesta — por eso viaja
+//! en `self.scanner.usage.speed`, no en `MetricBase`.
 use crate::provider::{ContextBreakdown, Provider, ToolServerBytes, Usage};
 use crate::telemetry::logger::{flatten_context_breakdown, tools_fields};
 use crate::telemetry::pricing;
@@ -60,6 +66,16 @@ pub struct MetricBase {
     /// Microsegundos que `middleware::proxy::run` pasó dentro de
     /// `provider.prepare(...)`. Viaja intacto hasta `RequestMetric::prepare_us`.
     pub prepare_us: u64,
+    /// Nivel de esfuerzo de razonamiento PEDIDO por el cliente
+    /// (`Outgoing::requested_effort`). Viaja intacto hasta
+    /// `RequestMetric::requested_effort`.
+    pub requested_effort: Option<String>,
+    /// Modo de velocidad PEDIDO por el cliente (`Outgoing::requested_speed`).
+    /// Viaja intacto hasta `RequestMetric::requested_speed`. Ver esa doc para
+    /// por qué es un campo SEPARADO de la velocidad servida (`served_speed`,
+    /// que sale de `self.scanner.usage.speed` recién en [`MeteredBody::emit`],
+    /// no acá: solo se conoce después de leer la respuesta).
+    pub requested_speed: Option<String>,
     /// Proveedor dueño del dialecto de esta respuesta: la extracción del
     /// `usage` se delega íntegramente en él, así este módulo no necesita
     /// saber nada de ningún proveedor concreto.
@@ -256,6 +272,9 @@ impl MeteredBody {
             tools_by_server,
             tools_overhead_bytes,
             prepare_us: self.base.prepare_us,
+            requested_effort: self.base.requested_effort.clone(),
+            requested_speed: self.base.requested_speed.clone(),
+            served_speed: self.scanner.usage.speed.clone(),
         });
     }
 }

@@ -61,6 +61,32 @@ pub struct RequestMetric {
     /// las llamadas repetidas. `false` si la palanca estaba apagada, el
     /// cliente ya gestionaba su propio caching, o el proveedor no aplica.
     pub cache_control_forced: bool,
+    /// Nivel de esfuerzo de razonamiento PEDIDO por el cliente
+    /// (`output_config.effort`, ver `provider::Outgoing::requested_effort`).
+    /// Dialecto exclusivo de Anthropic: `None` en OpenAI/Gemini, o si el
+    /// campo estaba ausente o no era un string en el body de Anthropic.
+    pub requested_effort: Option<String>,
+    /// Modo de velocidad PEDIDO por el cliente (`speed` a nivel raíz del
+    /// body, ver `provider::Outgoing::requested_speed`). Dialecto exclusivo
+    /// de Anthropic.
+    ///
+    /// **SEPARADO A PROPÓSITO de `served_speed`** (no se colapsan en un solo
+    /// campo): el modo `fast` de Anthropic tiene su propio rate limit, así
+    /// que un request puede PEDIR `"fast"` y ser SERVIDO a `"standard"`.
+    /// Fusionar ambos en un único campo escondería exactamente el fallo que
+    /// este par de campos existe para exponer — un `requested_speed ==
+    /// Some("fast")` con `served_speed != Some("fast")` es la señal de que el
+    /// rate limit del modo rápido se activó para esta petición.
+    pub requested_speed: Option<String>,
+    /// Velocidad con la que el proveedor SIRVIÓ REALMENTE la respuesta
+    /// (`usage.speed`, ver `provider::Usage::speed`). Dialecto exclusivo de
+    /// Anthropic.
+    ///
+    /// ESTADO: campo DOCUMENTADO por Anthropic pero NO OBSERVADO todavía en
+    /// tráfico real de este proyecto (el modo `fast` no se ejercitó aún).
+    /// `None` significa "el proveedor no lo reportó", nunca "sirvió a
+    /// velocidad estándar" — no colapsar ambos casos.
+    pub served_speed: Option<String>,
 
     // --- Latencia ---
     /// Código de estado HTTP devuelto al cliente.

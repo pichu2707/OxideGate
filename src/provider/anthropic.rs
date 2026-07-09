@@ -9,6 +9,16 @@
 //! `cache_control` a nivel raíz para que Anthropic cachee el prefijo estable
 //! (`tools` + `system`) y las llamadas repetidas paguen `cache_read` (0.1x)
 //! en vez de tarifa plena. Ver `docs/optimizer-prompt-cache.md`.
+//!
+//! `prepare` también LEE (sin mutar) dos palancas de VELOCIDAD que el
+//! cliente ya manda hoy en el body, dialecto exclusivo de Anthropic:
+//! `output_config.effort` (nivel de esfuerzo de razonamiento — menos
+//! "thinking" ⇒ generación más corta) y `speed` a nivel raíz (modo `fast`
+//! beta de Opus 4.8/4.7). Ver [`Outgoing::requested_effort`] y
+//! [`Outgoing::requested_speed`] para el contrato completo. `extract_usage`
+//! lee el complemento del lado de la respuesta, `usage.speed` (ver
+//! [`Usage::speed`]): documentado por Anthropic pero no observado todavía en
+//! tráfico real de este proyecto.
 use super::{
     array_field, fingerprint, measure_key, measure_other, model_and_stream_from_value, parse_body,
     split_history_and_last_turn, tools_overhead_bytes, ContextBreakdown, Incoming, Outgoing,
@@ -46,6 +56,10 @@ impl Provider for Anthropic {
     /// si el body no parseó), y `tools_overhead_bytes` restando esa suma de
     /// `context.tools_bytes` con el helper compartido [`tools_overhead_bytes`]
     /// (`0` si `context` es `None`).
+    ///
+    /// `requested_effort`/`requested_speed` se leen del mismo `Value` (ver
+    /// [`requested_effort_of`]/[`requested_speed_of`]): `None` si `parsed` es
+    /// `None` (body no parseó como JSON).
     fn prepare(&self, incoming: Incoming, cfg: &AppConfig) -> Outgoing {
         let prompt_hash = fingerprint(&incoming.body);
         let prompt_bytes = incoming.body.len();
@@ -64,6 +78,8 @@ impl Provider for Anthropic {
             .as_ref()
             .map(|c| tools_overhead_bytes(c.tools_bytes, &by_server))
             .unwrap_or(0);
+        let requested_effort = parsed.as_ref().and_then(requested_effort_of);
+        let requested_speed = parsed.as_ref().and_then(requested_speed_of);
 
         let (body, cache_control_forced) = if cfg.force_prompt_cache {
             force_cache_control(incoming.body, parsed)
@@ -84,6 +100,8 @@ impl Provider for Anthropic {
             context,
             tools_by_server: by_server,
             tools_overhead_bytes: overhead,
+            requested_effort,
+            requested_speed,
         }
     }
 
@@ -94,6 +112,11 @@ impl Provider for Anthropic {
     /// Anthropic reporta la caché APARTE de `input_tokens`:
     /// `cache_read_input_tokens` (lectura) y `cache_creation_input_tokens`
     /// (escritura) se guardan crudos, sin tocar `input_tokens`.
+    ///
+    /// `usage.speed` (ver [`Usage::speed`]) se lee con la MISMA semántica
+    /// "último gana" y de las MISMAS dos ubicaciones que el resto de los
+    /// campos: documentado por Anthropic, todavía no observado en tráfico
+    /// real de este proyecto.
     fn extract_usage(&self, value: &Value, usage: &mut Usage) {
         let Some(u) = value
             .get("usage")
@@ -116,6 +139,9 @@ impl Provider for Anthropic {
             .and_then(Value::as_u64)
         {
             usage.cache_write_tokens = Some(v);
+        }
+        if let Some(v) = u.get("speed").and_then(Value::as_str) {
+            usage.speed = Some(v.to_string());
         }
     }
 
@@ -165,6 +191,27 @@ impl Provider for Anthropic {
                 .collect(),
         )
     }
+}
+
+/// Lee `output_config.effort` de un `Value` YA PARSEADO (ver
+/// [`Outgoing::requested_effort`] para el contrato completo del campo).
+/// `None` si `output_config` está ausente, si `effort` está ausente dentro de
+/// `output_config`, o si `effort` no es un string — nunca hace panic ni
+/// inventa un valor a partir de un tipo inesperado (p. ej. un número).
+fn requested_effort_of(value: &Value) -> Option<String> {
+    value
+        .get("output_config")?
+        .get("effort")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Lee `speed` a nivel RAÍZ de un `Value` YA PARSEADO (ver
+/// [`Outgoing::requested_speed`] para el contrato completo del campo). A
+/// diferencia de `effort`, este campo NO está anidado bajo `output_config`.
+/// `None` si `speed` está ausente en la raíz o no es un string.
+fn requested_speed_of(value: &Value) -> Option<String> {
+    value.get("speed")?.as_str().map(str::to_string)
 }
 
 /// Palanca A del optimizador: si el body es JSON válido y NO trae ya ningún
@@ -691,5 +738,77 @@ mod tests {
             out.tools_overhead_bytes,
             measure_value(&serde_json::json!([]))
         );
+    }
+
+    /// Con `output_config.effort: "xhigh"` y `speed: "fast"` en la raíz,
+    /// `prepare` debe capturar ambos como `Some`, y el body reenviado debe
+    /// seguir siendo BYTE-IDÉNTICO al original (leer no es mutar).
+    #[test]
+    fn prepare_captura_effort_y_speed_cuando_estan_presentes() {
+        let cfg = test_config(false);
+        let incoming = incoming_with_body(
+            r#"{"model":"claude-opus-4","output_config":{"effort":"xhigh"},"speed":"fast","messages":[]}"#,
+        );
+        let original_body = incoming.body.clone();
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert_eq!(out.requested_effort.as_deref(), Some("xhigh"));
+        assert_eq!(out.requested_speed.as_deref(), Some("fast"));
+        assert_eq!(out.body, original_body);
+    }
+
+    /// `output_config: {}` (presente pero sin `effort`) y sin `speed` en la
+    /// raíz: ambos campos deben quedar en `None`, no en un string vacío ni en
+    /// pánico.
+    #[test]
+    fn prepare_effort_y_speed_none_cuando_ausentes() {
+        let cfg = test_config(false);
+        let incoming = incoming_with_body(
+            r#"{"model":"claude-opus-4","output_config":{},"messages":[]}"#,
+        );
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert_eq!(out.requested_effort, None);
+        assert_eq!(out.requested_speed, None);
+    }
+
+    /// `output_config.effort` presente pero de tipo NÚMERO, no string: debe
+    /// dar `None`, nunca un pánico ni una conversión implícita a `"5"`.
+    #[test]
+    fn prepare_effort_none_cuando_no_es_string() {
+        let cfg = test_config(false);
+        let incoming = incoming_with_body(
+            r#"{"model":"claude-opus-4","output_config":{"effort":5},"messages":[]}"#,
+        );
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert_eq!(out.requested_effort, None);
+    }
+
+    /// `usage.speed` en un evento `message_start` (anidado bajo `message`)
+    /// debe capturarse en `Usage.speed`; un evento equivalente sin `speed`
+    /// debe dejarlo en `None`.
+    #[test]
+    fn extracts_served_speed_from_message_start() {
+        let mut usage = Usage::default();
+        let with_speed: Value = serde_json::from_str(
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1,"speed":"fast"}}}"#,
+        )
+        .unwrap();
+
+        ANTHROPIC.extract_usage(&with_speed, &mut usage);
+        assert_eq!(usage.speed.as_deref(), Some("fast"));
+
+        let mut usage_sin_speed = Usage::default();
+        let without_speed: Value = serde_json::from_str(
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":10,"output_tokens":1}}}"#,
+        )
+        .unwrap();
+
+        ANTHROPIC.extract_usage(&without_speed, &mut usage_sin_speed);
+        assert_eq!(usage_sin_speed.speed, None);
     }
 }

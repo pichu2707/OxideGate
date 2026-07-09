@@ -322,6 +322,22 @@ struct RequestRow {
     cost_estimate_usd: Option<f64>,
     #[allow(dead_code)]
     cache_control_forced: bool,
+    /// Nivel de esfuerzo de razonamiento PEDIDO por el cliente
+    /// (`output_config.effort`). Dialecto exclusivo de Anthropic. `None`
+    /// tanto si el proxy no lo reportó (build anterior a este campo, clave
+    /// ausente en el JSON) como si el request no lo pedía explícitamente:
+    /// espejo de `RecentRequest::requested_effort` del lado del proxy.
+    requested_effort: Option<String>,
+    /// Modo de velocidad PEDIDO por el cliente (`speed` a nivel raíz,
+    /// `"fast"` en el beta de Anthropic). SEPARADO a propósito de
+    /// `served_speed`: un request puede pedir `"fast"` y ser servido a
+    /// `"standard"` si el rate limit del modo rápido se activó.
+    requested_speed: Option<String>,
+    /// Velocidad con la que el proveedor SIRVIÓ REALMENTE la respuesta
+    /// (`usage.speed`). DOCUMENTADA por Anthropic, NO OBSERVADA todavía en
+    /// tráfico real de este proyecto: `None` significa "no reportada", nunca
+    /// "estándar".
+    served_speed: Option<String>,
     ttft_ms: Option<f64>,
     total_ms: f64,
 
@@ -1054,8 +1070,14 @@ fn tools_row_cells(d: &ServerDiffRow, tools_bytes: Option<usize>) -> Vec<String>
 /// ya perdió sentido binario.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum RequestsView {
-    /// Columnas de latencia/tokens/coste (las que ya existían antes de
-    /// este slice). Vista por defecto.
+    /// Columnas de latencia/tokens/coste, más las tres palancas de
+    /// VELOCIDAD agregadas en este slice: `effort` (`requested_effort`,
+    /// `output_config.effort` pedido), `spd_req` (`requested_speed`, `speed`
+    /// pedido a nivel raíz) y `spd_got` (`served_speed`, `usage.speed`
+    /// REALMENTE servido — documentado por Anthropic, no observado aún en
+    /// tráfico real). Van acá y no en `Context` porque son palancas de
+    /// velocidad, igual que `tok/s`/`ttft_ms`, no bytes de contexto. Vista
+    /// por defecto.
     #[default]
     Latency,
     /// Columnas del desglose de bytes de contexto (`tools`, `history`,
@@ -1738,7 +1760,10 @@ fn draw_tools_panel(f: &mut Frame, area: Rect, app: &App) {
 fn requests_table_header<'a>(view: RequestsView) -> Row<'a> {
     let labels: Vec<&'a str> = match view {
         RequestsView::Latency => {
-            vec!["hora", "modelo", "st", "status", "in", "out", "c_rd", "c_wr", "ttft_ms", "gen_ms", "tok/s", "usd", "outlier"]
+            vec![
+                "hora", "modelo", "st", "status", "in", "out", "c_rd", "c_wr", "ttft_ms", "gen_ms", "tok/s", "effort", "spd_req",
+                "spd_got", "usd", "outlier",
+            ]
         }
         RequestsView::Context => {
             vec![
@@ -1768,6 +1793,9 @@ fn requests_table_widths(view: RequestsView) -> Vec<Constraint> {
             Constraint::Length(8),
             Constraint::Length(8),
             Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(8),
+            Constraint::Length(8),
             Constraint::Length(8),
             Constraint::Length(14),
         ],
@@ -1807,6 +1835,9 @@ fn requests_row_cells(view: RequestsView, r: &RequestRow) -> Vec<String> {
             opt_fixed(r.ttft_ms, 1),
             opt_fixed(gen_ms_of(r), 1),
             tokens_per_sec_cell(r),
+            opt_str_short(r.requested_effort.as_deref()),
+            opt_str_short(r.requested_speed.as_deref()),
+            opt_str_short(r.served_speed.as_deref()),
             opt_fixed(r.cost_estimate_usd, 4),
         ],
         RequestsView::Context => vec![
@@ -1865,6 +1896,28 @@ fn opt_u64(v: Option<u64>) -> String {
 /// mensajes del historial). `None` se muestra como `-`, nunca como `0`.
 fn opt_usize(v: Option<usize>) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string())
+}
+
+/// Máximo de caracteres para las celdas cortas de esfuerzo/velocidad
+/// (`effort`, `spd_req`, `spd_got`). Los valores documentados hoy son todos
+/// cortos (`low`|`medium`|`high`|`xhigh`|`max`; `fast`), pero se trunca de
+/// todos modos para no romper el ancho fijo de columna si un proveedor
+/// futuro manda algo más largo.
+const SPEED_DISPLAY_MAX: usize = 8;
+
+/// Celda corta para `effort`/`spd_req`/`spd_got`: `None` se muestra como
+/// `-` (NUNCA string vacío, mismo criterio que el resto de los `opt_*`),
+/// truncando valores más largos que [`SPEED_DISPLAY_MAX`] con `…` — mismo
+/// patrón que [`truncate_model`].
+fn opt_str_short(v: Option<&str>) -> String {
+    match v {
+        None => "-".to_string(),
+        Some(s) if s.chars().count() <= SPEED_DISPLAY_MAX => s.to_string(),
+        Some(s) => {
+            let head: String = s.chars().take(SPEED_DISPLAY_MAX.saturating_sub(1)).collect();
+            format!("{head}…")
+        }
+    }
 }
 
 /// Convierte un tamaño en bytes a una representación compacta y legible.
@@ -1955,37 +2008,49 @@ fn marker_text(kinds: &[OutlierKind]) -> String {
 
 /// Imprime la tabla LATENCY de requests recientes en texto plano (modo
 /// `--once`), más nuevo arriba, con los mismos marcadores de outlier que la
-/// TUI. Es la vista por defecto (columnas de latencia/tokens/coste). Ver
-/// [`print_context_table`] para la vista complementaria del desglose de
+/// TUI. Es la vista por defecto (columnas de latencia/tokens/coste, más
+/// `effort`/`spd_req`/`spd_got` desde este slice). Reusa
+/// [`requests_row_cells`] (mismo patrón que [`print_context_table`]) para que
+/// esta vista en texto plano y la vista `Latency` de la TUI
+/// (`draw_requests_panel`) nunca diverjan en qué dato muestra cada columna.
+/// Ver [`print_context_table`] para la vista complementaria del desglose de
 /// contexto — `--once` imprime AMBAS, una debajo de la otra (ver
 /// [`run_once`]).
 fn print_requests_table(rows: &[RequestRow]) {
     let outliers = classify_outliers(rows);
 
     println!(
-        "{:<10} {:<16} {:>2} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>7} {:>8} {:<14}",
-        "HORA", "MODELO", "st", "status", "in", "out", "c_rd", "c_wr", "ttft_ms", "gen_ms", "tok/s", "usd", "outlier"
+        "{:<10} {:<16} {:>2} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>7} {:>7} {:>8} {:>8} {:>8} {:<14}",
+        "HORA", "MODELO", "st", "status", "in", "out", "c_rd", "c_wr", "ttft_ms", "gen_ms", "tok/s", "effort", "spd_req", "spd_got",
+        "usd", "outlier"
     );
     for (i, r) in rows.iter().enumerate().rev() {
+        let cells = requests_row_cells(RequestsView::Latency, r);
         println!(
-            "{:<10} {:<16} {:>2} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>7} {:>8} {:<14}",
-            format_time(&r.timestamp),
-            truncate_model(r.model.as_deref()),
-            if r.stream { "y" } else { "n" },
-            r.status,
-            opt_u64(r.input_tokens),
-            opt_u64(r.output_tokens),
-            opt_u64(r.cache_read_tokens),
-            opt_u64(r.cache_write_tokens),
-            opt_fixed(r.ttft_ms, 1),
-            opt_fixed(gen_ms_of(r), 1),
-            tokens_per_sec_cell(r),
-            opt_fixed(r.cost_estimate_usd, 4),
+            "{:<10} {:<16} {:>2} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>7} {:>7} {:>8} {:>8} {:>8} {:<14}",
+            cells[0],
+            cells[1],
+            cells[2],
+            cells[3],
+            cells[4],
+            cells[5],
+            cells[6],
+            cells[7],
+            cells[8],
+            cells[9],
+            cells[10],
+            cells[11],
+            cells[12],
+            cells[13],
+            cells[14],
             marker_text(&outliers[i]),
         );
     }
     println!(
         "leyenda: ERR=error(status>=400) · MISS=cache-miss atípico · TTFT=TTFT lento(>=2σ) · SLOW=generación lenta(>=2σ) · TRUNC=tope de tokens (ver docs/monitor-tui.md)"
+    );
+    println!(
+        "nota: effort = output_config.effort pedido; spd_req = speed pedido (raíz); spd_got = usage.speed servido (Anthropic; documentado pero no observado aún en tráfico real)"
     );
 }
 
@@ -2262,6 +2327,9 @@ mod tests {
             cache_write_tokens: Some(0),
             cost_estimate_usd: Some(0.01),
             cache_control_forced: false,
+            requested_effort: None,
+            requested_speed: None,
+            served_speed: None,
             ttft_ms,
             total_ms,
             context_system_bytes: Some(281),
@@ -3072,5 +3140,75 @@ mod tests {
 
         let baseline = app.baseline.as_ref().expect("mark_baseline debe crear un baseline igual");
         assert!(baseline.tools_by_server.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // effort / spd_req / spd_got — columnas nuevas de la vista Latency
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn opt_str_short_none_da_guion() {
+        assert_eq!(opt_str_short(None), "-");
+    }
+
+    #[test]
+    fn opt_str_short_no_trunca_si_entra_justo() {
+        // "standard" mide exactamente SPEED_DISPLAY_MAX (8) caracteres.
+        assert_eq!(opt_str_short(Some("standard")), "standard");
+    }
+
+    #[test]
+    fn opt_str_short_trunca_valores_mas_largos_que_el_maximo() {
+        assert_eq!(opt_str_short(Some("extralongvalue")), "extralo…");
+    }
+
+    /// Un proxy ANTERIOR a este slice no manda las claves
+    /// `requested_effort`/`requested_speed`/`served_speed` en absoluto (ni
+    /// siquiera como `null`): `serde` debe tratar la ausencia como `None` sin
+    /// necesidad de `#[serde(default)]` (mismo comportamiento ya documentado
+    /// para `prepare_us`), y esas celdas deben renderizar `-`.
+    #[test]
+    fn request_row_deserializa_effort_speed_ausentes_como_none_en_proxy_viejo() {
+        let json = r#"{
+            "timestamp": "2024-01-01T00:00:00Z",
+            "route": "/v1/messages",
+            "upstream": "anthropic",
+            "stream": false,
+            "status": 200,
+            "cache_control_forced": false,
+            "total_ms": 100.0
+        }"#;
+        let row: RequestRow = serde_json::from_str(json).unwrap();
+
+        assert_eq!(row.requested_effort, None);
+        assert_eq!(row.requested_speed, None);
+        assert_eq!(row.served_speed, None);
+        assert_eq!(opt_str_short(row.requested_effort.as_deref()), "-");
+        assert_eq!(opt_str_short(row.requested_speed.as_deref()), "-");
+        assert_eq!(opt_str_short(row.served_speed.as_deref()), "-");
+    }
+
+    /// Con las tres claves presentes en el JSON (un proxy de este slice, en
+    /// una petición real de Claude Code con `output_config.effort: "high"`),
+    /// deben deserializar a sus valores exactos.
+    #[test]
+    fn request_row_deserializa_effort_speed_presentes() {
+        let json = r#"{
+            "timestamp": "2024-01-01T00:00:00Z",
+            "route": "/v1/messages",
+            "upstream": "anthropic",
+            "stream": false,
+            "status": 200,
+            "cache_control_forced": false,
+            "total_ms": 100.0,
+            "requested_effort": "high",
+            "requested_speed": "fast",
+            "served_speed": "fast"
+        }"#;
+        let row: RequestRow = serde_json::from_str(json).unwrap();
+
+        assert_eq!(row.requested_effort.as_deref(), Some("high"));
+        assert_eq!(row.requested_speed.as_deref(), Some("fast"));
+        assert_eq!(row.served_speed.as_deref(), Some("fast"));
     }
 }
