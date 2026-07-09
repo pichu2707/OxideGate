@@ -12,7 +12,7 @@
 Es un **cliente HTTP separado del proxy**: pollea `GET /stats` cada ~1
 segundo, igual que haría `curl` en loop, y pinta lo que recibe. Además,
 pollea `GET /requests` (`docs/telemetry-per-request.md`) para el panel de
-detalle por petición (ver §8). No lee `telemetry.jsonl`, no conoce el
+detalle por petición (ver §7). No lee `telemetry.jsonl`, no conoce el
 acumulador interno (`src/telemetry/stats.rs`) más allá del contrato JSON de
 ambos endpoints, y no toca la captura de métricas. Se puede matar y volver a
 levantar sin afectar al proxy — es un observador, no una dependencia.
@@ -60,11 +60,16 @@ cargo run --bin monitor -- --url http://127.0.0.1:8899/stats
 cargo run --bin monitor -- --once
 ```
 
-Hace UN solo fetch de `/stats`, imprime una tabla de texto plano (sin raw
-mode, sin pantalla alternada) y sale con código `0`. Sirve para scripts,
-CI, o para chequear rápido sin entrar a la TUI. Igual que el modo
-interactivo, si el proxy está caído no crashea: imprime `proxy no
-disponible en {url}` y sale limpio.
+Hace UN solo fetch de `/stats` y otro de `/requests`, e imprime todo en texto
+plano (sin raw mode, sin pantalla alternada) y sale con código `0`. Sirve para
+scripts, CI, o para pegar resultados en una conversación sin entrar a la TUI.
+Igual que el modo interactivo, si el proxy está caído no crashea: imprime
+`proxy no disponible en {url}` y sale limpio.
+
+Para `/requests`, `--once` imprime **las dos vistas, una debajo de la otra**
+(`Latency` y luego `Context`, cada una con su propio header) — no hay forma
+de apretar `c` en un snapshot que ya salió, así que ambas salen siempre. Ver
+§7.1 para qué muestra cada vista.
 
 ## 3. El flujo ANTES/DESPUÉS (el punto central de la herramienta)
 
@@ -87,7 +92,7 @@ Pasos:
    cache-hit de la ventana, Δcoste, Δrequests, Δoutput_tokens y error% de la
    ventana — todo calculado sobre lo que pasó **después** de marcar `b`, no
    sobre el histórico completo.
-6. `r` resetea el baseline si querés volver a arrancar la medición.
+6. `r` resetea el baseline para volver a arrancar la medición.
 
 ### Por qué no se promedian dos promedios
 
@@ -107,7 +112,8 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
 | `b` | Marcar baseline (para el panel ANTES/DESPUÉS) |
 | `r` | Resetear baseline |
 | `↑` / `↓` | Elegir el modelo (fila resaltada, afecta el panel ANTES/DESPUÉS y los sparklines) |
-| `p` | Mostrar/ocultar el panel de requests recientes (ver §8) |
+| `p` | Mostrar/ocultar el panel de requests recientes (ver §7) |
+| `c` | Ciclar la vista de columnas del panel de requests recientes — `Latency` ⇄ `Context` (ver §7.1). **No-op si el panel está oculto**: no cambia nada mientras `p` lo tenga escondido |
 
 ## 5. Layout de la pantalla
 
@@ -121,8 +127,9 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
    el baseline (ver §3). Si no hay baseline, muestra el aviso para marcarlo.
 4. **Sparklines**: throughput (tok/s) y TTFT (ms) del modelo seleccionado a
    lo largo del tiempo, últimas ~120 muestras (~2 minutos a 1 poll/seg).
-5. **Panel de requests recientes** (toggleable con `p`, ver §8): las últimas
-   peticiones individuales, más nueva arriba, con marcadores de outlier.
+5. **Panel de requests recientes** (toggleable con `p`, ver §7): las últimas
+   peticiones individuales, más nueva arriba, con marcadores de outlier, en
+   una de dos vistas cicladas con `c` (`Latency` o `Context`, ver §7.1).
 6. **Footer**: recordatorio de teclas.
 
 ## 6. Enhance del snapshot (`ModelStatsRow`)
@@ -150,7 +157,26 @@ peticiones individuales atendidas por el proxy, no un agregado. Sirve para
 ver la fila puntual que un promedio esconde — el cache-miss aislado, el TTFT
 que se disparó una sola vez. Se alterna con la tecla `p`; arranca visible.
 
-### Columnas
+### 7.1. Dos vistas, una tecla (`c`)
+
+El panel ya tiene ~12 columnas — cramear más ahí lo haría ilegible. En vez de
+eso, el panel tiene **dos vistas mutuamente excluyentes**, cicladas con `c`:
+
+| Vista | Para qué sirve | Es la que ves con... |
+|---|---|---|
+| `Latency` (default) | Latencia, tokens y coste por request — la que ya existía | `q`/`b`/`r` recién arrancado el monitor |
+| `Context` | Desglose de bytes de contexto por request: cuánto pesa cada bucket del body (`tools`, `history`, `system`, `last_turn`, `other`) | apretando `c` una vez |
+
+El título del panel muestra la vista activa (`vista:latency` /
+`vista:context`) y el estado del último poll a `/requests`.
+
+**`c` es un no-op si el panel está oculto** (`p` lo escondió): no tiene
+sentido cambiar qué columnas se muestran en algo que no se está mostrando, y
+hacerlo igual dejaría un cambio de estado invisible hasta volver a mostrar el
+panel — así que directamente no pasa nada. Muestre el panel de nuevo con `p`
+para poder ciclar la vista.
+
+### 7.2. Columnas — vista `Latency`
 
 Tabla con **más nueva arriba** (al revés que el orden cronológico en que
 llega el JSON, que es más vieja primero — el monitor invierte para
@@ -174,7 +200,40 @@ Un valor ausente se muestra como `-`, **nunca como `0`**: un `0` real (p. ej.
 0 tokens de caché) y un dato que no llegó son cosas distintas, y confundirlos
 lleva a conclusiones equivocadas sobre qué está pasando.
 
-### Marcadores de outlier
+### 7.3. Columnas — vista `Context`
+
+Mismo orden (más nueva arriba) y los mismos marcadores de outlier que la
+vista `Latency`; lo único que cambia es qué mide cada columna. Todos los
+campos de bytes vienen de `RecentRequest`/`ContextBreakdown` — ver
+`docs/telemetry-per-request.md` para el contrato completo del endpoint.
+
+| Columna | Qué muestra | Qué SEÑALA |
+|---|---|---|
+| `hora` / `modelo` | Igual que en `Latency` | — |
+| `msgs` | `context_messages_count`: cantidad de mensajes del historial completo | Una conversación que crece sin recortar prefijo: `history` va a subir en proporción |
+| `tools` | Bytes del esquema de herramientas (`context_tools_bytes`) | **La columna más importante de este slice.** Si `tools` domina el body en TODAS las filas, es un candidato directo a desconectar servidores MCP que este proyecto no usa — en tráfico real medido, `tools` llegó a ser ~71% del body |
+| `history` | Bytes de todos los mensajes menos el último (`context_history_bytes`) | Crece con la conversación; si domina sobre `tools`, el prefijo de historial es el costo principal, no el catálogo de herramientas |
+| `system` | Bytes del prompt de sistema (`context_system_bytes`) | Estable entre requests del mismo cliente; un salto brusco sugiere que cambió el system prompt |
+| `last_turn` | Bytes del último mensaje, el turno genuinamente nuevo (`context_last_turn_bytes`) | Esto es lo ÚNICO que el usuario "escribió ahora". En tráfico real medido, puede ser tan poco como 0.06% del body — el resto es reenviar lo mismo de siempre |
+| `other` | Bytes del resto de campos de control a nivel raíz (`context_other_bytes`) | Normalmente chico; si crece, revisar qué campos nuevos está mandando el cliente |
+| `total` | Suma de los cinco anteriores (`context_measured_bytes`) — BYTES de JSON canónico re-serializado, **nunca tokens**, y **nunca combinar con el tamaño de wire** (ver `docs/telemetry-per-request.md`) | El tamaño total que el proxy mide por request |
+| `tax%` | `context_tax_ratio * 100`, un decimal — `(system + tools + history) / total` | **Cercano a 100% ⇒ casi todo lo que mandás ya lo habías mandado antes.** Es la "tasa" que pagás por turno solo para repetir contexto; un `tax%` alto con `cache-hit` bajo (ver vista `Latency`/tabla principal) es la peor combinación posible |
+| `prep_us` | Microsegundos que el proxy pasó dentro de `Provider::prepare` (parseo + `decompose` + mutación opcional) | Overhead propio de OxideGate, NO incluye leer el body del socket ni el round-trip al proveedor — si esto crece con el tamaño del body, el parseo/decompose es el cuello de botella, no la red |
+| `outlier` | Igual que en `Latency` | — |
+
+Los bytes se muestran en formato compacto vía `format_bytes` (ver
+`src/bin/monitor.rs`): **convención DECIMAL** (base 1000, no binaria
+KiB/MiB) — `159123 B` se ve como `159.1 kB`, `281 B` se ve tal cual. Se
+eligió decimal porque mide tamaño de un JSON re-serializado, no bloques de
+memoria alineados a potencias de 2.
+
+`tax%` se muestra como `-` (nunca `0.0`) cuando `context_tax_ratio` es
+`None` — mismo criterio de "ausente ≠ cero" que el resto del panel.
+
+### 7.4. Marcadores de outlier
+
+Aplican por igual a AMBAS vistas (`Latency` y `Context`): la clasificación de
+outliers no depende de qué columnas estás mirando.
 
 Cada fila se compara solo contra las OTRAS filas del mismo `(upstream,
 model)` — nunca contra el total del panel. El color de fila (rojo si tiene
@@ -191,7 +250,7 @@ real, para que no se pierda en terminales sin color.
 Una fila puede llevar más de un marcador a la vez (p. ej. `ERR+TTFT`): no se
 colapsa a uno solo porque eso escondería información real.
 
-### Guardas estadísticas (y por qué existen)
+### 7.5. Guardas estadísticas (y por qué existen)
 
 - **`MIN_GROUP_SAMPLE = 5` muestras VÁLIDAS por métrica**, no solo el tamaño
   del grupo. Antes de flaggear `TTFT`, `SLOW` o `MISS`, hace falta que al
@@ -213,7 +272,7 @@ colapsa a uno solo porque eso escondería información real.
   coercionan a `0` (un `0` real distorsionaría el cálculo tanto como uno
   falso).
 
-### URL de `/requests`
+### 7.6. URL de `/requests`
 
 Se deriva de la URL de `/stats` ya resuelta, con esta prioridad:
 
@@ -225,7 +284,7 @@ Se deriva de la URL de `/stats` ya resuelta, con esta prioridad:
    atípico), no hay forma segura de derivarla: cae al default
    `http://127.0.0.1:{OXIDEGATE_PORT|8080}/requests`
 
-### Degradación si `/requests` no está disponible
+### 7.7. Degradación si `/requests` no está disponible
 
 `/requests` es un endpoint más nuevo que `/stats`: un proxy de build
 anterior puede no tenerlo todavía. Si el fetch falla, el monitor:

@@ -122,10 +122,45 @@ haya o no autenticación de por medio.
 | `cache_control_forced` | `true` si OxideGate inyectó el breakpoint de `cache_control` (Palanca A) | Sirve para correlacionar si la palanca estaba activa en esa fila puntual |
 | `ttft_ms` | Time To First Token en ms | `null` si no aplica (sin streaming); un valor mucho más alto que el resto del mismo modelo es la señal de latencia percibida |
 | `total_ms` | Latencia total, del request al cierre de la respuesta | Junto con `ttft_ms`, permite derivar el tiempo de generación (`total_ms - ttft_ms`) fuera del endpoint |
+| `context_system_bytes` | Bytes del prompt de sistema | `null` si no se pudo calcular el desglose (ver `provider::ContextBreakdown`) |
+| `context_tools_bytes` | Bytes del esquema de herramientas (tool definitions) | En tráfico real medido, esta fue la porción más grande del body (~71%) — un valor alto y estable en todas las filas es candidato a desconectar servidores MCP sin uso |
+| `context_history_bytes` | Bytes de todos los mensajes del historial menos el último | Crece con la conversación; junto con `context_tools_bytes`, compite por ser la porción dominante del body |
+| `context_last_turn_bytes` | Bytes del último mensaje — el turno genuinamente NUEVO de esta petición | Lo único que el cliente "agregó ahora"; en tráfico real medido llegó a ser tan poco como 0.06% del body |
+| `context_other_bytes` | Bytes del resto de campos de control a nivel raíz del body | Normalmente chico; un salto sugiere un campo nuevo que el cliente empezó a mandar |
+| `context_measured_bytes` | Suma de los cinco campos de arriba | Ver la nota sobre BYTES vs. tokens y vs. tamaño de wire, más abajo |
+| `context_messages_count` | Cantidad de mensajes del historial completo (incluyendo el último) | Sube con la conversación; útil para correlacionar contra `context_history_bytes` |
+| `context_tax_ratio` | `(context_system_bytes + context_tools_bytes + context_history_bytes) / context_measured_bytes` | Cercano a `1.0` (100%) ⇒ casi todo el body de esta petición es contexto YA enviado antes, no turno nuevo — la "tasa" que se paga por repetir contexto en cada request |
+| `prepare_us` | Microsegundos que el proxy pasó dentro de `Provider::prepare` (parseo del body + `decompose` + mutación opcional, p. ej. inyectar `cache_control`) | Ver la nota sobre qué NO incluye, más abajo |
 
-Ninguno de estos campos es nuevo: todos ya existían en `RequestMetric`
-(Nivel 1). Este endpoint no mide nada distinto, solo expone en vivo lo que
-antes solo llegaba a disco.
+Ninguno de los campos de latencia/coste/identidad es nuevo: todos ya existían
+en `RequestMetric` (Nivel 1). Los campos `context_*` y `prepare_us` sí son
+nuevos — provienen del desglose de contexto (`provider::ContextBreakdown`) y
+de instrumentar `Provider::prepare`. Este endpoint sigue sin medir nada por
+su cuenta: solo expone en vivo lo que `RequestMetric` ya mide.
+
+### 4.1. Tres precisiones que hay que leer antes de usar estos campos
+
+- **`context_*` son BYTES, nunca tokens.** Se calculan re-serializando cada
+  bucket del body a JSON canónico y midiendo su longitud en bytes — no hay
+  tokenización de por medio en ningún punto de este cálculo. No los uses
+  como proxy de "cuántos tokens cuesta esto"; para eso están `input_tokens` /
+  `output_tokens`, que sí vienen del proveedor.
+- **`context_measured_bytes` es, por diseño, distinto del tamaño de wire del
+  request**, y los dos NUNCA deben combinarse en un solo ratio. El tamaño de
+  wire incluye framing HTTP, y el JSON puede re-serializarse con espaciado o
+  ausencia de campos ligeramente distinta a como llegó originalmente
+  (canonicalización). Mezclar ambos números en una sola fracción (p. ej.
+  `context_measured_bytes / tamaño_de_wire`) produciría un ratio sin
+  significado estable: son dos mediciones de cosas relacionadas pero no
+  idénticas, tomadas en puntos distintos del pipeline.
+- **`prepare_us` mide ÚNICAMENTE el tiempo dentro de `prepare`** (parseo del
+  body, `decompose`, y la mutación opcional del body si aplica). NO incluye:
+  leer el body completo desde el socket del cliente, ni el round-trip al
+  proveedor upstream. Es el overhead propio de OxideGate en esa fase
+  puntual, no la latencia total de la petición — para eso está `total_ms`.
+
+Ver `docs/monitor-tui.md` §7.3 para cómo el monitor presenta estos campos en
+la vista `Context` del panel de requests recientes.
 
 ---
 

@@ -36,6 +36,8 @@
 //!   r         resetear baseline
 //!   ↑ / ↓     elegir modelo en la tabla de agregados
 //!   p         mostrar/ocultar el panel de requests recientes (outliers)
+//!   c         ciclar la vista de columnas del panel de requests
+//!             (Latency ⇄ Context); no-op si el panel está oculto (`p`)
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -193,7 +195,15 @@ fn run_once(url: &str, requests_url: &str) {
             println!("(sin requests individuales todavía en {requests_url})");
         }
         Ok(rows) => {
+            // `--once` es el modo para pegar resultados en texto plano en
+            // una conversación: imprime AMBAS vistas (Latency y Context),
+            // no una sola, cada una con su propio header — el usuario no
+            // tiene forma de "apretar `c`" en un snapshot que ya salió.
+            println!("--- vista: latency ---");
             print_requests_table(&rows);
+            println!();
+            println!("--- vista: context ---");
+            print_context_table(&rows);
         }
         Err(e) => {
             println!("/requests no disponible en {requests_url} ({e}) — puede ser una build del proxy anterior a este endpoint");
@@ -309,6 +319,31 @@ struct RequestRow {
     cache_control_forced: bool,
     ttft_ms: Option<f64>,
     total_ms: f64,
+
+    // --- Desglose de contexto (espejo de `RecentRequest` en
+    //     `src/telemetry/recent.rs`; ver esos docs para el significado
+    //     completo de cada campo) ---
+    context_system_bytes: Option<usize>,
+    context_tools_bytes: Option<usize>,
+    context_history_bytes: Option<usize>,
+    context_last_turn_bytes: Option<usize>,
+    context_other_bytes: Option<usize>,
+    context_measured_bytes: Option<usize>,
+    context_messages_count: Option<usize>,
+    context_tax_ratio: Option<f64>,
+    /// Microsegundos que el proxy pasó dentro de `Provider::prepare`.
+    ///
+    /// En `RecentRequest` (lado servidor) este campo NO es `Option`: el proxy
+    /// siempre lo mide. Acá SÍ lo es, a propósito. El tipo del espejo no
+    /// tiene por qué copiar al del servidor: modela lo que el monitor puede
+    /// SABER. Un proxy de build anterior a este slice no manda la clave, y
+    /// `serde` deja un `Option` ausente en `None` sin necesidad de atributos.
+    ///
+    /// `None` significa "el proxy no lo informó"; `Some(0)` significaría "lo
+    /// midió y dio cero". Colapsar ambos casos en `0` sería inventar una
+    /// medición que nadie hizo: este proyecto prefiere un hueco honesto a un
+    /// cero falso.
+    prepare_us: Option<u64>,
 }
 
 /// Hace el GET a `/requests` y parsea el array de filas (orden cronológico,
@@ -677,6 +712,49 @@ fn compute_window_delta(baseline: &RawCounters, current: &RawCounters, elapsed_s
 }
 
 // ---------------------------------------------------------------------------
+// Vista de columnas del panel de requests recientes
+// ---------------------------------------------------------------------------
+
+/// Vista activa del panel de requests recientes (tecla `c`, ver [`App`]).
+///
+/// Las dos vistas son un conjunto de columnas MUTUAMENTE EXCLUYENTE: nunca
+/// se combinan en una sola tabla ancha, porque el panel ya tiene ~12
+/// columnas en cualquiera de las dos y cramear las de la otra lo haría
+/// ilegible. Se modela como enum (no como `bool`) para que agregar una
+/// tercera vista el día de mañana no obligue a renombrar un booleano que
+/// ya perdió sentido binario.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum RequestsView {
+    /// Columnas de latencia/tokens/coste (las que ya existían antes de
+    /// este slice). Vista por defecto.
+    #[default]
+    Latency,
+    /// Columnas del desglose de bytes de contexto (`tools`, `history`,
+    /// `system`, `last_turn`, `other`, `total`, `tax%`, `prep_us`, `msgs`).
+    Context,
+}
+
+impl RequestsView {
+    /// Cicla a la siguiente vista. Función PURA y TOTAL (cubre ambas
+    /// variantes sin rama de error): Latency → Context → Latency.
+    fn next(self) -> Self {
+        match self {
+            RequestsView::Latency => RequestsView::Context,
+            RequestsView::Context => RequestsView::Latency,
+        }
+    }
+
+    /// Etiqueta corta para el título del panel, en minúsculas para
+    /// combinar con el resto del texto de estado de la UI.
+    fn label(self) -> &'static str {
+        match self {
+            RequestsView::Latency => "latency",
+            RequestsView::Context => "context",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Estado de la aplicación
 // ---------------------------------------------------------------------------
 
@@ -727,6 +805,10 @@ struct App {
     requests_status: String,
     /// Visibilidad del panel de requests recientes, toggleable con `p`.
     show_requests_panel: bool,
+    /// Vista de columnas del panel de requests recientes, ciclable con `c`.
+    /// Ver [`RequestsView`] y [`App::cycle_requests_view`] para el
+    /// contrato de qué pasa cuando el panel está oculto.
+    requests_view: RequestsView,
 }
 
 impl App {
@@ -742,6 +824,7 @@ impl App {
             recent_requests: Vec::new(),
             requests_status: "esperando el primer poll...".to_string(),
             show_requests_panel: true,
+            requests_view: RequestsView::Latency,
         }
     }
 
@@ -818,6 +901,18 @@ impl App {
     /// Alterna la visibilidad del panel de requests recientes (tecla `p`).
     fn toggle_requests_panel(&mut self) {
         self.show_requests_panel = !self.show_requests_panel;
+    }
+
+    /// Cicla la vista de columnas del panel de requests recientes (tecla
+    /// `c`). Es un NO-OP si el panel está oculto (`show_requests_panel ==
+    /// false`): cambiar qué columnas se muestran en algo que no se está
+    /// mostrando sería un cambio de estado invisible para el usuario hasta
+    /// que vuelva a mostrar el panel con `p` — mejor no mutar nada que
+    /// mutar en silencio.
+    fn cycle_requests_view(&mut self) {
+        if self.show_requests_panel {
+            self.requests_view = self.requests_view.next();
+        }
     }
 
     /// Marca el baseline en el instante actual con los contadores crudos de
@@ -901,6 +996,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, url: &str, request
                     KeyCode::Up => app.select_prev(),
                     KeyCode::Down => app.select_next(),
                     KeyCode::Char('p') => app.toggle_requests_panel(),
+                    KeyCode::Char('c') => app.cycle_requests_view(),
                     _ => {}
                 }
             }
@@ -1082,9 +1178,11 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(" requests recientes · {} ", app.requests_status));
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " requests recientes · vista:{} · {} ",
+        app.requests_view.label(),
+        app.requests_status
+    ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1116,30 +1214,15 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
         let capacity = (table_area.height - 1) as usize;
         indexed.truncate(capacity);
 
-        let header = Row::new(vec![
-            "hora", "modelo", "st", "status", "in", "out", "c_rd", "c_wr", "ttft_ms", "gen_ms", "tok/s", "usd", "outlier",
-        ])
-        .style(Style::default().add_modifier(Modifier::BOLD));
+        let header = requests_table_header(app.requests_view);
 
         let rows: Vec<Row> = indexed
             .iter()
             .map(|(i, r)| {
                 let kinds = &outliers[*i];
-                let row = Row::new(vec![
-                    Cell::from(format_time(&r.timestamp)),
-                    Cell::from(truncate_model(r.model.as_deref())),
-                    Cell::from(if r.stream { "y" } else { "n" }),
-                    Cell::from(r.status.to_string()),
-                    Cell::from(opt_u64(r.input_tokens)),
-                    Cell::from(opt_u64(r.output_tokens)),
-                    Cell::from(opt_u64(r.cache_read_tokens)),
-                    Cell::from(opt_u64(r.cache_write_tokens)),
-                    Cell::from(opt_fixed(r.ttft_ms, 1)),
-                    Cell::from(opt_fixed(gen_ms_of(r), 1)),
-                    Cell::from(tokens_per_sec_cell(r)),
-                    Cell::from(opt_fixed(r.cost_estimate_usd, 4)),
-                    Cell::from(marker_text(kinds)),
-                ]);
+                let mut cells = requests_row_cells(app.requests_view, r);
+                cells.push(marker_text(kinds));
+                let row = Row::new(cells);
                 if kinds.is_empty() {
                     row
                 } else {
@@ -1148,7 +1231,45 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
             })
             .collect();
 
-        let widths = [
+        let widths = requests_table_widths(app.requests_view);
+
+        // Un terminal angosto no alcanza a mostrar todas las columnas del
+        // ancho declarado (la vista Context es más ancha que Latency):
+        // `ratatui::Table` recorta las columnas que no entran en vez de
+        // hacer wrap o panickear, así que no hace falta guard adicional acá
+        // más allá de los chequeos de área ya hechos arriba.
+        f.render_widget(Table::new(rows, widths).header(header), table_area);
+    }
+
+    if legend_area.height > 0 {
+        let legend = Paragraph::new(Line::from(
+            "leyenda: ERR=error(status>=400) · MISS=cache-miss atípico · TTFT=TTFT lento(>=2σ) · SLOW=generación lenta(>=2σ)",
+        ));
+        f.render_widget(legend, legend_area);
+    }
+}
+
+/// Header de columnas del panel/tabla de requests, según la vista activa.
+/// Ver [`RequestsView`] para el contrato de qué columnas trae cada una.
+fn requests_table_header<'a>(view: RequestsView) -> Row<'a> {
+    let labels: Vec<&'a str> = match view {
+        RequestsView::Latency => {
+            vec!["hora", "modelo", "st", "status", "in", "out", "c_rd", "c_wr", "ttft_ms", "gen_ms", "tok/s", "usd", "outlier"]
+        }
+        RequestsView::Context => {
+            vec!["hora", "modelo", "msgs", "tools", "history", "system", "last_turn", "other", "total", "tax%", "prep_us", "outlier"]
+        }
+    };
+    Row::new(labels).style(Style::default().add_modifier(Modifier::BOLD))
+}
+
+/// Anchos de columna del panel/tabla de requests, según la vista activa.
+/// La vista Context es más ancha en total que Latency (más columnas de
+/// bytes con nombres largos) — ver el comentario sobre truncado en
+/// [`draw_requests_panel`].
+fn requests_table_widths(view: RequestsView) -> Vec<Constraint> {
+    match view {
+        RequestsView::Latency => vec![
             Constraint::Length(9),
             Constraint::Length(16),
             Constraint::Length(3),
@@ -1162,16 +1283,57 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
             Constraint::Length(7),
             Constraint::Length(8),
             Constraint::Length(14),
-        ];
-
-        f.render_widget(Table::new(rows, widths).header(header), table_area);
+        ],
+        RequestsView::Context => vec![
+            Constraint::Length(9),
+            Constraint::Length(16),
+            Constraint::Length(5),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(6),
+            Constraint::Length(8),
+            Constraint::Length(14),
+        ],
     }
+}
 
-    if legend_area.height > 0 {
-        let legend = Paragraph::new(Line::from(
-            "leyenda: ERR=error(status>=400) · MISS=cache-miss atípico · TTFT=TTFT lento(>=2σ) · SLOW=generación lenta(>=2σ)",
-        ));
-        f.render_widget(legend, legend_area);
+/// Celdas de datos de una fila (SIN el marcador de outlier, que el llamador
+/// agrega al final: es común a ambas vistas y se calcula una sola vez por
+/// fila en [`draw_requests_panel`] / [`print_requests_table`] /
+/// [`print_context_table`]), según la vista activa.
+fn requests_row_cells(view: RequestsView, r: &RequestRow) -> Vec<String> {
+    match view {
+        RequestsView::Latency => vec![
+            format_time(&r.timestamp),
+            truncate_model(r.model.as_deref()),
+            if r.stream { "y" } else { "n" }.to_string(),
+            r.status.to_string(),
+            opt_u64(r.input_tokens),
+            opt_u64(r.output_tokens),
+            opt_u64(r.cache_read_tokens),
+            opt_u64(r.cache_write_tokens),
+            opt_fixed(r.ttft_ms, 1),
+            opt_fixed(gen_ms_of(r), 1),
+            tokens_per_sec_cell(r),
+            opt_fixed(r.cost_estimate_usd, 4),
+        ],
+        RequestsView::Context => vec![
+            format_time(&r.timestamp),
+            truncate_model(r.model.as_deref()),
+            opt_usize(r.context_messages_count),
+            opt_bytes(r.context_tools_bytes),
+            opt_bytes(r.context_history_bytes),
+            opt_bytes(r.context_system_bytes),
+            opt_bytes(r.context_last_turn_bytes),
+            opt_bytes(r.context_other_bytes),
+            opt_bytes(r.context_measured_bytes),
+            opt_tax_ratio(r.context_tax_ratio),
+            opt_u64(r.prepare_us),
+        ],
     }
 }
 
@@ -1210,6 +1372,64 @@ fn opt_u64(v: Option<u64>) -> String {
     v.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string())
 }
 
+/// Igual que [`opt_u64`] pero para `usize` (usado en `msgs`, la cantidad de
+/// mensajes del historial). `None` se muestra como `-`, nunca como `0`.
+fn opt_usize(v: Option<usize>) -> String {
+    v.map(|x| x.to_string()).unwrap_or_else(|| "-".to_string())
+}
+
+/// Convierte un tamaño en bytes a una representación compacta y legible.
+///
+/// Convención elegida: DECIMAL (base 1000), no binaria (KiB/MiB base 1024).
+/// `1_000 B = 1.0 kB`, `1_000_000 B = 1.0 MB`. Se prefiere la convención
+/// decimal porque estos bytes miden el tamaño de un JSON canónico
+/// re-serializado (ver `ContextBreakdown` en `src/telemetry/recent.rs`), no
+/// bloques de memoria alineados a potencias de 2 — no hay ninguna razón
+/// binaria de por medio, y la convención decimal es la que usan la mayoría
+/// de las herramientas de red/observabilidad con las que se compara este
+/// dato (curl, nginx, etc.).
+///
+/// Umbrales:
+/// - `< 1_000` bytes → se muestra tal cual, sin decimales (`"281 B"`).
+/// - hasta `999.9 kB` → kB con un decimal (`"159.1 kB"`).
+/// - a partir de ahí → MB con un decimal (`"1.0 MB"`).
+///
+/// El salto a MB se decide DESPUÉS de redondear, no antes. Elegir la unidad
+/// comparando contra `1_000_000` y redondear luego produce `"1000.0 kB"` para
+/// cualquier valor entre `999_950` y `999_999`: un número que se lee como un
+/// error de escala, no como un redondeo. Por eso el corte está en `999.95 kB`,
+/// que es exactamente donde el formato de un decimal empezaría a mostrar
+/// `1000.0`.
+fn format_bytes(bytes: usize) -> String {
+    if bytes < 1_000 {
+        return format!("{bytes} B");
+    }
+
+    let kb = bytes as f64 / 1_000.0;
+    if kb < 999.95 {
+        return format!("{kb:.1} kB");
+    }
+
+    format!("{:.1} MB", bytes as f64 / 1_000_000.0)
+}
+
+/// Igual que [`opt_u64`] pero aplicando [`format_bytes`] al valor presente.
+/// `None` se muestra como `-`, nunca como `"0 B"`: un tamaño no medido y un
+/// tamaño de cero bytes real son cosas distintas.
+fn opt_bytes(v: Option<usize>) -> String {
+    v.map(format_bytes).unwrap_or_else(|| "-".to_string())
+}
+
+/// Celda de `tax%`: `context_tax_ratio * 100` con un decimal, o `-` si no
+/// hay dato. Mismo criterio que [`opt_fixed`] para valores no finitos
+/// (NaN/inf se tratan como ausentes, nunca se imprimen tal cual).
+fn opt_tax_ratio(v: Option<f64>) -> String {
+    match v {
+        Some(x) if x.is_finite() => format!("{:.1}", x * 100.0),
+        _ => "-".to_string(),
+    }
+}
+
 /// Igual que [`opt_u64`] pero para `f64`, con precisión fija de `decimals`.
 /// Filtra valores no finitos (NaN/inf) como si fueran `None`: no deberían
 /// llegar hasta acá, pero un `-` es preferible a imprimir `NaN` en la UI.
@@ -1244,8 +1464,12 @@ fn marker_text(kinds: &[OutlierKind]) -> String {
     }
 }
 
-/// Imprime la tabla de requests recientes en texto plano (modo `--once`),
-/// más nuevo arriba, con los mismos marcadores de outlier que la TUI.
+/// Imprime la tabla LATENCY de requests recientes en texto plano (modo
+/// `--once`), más nuevo arriba, con los mismos marcadores de outlier que la
+/// TUI. Es la vista por defecto (columnas de latencia/tokens/coste). Ver
+/// [`print_context_table`] para la vista complementaria del desglose de
+/// contexto — `--once` imprime AMBAS, una debajo de la otra (ver
+/// [`run_once`]).
 fn print_requests_table(rows: &[RequestRow]) {
     let outliers = classify_outliers(rows);
 
@@ -1274,8 +1498,48 @@ fn print_requests_table(rows: &[RequestRow]) {
     println!("leyenda: ERR=error(status>=400) · MISS=cache-miss atípico · TTFT=TTFT lento(>=2σ) · SLOW=generación lenta(>=2σ)");
 }
 
+/// Imprime la tabla CONTEXT de requests recientes en texto plano (modo
+/// `--once`): mismo orden (más nuevo arriba) y mismos marcadores de outlier
+/// que [`print_requests_table`], pero con las columnas del desglose de
+/// bytes de contexto en vez de las de latencia/tokens. Reusa
+/// [`requests_row_cells`] para que esta vista en texto plano y la vista
+/// `Context` de la TUI (`draw_requests_panel`) nunca diverjan en qué dato
+/// muestra cada columna.
+fn print_context_table(rows: &[RequestRow]) {
+    let outliers = classify_outliers(rows);
+
+    println!(
+        "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>8} {:<14}",
+        "HORA", "MODELO", "msgs", "tools", "history", "system", "last_turn", "other", "total", "tax%", "prep_us", "outlier"
+    );
+    for (i, r) in rows.iter().enumerate().rev() {
+        let cells = requests_row_cells(RequestsView::Context, r);
+        println!(
+            "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>8} {:<14}",
+            cells[0],
+            cells[1],
+            cells[2],
+            cells[3],
+            cells[4],
+            cells[5],
+            cells[6],
+            cells[7],
+            cells[8],
+            cells[9],
+            cells[10],
+            marker_text(&outliers[i]),
+        );
+    }
+    println!("leyenda: ERR=error(status>=400) · MISS=cache-miss atípico · TTFT=TTFT lento(>=2σ) · SLOW=generación lenta(>=2σ)");
+    println!(
+        "nota: tools/history/system/last_turn/other/total son BYTES (kB decimal, no tokens); tax% = (system+tools+history)/total"
+    );
+}
+
 fn draw_footer(f: &mut Frame, area: Rect) {
-    let text = Line::from("q salir · b marcar baseline · r reset · ↑/↓ elegir modelo · p mostrar/ocultar requests");
+    let text = Line::from(
+        "q salir · b marcar baseline · r reset · ↑/↓ elegir modelo · p mostrar/ocultar requests · c vista latency/context",
+    );
     f.render_widget(Paragraph::new(text), area);
 }
 
@@ -1461,6 +1725,15 @@ mod tests {
             cache_control_forced: false,
             ttft_ms,
             total_ms,
+            context_system_bytes: Some(281),
+            context_tools_bytes: Some(159_100),
+            context_history_bytes: Some(4_000),
+            context_last_turn_bytes: Some(96),
+            context_other_bytes: Some(50),
+            context_measured_bytes: Some(163_527),
+            context_messages_count: Some(12),
+            context_tax_ratio: Some(0.9994),
+            prepare_us: Some(850),
         }
     }
 
@@ -1576,5 +1849,232 @@ mod tests {
         let result = classify_outliers(&rows);
 
         assert!(result[4].is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // format_bytes — convención decimal (base 1000), casos de borde
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn format_bytes_cero() {
+        assert_eq!(format_bytes(0), "0 B");
+    }
+
+    #[test]
+    fn format_bytes_justo_debajo_del_kb() {
+        assert_eq!(format_bytes(999), "999 B");
+    }
+
+    #[test]
+    fn format_bytes_exactamente_un_kb_decimal() {
+        assert_eq!(format_bytes(1_000), "1.0 kB");
+    }
+
+    #[test]
+    fn format_bytes_1024_no_es_un_caso_especial_binario() {
+        // Convención DECIMAL: 1024 bytes son 1.024 kB, que redondeado a un
+        // decimal da "1.0 kB" — igual que 1000. Este test documenta que
+        // NO se usa la convención binaria (que mostraría "1.0 KiB" recién
+        // en 1024 y no en 1000).
+        assert_eq!(format_bytes(1_024), "1.0 kB");
+    }
+
+    #[test]
+    fn format_bytes_un_millon_pasa_a_mb() {
+        assert_eq!(format_bytes(1_000_000), "1.0 MB");
+    }
+
+    /// La frontera real no está en `1_000_000` sino donde el redondeo a un
+    /// decimal empezaría a imprimir `1000.0`. Elegir la unidad ANTES de
+    /// redondear devuelve `"1000.0 kB"` para todo el tramo `999_950..=999_999`,
+    /// que se lee como un error de escala. Este test es el que muerde.
+    #[test]
+    fn format_bytes_no_imprime_mil_kb_nunca() {
+        assert_eq!(format_bytes(999_949), "999.9 kB");
+        assert_eq!(format_bytes(999_950), "1.0 MB");
+        assert_eq!(format_bytes(999_999), "1.0 MB");
+
+        for bytes in [999_950_usize, 999_975, 999_999] {
+            assert!(
+                !format_bytes(bytes).starts_with("1000"),
+                "format_bytes({bytes}) no debe rendirse como 1000.x kB"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // RequestsView — enum total, ciclado con `c`
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn requests_view_next_cicla_entre_las_dos_variantes() {
+        assert_eq!(RequestsView::Latency.next(), RequestsView::Context);
+        assert_eq!(RequestsView::Context.next(), RequestsView::Latency);
+    }
+
+    #[test]
+    fn requests_view_default_es_latency() {
+        assert_eq!(RequestsView::default(), RequestsView::Latency);
+    }
+
+    #[test]
+    fn cycle_requests_view_no_op_si_el_panel_esta_oculto() {
+        let mut app = App::new("http://x".to_string());
+        app.show_requests_panel = false;
+
+        app.cycle_requests_view();
+
+        assert_eq!(app.requests_view, RequestsView::Latency);
+    }
+
+    #[test]
+    fn cycle_requests_view_cicla_si_el_panel_esta_visible() {
+        let mut app = App::new("http://x".to_string());
+        assert!(app.show_requests_panel);
+
+        app.cycle_requests_view();
+        assert_eq!(app.requests_view, RequestsView::Context);
+
+        app.cycle_requests_view();
+        assert_eq!(app.requests_view, RequestsView::Latency);
+    }
+
+    // -----------------------------------------------------------------
+    // RequestRow — deserialización de un payload realista de /requests,
+    // incluyendo compatibilidad con una build vieja del proxy (sin los
+    // campos nuevos de este slice).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn request_row_deserializa_payload_realista_con_campos_de_contexto() {
+        let json = r#"{
+            "timestamp": "2026-07-09T14:02:11.483Z",
+            "route": "/v1/messages",
+            "upstream": "anthropic",
+            "model": "claude-opus-4-1",
+            "stream": true,
+            "status": 200,
+            "input_tokens": 5000,
+            "output_tokens": 412,
+            "cache_read_tokens": 4200,
+            "cache_write_tokens": 0,
+            "cost_estimate_usd": 0.0891,
+            "cache_control_forced": false,
+            "ttft_ms": 780.4,
+            "total_ms": 3210.9,
+            "context_system_bytes": 281,
+            "context_tools_bytes": 159123,
+            "context_history_bytes": 4000,
+            "context_last_turn_bytes": 96,
+            "context_other_bytes": 50,
+            "context_measured_bytes": 163550,
+            "context_messages_count": 12,
+            "context_tax_ratio": 0.9994,
+            "prepare_us": 850
+        }"#;
+
+        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar un payload con todos los campos");
+
+        assert_eq!(row.context_system_bytes, Some(281));
+        assert_eq!(row.context_tools_bytes, Some(159_123));
+        assert_eq!(row.context_history_bytes, Some(4_000));
+        assert_eq!(row.context_last_turn_bytes, Some(96));
+        assert_eq!(row.context_other_bytes, Some(50));
+        assert_eq!(row.context_measured_bytes, Some(163_550));
+        assert_eq!(row.context_messages_count, Some(12));
+        assert!((row.context_tax_ratio.unwrap() - 0.9994).abs() < 1e-9);
+        assert_eq!(row.prepare_us, Some(850));
+    }
+
+    #[test]
+    fn request_row_deserializa_build_vieja_del_proxy_sin_romper() {
+        // Caso de compatibilidad real: un proxy de build ANTERIOR a este
+        // slice no conoce los campos de contexto ni `prepare_us`, así que
+        // ni siquiera los manda en el JSON (a diferencia de los campos
+        // `Option` que YA existían, que si el proveedor no los reporta se
+        // mandan como `null` explícito). El monitor NUEVO tiene que poder
+        // hablar con un proxy VIEJO sin panickear ni fallar la
+        // deserialización de la fila entera.
+        //
+        // `prepare_us` se espeja como `Option<u64>` aunque el proxy lo
+        // exponga como `u64`: el espejo modela lo que el monitor puede
+        // SABER, no lo que el servidor declara. Contra un proxy viejo la
+        // clave no llega y el dato queda en `None`, distinguible de un
+        // `Some(0)` legítimo.
+        let json = r#"{
+            "timestamp": "2024-01-01T00:00:00Z",
+            "route": "/v1/messages",
+            "upstream": "anthropic",
+            "model": "claude-opus-4",
+            "stream": true,
+            "status": 200,
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_tokens": null,
+            "cache_write_tokens": null,
+            "cost_estimate_usd": null,
+            "cache_control_forced": false,
+            "ttft_ms": null,
+            "total_ms": 100.0
+        }"#;
+
+        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar aunque falten los campos nuevos");
+
+        assert_eq!(row.context_system_bytes, None);
+        assert_eq!(row.context_tools_bytes, None);
+        assert_eq!(row.context_history_bytes, None);
+        assert_eq!(row.context_last_turn_bytes, None);
+        assert_eq!(row.context_other_bytes, None);
+        assert_eq!(row.context_measured_bytes, None);
+        assert_eq!(row.context_messages_count, None);
+        assert_eq!(row.context_tax_ratio, None);
+        // `None`, no `Some(0)`: contra un proxy viejo el dato está AUSENTE.
+        // Un `0` significaría que el proxy midió cero microsegundos.
+        assert_eq!(row.prepare_us, None);
+
+        // La capa de presentación cumple la regla del proyecto: nunca `0`
+        // para un dato ausente, siempre `-`.
+        assert_eq!(opt_bytes(row.context_system_bytes), "-");
+        assert_eq!(opt_usize(row.context_messages_count), "-");
+        assert_eq!(opt_tax_ratio(row.context_tax_ratio), "-");
+        assert_eq!(opt_u64(row.prepare_us), "-");
+    }
+
+    #[test]
+    fn request_row_deserializa_campos_de_contexto_explicitamente_null() {
+        // Variante del caso de compatibilidad, pero con las claves nuevas
+        // PRESENTES y en `null` explícito (p. ej. un proxy que ya conoce el
+        // campo pero no pudo calcular el desglose para esta fila puntual).
+        let json = r#"{
+            "timestamp": "2024-01-01T00:00:00Z",
+            "route": "/v1/messages",
+            "upstream": "anthropic",
+            "model": "claude-opus-4",
+            "stream": false,
+            "status": 200,
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_tokens": null,
+            "cache_write_tokens": null,
+            "cost_estimate_usd": null,
+            "cache_control_forced": false,
+            "ttft_ms": null,
+            "total_ms": 100.0,
+            "context_system_bytes": null,
+            "context_tools_bytes": null,
+            "context_history_bytes": null,
+            "context_last_turn_bytes": null,
+            "context_other_bytes": null,
+            "context_measured_bytes": null,
+            "context_messages_count": null,
+            "context_tax_ratio": null,
+            "prepare_us": 12
+        }"#;
+
+        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar con context_* en null explícito");
+
+        assert_eq!(row.context_system_bytes, None);
+        assert_eq!(row.context_tax_ratio, None);
+        assert_eq!(row.prepare_us, Some(12));
     }
 }
