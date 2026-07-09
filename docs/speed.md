@@ -88,27 +88,72 @@ esperan. Menos `effort` ⇒ menos pensamiento ⇒ menos tiempo de generación.
   > concluir, falsamente, que Claude Code no manda `effort`. Al filtrar el
   > JSONL, conviene comprobar `'requested_effort' in row` antes de leer su
   > valor.
-- Observación honesta, con la muestra que hay: esas dos sondas de la misma
-  frase dieron `gen_ms` (`total_ms − ttft_ms`) de 74 ms con `high` (5 tokens
-  de salida) y 24 ms con `low` (4 tokens de salida). La dirección es la
-  esperada, pero con salidas de cuatro/cinco tokens esto NO es una medición
-  del efecto, solo una comprobación de que la captura funciona. Se dice así,
-  sin adornos.
+### 3.1. `--effort low`: no genera más rápido, genera menos — MEDIDO
+
+Tres pares de sondas, misma tarea de razonamiento, mismo modelo, mismo
+prompt. La única variable es el `effort`:
+
+| métrica | `high` (media) | `low` (media) | delta | rangos |
+|---|---|---|---|---|
+| `output_tokens` | 1.279,3 | 1.023,0 | **−20,0%** | sin solape (1.114–1.392 frente a 1.012–1.037) |
+| `total_ms` | 21.389,2 | 16.685,7 | **−22,0%** | sin solape (19.916–23.019 frente a 16.406–17.034) |
+| `tok/s` | 65,2 | 66,8 | +2,4% | **se solapan** (64–68 frente a 66–68) |
+
+Las dos últimas columnas se leen juntas. El `tok/s` se solapa: **la velocidad
+de generación no cambia**. Lo que cae es la cantidad de tokens a generar, y
+por eso el turno completo tarda un 22% menos.
+
+El mecanismo es "menos tokens que esperar", no "tokens más rápidos". La
+distinción no es académica: quien espere una aceleración de la generación no
+verá nada, y quien mida sobre una tarea que no requiere razonar tampoco.
+
+> **Un experimento fallido, conservado porque enseña más que el bueno.** El
+> primer intento comparó `high` y `low` sobre "escriba 500 palabras de prosa,
+> sin usar herramientas". Resultado: 1.374 frente a 1.376 tokens de salida, una
+> diferencia del 0,1%. El `effort` gobierna cuánto piensa el modelo; en una
+> tarea que no pide pensamiento, el pensamiento adaptativo no se activa y la
+> palanca no tiene sobre qué actuar. Se le puso una palanca a una puerta que ya
+> estaba abierta. Para medir `effort` hace falta una tarea que obligue a
+> razonar.
+
+El precio no es cero: menos pensamiento es menos razonamiento. En tareas
+sensibles a la calidad, el 22% de tiempo se paga con la profundidad de la
+respuesta. Esto no se ha medido aquí y no se afirma.
 
 **Fast mode (`speed: "fast"`)**. Documentado por Anthropic: hasta ~2,5×
 más tokens por segundo de salida, a precio premium, sobre Opus 4.8 y 4.7.
 Tiene su propio rate limit, separado del estándar.
 
 - En Claude Code se activa con el comando interactivo `/fast`.
-- Es la única palanca que ataca directamente el 82% de §1.
+- Es la única palanca que atacaría directamente el 82% de §1: acelera los
+  tokens en sí, no reduce su número.
+- **REQUIERE CRÉDITOS DE API.** Comprobado en este proyecto: con una
+  suscripción plana (Max), `/fast` responde que hacen falta créditos y no se
+  activa. El precio premium no está cubierto por la cuota mensual. Para quien
+  trabaja con suscripción y no con facturación por uso, **fast mode no es una
+  palanca accionable**, por mucho que esté documentada.
 - No está disponible en Amazon Bedrock, Vertex AI ni Microsoft Foundry
   (documentado por Anthropic; OxideGate no enruta tráfico hacia esos tres
   hoy, así que no hay forma de confirmarlo desde este repo).
-- ESTADO EN ESTE PROYECTO: **no observado todavía**. Ni `requested_speed`
-  (la clave `speed` de la raíz del body) ni `served_speed`
-  (`usage.speed` de la respuesta) aparecen en ninguna de las 90 peticiones
-  capturadas: el tráfico de este proyecto corre entero en velocidad
-  estándar.
+- ESTADO EN ESTE PROYECTO: **no observado**, y no por falta de intentarlo.
+  `requested_speed` (la clave `speed` de la raíz del body) nunca se envía.
+  `served_speed` (`usage.speed` de la respuesta) tampoco llega: sigue siendo
+  `-` incluso en las sondas a velocidad estándar. Esto **confirma la
+  convención** del proyecto: `None` significa "el proveedor no lo reportó",
+  nunca "es estándar". Anthropic solo devuelve `usage.speed` cuando se le
+  pide fast mode.
+
+### Cuál de las dos se puede accionar hoy
+
+Solo `--effort`. Y no acelera nada: recorta. Es una palanca de **cantidad**,
+no de **velocidad**, y por eso su efecto desaparece en cuanto la tarea no
+requiere razonar. La palanca que sí atacaría la velocidad de generación —
+fast mode — está detrás de un muro de facturación.
+
+Conviene decirlo sin rodeos, porque es el resultado incómodo de este
+documento: de las dos palancas que Anthropic ofrece, una está fuera de
+alcance con suscripción plana y la otra funciona pagando en profundidad de
+razonamiento lo que ahorra en segundos.
 
 ---
 
@@ -145,17 +190,27 @@ con la razón escrita en el código (`src/provider/openai.rs`,
 2. Levante el monitor en otra terminal: `OXIDEGATE_PORT=8899 cargo run --bin monitor`
 3. Apunte el cliente al proxy: `ANTHROPIC_BASE_URL=http://localhost:8899 claude`
 4. Genere tráfico normal y pulse `b` en el monitor para marcar el baseline.
-5. Active la palanca: `/fast` dentro de la sesión de Claude Code, o
-   reinicie con `--effort low`.
-6. Genere tráfico equivalente y observe el panel `Δ desde baseline`: la
-   columna `tok/s` es la que responde. `p` abre el panel por petición; las
-   columnas `effort`, `spd_req` y `spd_got` confirman que la palanca llegó
-   al cable.
+5. Active la palanca: reinicie con `--effort low` (o `/fast`, si dispone de
+   créditos de API — ver §3).
+6. Genere tráfico equivalente y observe el panel `Δ desde baseline`. `p` abre
+   el panel por petición; las columnas `effort`, `spd_req` y `spd_got`
+   confirman que la palanca llegó al cable.
 
-Regla metodológica, tomada del resto del proyecto (ver §2): comparar
-únicamente peticiones con tareas equivalentes. El `tok/s` de un turno de
-cuatro tokens no dice nada; hace falta salida larga para que el throughput
-signifique algo.
+**Qué columna mirar, según la palanca.** Confundirlas lleva a concluir que
+`--effort` no hace nada:
+
+- Con `--effort`, responden `output_tokens` y `total_ms`. **`tok/s` no se
+  mueve** (§3.1): la generación va a la misma velocidad, simplemente hay
+  menos que generar.
+- Con fast mode, respondería `tok/s`, y `output_tokens` no.
+
+Dos reglas metodológicas más, ambas aprendidas a base de medir mal:
+
+- **Tareas equivalentes, y suficientemente largas.** El `tok/s` de un turno de
+  cuatro tokens no dice nada; hace falta salida larga para que el throughput
+  signifique algo.
+- **La tarea debe ejercitar la palanca.** Medir `--effort` sobre prosa sin
+  razonamiento da cero diferencia, y no porque la palanca no funcione (§3.1).
 
 ---
 
@@ -168,6 +223,8 @@ signifique algo.
 | Optimizar el transporte MCP | 0,68 ms de mediana (salto JSON-RPC por stdio) contra un turno real de 11.123 ms | `docs/findings.md` §E |
 | El overhead del propio proxy | `prepare_us` va de 43 µs a 15.135 µs — el 0,67% de una petición típica | `docs/findings.md` §E |
 | Hilos paralelos | compran reloj de pared, lo pagan en tokens de prefijo por hilo | `docs/context-tax.md` §3, `docs/findings.md` §E |
+| `--effort low`, como acelerador | no acelera: el `tok/s` se solapa (64–68 frente a 66–68, n=3). Recorta un 20% de tokens generados, y de ahí sale el 22% de reloj | esta página, §3.1 |
+| `--effort low` en tareas sin razonamiento | 1.374 frente a 1.376 tokens de salida: la palanca no tiene sobre qué actuar | esta página, §3.1 |
 
 ---
 

@@ -10,9 +10,15 @@
 ## A. La conclusión central
 
 El código de este repositorio no optimiza nada. Construye el instrumento que
-permite ver dónde está el desperdicio. Las dos optimizaciones reales
-encontradas en una jornada completa fueron un archivo de configuración de
-siete líneas y un flag del CLI. Ninguna se habría encontrado sin medir.
+permite ver dónde está el desperdicio. Las optimizaciones reales encontradas
+en una jornada completa fueron un archivo de configuración de siete líneas y
+dos flags del CLI. Ninguna se habría encontrado sin medir.
+
+Y una advertencia que vale para las tres: **ninguna es gratis.** `--tools`
+recorta lo que el agente puede hacer, `CLAUDE.md` lean recorta las reglas que
+obedece, y `--effort low` recorta cuánto razona. La optimización aquí no
+consiste en encontrar desperdicio puro, sino en saber exactamente qué se está
+cambiando por qué.
 
 ---
 
@@ -60,8 +66,11 @@ cada request.
 | `--tools <lista>` | Recorta 94,9% del array de esquemas | `--disallowedTools` NO sirve para esto — solo ahorra 0,5%, porque es una puerta de permiso, no de payload |
 | Techo apilado sobre la misma sonda | 224.653 B (sin cambios) → 149.221 B (+ `--strict-mcp-config`) → 51.540 B (+ `--tools Read,Bash`), −77,1% total | El trade es real: un agente así no edita, no busca por patrón ni delega a subagentes |
 | `CLAUDE.md` lean | Medido: ahorra 29.867 B por petición (−13,3%). El 85,1% de ese archivo describe flujos que se invocan, no reglas que se obedecen | **No es una palanca lista.** Se midió el byte, no el comportamiento. Adoptarlo sin crear antes las skills a las que apunta perdería las reglas en silencio: el agente dejaría de delegar y de guardar en memoria sin avisar |
+| `--effort low` | −20,0% tokens de salida y −22,0% de reloj de pared en una tarea de razonamiento (n=3 pares, rangos sin solape) | **No acelera: recorta.** El `tok/s` no se mueve (rangos solapados). Y lo que recorta es pensamiento, así que el tiempo se paga en profundidad de razonamiento. En tareas que no razonan, no hace nada |
 
-Detalle completo y las cuatro sondas: `docs/context-tax.md` §5.
+Detalle completo y las cuatro sondas: `docs/context-tax.md` §5. La única
+palanca de velocidad medida, con su experimento y su experimento fallido:
+`docs/speed.md` §3.1.
 
 ---
 
@@ -77,6 +86,7 @@ Descartados con evidencia, para que nadie los repita.
 | Hilos paralelos como ahorro | Compran reloj de pared, no lo ahorran gratis: cada hilo paga su propio piso de prefijo de herramientas (del orden de las decenas de miles de tokens, ver §B). Además, la mayor parte del reloj de pared de una sesión con humano en el loop es el humano pensando, no la máquina: el 77% del reloj de pared de la sesión medida | `docs/context-tax.md` §3 |
 | Subida de bytes y overhead del propio proxy | ~280 KB por request son ~7 ms de transferencia en fibra. `prepare_us` (el tiempo que OxideGate pasa dentro de `prepare`) va de 43 µs con un body minúsculo a 15.135 µs con uno de 450 kB: entre 0,04 y 15 milisegundos, frente a un TTFT medio de 2.097 ms. Es el 0,67% de una petición típica. Ninguno de los dos explica la dispersión del TTFT | `docs/context-tax.md` §3 |
 | El tiempo de generación del modelo | 82% del tiempo "ocupado" de una petición es el modelo generando tokens. Un proxy se sienta en el medio del wire; no puede acelerar eso | `docs/context-tax.md` §3 |
+| Fast mode (`speed: "fast"`) como palanca disponible | Existe, está documentada y ataca precisamente ese 82%. Pero **requiere créditos de API**: con suscripción plana (Max), `/fast` pide créditos y no se activa. No es una palanca que se pueda accionar sin cambiar de modelo de facturación | `docs/speed.md` §3 |
 
 > **Dónde vive la evidencia.** Estas cifras están medidas, pero su evidencia
 > cruda no está versionada en el repositorio, así que conviene decir dónde
