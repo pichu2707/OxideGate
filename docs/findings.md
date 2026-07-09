@@ -160,6 +160,19 @@ relacionado: `docs/optimizer-prompt-cache.md` §8-§10.
   Claude Code, `curl` y Ollama, que respetan la variable de entorno de base
   URL del proveedor. No vale para clientes que traen su propio gateway
   interno y no exponen ese punto de redirección de la misma forma.
+- **La Palanca A funciona, y es inerte donde se usa.** El optimizador de
+  prompt cache (`force_cache_control`) se ejecutó por primera vez fuera de sus
+  tests unitarios, contra un sumidero HTTP local: inyecta el breakpoint cuando
+  el cliente no trae el suyo, y respeta el del cliente cuando lo trae, incluso
+  anidado. Pero contra Claude Code —el único cliente que atraviesa este
+  proxy— **nunca dispara**, porque Claude Code cachea por su cuenta. Una
+  palanca correcta apuntando a un cliente que no existe. Detalle y sondas:
+  `docs/optimizer-prompt-cache.md` §6.1.
+- **Un flag apagado explica una ausencia mejor que cualquier teoría.** Durante
+  133 peticiones, `cache_control_forced` fue `false` siempre. La causa no era
+  ninguna hipótesis interesante sobre el cliente: `OXIDEGATE_FORCE_CACHE`
+  nunca se puso, y `unwrap_or(false)` hizo el resto. Antes de explicar por qué
+  un mecanismo se comporta raro, conviene comprobar que llegó a ejecutarse.
 - **OxideGate mide modelos locales sin código nuevo.** Ollama habla el
   dialecto de la API de OpenAI, así que el adaptador existente lo mide sin
   cambios (`docs/telemetry-level-1.md` §5, `docs/monitor-tui.md` §7.3.1).
@@ -181,6 +194,14 @@ se cargaban en cada corrida. Verificado con captura directa de ambos bodies y
 con cuatro repeticiones: la diferencia real de estar dentro del proyecto son
 **589 bytes**, no 22.153 tokens. Detalle completo en `docs/context-tax.md`
 §4.
+
+Se afirmó que la Palanca A nunca disparaba **porque** Claude Code manda su
+propio `cache_control`. La conclusión resultó cierta, pero se enunció sin
+comprobarla, y la causa inmediata era otra: el flag `OXIDEGATE_FORCE_CACHE`
+estaba apagado por defecto, así que la comprobación sobre el cliente ni
+siquiera llegaba a ejecutarse. Había dos puertas y se señaló la segunda sin
+mirar la primera. Acertar sin verificar no es acertar; es tener suerte, y la
+suerte no es reproducible.
 
 ---
 

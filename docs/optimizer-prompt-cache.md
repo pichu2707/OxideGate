@@ -109,6 +109,64 @@ Si `cache_control_forced` es siempre `false` con la palanca prendida, hay dos
 explicaciones esperables (no un bug): el cliente ya trae su propio
 `cache_control`, o el body no es JSON válido.
 
+### 6.1. Verificado en el cable (primera ejecución real de la palanca)
+
+Durante 133 peticiones capturadas, `cache_control_forced` fue `false` **en
+todas**. La causa no era ninguna de las dos de arriba: `OXIDEGATE_FORCE_CACHE`
+nunca se había puesto, así que la palanca vivía detrás de un `if` que jamás se
+evaluó a `true`. El código de la sección 4 no se había ejecutado nunca fuera
+de sus tests unitarios.
+
+Se probó con tres proxies simultáneos y aislados por `HOME` (el `storage_dir`
+se deriva de esa variable y no tiene override propio):
+
+**Contra Anthropic real, con `OXIDEGATE_FORCE_CACHE=true` y tráfico de Claude
+Code:**
+
+| campo | valor |
+|---|---|
+| `cache_control_forced` | `false` |
+| `cache_write_tokens` | 54.257 |
+
+Con la palanca **encendida**, no disparó. El único camino a ese `false` es que
+`has_cache_control` devolviera `true`. Queda así confirmado lo que la sección
+5 afirmaba: **Claude Code trae su propio `cache_control`**, y esos 54.257
+tokens de escritura son suyos, no de OxideGate.
+
+**Contra un sumidero HTTP local que hace de `api.anthropic.com`**, para poder
+inspeccionar los bytes exactos que el proxy pone en el cable:
+
+| sonda | el cliente manda `cache_control` | raíz del body saliente | `cache_control_forced` |
+|---|---|---|---|
+| 1 | no | `{"cache_control":{"type":"ephemeral"}}` **inyectado** | `true` |
+| 2 | sí, anidado en `system[0]` | intacta, sin inyección | `false` |
+
+La sonda 2 es la que importa: sin ella, "siempre inyecta" y "sabe cuándo
+inyectar" son indistinguibles. Confirma además que `has_cache_control` detecta
+el breakpoint del cliente aunque esté **anidado**, no solo en la raíz.
+
+### 6.2. Lo que sigue SIN verificar, y sostiene toda la palanca
+
+Que Anthropic **honre** el breakpoint inyectado. Nunca se ha observado un
+`cache_write_tokens > 0` producido por una inyección de OxideGate.
+
+No es negligencia, es una tenaza: el único cliente que atraviesa este proxy
+(Claude Code) cachea por su cuenta, así que la palanca nunca dispara contra
+Anthropic real; y el sumidero, que sí la hace disparar, no es Anthropic y su
+`usage` es inventado. Cerrar esto exige un cliente que hable `/v1/messages`
+sin `cache_control` propio y con credenciales válidas.
+
+Que el campo de raíz sea **válido** sí está confirmado, pero por documentación
+(sección 8), que es una fuente distinta de una medición. La diferencia importa:
+un campo válido que Anthropic ignora en silencio produce exactamente los mismos
+bytes en el cable que uno que honra.
+
+Y hay una trampa concreta esperando a quien intente cerrarlo: la sonda 1 de
+arriba llevaba un body de cuatro tokens, muy por debajo del prefijo mínimo
+cacheable (4.096 en Opus 4.8). Contra Anthropic real habría vuelto con
+`cache_write_tokens = 0` y sin un solo error — el fallo silencioso de la
+sección 9, y la razón de ser del detector de la sección 10.
+
 ## 7. Por qué es Anthropic-only (por ahora)
 
 - **OpenAI** cachea el prefijo de forma **automática** (sin ningún campo
