@@ -9,7 +9,10 @@
 //! `cache_control` a nivel raíz para que Anthropic cachee el prefijo estable
 //! (`tools` + `system`) y las llamadas repetidas paguen `cache_read` (0.1x)
 //! en vez de tarifa plena. Ver `docs/optimizer-prompt-cache.md`.
-use super::{fingerprint, model_and_stream_from_body, Incoming, Outgoing, Provider, Usage};
+use super::{
+    array_field, fingerprint, measure_key, measure_other, model_and_stream_from_body,
+    split_history_and_last_turn, ContextBreakdown, Incoming, Outgoing, Provider, Usage,
+};
 use crate::config::AppConfig;
 use serde_json::Value;
 
@@ -83,6 +86,36 @@ impl Provider for Anthropic {
             usage.cache_write_tokens = Some(v);
         }
     }
+
+    /// Desglosa el body de `/v1/messages`. Mapeo directo del dialecto:
+    /// `system` (string o array de bloques de contenido, ambos se miden
+    /// igual con `serde_json::to_vec`) → `system_bytes`; `tools` →
+    /// `tools_bytes`; `messages` → todo menos el último a `history_bytes`, el
+    /// último a `last_turn_bytes`; cualquier otra clave de la raíz (`model`,
+    /// `max_tokens`, `temperature`, `stream`…) → `other_bytes`.
+    ///
+    /// `None` solo si `body` no es un objeto JSON (array, string, número):
+    /// nunca hace panic sobre un body inesperado.
+    fn decompose(&self, body: &Value) -> Option<ContextBreakdown> {
+        let obj = body.as_object()?;
+
+        let system_bytes = measure_key(obj, "system");
+        let tools_bytes = measure_key(obj, "tools");
+        let messages = array_field(obj, "messages");
+        let (history_bytes, last_turn_bytes, messages_count) =
+            split_history_and_last_turn(messages.iter());
+        let other_bytes = measure_other(obj, &["system", "tools", "messages"]);
+
+        Some(ContextBreakdown {
+            system_bytes,
+            tools_bytes,
+            history_bytes,
+            last_turn_bytes,
+            other_bytes,
+            measured_bytes: system_bytes + tools_bytes + history_bytes + last_turn_bytes + other_bytes,
+            messages_count,
+        })
+    }
 }
 
 /// Palanca A del optimizador: si el body es JSON válido y NO trae ya ningún
@@ -134,6 +167,7 @@ fn has_cache_control(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::measure_value;
 
     /// Anthropic manda el input en `message_start` y el output acumulado en
     /// `message_delta`. Extraer ambos eventos por separado debe dejar los
@@ -290,5 +324,109 @@ mod tests {
             assert!(!out.cache_control_forced, "body {body} no debe forzar caché");
             assert_eq!(out.body, original_body, "body {body} debe reenviarse intacto");
         }
+    }
+
+    /// Body realista: `system` string, `tools` con un esquema, y 3 mensajes.
+    /// Cada balde debe coincidir con su fragmento y la suma debe cerrar con
+    /// `measured_bytes`.
+    #[test]
+    fn decompose_body_realista_con_system_string() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "claude-3-5-sonnet",
+                "max_tokens": 1024,
+                "system": "eres un asistente que ayuda con código Rust",
+                "tools": [{"name": "buscar", "input_schema": {"type": "object"}}],
+                "messages": [
+                    {"role": "user", "content": "hola"},
+                    {"role": "assistant", "content": "hola, en qué te ayudo"},
+                    {"role": "user", "content": "explicame ownership"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let bd = ANTHROPIC.decompose(&body).expect("body es objeto");
+
+        assert_eq!(bd.system_bytes, measure_value(&body["system"]));
+        assert_eq!(bd.tools_bytes, measure_value(&body["tools"]));
+        assert_eq!(bd.messages_count, 3);
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(
+            bd.history_bytes,
+            measure_value(&messages[0]) + measure_value(&messages[1])
+        );
+        assert_eq!(bd.last_turn_bytes, measure_value(&messages[2]));
+        assert_eq!(
+            bd.other_bytes,
+            measure_value(&body["model"]) + measure_value(&body["max_tokens"])
+        );
+        assert_eq!(
+            bd.measured_bytes,
+            bd.system_bytes + bd.tools_bytes + bd.history_bytes + bd.last_turn_bytes + bd.other_bytes
+        );
+    }
+
+    /// `system` como array de bloques de contenido (con `cache_control`
+    /// propio del cliente, por ejemplo): debe medirse igual que el string,
+    /// sin distinción especial.
+    #[test]
+    fn decompose_system_como_array_de_bloques() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "claude-3-5-sonnet",
+                "system": [{"type": "text", "text": "instrucciones largas", "cache_control": {"type": "ephemeral"}}],
+                "messages": [{"role": "user", "content": "hola"}]
+            }"#,
+        )
+        .unwrap();
+
+        let bd = ANTHROPIC.decompose(&body).expect("body es objeto");
+
+        assert_eq!(bd.system_bytes, measure_value(&body["system"]));
+        assert!(bd.system_bytes > 0);
+        assert_eq!(bd.messages_count, 1);
+        assert_eq!(bd.history_bytes, 0);
+        assert_eq!(bd.last_turn_bytes, measure_value(&body["messages"][0]));
+    }
+
+    /// Body que no es un objeto JSON (array): `decompose` debe devolver
+    /// `None`, nunca panic.
+    #[test]
+    fn decompose_none_en_body_no_objeto() {
+        let body: Value = serde_json::from_str("[1,2,3]").unwrap();
+        assert_eq!(ANTHROPIC.decompose(&body), None);
+    }
+
+    /// `messages` ausente: ceros limpios en historial/turno, sin panic.
+    #[test]
+    fn decompose_messages_ausente() {
+        let body: Value = serde_json::from_str(r#"{"model": "claude-3-5-sonnet"}"#).unwrap();
+        let bd = ANTHROPIC.decompose(&body).expect("body es objeto");
+        assert_eq!(bd.history_bytes, 0);
+        assert_eq!(bd.last_turn_bytes, 0);
+        assert_eq!(bd.messages_count, 0);
+    }
+
+    /// `messages` vacío: igual que ausente, ceros limpios.
+    #[test]
+    fn decompose_messages_vacio() {
+        let body: Value =
+            serde_json::from_str(r#"{"model": "claude-3-5-sonnet", "messages": []}"#).unwrap();
+        let bd = ANTHROPIC.decompose(&body).expect("body es objeto");
+        assert_eq!(bd.history_bytes, 0);
+        assert_eq!(bd.last_turn_bytes, 0);
+        assert_eq!(bd.messages_count, 0);
+    }
+
+    /// `tools` ausente: `tools_bytes = 0`, no `None`.
+    #[test]
+    fn decompose_tools_ausente_da_cero_no_none() {
+        let body: Value = serde_json::from_str(
+            r#"{"model": "claude-3-5-sonnet", "messages": [{"role": "user", "content": "hola"}]}"#,
+        )
+        .unwrap();
+        let bd = ANTHROPIC.decompose(&body).expect("body es objeto");
+        assert_eq!(bd.tools_bytes, 0);
     }
 }

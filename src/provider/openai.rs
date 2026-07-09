@@ -8,7 +8,10 @@
 //! - [`OpenAiResponses`] cubre `/v1/responses` (Responses API, la que usan
 //!   clientes modernos como Codex). Ya reporta `usage` en el evento
 //!   `response.completed` sin pedir nada: no inyecta.
-use super::{fingerprint, model_and_stream_from_body, Incoming, Outgoing, Provider, Usage};
+use super::{
+    array_field, fingerprint, measure_key, measure_other, measure_value, model_and_stream_from_body,
+    split_history_and_last_turn, ContextBreakdown, Incoming, Outgoing, Provider, Usage,
+};
 use crate::config::AppConfig;
 use serde_json::Value;
 
@@ -58,6 +61,55 @@ impl Provider for OpenAiChat {
     fn extract_usage(&self, value: &Value, usage: &mut Usage) {
         extract_openai_usage(value, usage);
     }
+
+    /// Desglosa el body de `/v1/chat/completions`. A diferencia de
+    /// Anthropic, acá NO hay un campo `system` a nivel raíz: el prompt de
+    /// sistema es un mensaje más, con `role: "system"` (o `"developer"`, el
+    /// alias que usan los modelos de razonamiento). Por eso el reparto es en
+    /// dos pasadas sobre `messages`:
+    /// 1. Los mensajes con `role` `system`/`developer` van íntegros a
+    ///    `system_bytes` (sin importar en qué posición del array estén).
+    /// 2. De los mensajes RESTANTES (los de conversación real), todos menos
+    ///    el último van a `history_bytes` y el último a `last_turn_bytes`.
+    ///
+    /// `messages_count` es el total del array `messages` (incluye los de
+    /// sistema): representa el tamaño real del payload conversacional, no
+    /// solo la porción de historial/turno.
+    ///
+    /// Si TODOS los mensajes son `system`/`developer` (sin turno de usuario
+    /// todavía), no queda nada para el segundo paso: `history_bytes = 0` y
+    /// `last_turn_bytes = 0`, y el body entero de mensajes queda en
+    /// `system_bytes`.
+    fn decompose(&self, body: &Value) -> Option<ContextBreakdown> {
+        let obj = body.as_object()?;
+        let tools_bytes = measure_key(obj, "tools");
+        let messages = array_field(obj, "messages");
+        let messages_count = messages.len();
+
+        let mut system_bytes = 0usize;
+        let mut rest: Vec<&Value> = Vec::with_capacity(messages.len());
+        for m in messages {
+            let role = m.get("role").and_then(Value::as_str);
+            if matches!(role, Some("system") | Some("developer")) {
+                system_bytes += measure_value(m);
+            } else {
+                rest.push(m);
+            }
+        }
+        let (history_bytes, last_turn_bytes, _) = split_history_and_last_turn(rest);
+
+        let other_bytes = measure_other(obj, &["messages", "tools"]);
+
+        Some(ContextBreakdown {
+            system_bytes,
+            tools_bytes,
+            history_bytes,
+            last_turn_bytes,
+            other_bytes,
+            measured_bytes: system_bytes + tools_bytes + history_bytes + last_turn_bytes + other_bytes,
+            messages_count,
+        })
+    }
 }
 
 impl Provider for OpenAiResponses {
@@ -89,6 +141,44 @@ impl Provider for OpenAiResponses {
 
     fn extract_usage(&self, value: &Value, usage: &mut Usage) {
         extract_openai_usage(value, usage);
+    }
+
+    /// Desglosa el body de `/v1/responses`. `instructions` → `system_bytes`
+    /// (es el equivalente del `system` de Anthropic en este dialecto);
+    /// `tools` → `tools_bytes` igual que en el resto de proveedores.
+    ///
+    /// `input` tiene DOS formas válidas en esta API y hay que manejar ambas:
+    /// - String plano (el caso simple, un solo turno de texto): entra
+    ///   ENTERO en `last_turn_bytes`, no hay historial (`history_bytes = 0`)
+    ///   y `messages_count = 1` (un único "mensaje" implícito).
+    /// - Array de items (turnos/mensajes estructurados, como en Chat
+    ///   Completions): se reparte igual que `messages` en Anthropic, todos
+    ///   menos el último a `history_bytes`, el último a `last_turn_bytes`.
+    ///
+    /// Si `input` está ausente o no es ninguna de las dos formas, se trata
+    /// como vacío: ceros limpios, sin panic.
+    fn decompose(&self, body: &Value) -> Option<ContextBreakdown> {
+        let obj = body.as_object()?;
+        let system_bytes = measure_key(obj, "instructions");
+        let tools_bytes = measure_key(obj, "tools");
+
+        let (history_bytes, last_turn_bytes, messages_count) = match obj.get("input") {
+            Some(input @ Value::String(_)) => (0, measure_value(input), 1),
+            Some(Value::Array(items)) => split_history_and_last_turn(items.iter()),
+            _ => (0, 0, 0),
+        };
+
+        let other_bytes = measure_other(obj, &["instructions", "tools", "input"]);
+
+        Some(ContextBreakdown {
+            system_bytes,
+            tools_bytes,
+            history_bytes,
+            last_turn_bytes,
+            other_bytes,
+            measured_bytes: system_bytes + tools_bytes + history_bytes + last_turn_bytes + other_bytes,
+            messages_count,
+        })
     }
 }
 
@@ -202,5 +292,202 @@ mod tests {
 
         assert_eq!(usage.input_tokens, Some(50));
         assert_eq!(usage.cache_read_tokens, Some(30));
+    }
+
+    /// Chat Completions con un mensaje `system` al frente y 3 más de
+    /// conversación: el `system` debe ir entero a `system_bytes`, y de los
+    /// 3 restantes, los 2 primeros a historial y el último al turno nuevo.
+    ///
+    /// `other_bytes` se asegura EXACTAMENTE contra `measure_value(&body["model"])`
+    /// (la única clave de raíz fuera de `messages`/`tools` en este fixture):
+    /// esto también sirve de regresión, porque si alguien saca `"messages"`
+    /// o `"tools"` de la exclude list de `measure_other`, esos bytes se
+    /// contarían dos veces y la igualdad exacta deja de cumplirse.
+    #[test]
+    fn decompose_chat_con_system_y_tres_mensajes() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "gpt-4o",
+                "tools": [{"type": "function", "function": {"name": "buscar"}}],
+                "messages": [
+                    {"role": "system", "content": "eres un asistente útil"},
+                    {"role": "user", "content": "hola"},
+                    {"role": "assistant", "content": "hola, en qué te ayudo"},
+                    {"role": "user", "content": "explicame closures"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let bd = OPENAI_CHAT.decompose(&body).expect("body es objeto");
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(bd.system_bytes, measure_value(&messages[0]));
+        assert_eq!(bd.tools_bytes, measure_value(&body["tools"]));
+        assert_eq!(bd.other_bytes, measure_value(&body["model"]));
+        assert_eq!(bd.messages_count, 4);
+        assert_eq!(
+            bd.history_bytes,
+            measure_value(&messages[1]) + measure_value(&messages[2])
+        );
+        assert_eq!(bd.last_turn_bytes, measure_value(&messages[3]));
+        assert_eq!(
+            bd.measured_bytes,
+            bd.system_bytes + bd.tools_bytes + bd.history_bytes + bd.last_turn_bytes + bd.other_bytes
+        );
+    }
+
+    /// Si TODOS los mensajes son `system`/`developer` (sin turno de usuario
+    /// aún), no debe quedar nada para historial/turno nuevo: todo va a
+    /// `system_bytes`.
+    #[test]
+    fn decompose_chat_todos_los_mensajes_son_system() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "o1",
+                "messages": [
+                    {"role": "system", "content": "primera instrucción"},
+                    {"role": "developer", "content": "segunda instrucción"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let bd = OPENAI_CHAT.decompose(&body).expect("body es objeto");
+        let messages = body["messages"].as_array().unwrap();
+
+        assert_eq!(bd.history_bytes, 0);
+        assert_eq!(bd.last_turn_bytes, 0);
+        assert_eq!(bd.messages_count, 2);
+        assert_eq!(
+            bd.system_bytes,
+            measure_value(&messages[0]) + measure_value(&messages[1])
+        );
+    }
+
+    /// Un solo mensaje de usuario, sin `system`: todo el mensaje va a
+    /// `last_turn_bytes`, sin historial.
+    #[test]
+    fn decompose_chat_un_solo_mensaje() {
+        let body: Value = serde_json::from_str(
+            r#"{"model": "gpt-4o", "messages": [{"role": "user", "content": "hola"}]}"#,
+        )
+        .unwrap();
+
+        let bd = OPENAI_CHAT.decompose(&body).expect("body es objeto");
+        assert_eq!(bd.history_bytes, 0);
+        assert_eq!(bd.messages_count, 1);
+        assert_eq!(bd.last_turn_bytes, measure_value(&body["messages"][0]));
+    }
+
+    /// `tools` ausente en Chat Completions: `tools_bytes = 0`, no `None`.
+    #[test]
+    fn decompose_chat_tools_ausente_da_cero() {
+        let body: Value = serde_json::from_str(
+            r#"{"model": "gpt-4o", "messages": [{"role": "user", "content": "hola"}]}"#,
+        )
+        .unwrap();
+        let bd = OPENAI_CHAT.decompose(&body).expect("body es objeto");
+        assert_eq!(bd.tools_bytes, 0);
+    }
+
+    /// Body no-objeto en Chat Completions: `None`, sin panic.
+    #[test]
+    fn decompose_chat_none_en_body_no_objeto() {
+        let body: Value = serde_json::from_str(r#""solo un string""#).unwrap();
+        assert_eq!(OPENAI_CHAT.decompose(&body), None);
+    }
+
+    /// Responses API con `input` como STRING plano: todo el input es el
+    /// turno nuevo, sin historial, un solo "mensaje" implícito.
+    ///
+    /// `tools` está ausente en este fixture (debe dar `0`, no `None`), y
+    /// `other_bytes` se asegura EXACTAMENTE contra `measure_value(&body["model"])`
+    /// (la única clave de raíz fuera de `instructions`/`input` acá): si
+    /// alguien saca `"input"` o `"instructions"` de la exclude list de
+    /// `measure_other`, esos bytes se contarían dos veces y esta igualdad
+    /// exacta deja de cumplirse.
+    #[test]
+    fn decompose_responses_con_input_string() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "gpt-4o",
+                "instructions": "eres un asistente útil",
+                "input": "explicame el patrón builder"
+            }"#,
+        )
+        .unwrap();
+
+        let bd = OPENAI_RESPONSES.decompose(&body).expect("body es objeto");
+
+        assert_eq!(bd.system_bytes, measure_value(&body["instructions"]));
+        assert_eq!(bd.tools_bytes, 0);
+        assert_eq!(bd.other_bytes, measure_value(&body["model"]));
+        assert_eq!(bd.history_bytes, 0);
+        assert_eq!(bd.messages_count, 1);
+        assert_eq!(bd.last_turn_bytes, measure_value(&body["input"]));
+        assert_eq!(
+            bd.measured_bytes,
+            bd.system_bytes + bd.tools_bytes + bd.history_bytes + bd.last_turn_bytes + bd.other_bytes
+        );
+    }
+
+    /// Responses API con `input` como ARRAY estructurado: se reparte igual
+    /// que `messages` en el resto de los proveedores.
+    ///
+    /// `tools_bytes` y `other_bytes` se aseguran independientemente contra
+    /// sus fragmentos crudos: si alguien saca `"input"` de la exclude list
+    /// de `measure_other`, el array completo se contaría dos veces (como
+    /// historial/turno Y como `other_bytes`) y la igualdad exacta de
+    /// `other_bytes` deja de cumplirse.
+    #[test]
+    fn decompose_responses_con_input_array() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "gpt-4o",
+                "instructions": "eres un asistente útil",
+                "tools": [{"type": "function", "function": {"name": "buscar"}}],
+                "input": [
+                    {"role": "user", "content": "hola"},
+                    {"role": "assistant", "content": "hola, en qué te ayudo"},
+                    {"role": "user", "content": "explicame generics"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let bd = OPENAI_RESPONSES.decompose(&body).expect("body es objeto");
+        let input = body["input"].as_array().unwrap();
+
+        assert_eq!(bd.tools_bytes, measure_value(&body["tools"]));
+        assert_eq!(bd.other_bytes, measure_value(&body["model"]));
+        assert_eq!(bd.messages_count, 3);
+        assert_eq!(
+            bd.history_bytes,
+            measure_value(&input[0]) + measure_value(&input[1])
+        );
+        assert_eq!(bd.last_turn_bytes, measure_value(&input[2]));
+        assert_eq!(
+            bd.measured_bytes,
+            bd.system_bytes + bd.tools_bytes + bd.history_bytes + bd.last_turn_bytes + bd.other_bytes
+        );
+    }
+
+    /// Responses API sin `input`: ceros limpios, sin panic.
+    #[test]
+    fn decompose_responses_sin_input() {
+        let body: Value =
+            serde_json::from_str(r#"{"model": "gpt-4o", "instructions": "hola"}"#).unwrap();
+        let bd = OPENAI_RESPONSES.decompose(&body).expect("body es objeto");
+        assert_eq!(bd.history_bytes, 0);
+        assert_eq!(bd.last_turn_bytes, 0);
+        assert_eq!(bd.messages_count, 0);
+    }
+
+    /// Body no-objeto en Responses: `None`, sin panic.
+    #[test]
+    fn decompose_responses_none_en_body_no_objeto() {
+        let body: Value = serde_json::from_str("42").unwrap();
+        assert_eq!(OPENAI_RESPONSES.decompose(&body), None);
     }
 }
