@@ -5,7 +5,7 @@
 //! API key) al reenviar hacia el host de Gemini.
 use super::{
     array_field, fingerprint, measure_key, measure_other, parse_body, split_history_and_last_turn,
-    ContextBreakdown, Incoming, Outgoing, Provider, Usage,
+    tools_overhead_bytes, ContextBreakdown, Incoming, Outgoing, Provider, Usage,
 };
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -32,9 +32,23 @@ impl Provider for Gemini {
     /// el body no parsea como JSON (o no es un objeto), `context` queda en
     /// `None` y el body se reenvía intacto igual que siempre: el parseo es
     /// de solo lectura, nunca reserializa ni muta nada acá.
+    ///
+    /// `tools_by_server`/`tools_overhead_bytes` reutilizan el MISMO `Value`
+    /// parseado (`parsed`, guardado en una variable acá para poder pasarlo
+    /// tanto a `decompose` como a `tools_by_server` sin parsear dos veces):
+    /// mismo contrato `None`/vacío que en el resto de proveedores.
     fn prepare(&self, incoming: Incoming, cfg: &AppConfig) -> Outgoing {
         let (model, stream) = parse_gemini_path(&incoming.path);
-        let context = parse_body(&incoming.body).and_then(|v| self.decompose(&v));
+        let parsed = parse_body(&incoming.body);
+        let context = parsed.as_ref().and_then(|v| self.decompose(v));
+        let by_server = parsed
+            .as_ref()
+            .map(|v| self.tools_by_server(v))
+            .unwrap_or_default();
+        let overhead = context
+            .as_ref()
+            .map(|c| tools_overhead_bytes(c.tools_bytes, &by_server))
+            .unwrap_or(0);
 
         let mut url = format!("{}{}", cfg.target_gemini_url, incoming.path);
         if let Some(query) = &incoming.query {
@@ -55,6 +69,8 @@ impl Provider for Gemini {
             // vía `cachedContent`), no con esta palanca: no aplica acá.
             cache_control_forced: false,
             context,
+            tools_by_server: by_server,
+            tools_overhead_bytes: overhead,
         }
     }
 

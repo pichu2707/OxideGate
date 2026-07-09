@@ -7,7 +7,7 @@
 //! para que `/stats` y `/requests` puedan leer, respectivamente, la
 //! agregación y el detalle reciente en vivo sin tocar el JSONL. Así el I/O de
 //! log NUNCA se suma a la latencia que le devolvemos a gentle-ai.
-use crate::provider::ContextBreakdown;
+use crate::provider::{ContextBreakdown, ToolServerBytes};
 use crate::telemetry::{RecentRequests, StatsRegistry};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -111,6 +111,48 @@ pub struct RequestMetric {
     /// es una inconsistencia: son dos preguntas distintas ("¿cuánto medimos?"
     /// vs. "¿qué fracción es prefijo estable?").
     pub context_tax_ratio: Option<f64>,
+
+    // --- Desglose de herramientas por servidor MCP (ver `provider::ToolServerBytes`) ---
+    /// Desglose de `tools` por servidor MCP: cuántas herramientas y cuántos
+    /// bytes aporta cada servidor (`(native)`, cada `mcp__<server>__*`
+    /// identificado individualmente, y `(others)` si se agotó el cupo de
+    /// servidores trackeados —ver `provider::MAX_TOOL_SERVERS`—).
+    ///
+    /// **ESTE ES EL ÚNICO CAMPO NO-PLANO DE TODA LA FILA.** El resto de
+    /// `RequestMetric` son escalares (número, string, booleano) porque el
+    /// esquema de columnas de un JSONL de telemetría se fija de antemano.
+    /// Acá no puede serlo: la cardinalidad es DEPENDIENTE DEL DATO (una fila
+    /// por cada servidor MCP distinto que el cliente declare en ESTE request
+    /// puntual, de cero a `provider::MAX_TOOL_SERVERS + 1`), así que no
+    /// existe un conjunto fijo de columnas (`tool_server_1_bytes`,
+    /// `tool_server_2_bytes`…) que lo cubra sin desperdiciar espacio en la
+    /// mayoría de las filas o sin truncar arbitrariamente en las que
+    /// declaran más servidores. Un array JSON anidado es la única
+    /// representación honesta de este dato.
+    ///
+    /// `None` y `Some(vec![])` son estados DISTINTOS, mismo criterio que ya
+    /// aplica `Provider::tool_entries` entre "ausente" y "vacío": `None`
+    /// cuando `Provider::decompose` no produjo nada (el body no parseó como
+    /// JSON, o parseó pero no era un objeto — ni siquiera pudimos mirar
+    /// adentro); `Some(vec![])` cuando el body SÍ parseó como objeto pero no
+    /// declaró ninguna herramienta atribuible a ningún servidor (`tools`
+    /// ausente, no-array, o `[]`). Confundir ambos perdería la diferencia
+    /// entre "no sabemos" y "sabemos que no hay".
+    ///
+    /// BYTES, nunca tokens — mismo contrato de medición que los campos
+    /// `context_*` de arriba: cada `bytes` de un `ToolServerBytes` es la
+    /// longitud de re-serializar con `serde_json::to_vec` el fragmento de esa
+    /// herramienta (JSON canónico, no bytes de wire ni tokens del modelo).
+    pub tools_by_server: Option<Vec<ToolServerBytes>>,
+    /// Bytes de `tools` no atribuidos a ningún servidor (ver
+    /// `provider::tools_overhead_bytes`): estructura del array `tools`
+    /// (corchetes y comas), wrappers sin atribución propia (el
+    /// `functionDeclarations` de Gemini), y herramientas huérfanas sin
+    /// `name`. Mismo contrato `None`/`Some` que `tools_by_server` — nacen del
+    /// mismo `context.is_some()` calculado en `provider::*::prepare`, nunca
+    /// se puede tener uno `Some` y el otro `None`.
+    pub tools_overhead_bytes: Option<usize>,
+
     /// Microsegundos que `middleware::proxy::run` pasó DENTRO de
     /// `Provider::prepare` (parseo del body + `decompose` + mutación
     /// opcional del body). `u64` en MICROsegundos, no `f64` en milisegundos:
@@ -121,6 +163,15 @@ pub struct RequestMetric {
     /// `run`), ni el round-trip hacia el proveedor upstream (eso pasa
     /// DESPUÉS, en `send_and_meter`). Es, a propósito, el costo propio del
     /// proxy — la primera vez que OxideGate se mide a sí mismo.
+    ///
+    /// A partir de este slice, `prepare` también calcula `tools_by_server`
+    /// (que re-serializa CADA herramienta individualmente, además del array
+    /// completo que ya medía `decompose` para `context_tools_bytes`): sobre
+    /// el componente más pesado del body (esquemas de herramientas, decenas
+    /// de KB en agentes reales) esto duplica aproximadamente el trabajo de
+    /// serialización en el camino crítico. Se espera que `prepare_us` suba
+    /// en la misma proporción en requests con muchas herramientas; no se
+    /// optimiza acá a propósito (ver informe del cambio).
     pub prepare_us: u64,
 }
 
@@ -162,6 +213,36 @@ pub(crate) fn flatten_context_breakdown(context: Option<&ContextBreakdown>) -> C
             c.context_tax_ratio(),
         ),
         None => (None, None, None, None, None, None, None, None),
+    }
+}
+
+/// Deriva los dos campos `tools_by_server`/`tools_overhead_bytes` de
+/// [`RequestMetric`] a partir de lo que calculó `Provider::prepare`.
+///
+/// `Outgoing::tools_by_server` es un `Vec` liso (nunca `Option`): queda
+/// vacío tanto si el body no parseó / no era un objeto, como si SÍ era un
+/// objeto pero no declaró herramientas — `Outgoing` no distingue esos dos
+/// casos por sí solo. La señal que SÍ los distingue es `context.is_some()`
+/// (mismo criterio que decide el resto del desglose de contexto, ver
+/// `flatten_context_breakdown`): si `context` es `None`, el body no era
+/// indexable y no pudimos ni mirar, así que acá se devuelve `None` en vez de
+/// `Some(vec![])` (mentir con un vacío "sabido" sería peor que un hueco
+/// honesto). Si `context` es `Some`, el dialecto SÍ se evaluó de verdad, así
+/// que se devuelve `Some(...)`, aunque el vector venga vacío.
+///
+/// Único lugar que sabe hacer este mapeo; usado tanto desde
+/// `middleware::proxy` (camino de error de upstream) como desde
+/// `telemetry::metered` (camino de streaming), igual que
+/// `flatten_context_breakdown`.
+pub(crate) fn tools_fields(
+    context: Option<&ContextBreakdown>,
+    tools_by_server: Vec<ToolServerBytes>,
+    tools_overhead_bytes: usize,
+) -> (Option<Vec<ToolServerBytes>>, Option<usize>) {
+    if context.is_some() {
+        (Some(tools_by_server), Some(tools_overhead_bytes))
+    } else {
+        (None, None)
     }
 }
 

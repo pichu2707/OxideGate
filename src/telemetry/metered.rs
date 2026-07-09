@@ -12,8 +12,8 @@
 //! el cliente se desconecta a media respuesta (vía `Drop`). Este módulo es
 //! mecánica PURA de medición: no conoce el dialecto de ningún proveedor
 //! concreto, solo el trait [`Provider`].
-use crate::provider::{ContextBreakdown, Provider, Usage};
-use crate::telemetry::logger::flatten_context_breakdown;
+use crate::provider::{ContextBreakdown, Provider, ToolServerBytes, Usage};
+use crate::telemetry::logger::{flatten_context_breakdown, tools_fields};
 use crate::telemetry::pricing;
 use crate::telemetry::{RequestMetric, TelemetrySink};
 use bytes::Bytes;
@@ -46,6 +46,17 @@ pub struct MetricBase {
     /// recién en [`MeteredBody::emit`], vía
     /// [`flatten_context_breakdown`](crate::telemetry::logger::flatten_context_breakdown).
     pub context: Option<ContextBreakdown>,
+    /// Desglose de `tools` por servidor MCP, calculado por `provider.prepare`
+    /// (`Outgoing::tools_by_server`). Vacío por construcción tanto si el
+    /// body no parseó como si parseó pero no declaró herramientas — ver
+    /// `telemetry::logger::tools_fields`, que es quien recupera esa
+    /// distinción usando `context.is_some()` al emitir la métrica final.
+    pub tools_by_server: Vec<ToolServerBytes>,
+    /// Bytes de `tools` no atribuidos a ningún servidor
+    /// (`Outgoing::tools_overhead_bytes`). Mismo criterio que
+    /// `tools_by_server` sobre cuándo vale `0` "de verdad" vs. "no se pudo
+    /// calcular".
+    pub tools_overhead_bytes: usize,
     /// Microsegundos que `middleware::proxy::run` pasó dentro de
     /// `provider.prepare(...)`. Viaja intacto hasta `RequestMetric::prepare_us`.
     pub prepare_us: u64,
@@ -210,6 +221,12 @@ impl MeteredBody {
             context_tax_ratio,
         ) = flatten_context_breakdown(self.base.context.as_ref());
 
+        let (tools_by_server, tools_overhead_bytes) = tools_fields(
+            self.base.context.as_ref(),
+            self.base.tools_by_server.clone(),
+            self.base.tools_overhead_bytes,
+        );
+
         self.sink.record(RequestMetric {
             timestamp: self.base.timestamp.clone(),
             route: self.base.route.clone(),
@@ -236,6 +253,8 @@ impl MeteredBody {
             context_measured_bytes,
             context_messages_count,
             context_tax_ratio,
+            tools_by_server,
+            tools_overhead_bytes,
             prepare_us: self.base.prepare_us,
         });
     }

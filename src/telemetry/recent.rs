@@ -13,8 +13,17 @@
 //! expone los campos de coste/latencia/identidad de ruta que ya son
 //! públicamente inofensivos.
 //!
+//! La misma invariante aplica al desglose de herramientas por servidor
+//! (`tools_by_server`): lo que se expone es la ETIQUETA del servidor
+//! (`(native)`, `claude_ai_Gmail`, `(others)`…) y un conteo de bytes/cantidad
+//! de herramientas, NUNCA el nombre individual de cada herramienta ni ningún
+//! fragmento del `input_schema`/`description` que la compone. Un nombre de
+//! servidor no es contenido de prompt: no filtra nada que el propio cliente
+//! no le haya declarado ya al proveedor en texto plano.
+//!
 //! Es PURO: no conoce axum ni ningún framework HTTP, solo `RequestMetric`. El
 //! handler que lo expone por HTTP vive en `middleware::requests`.
+use crate::provider::ToolServerBytes;
 use crate::telemetry::logger::RequestMetric;
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -92,6 +101,22 @@ pub struct RecentRequest {
     /// o si no se pudo calcular el desglose (asimetría documentada en
     /// `ContextBreakdown::context_tax_ratio`).
     pub context_tax_ratio: Option<f64>,
+    /// Desglose de `tools` por servidor MCP (ver
+    /// `telemetry::logger::RequestMetric::tools_by_server` para el contrato
+    /// completo `None`/`Some(vec![])`). Expone SOLO etiqueta de servidor +
+    /// conteos (ver invariante de privacidad en el header del módulo): jamás
+    /// nombres de herramienta individuales ni fragmentos de su esquema.
+    ///
+    /// IMPLICACIÓN DE MEMORIA: este ring buffer guarda hasta
+    /// [`RECENT_CAPACITY`] filas; cada una carga ahora un `Vec` de hasta
+    /// `provider::MAX_TOOL_SERVERS + 1` entradas (el cupo de servidores
+    /// trackeados individualmente más el bucket de desborde), en vez de un
+    /// campo de tamaño fijo. El buffer sigue acotado en cantidad de FILAS,
+    /// pero el tamaño de CADA fila ya no es constante.
+    pub tools_by_server: Option<Vec<ToolServerBytes>>,
+    /// Bytes de `tools` no atribuidos a ningún servidor. Mismo contrato
+    /// `None`/`Some` que `tools_by_server`.
+    pub tools_overhead_bytes: Option<usize>,
     /// Microsegundos que el proxy pasó dentro de `Provider::prepare`
     /// (parseo, `decompose` y mutación opcional del body). No incluye la
     /// lectura del body del socket ni el round-trip upstream.
@@ -126,6 +151,8 @@ impl From<&RequestMetric> for RecentRequest {
             context_measured_bytes: m.context_measured_bytes,
             context_messages_count: m.context_messages_count,
             context_tax_ratio: m.context_tax_ratio,
+            tools_by_server: m.tools_by_server.clone(),
+            tools_overhead_bytes: m.tools_overhead_bytes,
             prepare_us: m.prepare_us,
         }
     }
@@ -198,6 +225,13 @@ mod tests {
             context_measured_bytes: Some(52),
             context_messages_count: Some(3),
             context_tax_ratio: Some(30.0 / 52.0),
+            tools_by_server: Some(vec![ToolServerBytes {
+                server: "claude_ai_Gmail".to_string(),
+                kind: crate::provider::ToolServerKind::Mcp,
+                tools: 2,
+                bytes: 30,
+            }]),
+            tools_overhead_bytes: Some(4),
             prepare_us: 42,
         }
     }
@@ -263,6 +297,8 @@ mod tests {
         m.context_measured_bytes = None;
         m.context_messages_count = None;
         m.context_tax_ratio = None;
+        m.tools_by_server = None;
+        m.tools_overhead_bytes = None;
 
         let mut recent = RecentRequests::default();
         recent.ingest(&m);
@@ -291,6 +327,8 @@ mod tests {
         assert_eq!(row.context_measured_bytes, None);
         assert_eq!(row.context_messages_count, None);
         assert_eq!(row.context_tax_ratio, None);
+        assert_eq!(row.tools_by_server, None);
+        assert_eq!(row.tools_overhead_bytes, None);
         assert_eq!(row.prepare_us, 42);
     }
 
@@ -311,6 +349,77 @@ mod tests {
         assert_eq!(row.context_measured_bytes, Some(52));
         assert_eq!(row.context_messages_count, Some(3));
         assert_eq!(row.context_tax_ratio, Some(30.0 / 52.0));
+        assert_eq!(
+            row.tools_by_server,
+            Some(vec![ToolServerBytes {
+                server: "claude_ai_Gmail".to_string(),
+                kind: crate::provider::ToolServerKind::Mcp,
+                tools: 2,
+                bytes: 30,
+            }])
+        );
+        assert_eq!(row.tools_overhead_bytes, Some(4));
         assert_eq!(row.prepare_us, 42);
+    }
+
+    /// `RecentRequest` NUNCA debe exponer `prompt_hash` ni `prompt_bytes`
+    /// (invariante de privacidad documentada en el header del módulo): lo
+    /// verificamos a nivel de JSON serializado, no solo por inspección del
+    /// tipo, para que un futuro `#[serde(flatten)]` accidental no cuele estas
+    /// claves sin que ningún test lo note.
+    #[test]
+    fn recent_request_no_expone_prompt_hash_ni_prompt_bytes() {
+        let mut recent = RecentRequests::default();
+        recent.ingest(&base_metric("t1"));
+
+        let row = &recent.snapshot()[0];
+        let json = serde_json::to_string(row).unwrap();
+
+        assert!(!json.contains("prompt_hash"), "no debe exponer prompt_hash");
+        assert!(!json.contains("prompt_bytes"), "no debe exponer prompt_bytes");
+    }
+
+    /// `RequestMetric` (con el desglose de herramientas presente) y
+    /// `RecentRequest` (su proyección) deben sobrevivir un round-trip por
+    /// `serde_json` sin perder el campo anidado `tools_by_server`.
+    #[test]
+    fn round_trip_serde_con_tools_by_server_presente() {
+        let m = base_metric("t1");
+
+        let metric_json = serde_json::to_string(&m).unwrap();
+        assert!(metric_json.contains("\"tools_by_server\""));
+        assert!(metric_json.contains("\"claude_ai_Gmail\""));
+        assert!(metric_json.contains("\"mcp\""));
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+        let row = &recent.snapshot()[0];
+        let recent_json = serde_json::to_string(row).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&recent_json).unwrap();
+        assert_eq!(parsed["tools_by_server"][0]["server"], "claude_ai_Gmail");
+        assert_eq!(parsed["tools_by_server"][0]["kind"], "mcp");
+        assert_eq!(parsed["tools_overhead_bytes"], 4);
+    }
+
+    /// Mismo round-trip, con el campo en `None`: debe serializar a `null`,
+    /// nunca desaparecer ni fallar.
+    #[test]
+    fn round_trip_serde_con_tools_by_server_none() {
+        let mut m = base_metric("t1");
+        m.tools_by_server = None;
+        m.tools_overhead_bytes = None;
+
+        let metric_json = serde_json::to_string(&m).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&metric_json).unwrap();
+        assert!(parsed["tools_by_server"].is_null());
+        assert!(parsed["tools_overhead_bytes"].is_null());
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+        let row = &recent.snapshot()[0];
+        let recent_json = serde_json::to_string(row).unwrap();
+        let parsed_recent: serde_json::Value = serde_json::from_str(&recent_json).unwrap();
+        assert!(parsed_recent["tools_by_server"].is_null());
+        assert!(parsed_recent["tools_overhead_bytes"].is_null());
     }
 }

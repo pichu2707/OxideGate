@@ -10,7 +10,7 @@
 //! coste sin tocar el camino crítico.
 use crate::provider::{self, Incoming, Outgoing, Provider};
 use crate::state::AppState;
-use crate::telemetry::logger::flatten_context_breakdown;
+use crate::telemetry::logger::{flatten_context_breakdown, tools_fields};
 use crate::telemetry::{MeteredBody, MetricBase, RequestMetric};
 use axum::{
     body::Body,
@@ -126,6 +126,11 @@ async fn send_and_meter(
                 context_messages_count,
                 context_tax_ratio,
             ) = flatten_context_breakdown(out.context.as_ref());
+            let (tools_by_server, tools_overhead_bytes) = tools_fields(
+                out.context.as_ref(),
+                out.tools_by_server,
+                out.tools_overhead_bytes,
+            );
 
             state.telemetry.record(RequestMetric {
                 timestamp: chrono::Utc::now().to_rfc3339(),
@@ -153,6 +158,8 @@ async fn send_and_meter(
                 context_measured_bytes,
                 context_messages_count,
                 context_tax_ratio,
+                tools_by_server,
+                tools_overhead_bytes,
                 prepare_us,
             });
             return plain_error(
@@ -176,6 +183,8 @@ async fn send_and_meter(
         status: status.as_u16(),
         cache_control_forced: out.cache_control_forced,
         context: out.context,
+        tools_by_server: out.tools_by_server,
+        tools_overhead_bytes: out.tools_overhead_bytes,
         prepare_us,
         provider: prov,
     };

@@ -339,6 +339,8 @@ mod tests {
             context_measured_bytes: None,
             context_messages_count: None,
             context_tax_ratio: None,
+            tools_by_server: None,
+            tools_overhead_bytes: None,
             prepare_us: 0,
         }
     }

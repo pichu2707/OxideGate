@@ -73,6 +73,23 @@ pub struct Outgoing {
     /// body). `None` si el body no parseó como JSON o no era un objeto: viaja
     /// tal cual hasta la métrica final.
     pub context: Option<ContextBreakdown>,
+    /// Desglose de `tools` por servidor MCP (ver [`ToolServerBytes`]),
+    /// calculado en `prepare` a partir del mismo `Value` ya parseado que
+    /// `context` (nunca vuelve a llamar a [`parse_body`] ni clona el body).
+    /// Vacío (`Vec::new()`) tanto si el body no parseó / no era un objeto,
+    /// como si SÍ era un objeto pero no declaró herramientas (`tools`
+    /// ausente, no-array, o `[]`): `Outgoing` no distingue por sí solo esos
+    /// dos casos (para eso está `context`, que sí distingue "no pude ni
+    /// mirar" de "miré y no había"). La métrica final
+    /// (`telemetry::logger::RequestMetric::tools_by_server`) SÍ recupera esa
+    /// distinción combinando este campo con `context.is_some()`.
+    pub tools_by_server: Vec<ToolServerBytes>,
+    /// Bytes de `tools` no atribuidos a ningún servidor (ver
+    /// [`tools_overhead_bytes`]): `context.tools_bytes -
+    /// suma(tools_by_server)`, calculado con ese mismo helper. `0` en los
+    /// mismos casos donde `tools_by_server` queda vacío (nada que restar, o
+    /// no hay `context` del que sacar `tools_bytes`).
+    pub tools_overhead_bytes: usize,
 }
 
 /// Acumulador de tokens medidos desde la respuesta del proveedor.
@@ -255,18 +272,6 @@ pub(crate) fn array_field<'a>(obj: &'a serde_json::Map<String, Value>, key: &str
     }
 }
 
-// NOTA DE ALCANCE (todo este bloque, hasta `tools_overhead_bytes`): este
-// slice entrega SOLO la lógica pura de agrupar herramientas por servidor
-// MCP, probada exhaustivamente más abajo. Conectarla a la métrica final
-// (`telemetry::logger`/`RequestMetric`) es un slice DELIBERADAMENTE
-// separado, fuera de alcance acá (ver instrucciones del cambio: no se toca
-// `src/telemetry/` ni `src/middleware/` en este slice). Como este crate es
-// SOLO binario (no hay `[lib]` en `Cargo.toml`), `pub` no exime a estos
-// ítems de `dead_code`: la alcanzabilidad se mide desde `main()`, no desde
-// una API pública de librería. `#[allow(dead_code)]` es la señal explícita
-// y visible de "todavía sin consumidor, a propósito"; se retira en el
-// slice de wiring.
-#[allow(dead_code)]
 /// Etiqueta para herramientas NATIVAS: nombres que no siguen el patrón
 /// `mcp__<server>__<tool>`, o que empiezan con `mcp__` pero no tienen un
 /// segundo separador `__` válido (ver [`server_of`]). Un `name` faltante o
@@ -274,7 +279,6 @@ pub(crate) fn array_field<'a>(obj: &'a serde_json::Map<String, Value>, key: &str
 /// llegar a este punto, para no inflar el bucket nativo con datos ajenos.
 const NATIVE_TOOLS_LABEL: &str = "(native)";
 
-#[allow(dead_code)]
 /// Etiqueta del bucket de desborde de [`group_tools_by_server`]: servidores
 /// MCP distintos que aparecen después de agotar el cupo [`MAX_TOOL_SERVERS`].
 const OTHERS_LABEL: &str = "(others)";
@@ -296,7 +300,6 @@ const OTHERS_LABEL: &str = "(others)";
 /// reportados por [`group_tools_by_server`] siempre suman el total exacto de
 /// la entrada — se pierde el desglose fino más allá del cupo, nunca un byte
 /// ni una herramienta.
-#[allow(dead_code)]
 const MAX_TOOL_SERVERS: usize = 32;
 
 /// Naturaleza del cubo al que se atribuye una herramienta. Distingue por
@@ -315,8 +318,12 @@ const MAX_TOOL_SERVERS: usize = 32;
 /// servidores concretos identificados por el cliente; `Others` es
 /// enteramente sintético (producto del cupo agotado, sin identidad propia),
 /// así que va último.
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+///
+/// Serializa en minúsculas (`"native"`, `"mcp"`, `"others"`) vía
+/// `#[serde(rename_all = "lowercase")]`: es la forma que consume
+/// `RequestMetric::tools_by_server` en el JSONL y cualquier UI que lo lea.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ToolServerKind {
     /// Herramienta nativa: nombre que no sigue el patrón `mcp__<server>__<tool>`.
     Native,
@@ -329,8 +336,7 @@ pub enum ToolServerKind {
 
 /// Bytes de las herramientas del body agrupadas por servidor MCP que las
 /// declara. Ver [`Provider::tools_by_server`] y [`group_tools_by_server`].
-#[allow(dead_code)]
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ToolServerBytes {
     /// Servidor propietario. `mcp__claude_ai_Gmail` -> `claude_ai_Gmail`.
     /// Las herramientas nativas (sin prefijo `mcp__`) caen en `NATIVE_TOOLS_LABEL`.
@@ -378,7 +384,6 @@ pub struct ToolServerBytes {
 /// desborde; sigue siendo `Mcp` con ese nombre de servidor. La colisión de
 /// cadenas de display se resuelve en [`group_tools_by_server`], que keyea
 /// por el `ToolServerKind` devuelto acá, no por el string solo.
-#[allow(dead_code)]
 pub fn classify(tool_name: &str) -> (ToolServerKind, &str) {
     let mut segments = tool_name.splitn(3, "__");
     match (segments.next(), segments.next(), segments.next()) {
@@ -398,6 +403,14 @@ pub fn classify(tool_name: &str) -> (ToolServerKind, &str) {
 /// para quien ya lo use solo para display. [`group_tools_by_server`] usa
 /// `classify` directamente, no `server_of`, porque necesita el tipo para no
 /// colisionar buckets.
+///
+/// NOTA DE ALCANCE: a diferencia del resto de los ítems de este bloque,
+/// `server_of` SIGUE sin consumidor en `main()` incluso después de este
+/// slice de wiring: ningún proveedor ni ninguna capa de telemetría lo llama,
+/// solo lo ejercitan los tests (`server_of_casos_borde`). Se conserva
+/// `#[allow(dead_code)]`, a diferencia de sus vecinos, porque de verdad no
+/// tiene consumidor todavía — no es un descuido, es el único ítem de este
+/// módulo del que eso sigue siendo cierto.
 #[allow(dead_code)]
 pub fn server_of(tool_name: &str) -> &str {
     classify(tool_name).1
@@ -438,7 +451,6 @@ pub fn server_of(tool_name: &str) -> &str {
 /// construir cada `ToolServerBytes`), nunca dentro del loop por-herramienta:
 /// un body con 76 herramientas de 1 solo servidor hace 1 alocación de
 /// `String`, no 76.
-#[allow(dead_code)]
 pub fn group_tools_by_server<'a>(
     entries: impl Iterator<Item = (&'a str, &'a Value)>,
 ) -> Vec<ToolServerBytes> {
@@ -510,7 +522,6 @@ pub fn group_tools_by_server<'a>(
 /// La aritmética no cambia por documentar estos tres contribuyentes: sigue
 /// siendo la misma resta de siempre, solo se precisa QUÉ compone el
 /// resultado.
-#[allow(dead_code)]
 pub fn tools_overhead_bytes(tools_bytes: usize, by_server: &[ToolServerBytes]) -> usize {
     let attributed: usize = by_server.iter().map(|s| s.bytes).sum();
     tools_bytes.saturating_sub(attributed)
@@ -578,7 +589,6 @@ pub trait Provider: Send + Sync {
     ///
     /// Nunca clona `body`: toma `&Value` y devuelve referencias con el mismo
     /// lifetime, igual que el resto de las funciones de este módulo.
-    #[allow(dead_code)]
     fn tool_entries<'a>(&self, body: &'a Value) -> Option<Vec<(&'a str, &'a Value)>>;
 
     /// Desglosa `tools` por servidor MCP. Vacío si el body no declara
@@ -590,7 +600,6 @@ pub trait Provider: Send + Sync {
     /// misma operación para los cuatro dialectos
     /// ([`group_tools_by_server`]) — no hay conocimiento de dialecto que
     /// decidir acá.
-    #[allow(dead_code)]
     fn tools_by_server(&self, body: &Value) -> Vec<ToolServerBytes> {
         match self.tool_entries(body) {
             Some(entries) => group_tools_by_server(entries.into_iter()),

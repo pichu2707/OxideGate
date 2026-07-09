@@ -10,7 +10,8 @@
 //!   `response.completed` sin pedir nada: no inyecta.
 use super::{
     array_field, fingerprint, measure_key, measure_other, measure_value, model_and_stream_from_value,
-    parse_body, split_history_and_last_turn, ContextBreakdown, Incoming, Outgoing, Provider, Usage,
+    parse_body, split_history_and_last_turn, tools_overhead_bytes, ContextBreakdown, Incoming,
+    Outgoing, Provider, Usage,
 };
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -37,6 +38,10 @@ impl Provider for OpenAiChat {
     ///
     /// `prompt_hash`/`prompt_bytes` se calculan siempre sobre `incoming.body`
     /// ORIGINAL, nunca sobre el `Value` parseado.
+    ///
+    /// `tools_by_server`/`tools_overhead_bytes` salen del mismo `Value` ya
+    /// parseado (nunca un segundo parseo): ver el contrato completo en
+    /// `Anthropic::prepare`, idéntico acá.
     fn prepare(&self, incoming: Incoming, cfg: &AppConfig) -> Outgoing {
         let prompt_hash = fingerprint(&incoming.body);
         let prompt_bytes = incoming.body.len();
@@ -47,6 +52,14 @@ impl Provider for OpenAiChat {
             .map(model_and_stream_from_value)
             .unwrap_or((None, false));
         let context = parsed.as_ref().and_then(|v| self.decompose(v));
+        let by_server = parsed
+            .as_ref()
+            .map(|v| self.tools_by_server(v))
+            .unwrap_or_default();
+        let overhead = context
+            .as_ref()
+            .map(|c| tools_overhead_bytes(c.tools_bytes, &by_server))
+            .unwrap_or(0);
 
         let body = if stream {
             inject_include_usage(incoming.body, parsed)
@@ -67,6 +80,8 @@ impl Provider for OpenAiChat {
             // falta ningún breakpoint explícito): esta palanca no aplica acá.
             cache_control_forced: false,
             context,
+            tools_by_server: by_server,
+            tools_overhead_bytes: overhead,
         }
     }
 
@@ -169,9 +184,10 @@ impl Provider for OpenAiResponses {
     /// Arma el request hacia `{openai}/responses`. Modelo y `stream` van en
     /// el body igual que en Chat Completions, pero acá NO se inyecta nada:
     /// la Responses API ya manda `usage` por su cuenta. Parsea el body UNA
-    /// sola vez ([`parse_body`]) y reutiliza el `Value` para `model`/`stream`
-    /// y `context`; el body reenviado es siempre `incoming.body` intacto (no
-    /// hay mutación en esta variante).
+    /// sola vez ([`parse_body`]) y reutiliza el `Value` para `model`/`stream`,
+    /// `context` y `tools_by_server`/`tools_overhead_bytes` (mismo contrato
+    /// que `OpenAiChat::prepare`); el body reenviado es siempre
+    /// `incoming.body` intacto (no hay mutación en esta variante).
     fn prepare(&self, incoming: Incoming, cfg: &AppConfig) -> Outgoing {
         let prompt_hash = fingerprint(&incoming.body);
         let prompt_bytes = incoming.body.len();
@@ -182,6 +198,14 @@ impl Provider for OpenAiResponses {
             .map(model_and_stream_from_value)
             .unwrap_or((None, false));
         let context = parsed.as_ref().and_then(|v| self.decompose(v));
+        let by_server = parsed
+            .as_ref()
+            .map(|v| self.tools_by_server(v))
+            .unwrap_or_default();
+        let overhead = context
+            .as_ref()
+            .map(|c| tools_overhead_bytes(c.tools_bytes, &by_server))
+            .unwrap_or(0);
 
         Outgoing {
             url: format!("{}/responses", cfg.target_openai_url),
@@ -195,6 +219,8 @@ impl Provider for OpenAiResponses {
             // Ídem: caché automática del lado de OpenAI, no aplica.
             cache_control_forced: false,
             context,
+            tools_by_server: by_server,
+            tools_overhead_bytes: overhead,
         }
     }
 

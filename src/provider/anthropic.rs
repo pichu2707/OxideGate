@@ -11,7 +11,8 @@
 //! en vez de tarifa plena. Ver `docs/optimizer-prompt-cache.md`.
 use super::{
     array_field, fingerprint, measure_key, measure_other, model_and_stream_from_value, parse_body,
-    split_history_and_last_turn, ContextBreakdown, Incoming, Outgoing, Provider, Usage,
+    split_history_and_last_turn, tools_overhead_bytes, ContextBreakdown, Incoming, Outgoing,
+    Provider, Usage,
 };
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -38,6 +39,13 @@ impl Provider for Anthropic {
     /// `prompt_hash`/`prompt_bytes` se calculan siempre sobre `incoming.body`
     /// ORIGINAL (antes de parsear o mutar nada): son la huella y el tamaño
     /// del body tal como llegó del cliente, no del JSON canónico.
+    ///
+    /// `tools_by_server`/`tools_overhead_bytes` se calculan también del mismo
+    /// `Value` ya parseado (nunca un segundo parseo): `tools_by_server` vía
+    /// [`Provider::tools_by_server`] (vacío si `parsed` es `None`, es decir
+    /// si el body no parseó), y `tools_overhead_bytes` restando esa suma de
+    /// `context.tools_bytes` con el helper compartido [`tools_overhead_bytes`]
+    /// (`0` si `context` es `None`).
     fn prepare(&self, incoming: Incoming, cfg: &AppConfig) -> Outgoing {
         let prompt_hash = fingerprint(&incoming.body);
         let prompt_bytes = incoming.body.len();
@@ -48,6 +56,14 @@ impl Provider for Anthropic {
             .map(model_and_stream_from_value)
             .unwrap_or((None, false));
         let context = parsed.as_ref().and_then(|v| self.decompose(v));
+        let by_server = parsed
+            .as_ref()
+            .map(|v| self.tools_by_server(v))
+            .unwrap_or_default();
+        let overhead = context
+            .as_ref()
+            .map(|c| tools_overhead_bytes(c.tools_bytes, &by_server))
+            .unwrap_or(0);
 
         let (body, cache_control_forced) = if cfg.force_prompt_cache {
             force_cache_control(incoming.body, parsed)
@@ -66,6 +82,8 @@ impl Provider for Anthropic {
             body,
             cache_control_forced,
             context,
+            tools_by_server: by_server,
+            tools_overhead_bytes: overhead,
         }
     }
 
@@ -571,5 +589,107 @@ mod tests {
             .expect("debe existir el bucket de Calendar");
         assert_eq!(calendar.tools, 1);
         assert_eq!(calendar.bytes, measure_value(&tools[4]));
+    }
+
+    /// `prepare` con un body Anthropic realista (2 herramientas nativas + 2
+    /// MCP de servidores DISTINTOS) debe producir `tools_by_server` con las
+    /// filas correctas y `tools_overhead_bytes` exacto. Los bytes esperados
+    /// se derivan INDEPENDIENTEMENTE con `measure_value` sobre los nodos del
+    /// fixture, nunca recomputando con el propio código bajo prueba (una
+    /// aserción tautológica no valdría nada).
+    #[test]
+    fn prepare_produce_tools_by_server_con_numeros_concretos() {
+        let cfg = test_config(false);
+        let incoming = incoming_with_body(
+            r#"{
+                "model": "claude-3-5-sonnet",
+                "tools": [
+                    {"name": "Read", "description": "lee un archivo"},
+                    {"name": "Write", "description": "escribe un archivo"},
+                    {"name": "mcp__claude_ai_Gmail__search_threads", "description": "busca hilos"},
+                    {"name": "mcp__claude_ai_Google_Calendar__list_events", "description": "lista eventos"}
+                ],
+                "messages": [{"role": "user", "content": "hola"}]
+            }"#,
+        );
+        let body: Value = serde_json::from_slice(&incoming.body).unwrap();
+        let tools = body["tools"].as_array().unwrap();
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        let expected_tools_bytes = measure_value(&body["tools"]);
+        let expected_native = measure_value(&tools[0]) + measure_value(&tools[1]);
+        let expected_gmail = measure_value(&tools[2]);
+        let expected_calendar = measure_value(&tools[3]);
+        let expected_sum = expected_native + expected_gmail + expected_calendar;
+
+        let native = out
+            .tools_by_server
+            .iter()
+            .find(|s| s.server == NATIVE_TOOLS_LABEL)
+            .expect("debe existir el bucket nativo");
+        assert_eq!(native.tools, 2);
+        assert_eq!(native.bytes, expected_native);
+
+        let gmail = out
+            .tools_by_server
+            .iter()
+            .find(|s| s.server == "claude_ai_Gmail")
+            .expect("debe existir el bucket de Gmail");
+        assert_eq!(gmail.tools, 1);
+        assert_eq!(gmail.bytes, expected_gmail);
+
+        let calendar = out
+            .tools_by_server
+            .iter()
+            .find(|s| s.server == "claude_ai_Google_Calendar")
+            .expect("debe existir el bucket de Calendar");
+        assert_eq!(calendar.tools, 1);
+        assert_eq!(calendar.bytes, expected_calendar);
+
+        assert_eq!(out.tools_overhead_bytes, expected_tools_bytes - expected_sum);
+    }
+
+    /// Body no-JSON: `prepare` no debe romper; `tools_by_server` vacío,
+    /// `tools_overhead_bytes` en cero, y el body reenviado BYTE-IDÉNTICO al
+    /// original (mismo criterio que ya vale para `context`).
+    #[test]
+    fn prepare_tools_by_server_vacio_en_body_no_json() {
+        let cfg = test_config(false);
+        let incoming = incoming_with_body("esto no es JSON");
+        let original_body = incoming.body.clone();
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert!(out.tools_by_server.is_empty());
+        assert_eq!(out.tools_overhead_bytes, 0);
+        assert_eq!(out.body, original_body);
+    }
+
+    /// `tools: []`: el body SÍ parseó como objeto pero declaró cero
+    /// herramientas. A nivel de `Outgoing` esto es indistinguible de "no
+    /// declaró tools en absoluto" (ambos dan vector vacío): la distinción
+    /// `None`/`Some(vec![])` recién aparece en `RequestMetric`, no acá (ver
+    /// `telemetry::logger::tools_fields`).
+    ///
+    /// `tools_overhead_bytes` NO da `0` acá: los corchetes `[]` del array
+    /// vacío SÍ pesan (2 bytes), y `tools_overhead_bytes` los atribuye
+    /// enteros al overhead porque no hay ningún servidor al que restárselos
+    /// (`by_server` está vacío). Esto es consistente con el contrato ya
+    /// documentado y probado de `super::tools_overhead_bytes` ("los
+    /// corchetes y comas del array SÍ pesan algo"): un array vacío sigue
+    /// siendo un array, con su propia estructura JSON.
+    #[test]
+    fn prepare_tools_by_server_vacio_cuando_tools_es_vacio() {
+        let cfg = test_config(false);
+        let incoming = incoming_with_body(r#"{"model":"claude-3-5-sonnet","tools":[],"messages":[]}"#);
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert!(out.tools_by_server.is_empty());
+        assert_eq!(
+            out.tools_overhead_bytes,
+            measure_value(&serde_json::json!([]))
+        );
     }
 }
