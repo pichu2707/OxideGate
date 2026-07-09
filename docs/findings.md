@@ -74,8 +74,8 @@ Descartados con evidencia, para que nadie los repita.
 | Palanca B — dedup de respuestas por `prompt_hash` | Muerta para tráfico conversacional: `redundancy_rate` es 0,0 por construcción (el hash se calcula sobre el body completo y `messages` crece cada turno), Claude Code siempre streamea, y el techo teórico de ahorro es solo el 3,0% del costo | `docs/optimizer-dedup.md` §0 |
 | Optimizar el transporte MCP | Un salto por stdio ronda el orden de un milisegundo, frente al orden de segundos que tarda un turno completo del agente — la brecha es de varios órdenes de magnitud; llevarlo a cero no movería el número que importa | reportado, sin fila de `docs/context-tax.md` que lo respalde línea a línea — ver nota de verificación abajo |
 | Gateway MCP que activa/desactiva servidores a mitad de sesión | Cambiar el array `tools` invalida el prefijo cacheado entero; el punto de equilibrio reportado ronda el centenar de turnos por toggle. Sirve como selector al arrancar, no como interruptor en vivo | reportado — mismo caso que la fila anterior, ver nota de verificación abajo |
-| Hilos paralelos como ahorro | Compran reloj de pared, no lo ahorran gratis: cada hilo paga su propio piso de prefijo de herramientas (del orden de las decenas de miles de tokens, ver §B). Además, la mayor parte del reloj de pared de una sesión con humano en el loop es el humano pensando, no la máquina — ver §B, columna "tiempo humano pensando" | `docs/context-tax.md` §3 (77% del reloj de pared) |
-| Subida de bytes y overhead del propio proxy | ~280 KB por request son ~7 ms de transferencia en fibra; `prepare_us` (el tiempo propio de OxideGate) ronda los microsegundos frente a los milisegundos de la latencia total. Ninguno de los dos explica el TTFT medido | `docs/context-tax.md` §3 |
+| Hilos paralelos como ahorro | Compran reloj de pared, no lo ahorran gratis: cada hilo paga su propio piso de prefijo de herramientas (del orden de las decenas de miles de tokens, ver §B). Además, la mayor parte del reloj de pared de una sesión con humano en el loop es el humano pensando, no la máquina: el 77% del reloj de pared de la sesión medida | `docs/context-tax.md` §3 |
+| Subida de bytes y overhead del propio proxy | ~280 KB por request son ~7 ms de transferencia en fibra. `prepare_us` (el tiempo que OxideGate pasa dentro de `prepare`) va de 43 µs con un body minúsculo a 15.135 µs con uno de 450 kB: entre 0,04 y 15 milisegundos, frente a un TTFT medio de 2.097 ms. Es el 0,67% de una petición típica. Ninguno de los dos explica la dispersión del TTFT | `docs/context-tax.md` §3 |
 | El tiempo de generación del modelo | 82% del tiempo "ocupado" de una petición es el modelo generando tokens. Un proxy se sienta en el medio del wire; no puede acelerar eso | `docs/context-tax.md` §3 |
 
 > **Dónde vive la evidencia.** Estas cifras están medidas, pero su evidencia
@@ -92,6 +92,50 @@ Descartados con evidencia, para que nadie los repita.
 >
 > Ninguna de las dos es una hipótesis. Ambas son mediciones cuya evidencia vive
 > fuera del control de versiones, que no es lo mismo.
+
+---
+
+### Compresión: dos cosas distintas, una sola importa
+
+**Compresión de bytes (gzip, brotli) — otro callejón sin salida.** El
+modelo tokeniza el texto DESCOMPRIMIDO. Un body de 280 KB comprimido a 40 KB
+sigue siendo la misma cantidad de tokens: mismo costo, misma ocupación de
+ventana de contexto, mismo prefill, mismo consumo de rate limit. El único
+ahorro posible es el tiempo de subida, y ese ya se midió y se descartó como
+cuello de botella: ~7 ms en fibra para un body de 280.764 bytes (~225 ms a
+10 Mbps), frente a un TTFT medio de 2.097 ms.
+
+Con un matiz honesto: hoy el proxy descarta a propósito `Accept-Encoding`
+(`src/middleware/proxy.rs`, línea 107) para que el proveedor devuelva la
+respuesta sin comprimir y el escáner SSE pueda leer `usage` en texto plano.
+Habilitar el feature `gzip` de `reqwest` dejaría que el transporte
+descomprima de forma transparente y restauraría la compresión de cable sin
+cegar el medidor. La ganancia es chica (la salida de esta sesión fue de
+20.943 tokens) y la interacción con el streaming está SIN VERIFICAR. Queda
+anotado como deuda, no como hallazgo.
+
+**Compresión de tokens — esta sí es real, y está medida como sub-usada.**
+Anthropic expone dos mecanismos, ambos visibles en la clave raíz
+`context_management` del body de la request: `clear_tool_uses_20250919`
+(limpia resultados viejos de tools del historial, opcionalmente también sus
+inputs) y `compact_20260112` (resume contexto anterior del lado servidor).
+
+MEDIDO sobre un body real capturado: Claude Code manda
+`context_management: {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]}`.
+Es decir, declara context editing pero no limpia nada (`keep: "all"`), y no
+usa ni `clear_tool_uses_20250919` ni `compact_20260112`. En la sesión
+interactiva medida, el historial llegó a 265.704 bytes — los resultados
+viejos de tools viven ahí y se releen en cada turno.
+
+También medido en el mismo body: `cache_control` aparece 3 veces (del máximo
+documentado de 4 breakpoints), o sea que el cliente sí gestiona su propio
+prompt caching. Es exactamente por eso que la Palanca A es un no-op contra
+Claude Code: `has_cache_control` encuentra una ocurrencia y declina inyectar
+(detalle en `docs/optimizer-prompt-cache.md` §5 y §8).
+
+OxideGate puede VER todo esto — `context_management` es una clave raíz del
+body que ya parsea. Detalle de la palanca de caché y del fallo silencioso
+relacionado: `docs/optimizer-prompt-cache.md` §8-§10.
 
 ---
 
@@ -143,6 +187,22 @@ La parte que sobrevive al proyecto, aunque el proyecto cambie.
 | Desconfiar de un número que se repite | Dos muestras de tamaños distintos con idéntico `prompt_tokens` no son casualidad: son un tope |
 | El instrumento también miente | Un barrido de texto que no distingue mayúsculas puede dar un falso limpio |
 | Ante "no se ve algo", sospechar primero de la vista, no del dato | La primera hipótesis debe ser "el dato existe y falta cómo mostrarlo", no "hay que medirlo de nuevo" |
+
+---
+
+## Pendiente
+
+Ideas registradas, no implementadas:
+
+- **Detector `NOCACHE`** en el monitor TUI: marca el fallo silencioso de la
+  Palanca A cuando `cache_control_forced == true` y `cache_write_tokens` es
+  `null` o `0` — misma forma que el detector `TRUNC` ya existente. Detalle:
+  `docs/optimizer-prompt-cache.md` §10.
+- **Reporte de `context_management` por petición**: exponer si el cliente
+  usa compresión de tokens (`clear_tool_uses_20250919`, `compact_20260112`)
+  y con qué configuración, ya que OxideGate parsea esa clave del body pero
+  hoy no la reporta. Detalle: sección "Compresión: dos cosas distintas, una
+  sola importa" más arriba en este mismo archivo.
 
 ---
 

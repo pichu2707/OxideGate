@@ -65,9 +65,10 @@ hace *prefix match* (el orden de render es `tools → system → messages`) y
 **auto-coloca** ese `cache_control` en el último bloque cacheable — no hace
 falta localizar a mano el bloque de `system` o el último `tool`.
 
-> Nota sobre el mínimo cacheable: Anthropic no cachea bloques por debajo de
-> ~1024-4096 tokens (según modelo), pero tampoco da error — la inyección es
-> inocua en prefijos chicos, simplemente no logra nada.
+> Nota sobre el mínimo cacheable: Anthropic no cachea bloques por debajo de un
+> mínimo que depende del modelo, pero tampoco da error — la inyección es
+> inocua en prefijos chicos, simplemente no logra nada. Tabla completa y
+> consecuencia para esta palanca en la sección 9.
 
 ## 5. El matiz: Claude Code ya cachea
 
@@ -119,3 +120,64 @@ explicaciones esperables (no un bug): el cliente ya trae su propio
 Por eso `OpenAiChat`, `OpenAiResponses` y `Gemini` setean
 `cache_control_forced: false` de forma fija en su `Outgoing` — la palanca
 simplemente no aplica a esos dialectos hoy.
+
+## 8. Confirmado: `cache_control` en la raíz del body es válido
+
+Se sospechó que `force_cache_control` (`src/provider/anthropic.rs`) tenía un
+defecto de diseño por escribir `cache_control` a nivel raíz del body en vez
+de localizar a mano el bloque `system` o el último `tools`. Antes de tocar
+código, la sospecha se contrastó contra la documentación oficial de
+Anthropic:
+
+- `cache_control` puede aparecer en bloques de contenido: bloques de texto de
+  `system`, entradas de `tools`, y bloques de contenido de `messages`
+  (`text`, `image`, `tool_use`, `tool_result`, `document`). Máximo 4
+  breakpoints por request.
+- También puede aparecer en la **raíz** de la request: un `cache_control` de
+  nivel superior se auto-coloca en el último bloque cacheable ("top-level
+  `cache_control` on the request body auto-places on the last cacheable
+  block").
+
+La sospecha quedó refutada: `force_cache_control` es correcto, y también lo
+es su doc comment. Queda registrado que la sospecha se verificó contra la
+documentación antes de cualquier cambio de código.
+
+El orden de render documentado es `tools → system → messages`. Es la razón
+por la que cambiar el array `tools` invalida el prefijo cacheado completo —
+algo que este proyecto midió de forma independiente: `cache_read` pasó de
+54.247 a 0, y `cache_write` de 0 a 76.356 (ver `docs/findings.md` §E).
+Documentación y medición coinciden.
+
+## 9. Deuda: el prefijo mínimo cacheable depende del modelo (fallo silencioso)
+
+El prefijo mínimo cacheable no es un valor único: depende del modelo, y por
+debajo de él la caché **no se escribe, en silencio**. No hay error de la API
+— `cache_creation_input_tokens` simplemente vuelve en `0`.
+
+| Modelo | Prefijo mínimo cacheable |
+|---|---|
+| Opus 4.8 / 4.7 / 4.6 / 4.5, Haiku 4.5 | 4096 tokens |
+| Fable 5, Sonnet 4.6, Haiku 3.5 / 3 | 2048 tokens |
+| Sonnet 4.5 / 4.1 / 4 / 3.7 | 1024 tokens |
+
+Consecuencia para este proyecto: con un cliente que manda prompts cortos,
+`OXIDEGATE_FORCE_CACHE=true` inyecta el `cache_control`, la fila de
+telemetría reporta `cache_control_forced = true`, y no se cachea nada. El
+proxy reportaría que la palanca actuó cuando en realidad no tuvo efecto. No
+es un bug del código de esta palanca — es un hueco en la telemetría: la fila
+afirma una intervención cuyo efecto nunca ocurrió.
+
+## 10. Pendiente: detector `NOCACHE` en el monitor
+
+Remedio propuesto para el fallo silencioso de la sección 9. **No
+implementado** — queda registrado como pendiente.
+
+Un marcador de outlier `NOCACHE` en el monitor TUI, con la misma forma que el
+detector `TRUNC` ya existente (`docs/monitor-tui.md` §7.4): no necesita
+ninguna constante mágica nueva, cruza dos campos que `GET /requests` ya
+expone:
+
+`cache_control_forced == true` AND (`cache_write_tokens` es `null` o `0`) ⇒
+la palanca se activó y no se cacheó nada.
+
+No adivina: expone una contradicción entre dos campos ya medidos.
