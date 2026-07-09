@@ -80,14 +80,14 @@ todo el tráfico previo.
 
 Pasos:
 
-1. Levantá el proxy con la optimización **apagada** (p. ej. `force_cache`
+1. Levante el proxy con la optimización **apagada** (p. ej. `force_cache`
    off — ver `docs/optimizer-prompt-cache.md`).
-2. Generá algo de tráfico normal para ese modelo.
-3. En el monitor, elegí el modelo con `↑`/`↓` y apretá **`b`** para marcar el
+2. Genere algo de tráfico normal para ese modelo.
+3. En el monitor, elija el modelo con `↑`/`↓` y pulse **`b`** para marcar el
    baseline (contadores crudos acumulados en ese instante).
-4. Prendé la optimización (p. ej. `OXIDEGATE_FORCE_CACHE=true` y reiniciá el
+4. Active la optimización (p. ej. `OXIDEGATE_FORCE_CACHE=true` y reinicie el
    proxy, o el mecanismo que corresponda).
-5. Seguí generando tráfico. El panel **ANTES/DESPUÉS** muestra el delta
+5. Siga generando tráfico. El panel **ANTES/DESPUÉS** muestra el delta
    desde el baseline: throughput de la ventana (tok/s), TTFT de la ventana,
    cache-hit de la ventana, Δcoste, Δrequests, Δoutput_tokens y error% de la
    ventana — todo calculado sobre lo que pasó **después** de marcar `b`, no
@@ -120,7 +120,7 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
 
 1. **Header**: título, URL del endpoint, estado del último fetch ("ok · N
    modelos" o "proxy no disponible en..."), y edad del baseline ("baseline
-   hace 12s" o "sin baseline — apretá 'b'").
+   hace 12s" o "sin baseline — pulse 'b'").
 2. **Tabla principal**, una fila por `(upstream, model)`, TOTAL acumulado
    desde que el proxy arrancó: `MODELO | REQ | tok/s | TTFT ms | cache-hit |
    coste $ | redun%`. Fila seleccionada resaltada.
@@ -223,6 +223,7 @@ campos de bytes vienen de `RecentRequest`/`ContextBreakdown` — ver
 | `other` | Bytes del resto de campos de control a nivel raíz (`context_other_bytes`) | Normalmente chico; si crece, revisar qué campos nuevos está mandando el cliente |
 | `total` | Suma de los cinco anteriores (`context_measured_bytes`) — BYTES de JSON canónico re-serializado, **nunca tokens**, y **nunca combinar con el tamaño de wire** (ver `docs/telemetry-per-request.md`) | El tamaño total que el proxy mide por request |
 | `tax%` | `context_tax_ratio * 100`, un decimal — `(system + tools + history) / total` | **Cercano a 100% ⇒ casi todo lo que mandás ya lo habías mandado antes.** Es la "tasa" que pagás por turno solo para repetir contexto; un `tax%` alto con `cache-hit` bajo (ver vista `Latency`/tabla principal) es la peor combinación posible |
+| `B/tok` | `context_measured_bytes / prompt_tokens_total(fila)`, un decimal — ver §7.3.1 para qué es `prompt_tokens_total` y por qué el denominador NO es siempre `input_tokens` | Un valor **muchas veces más alto que sus vecinos en la misma columna de modelo** es el olfato de que algo se truncó — el marcador `TRUNC` (§7.4) lo CONFIRMA cuando hay >= 2 filas con las que probarlo; `B/tok` es la escotilla de escape para el caso de una sola fila, donde `TRUNC` no puede probar nada |
 | `prep_us` | Microsegundos que el proxy pasó dentro de `Provider::prepare` (parseo + `decompose` + mutación opcional) | Overhead propio de OxideGate, NO incluye leer el body del socket ni el round-trip al proveedor — si esto crece con el tamaño del body, el parseo/decompose es el cuello de botella, no la red |
 | `outlier` | Igual que en `Latency` | — |
 
@@ -234,6 +235,43 @@ memoria alineados a potencias de 2.
 
 `tax%` se muestra como `-` (nunca `0.0`) cuando `context_tax_ratio` es
 `None` — mismo criterio de "ausente ≠ cero" que el resto del panel.
+
+### 7.3.1. `B/tok` y el denominador dependiente del dialecto
+
+`B/tok` divide `context_measured_bytes` (bytes del body, ver §7.3) por
+`prompt_tokens_total(fila)` — **no** por `input_tokens` a secas. La razón es
+que cada proveedor contabiliza los tokens de caché distinto (ver
+`src/telemetry/pricing.rs::CacheAccounting`, que este binario NO puede
+importar porque el crate no expone `lib.rs` — `src/bin/monitor.rs` define su
+propia copia de esta lógica en `prompt_tokens_total`, documentada como
+DUPLICACIÓN DELIBERADA que hay que mantener sincronizada a mano si
+`pricing.rs` cambia):
+
+| `upstream` | `prompt_tokens_total` |
+|---|---|
+| `anthropic` | `input_tokens + cache_read_tokens + cache_write_tokens` (la caché va APARTE del input medido) |
+| cualquier otro (`openai`, `gemini`, y cualquier proveedor compatible con su API — p. ej. Ollama vía el provider `openai`) | `input_tokens` solo (`cache_read` ya es SUBCONJUNTO de `input_tokens`; sumarlo encima doblaría el conteo) |
+
+**El gotcha que motiva esta tabla:** un request de Claude Code con un
+cache-hit grande puede reportar `input_tokens = 2` con un body de 224.653 B.
+Un detector naïve `bytes / input_tokens` da ~112.326 B/tok — un número que
+gritaría "truncamiento" en el request MÁS SANO posible. Sumando
+`cache_read_tokens` (124.733) y `cache_write_tokens` (1.355), el denominador
+real es 126.090 y el ratio cae a ~1,8 B/tok, coherente con el resto del
+tráfico Anthropic. **No "simplificar" este cálculo a `input_tokens` puro** —
+es exactamente el error que produciría el falso positivo catastrófico.
+
+Valores **observados** (no universales — cada tokenizer da un ratio propio,
+no hay una constante que sirva para todos los proveedores):
+
+| Proveedor/modelo | `B/tok` sano observado |
+|---|---|
+| Anthropic (Claude) | ~2,7 |
+| llama.cpp / Ollama (`llama3.2:3b`) | ~4,1 |
+
+`B/tok` se muestra como `-` (nunca `0.0`) cuando falta `input_tokens`, falta
+`context_measured_bytes`, o `prompt_tokens_total` da `0` — un denominador
+indefinido nunca se colapsa a un número inventado.
 
 ### 7.4. Marcadores de outlier
 
@@ -251,9 +289,21 @@ real, para que no se pierda en terminales sin color.
 | `MISS` | `cache_read_tokens` es `None`/`0` mientras **al menos la mitad** de las OTRAS filas del mismo grupo sí tuvieron `cache_read_tokens > 0` | En una conversación larga el prefijo estable debería venir de caché; un miss aislado es caro y, en un promedio, invisible |
 | `TTFT` | `ttft_ms >= media + 2σ` del grupo | TTFT muy por encima de lo normal para ese modelo |
 | `SLOW` | throughput de generación (`output_tokens / (gen_ms / 1000)`) `<= media - 2σ` del grupo | Generación mucho más lenta que el resto del mismo modelo |
+| `TRUNC` | Dentro del mismo grupo `(upstream, modelo)`, esta fila comparte el MISMO `prompt_tokens_total` (§7.3.1) que al menos otra fila, y sus `context_measured_bytes` difieren entre sí en >= 10% (`TRUNCATION_BYTES_DELTA`, fracción del body más grande del par) | El proveedor dejó de contar el prompt al llegar a un tope (`num_ctx` de Ollama, ventana de contexto del modelo, etc.) y lo truncó EN SILENCIO, devolviendo `200 OK` igual — el modelo nunca vio buena parte de lo que se le mandó. **Qué hacer:** subir `OLLAMA_CONTEXT_LENGTH` (o el equivalente del proveedor), o recortar `tools`/`history` — la ventana del modelo local puede ser más chica que el catálogo de herramientas por sí solo |
 
-Una fila puede llevar más de un marcador a la vez (p. ej. `ERR+TTFT`): no se
-colapsa a uno solo porque eso escondería información real.
+Una fila puede llevar más de un marcador a la vez (p. ej. `ERR+TTFT` o
+`TRUNC+SLOW`): no se colapsa a uno solo porque eso escondería información
+real.
+
+**Por qué `TRUNC` no es un umbral de bytes-por-token:** un detector naïve
+`bytes / input_tokens > constante` dispara sobre casi cualquier request sano
+de Anthropic con cache-hit (ver el gotcha de §7.3.1, `input_tokens = 2` con
+un body de 224.653 B). `TRUNC` en cambio prueba algo que NO necesita ninguna
+constante de bytes-por-token: que el MISMO total de tokens aparezca en >= 2
+bodies de tamaño MATERIALMENTE distinto no es casualidad, es la firma de que
+el proveedor dejó de contar. Un grupo donde todos los bodies miden
+prácticamente lo mismo (probes repetidos con el mismo prompt) NO flaggea:
+coincidir en tokens Y en bytes ahí es justamente lo esperado.
 
 ### 7.5. Guardas estadísticas (y por qué existen)
 
@@ -276,6 +326,15 @@ colapsa a uno solo porque eso escondería información real.
 - Los valores `None` se excluyen de la media/desvío de su métrica; nunca se
   coercionan a `0` (un `0` real distorsionaría el cálculo tanto como uno
   falso).
+- **`TRUNC` es la EXCEPCIÓN a `MIN_GROUP_SAMPLE`.** No es un test estadístico
+  (no calcula media ni desvío): la prueba es una igualdad exacta de tokens
+  más una diferencia de tamaño de body que ya de por sí prueba el tope, y esa
+  prueba es igual de válida con 2 muestras que con 50. Exigir 5 filas acá
+  escondería el caso real que motivó este detector (dos probes bastan). Filas
+  sin `input_tokens` o sin `context_measured_bytes` se EXCLUYEN del análisis
+  de `TRUNC` (no se tratan como cero), y una fila SOLA con un total de tokens
+  que nadie más repite NUNCA se flaggea — un solo dato no prueba nada, podría
+  ser genuinamente un prompt grande.
 
 ### 7.6. URL de `/requests`
 
@@ -364,11 +423,11 @@ instante (§8.1). `r` borra ambas fotos a la vez.
 
 Flujo completo:
 
-1. Con el cliente conectado a todos sus servidores MCP de siempre, apretá
+1. Con el cliente conectado a todos sus servidores MCP de siempre, pulse
    `b`. El panel de tools por servidor congela esa foto.
-2. Reiniciá tu cliente **sin** el servidor MCP que querés dejar de pagar en
-   cada request (p. ej. sacando Google Calendar de tu config de MCP).
-3. Generá una petición nueva. El panel se actualiza con la fila fuente más
+2. Reinicie el cliente **sin** el servidor MCP que se quiere dejar de pagar en
+   cada request (p. ej. sacando Google Calendar de la config de MCP).
+3. Genere una petición nueva. El panel se actualiza con la fila fuente más
    reciente.
 4. Mirá la columna `Δ baseline`: el servidor que sacaste aparece con
    `bytes: 0 B`, `tools: 0` y su delta NEGATIVO completo (p. ej.
@@ -424,7 +483,8 @@ apretar `b`.
 | `src/telemetry/recent.rs` | `RecentRequests` — buffer FIFO acotado de las últimas 200 peticiones individuales |
 | `src/middleware/requests.rs` | `handle_requests` — el handler HTTP de `GET /requests` |
 | `src/provider/mod.rs` | `ToolServerBytes`/`ToolServerKind` — el contrato de tipos del proxy que `RequestRow`/`ToolServerRow` (en `src/bin/monitor.rs`) espejan para el desglose de `tools_by_server` |
-| `src/bin/monitor.rs` | Binario TUI independiente: fetch por HTTP de `/stats` y `/requests`, estado (baseline, historial, selección, buffer de requests), detección de outliers, cálculo de delta de ventana y de delta de tools por servidor (funciones puras testeadas aparte), render con `ratatui` |
+| `src/bin/monitor.rs` | Binario TUI independiente: fetch por HTTP de `/stats` y `/requests`, estado (baseline, historial, selección, buffer de requests), detección de outliers (incluida la detección de truncamiento por tope de tokens, `TRUNC`, ver §7.4), cálculo de delta de ventana y de delta de tools por servidor (funciones puras testeadas aparte), render con `ratatui` |
+| `src/telemetry/pricing.rs` (`CacheAccounting`) | Fuente de verdad SERVIDOR-SIDE de la contabilidad de caché por proveedor (`Separate` para Anthropic, `Subset` para OpenAI/Gemini). `prompt_tokens_total` en `src/bin/monitor.rs` (§7.3.1) DUPLICA esta semántica a propósito — el binario `monitor` no puede importarla (el crate no expone `lib.rs`) — así que un cambio acá exige actualizar también `prompt_tokens_total` |
 | `docs/telemetry-by-model.md` | Contrato del endpoint `GET /stats` que este monitor consume |
 | `docs/telemetry-per-request.md` | Contrato del endpoint `GET /requests` que alimenta el panel de detalle y el panel de tools por servidor |
 

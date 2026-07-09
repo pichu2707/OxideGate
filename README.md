@@ -80,9 +80,9 @@ JSON por petición), fuera del camino crítico del request.
 
 El monitor es la forma de comprobar que una optimización sirve:
 
-1. Levantá el proxy **sin** la optimización y mandá tráfico.
+1. Levante el proxy **sin** la optimización y mande tráfico.
 2. En el monitor, pulse **`b`** para marcar el *baseline*.
-3. Reiniciá el proxy con la optimización (p. ej. `OXIDEGATE_FORCE_CACHE=true`).
+3. Reinicie el proxy con la optimización (p. ej. `OXIDEGATE_FORCE_CACHE=true`).
 4. Mirá el panel **Δ desde baseline**: el `cache-hit` subiendo, el coste/token
    bajando, los `tok/s` — el "después" limpio, sin que el "antes" lo diluya.
 

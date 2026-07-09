@@ -420,6 +420,24 @@ const MIN_GROUP_SAMPLE: usize = 5;
 /// falta para considerar una fila atípica en TTFT o throughput de generación.
 const OUTLIER_SIGMA: f64 = 2.0;
 
+/// Diferencia relativa mínima entre `context_measured_bytes` de dos filas del
+/// mismo grupo de "tope de tokens" (ver [`classify_truncation`]) para que la
+/// diferencia se considere MATERIAL y no ruido de serialización. Se expresa
+/// como fracción del body MÁS GRANDE del par:
+/// `(max_bytes - min_bytes) / max_bytes >= TRUNCATION_BYTES_DELTA`.
+///
+/// Por qué 10% y no un valor menor: dos requests con el mismo prompt lógico
+/// casi nunca producen bodies IDÉNTICOS byte a byte (timestamps, IDs,
+/// pequeñas variaciones del último turno) — un umbral demasiado bajo
+/// convertiría esa clase de ruido en falsos positivos de truncamiento. El
+/// caso real que motiva este detector tiene bodies que difieren en ~34%
+/// (18.955 B vs. 28.806 B, ambos con `input_tokens = 4095`), muy por encima
+/// de este piso; 10% alcanza para descartar el ruido sin dejar pasar la
+/// señal real. No es una constante de bytes-por-token (esas SÍ varían por
+/// tokenizer, ver [`bytes_per_token`]): es solo el umbral de "¿este cambio de
+/// tamaño es demasiado grande para ser casualidad?".
+const TRUNCATION_BYTES_DELTA: f64 = 0.10;
+
 /// Clasificación de una petición respecto a la distribución de SU MISMO
 /// modelo (agrupado por `(upstream, model)`). Una fila puede llevar más de
 /// una etiqueta a la vez (p. ej. error Y TTFT lento), por eso
@@ -442,6 +460,20 @@ pub enum OutlierKind {
     /// (`output_tokens / ((total_ms - ttft_ms) / 1000)`) está a >=
     /// [`OUTLIER_SIGMA`] desvíos estándar POR DEBAJO de la media del grupo.
     SlowGeneration,
+    /// El total de tokens de prompt de esta fila ([`prompt_tokens_total`])
+    /// coincide EXACTAMENTE con el de al menos otra fila del mismo grupo,
+    /// mientras sus `context_measured_bytes` difieren en al menos
+    /// [`TRUNCATION_BYTES_DELTA`]. Ver [`classify_truncation`] para el
+    /// detector completo.
+    ///
+    /// Que dos bodies de tamaño MUY distinto reporten el MISMO total de
+    /// tokens no es una coincidencia: es la firma de que el proveedor dejó
+    /// de contar al llegar a un tope (`num_ctx` de Ollama, ventana de
+    /// contexto, etc.) y truncó en silencio el resto del prompt, devolviendo
+    /// `200 OK` igual. A diferencia de `SlowTtft`/`SlowGeneration`/
+    /// `CacheMiss`, esto NO es un test estadístico (no usa media ni desvío)
+    /// y por eso no está gateado por [`MIN_GROUP_SAMPLE`].
+    Truncated,
 }
 
 impl OutlierKind {
@@ -454,6 +486,7 @@ impl OutlierKind {
             OutlierKind::CacheMiss => "MISS",
             OutlierKind::SlowTtft => "TTFT",
             OutlierKind::SlowGeneration => "SLOW",
+            OutlierKind::Truncated => "TRUNC",
         }
     }
 }
@@ -492,6 +525,66 @@ fn generation_throughput(output_tokens: u64, total_ms: f64, ttft_ms: f64) -> Opt
     } else {
         None
     }
+}
+
+/// Total de tokens de "prompt" (contexto enviado al proveedor) de una fila,
+/// con el denominador correcto según el dialecto de contabilidad de caché de
+/// `upstream`. `None` si `input_tokens` no vino en la fila: sin ese dato base
+/// no hay total que calcular, y tratarlo como `0` inventaría un denominador
+/// falso en [`bytes_per_token`].
+///
+/// - `upstream == "anthropic"`: `input_tokens + cache_read_tokens +
+///   cache_write_tokens` (caché APARTE del input medido). Un request
+///   cacheado real puede reportar `input_tokens = 2` con
+///   `cache_read_tokens` en las decenas de miles — sumarlas es obligatorio o
+///   el denominador queda absurdamente chico y dispara falsos positivos de
+///   truncamiento en el request MÁS SANO posible (el que mejor aprovechó la
+///   caché).
+/// - cualquier otro `upstream` (OpenAI, Gemini, y cualquier proveedor
+///   compatible con su API — p. ej. Ollama vía el provider `openai`, ver
+///   `src/provider/openai.rs`): `input_tokens` solo. `cache_read_tokens` ya
+///   es SUBCONJUNTO de `input_tokens` en estos dialectos; sumarlo encima
+///   sería doble conteo.
+///
+/// ESTA FUNCIÓN DUPLICA A PROPÓSITO conocimiento que
+/// `src/telemetry/pricing.rs::CacheAccounting` ya posee del lado del proxy
+/// (`Separate` para Anthropic, `Subset` para OpenAI/Gemini). La duplicación
+/// existe porque `monitor` es un binario INDEPENDIENTE — el crate no expone
+/// `lib.rs` (ver el comentario de cabecera del archivo), así que este binario
+/// no puede hacer `use crate::telemetry::pricing::CacheAccounting`. Si la
+/// semántica de contabilidad de caché de `pricing.rs` cambia (nuevo
+/// proveedor, un dialecto que pasa de `Subset` a `Separate`, etc.), ESTA
+/// FUNCIÓN DEBE ACTUALIZARSE A LA PAR: no hay ningún mecanismo del
+/// compilador que fuerce esa sincronía desde acá, solo esta nota.
+fn prompt_tokens_total(row: &RequestRow) -> Option<u64> {
+    let input = row.input_tokens?;
+    if row.upstream == "anthropic" {
+        let cache_read = row.cache_read_tokens.unwrap_or(0);
+        let cache_write = row.cache_write_tokens.unwrap_or(0);
+        Some(input + cache_read + cache_write)
+    } else {
+        Some(input)
+    }
+}
+
+/// Bytes medidos de contexto por token de prompt: `context_measured_bytes /
+/// prompt_tokens_total(row)`. `None` si falta cualquiera de los dos datos, o
+/// si el total de tokens es `0` (denominador indefinido) — NUNCA se devuelve
+/// `0.0` para un valor que en realidad no se pudo calcular.
+///
+/// Este ratio es la escotilla de escape para el caso de UNA sola fila, donde
+/// [`classify_truncation`] no puede probar nada (hacen falta >= 2 muestras
+/// con el mismo total de tokens). No hay una constante universal de
+/// bytes-por-token contra la que comparar: cada tokenizer da un ratio
+/// distinto (datos reales medidos: Anthropic ~2.7, llama.cpp/Ollama ~4.1) —
+/// ver `docs/monitor-tui.md` para cómo se lee este número en la práctica.
+fn bytes_per_token(row: &RequestRow) -> Option<f64> {
+    let bytes = row.context_measured_bytes?;
+    let tokens = prompt_tokens_total(row)?;
+    if tokens == 0 {
+        return None;
+    }
+    Some(bytes as f64 / tokens as f64)
 }
 
 /// `gen_ms` (tiempo de generación, `total_ms - ttft_ms`) de una fila, o
@@ -538,6 +631,13 @@ fn classify_outliers(rows: &[RequestRow]) -> Vec<Vec<OutlierKind>> {
             }
         }
 
+        // Truncated NO es un test estadístico (no usa media ni desvío
+        // estándar): la prueba es una igualdad exacta de tokens más una
+        // diferencia de tamaño material entre bodies, y esa prueba es igual
+        // de válida con 2 muestras que con 50. Por eso corre ANTES del gate
+        // de MIN_GROUP_SAMPLE, no después.
+        classify_truncation(rows, indices, &mut result);
+
         // Con menos de MIN_GROUP_SAMPLE filas en el grupo, cualquier media o
         // desvío sería ruido estadístico: no flaggeamos nada más.
         if indices.len() < MIN_GROUP_SAMPLE {
@@ -550,6 +650,59 @@ fn classify_outliers(rows: &[RequestRow]) -> Vec<Vec<OutlierKind>> {
     }
 
     result
+}
+
+/// Sub-paso de [`classify_outliers`]: marca `Truncated` en TODAS las filas
+/// del grupo que comparten un mismo total de tokens de prompt
+/// ([`prompt_tokens_total`]) cuando ese total lo reportan >= 2 filas VÁLIDAS
+/// cuyos `context_measured_bytes` difieren entre sí en al menos
+/// [`TRUNCATION_BYTES_DELTA`].
+///
+/// Filas sin [`prompt_tokens_total`] (falta `input_tokens`) o sin
+/// `context_measured_bytes` se EXCLUYEN del análisis por completo — no se
+/// tratan como cero ni participan del agrupamiento por token.
+///
+/// Deliberadamente NO gateado por [`MIN_GROUP_SAMPLE`]: no es una
+/// comparación contra una distribución (no hay media ni desvío de por
+/// medio), es una igualdad exacta de tokens combinada con una diferencia de
+/// tamaño de body que ya de por sí es la prueba. Exigir 5 muestras acá
+/// escondería el caso real que motivó este detector, donde 2 probes ya
+/// prueban el tope.
+///
+/// Un grupo donde TODOS los bodies miden lo mismo (p. ej. probes idénticos
+/// repetidos) NO flaggea nada: coincidir en tokens Y en bytes es lo
+/// ESPERADO, no una señal de truncamiento — para eso existe justamente el
+/// guard de [`TRUNCATION_BYTES_DELTA`].
+fn classify_truncation(rows: &[RequestRow], indices: &[usize], result: &mut [Vec<OutlierKind>]) {
+    // token_total -> [(índice de fila, bytes medidos), ...]
+    let mut by_token: HashMap<u64, Vec<(usize, usize)>> = HashMap::new();
+    for &i in indices {
+        let Some(tokens) = prompt_tokens_total(&rows[i]) else { continue };
+        let Some(bytes) = rows[i].context_measured_bytes else { continue };
+        by_token.entry(tokens).or_default().push((i, bytes));
+    }
+
+    for samples in by_token.values() {
+        // Hacen falta >= 2 muestras para EXCLUIR la coincidencia: un solo
+        // sample con ese total de tokens no prueba nada (podría ser
+        // genuinamente el tamaño real del prompt).
+        if samples.len() < 2 {
+            continue;
+        }
+
+        let min_bytes = samples.iter().map(|(_, b)| *b).min().expect("samples no está vacío (len >= 2)");
+        let max_bytes = samples.iter().map(|(_, b)| *b).max().expect("samples no está vacío (len >= 2)");
+        if max_bytes == 0 {
+            continue;
+        }
+
+        let relative_diff = (max_bytes - min_bytes) as f64 / max_bytes as f64;
+        if relative_diff >= TRUNCATION_BYTES_DELTA {
+            for &(i, _) in samples {
+                result[i].push(OutlierKind::Truncated);
+            }
+        }
+    }
 }
 
 /// Sub-paso de [`classify_outliers`]: marca `SlowTtft` en las filas del
@@ -906,7 +1059,9 @@ enum RequestsView {
     #[default]
     Latency,
     /// Columnas del desglose de bytes de contexto (`tools`, `history`,
-    /// `system`, `last_turn`, `other`, `total`, `tax%`, `prep_us`, `msgs`).
+    /// `system`, `last_turn`, `other`, `total`, `tax%`, `B/tok`, `prep_us`,
+    /// `msgs`). `B/tok` es [`bytes_per_token`]: bytes medidos por token de
+    /// prompt, el denominador correcto según dialecto de `upstream`.
     Context,
 }
 
@@ -1472,7 +1627,7 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
 
     if legend_area.height > 0 {
         let legend = Paragraph::new(Line::from(
-            "leyenda: ERR=error(status>=400) · MISS=cache-miss atípico · TTFT=TTFT lento(>=2σ) · SLOW=generación lenta(>=2σ)",
+            "leyenda: ERR=error(status>=400) · MISS=cache-miss atípico · TTFT=TTFT lento(>=2σ) · SLOW=generación lenta(>=2σ) · TRUNC=tope de tokens (ver docs)",
         ));
         f.render_widget(legend, legend_area);
     }
@@ -1586,7 +1741,10 @@ fn requests_table_header<'a>(view: RequestsView) -> Row<'a> {
             vec!["hora", "modelo", "st", "status", "in", "out", "c_rd", "c_wr", "ttft_ms", "gen_ms", "tok/s", "usd", "outlier"]
         }
         RequestsView::Context => {
-            vec!["hora", "modelo", "msgs", "tools", "history", "system", "last_turn", "other", "total", "tax%", "prep_us", "outlier"]
+            vec![
+                "hora", "modelo", "msgs", "tools", "history", "system", "last_turn", "other", "total", "tax%", "B/tok", "prep_us",
+                "outlier",
+            ]
         }
     };
     Row::new(labels).style(Style::default().add_modifier(Modifier::BOLD))
@@ -1624,6 +1782,7 @@ fn requests_table_widths(view: RequestsView) -> Vec<Constraint> {
             Constraint::Length(9),
             Constraint::Length(9),
             Constraint::Length(6),
+            Constraint::Length(7),
             Constraint::Length(8),
             Constraint::Length(14),
         ],
@@ -1661,6 +1820,7 @@ fn requests_row_cells(view: RequestsView, r: &RequestRow) -> Vec<String> {
             opt_bytes(r.context_other_bytes),
             opt_bytes(r.context_measured_bytes),
             opt_tax_ratio(r.context_tax_ratio),
+            opt_fixed(bytes_per_token(r), 1),
             opt_u64(r.prepare_us),
         ],
     }
@@ -1824,7 +1984,9 @@ fn print_requests_table(rows: &[RequestRow]) {
             marker_text(&outliers[i]),
         );
     }
-    println!("leyenda: ERR=error(status>=400) · MISS=cache-miss atípico · TTFT=TTFT lento(>=2σ) · SLOW=generación lenta(>=2σ)");
+    println!(
+        "leyenda: ERR=error(status>=400) · MISS=cache-miss atípico · TTFT=TTFT lento(>=2σ) · SLOW=generación lenta(>=2σ) · TRUNC=tope de tokens (ver docs/monitor-tui.md)"
+    );
 }
 
 /// Imprime la tabla CONTEXT de requests recientes en texto plano (modo
@@ -1838,13 +2000,13 @@ fn print_context_table(rows: &[RequestRow]) {
     let outliers = classify_outliers(rows);
 
     println!(
-        "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>8} {:<14}",
-        "HORA", "MODELO", "msgs", "tools", "history", "system", "last_turn", "other", "total", "tax%", "prep_us", "outlier"
+        "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<14}",
+        "HORA", "MODELO", "msgs", "tools", "history", "system", "last_turn", "other", "total", "tax%", "B/tok", "prep_us", "outlier"
     );
     for (i, r) in rows.iter().enumerate().rev() {
         let cells = requests_row_cells(RequestsView::Context, r);
         println!(
-            "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>8} {:<14}",
+            "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<14}",
             cells[0],
             cells[1],
             cells[2],
@@ -1856,12 +2018,18 @@ fn print_context_table(rows: &[RequestRow]) {
             cells[8],
             cells[9],
             cells[10],
+            cells[11],
             marker_text(&outliers[i]),
         );
     }
-    println!("leyenda: ERR=error(status>=400) · MISS=cache-miss atípico · TTFT=TTFT lento(>=2σ) · SLOW=generación lenta(>=2σ)");
+    println!(
+        "leyenda: ERR=error(status>=400) · MISS=cache-miss atípico · TTFT=TTFT lento(>=2σ) · SLOW=generación lenta(>=2σ) · TRUNC=tope de tokens (ver abajo)"
+    );
     println!(
         "nota: tools/history/system/last_turn/other/total son BYTES (kB decimal, no tokens); tax% = (system+tools+history)/total"
+    );
+    println!(
+        "nota: B/tok = total_bytes / prompt_tokens_total (denominador según dialecto, ver docs/monitor-tui.md §7.3.1); TRUNC = mismo total de tokens que otra fila con bodies que difieren >= 10% (tope de contexto probado, no estadística)"
     );
 }
 
@@ -2222,6 +2390,218 @@ mod tests {
         let result = classify_outliers(&rows);
 
         assert!(result[4].is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // prompt_tokens_total / bytes_per_token — denominador dependiente del
+    // dialecto de contabilidad de caché de cada proveedor
+    // -----------------------------------------------------------------
+
+    /// Variante de `req` (arriba) que permite fijar los campos relevantes
+    /// para [`prompt_tokens_total`], [`bytes_per_token`] y
+    /// [`classify_truncation`]: `input_tokens`, `cache_read_tokens`,
+    /// `cache_write_tokens` y `context_measured_bytes`. El resto de los
+    /// campos quedan en los valores neutros de `req`.
+    fn req_prompt(
+        upstream: &str,
+        model: &str,
+        input_tokens: Option<u64>,
+        cache_read_tokens: Option<u64>,
+        cache_write_tokens: Option<u64>,
+        context_measured_bytes: Option<usize>,
+    ) -> RequestRow {
+        let mut r = req(upstream, model, 200, Some(10.0), 100.0, Some(50), cache_read_tokens);
+        r.input_tokens = input_tokens;
+        r.cache_write_tokens = cache_write_tokens;
+        r.context_measured_bytes = context_measured_bytes;
+        r
+    }
+
+    #[test]
+    fn prompt_tokens_total_anthropic_suma_cache_read_y_write() {
+        // Caso real: cache-hit grande, input_tokens irrisorio. Sumar la
+        // caché es OBLIGATORIO o el denominador queda absurdo.
+        let r = req_prompt("anthropic", "claude-opus-4", Some(2), Some(124_733), Some(1_355), Some(224_653));
+        assert_eq!(prompt_tokens_total(&r), Some(2 + 124_733 + 1_355));
+    }
+
+    #[test]
+    fn prompt_tokens_total_no_anthropic_ignora_cache_read_por_ser_subconjunto() {
+        // OpenAI/Gemini: cache_read ya es SUBCONJUNTO de input_tokens.
+        // Sumarlo encima sería doble conteo.
+        let r = req_prompt("openai", "gpt-4o", Some(1000), Some(400), None, Some(50_000));
+        assert_eq!(prompt_tokens_total(&r), Some(1000));
+    }
+
+    #[test]
+    fn prompt_tokens_total_none_si_falta_input_tokens() {
+        let r = req_prompt("anthropic", "claude-opus-4", None, Some(100), Some(0), Some(1_000));
+        assert_eq!(prompt_tokens_total(&r), None);
+    }
+
+    #[test]
+    fn bytes_per_token_anthropic_usa_la_suma_no_solo_input_tokens() {
+        // input_tokens=2 solo daría 224_653/2=112_326.5 B/tok, un número que
+        // gritaría "truncamiento" en el request MÁS SANO posible (cache-hit
+        // grande, 200 OK). La suma da ~1.8, el valor real observado para
+        // Anthropic con caché — MUY por debajo de un input_tokens-only.
+        let r = req_prompt("anthropic", "claude-opus-4", Some(2), Some(124_733), Some(1_355), Some(224_653));
+        let b = bytes_per_token(&r).expect("debe calcularse con todos los datos presentes");
+        let expected = 224_653.0 / (2.0 + 124_733.0 + 1_355.0);
+        assert!((b - expected).abs() < 1e-6, "b={b} expected={expected}");
+        assert!((b - 1.8).abs() < 0.05, "b={b} debe rondar ~1.8, no 112_326 (input_tokens solo)");
+    }
+
+    #[test]
+    fn bytes_per_token_openai_con_cache_read_no_dobla_el_conteo() {
+        let r = req_prompt("openai", "gpt-4o", Some(1000), Some(400), None, Some(2_700));
+        let b = bytes_per_token(&r).expect("debe calcularse");
+        assert!((b - 2.7).abs() < 1e-9, "b={b} debe usar input_tokens=1000 solo, no 1000+400");
+    }
+
+    #[test]
+    fn bytes_per_token_none_si_falta_input_tokens() {
+        let r = req_prompt("anthropic", "claude-opus-4", None, Some(10), Some(0), Some(1_000));
+        assert_eq!(bytes_per_token(&r), None);
+    }
+
+    #[test]
+    fn bytes_per_token_none_si_falta_context_measured_bytes() {
+        let r = req_prompt("openai", "gpt-4o", Some(1_000), None, None, None);
+        assert_eq!(bytes_per_token(&r), None);
+    }
+
+    // -----------------------------------------------------------------
+    // classify_truncation / OutlierKind::Truncated — detección de tope de
+    // tokens sin constantes de bytes-por-token ni gate de MIN_GROUP_SAMPLE
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn classify_truncation_detecta_el_caso_real_medido_en_produccion() {
+        // Caso real: dos probes con EL MISMO input_tokens=4095 (justo el
+        // num_ctx de Ollama en ese momento) pero bodies de tamaño MUY
+        // distinto (18.955 B vs. 28.806 B). El proveedor truncó el prompt en
+        // silencio y devolvió 200 OK igual.
+        let rows = vec![
+            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(18_955)),
+            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(28_806)),
+        ];
+
+        let result = classify_outliers(&rows);
+
+        assert!(result[0].contains(&OutlierKind::Truncated));
+        assert!(result[1].contains(&OutlierKind::Truncated));
+    }
+
+    #[test]
+    fn classify_truncation_no_flaggea_si_los_bodies_son_del_mismo_tamano() {
+        // ESTE ES EL TEST QUE MÁS IMPORTA: mismo input_tokens y bodies
+        // dentro del 1% de diferencia (probe repetido con prompt
+        // prácticamente idéntico). Sin el guard de TRUNCATION_BYTES_DELTA,
+        // cualquier repetición idéntica se marcaría como "truncamiento"
+        // cuando en realidad es exactamente lo esperado — el falso positivo
+        // que un detector naïve `bytes/tokens > umbral` NO podría evitar.
+        let rows = vec![
+            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(20_000)),
+            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(20_150)), // +0.75%
+        ];
+
+        let result = classify_outliers(&rows);
+
+        assert!(!result[0].contains(&OutlierKind::Truncated));
+        assert!(!result[1].contains(&OutlierKind::Truncated));
+    }
+
+    #[test]
+    fn classify_truncation_anthropic_cache_hit_sano_no_flaggea() {
+        // Fila Anthropic con cache-hit grande: input_tokens=2 aislado sería
+        // el gatillo perfecto de un detector naïve. Como es la ÚNICA fila
+        // del grupo con ese total de tokens (prompt_tokens_total suma la
+        // caché), classify_truncation ni siquiera encuentra un par con el
+        // que comparar — no flaggea.
+        let rows = vec![req_prompt("anthropic", "claude-opus-4", Some(2), Some(124_733), Some(1_355), Some(224_653))];
+
+        let result = classify_outliers(&rows);
+
+        assert!(!result[0].contains(&OutlierKind::Truncated));
+    }
+
+    #[test]
+    fn classify_truncation_openai_con_cache_read_denominador_es_solo_input_tokens() {
+        // Dos filas OpenAI con el mismo input_tokens pero cache_read
+        // presente (subconjunto): el agrupamiento debe usar SOLO
+        // input_tokens como total, sin sumar cache_read — si sumara,
+        // estas dos filas caerían en grupos de tokens DISTINTOS y el
+        // detector nunca las compararía entre sí.
+        let rows = vec![
+            req_prompt("openai", "gpt-4o", Some(1000), Some(400), None, Some(10_000)),
+            req_prompt("openai", "gpt-4o", Some(1000), Some(400), None, Some(15_000)),
+        ];
+
+        let result = classify_outliers(&rows);
+
+        assert!(result[0].contains(&OutlierKind::Truncated));
+        assert!(result[1].contains(&OutlierKind::Truncated));
+    }
+
+    #[test]
+    fn classify_truncation_filas_sin_input_tokens_se_excluyen_sin_panic() {
+        let rows = vec![
+            req_prompt("openai", "llama3.2:3b", None, None, None, Some(18_955)),
+            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(28_806)),
+        ];
+
+        let result = classify_outliers(&rows);
+
+        assert!(result[0].is_empty());
+        assert!(result[1].is_empty());
+    }
+
+    #[test]
+    fn classify_truncation_una_sola_fila_no_se_puede_probar() {
+        // Un solo sample no prueba nada: podría ser genuinamente un prompt
+        // grande que necesita exactamente ese input_tokens. El doc de
+        // OutlierKind::Truncated es explícito: hacen falta >= 2 muestras
+        // para EXCLUIR la coincidencia.
+        let rows = vec![req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(77_783))];
+
+        let result = classify_outliers(&rows);
+
+        assert!(!result[0].contains(&OutlierKind::Truncated));
+    }
+
+    #[test]
+    fn requests_row_cells_context_b_tok_es_guion_si_falta_input_tokens() {
+        // Fila sin `input_tokens`: prompt_tokens_total es None, y la celda
+        // B/tok (índice 10 en la vista Context) debe renderizar `-`, NUNCA
+        // `0.0` — mismo criterio que el resto de las celdas opcionales del
+        // panel.
+        let r = req_prompt("openai", "gpt-4o", None, None, None, Some(50_000));
+        let cells = requests_row_cells(RequestsView::Context, &r);
+        assert_eq!(cells[10], "-");
+    }
+
+    #[test]
+    fn requests_row_cells_context_b_tok_calcula_bytes_por_token() {
+        let r = req_prompt("openai", "gpt-4o", Some(1_000), None, None, Some(2_700));
+        let cells = requests_row_cells(RequestsView::Context, &r);
+        assert_eq!(cells[10], "2.7");
+    }
+
+    #[test]
+    fn classify_truncation_compone_con_otro_marcador_en_la_misma_fila() {
+        // Truncated debe convivir con otro OutlierKind en la misma fila
+        // (acá, Error) sin pisarlo ni excluirlo.
+        let mut rows = vec![
+            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(18_955)),
+            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(28_806)),
+        ];
+        rows[0].status = 500;
+
+        let result = classify_outliers(&rows);
+
+        assert!(result[0].contains(&OutlierKind::Truncated));
+        assert!(result[0].contains(&OutlierKind::Error));
     }
 
     // -----------------------------------------------------------------
