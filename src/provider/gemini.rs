@@ -118,6 +118,16 @@ impl Provider for Gemini {
     /// Un elemento de `tools[]` sin `functionDeclarations` (o con un valor
     /// que no es array) se OMITE por completo, sin afectar al resto de los
     /// elementos.
+    ///
+    /// NOTA sobre bytes no atribuidos: medir la declaración individual en
+    /// vez del wrapper es intencional (cada declaración es la unidad
+    /// equivalente a una herramienta en los demás dialectos), pero tiene un
+    /// costo de atribución: los bytes del propio objeto wrapper
+    /// (`{"functionDeclarations": [...]}` — la clave, sus corchetes de
+    /// array, y las llaves `{...}` de cada wrapper) no pertenecen a ninguna
+    /// declaración individual y por lo tanto no aparecen en ningún elemento
+    /// de `by_server`. Ver [`super::tools_overhead_bytes`], donde esos bytes
+    /// quedan absorbidos junto con la estructura del array `tools` externo.
     fn tool_entries<'a>(&self, body: &'a Value) -> Option<Vec<(&'a str, &'a Value)>> {
         let tools = body.as_object()?.get("tools")?.as_array()?;
         Some(

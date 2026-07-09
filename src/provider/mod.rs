@@ -299,6 +299,34 @@ const OTHERS_LABEL: &str = "(others)";
 #[allow(dead_code)]
 const MAX_TOOL_SERVERS: usize = 32;
 
+/// Naturaleza del cubo al que se atribuye una herramienta. Distingue por
+/// TIPO, no por una cadena mágica: un servidor MCP llamado literalmente
+/// `(native)` (o `(others)`) es un servidor MCP, no una herramienta nativa
+/// ni el bucket de desborde, aunque su nombre de display coincida con el
+/// sentinel. [`group_tools_by_server`] keyea su mapa por `(ToolServerKind,
+/// &str)`, así que dos filas con el mismo `server` mostrado pero distinto
+/// `kind` NUNCA se fusionan.
+///
+/// Orden total (`Ord` derivado del orden de declaración de variantes, usado
+/// como desempate final en [`group_tools_by_server`] cuando dos filas
+/// empatan en bytes Y en nombre de servidor): `Native < Mcp < Others`. Se
+/// eligió ese orden porque refleja "especificidad decreciente": `Native` es
+/// el único cubo con un origen fijo y sin nombre de servidor real; `Mcp` son
+/// servidores concretos identificados por el cliente; `Others` es
+/// enteramente sintético (producto del cupo agotado, sin identidad propia),
+/// así que va último.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum ToolServerKind {
+    /// Herramienta nativa: nombre que no sigue el patrón `mcp__<server>__<tool>`.
+    Native,
+    /// Herramienta declarada por un servidor MCP identificado en el nombre.
+    Mcp,
+    /// Bucket de desborde: servidor MCP distinto que apareció después de
+    /// agotar [`MAX_TOOL_SERVERS`].
+    Others,
+}
+
 /// Bytes de las herramientas del body agrupadas por servidor MCP que las
 /// declara. Ver [`Provider::tools_by_server`] y [`group_tools_by_server`].
 #[allow(dead_code)]
@@ -306,15 +334,23 @@ const MAX_TOOL_SERVERS: usize = 32;
 pub struct ToolServerBytes {
     /// Servidor propietario. `mcp__claude_ai_Gmail` -> `claude_ai_Gmail`.
     /// Las herramientas nativas (sin prefijo `mcp__`) caen en `NATIVE_TOOLS_LABEL`.
+    /// Nombre de DISPLAY solamente: dos filas pueden compartir este valor
+    /// (p. ej. un servidor MCP llamado literalmente `(native)` y el bucket
+    /// nativo genuino) y aun así ser cubos distintos; usar [`Self::kind`]
+    /// para distinguirlos, nunca comparar solo por `server`.
     pub server: String,
+    /// Tipo de cubo (nativo, servidor MCP identificado, o desborde). Ver
+    /// [`ToolServerKind`].
+    pub kind: ToolServerKind,
     /// Cantidad de herramientas atribuidas a este servidor.
     pub tools: usize,
     /// Suma de los bytes de cada herramienta de este servidor.
     pub bytes: usize,
 }
 
-/// Servidor MCP dueño de `tool_name`, o [`NATIVE_TOOLS_LABEL`] si no se
-/// reconoce ninguno. Pura: no mide bytes, solo clasifica el nombre.
+/// Clasifica `tool_name` en `(ToolServerKind, servidor_o_sentinel)`. Pura: no
+/// mide bytes, solo parsea el nombre. Fuente única de verdad del parseo:
+/// [`server_of`] delega acá y descarta el `ToolServerKind`.
 ///
 /// Los nombres de herramienta MCP siguen el patrón `mcp__<server>__<tool>`.
 /// El nombre de la herramienta en sí puede contener `__` (p. ej.
@@ -336,13 +372,35 @@ pub struct ToolServerBytes {
 /// - `"__x__y"` (no empieza con el literal `mcp__`, el primer segmento antes
 ///   del primer `__` es la cadena vacía, no `"mcp"`): nativa.
 /// - `""`: nativa (no hay ni siquiera un primer segmento `"mcp"`).
+///
+/// IMPORTANTE (ver [`ToolServerKind`]): que el segmento de servidor sea
+/// literalmente `"(native)"` o `"(others)"` NO lo convierte en nativo ni en
+/// desborde; sigue siendo `Mcp` con ese nombre de servidor. La colisión de
+/// cadenas de display se resuelve en [`group_tools_by_server`], que keyea
+/// por el `ToolServerKind` devuelto acá, no por el string solo.
 #[allow(dead_code)]
-pub fn server_of(tool_name: &str) -> &str {
+pub fn classify(tool_name: &str) -> (ToolServerKind, &str) {
     let mut segments = tool_name.splitn(3, "__");
     match (segments.next(), segments.next(), segments.next()) {
-        (Some("mcp"), Some(server), Some(_)) if !server.is_empty() => server,
-        _ => NATIVE_TOOLS_LABEL,
+        (Some("mcp"), Some(server), Some(_)) if !server.is_empty() => {
+            (ToolServerKind::Mcp, server)
+        }
+        _ => (ToolServerKind::Native, NATIVE_TOOLS_LABEL),
     }
+}
+
+/// Servidor MCP dueño de `tool_name`, o [`NATIVE_TOOLS_LABEL`] si no se
+/// reconoce ninguno. Pura: no mide bytes, solo clasifica el nombre.
+///
+/// Envoltorio de compatibilidad sobre [`classify`], que conserva el
+/// `ToolServerKind`: `server_of` existía antes de distinguir por tipo y su
+/// contrato documentado (solo el segmento, sin tipo) se mantiene tal cual
+/// para quien ya lo use solo para display. [`group_tools_by_server`] usa
+/// `classify` directamente, no `server_of`, porque necesita el tipo para no
+/// colisionar buckets.
+#[allow(dead_code)]
+pub fn server_of(tool_name: &str) -> &str {
+    classify(tool_name).1
 }
 
 /// Agrupa herramientas por servidor MCP, midiendo cada una con
@@ -352,33 +410,48 @@ pub fn server_of(tool_name: &str) -> &str {
 /// adentro.
 ///
 /// Orden de salida DETERMINÍSTICO: bytes DESCENDENTE, empatando por nombre de
-/// servidor ASCENDENTE. Los tests dependen de este orden, y también lo hará
+/// servidor ASCENDENTE y, si TAMBIÉN empatan en nombre (posible ahora que
+/// `Native`/`Others` pueden compartir display con un `Mcp` homónimo, ver
+/// [`ToolServerKind`]), por `kind` según el orden total documentado en
+/// [`ToolServerKind`]. Los tests dependen de este orden, y también lo hará
 /// cualquier UI futura que liste estos totales.
 ///
-/// Cupo: hasta [`MAX_TOOL_SERVERS`] servidores se trackean de forma
-/// individual (por orden de aparición); el resto colapsa en
+/// Cupo: hasta [`MAX_TOOL_SERVERS`] cubos `(ToolServerKind, servidor)`
+/// distintos se trackean de forma individual (por orden de aparición); el
+/// resto colapsa en el bucket [`ToolServerKind::Others`] /
 /// [`OTHERS_LABEL`]. La cantidad de herramientas y la suma de bytes del
 /// resultado siempre suman exactamente el total de la entrada (ver
 /// [`MAX_TOOL_SERVERS`] para la comparación con el cap de
-/// `telemetry::stats`).
+/// `telemetry::stats`). El bucket nativo cuenta contra este mismo cupo,
+/// igual que cualquier servidor MCP: si el cupo ya se agotó antes de ver la
+/// primera herramienta nativa, esa herramienta también colapsa en
+/// `Others` — no es un caso especial.
 ///
 /// Toma un iterador de referencias (nunca clona `body` ni los `Value` de
 /// cada herramienta): el costo es proporcional a los fragmentos que mide,
 /// no al body entero.
+///
+/// COSTO DE ALOCACIÓN: la clave interna del acumulador es `(ToolServerKind,
+/// &'a str)` — un slice TOMADO PRESTADO de `name` (o el `&'static str` de
+/// [`NATIVE_TOOLS_LABEL`]/[`OTHERS_LABEL`]), nunca un `String` nuevo por
+/// herramienta. Solo se aloca un `String` una vez por FILA de salida (al
+/// construir cada `ToolServerBytes`), nunca dentro del loop por-herramienta:
+/// un body con 76 herramientas de 1 solo servidor hace 1 alocación de
+/// `String`, no 76.
 #[allow(dead_code)]
 pub fn group_tools_by_server<'a>(
     entries: impl Iterator<Item = (&'a str, &'a Value)>,
 ) -> Vec<ToolServerBytes> {
-    let mut totals: HashMap<String, (usize, usize)> = HashMap::new();
+    let mut totals: HashMap<(ToolServerKind, &'a str), (usize, usize)> = HashMap::new();
 
     for (name, value) in entries {
         let bytes = measure_value(value);
-        let raw_server = server_of(name);
+        let (kind, raw_server) = classify(name);
 
-        let key = if totals.contains_key(raw_server) || totals.len() < MAX_TOOL_SERVERS {
-            raw_server.to_string()
+        let key = if totals.contains_key(&(kind, raw_server)) || totals.len() < MAX_TOOL_SERVERS {
+            (kind, raw_server)
         } else {
-            OTHERS_LABEL.to_string()
+            (ToolServerKind::Others, OTHERS_LABEL)
         };
 
         let entry = totals.entry(key).or_insert((0, 0));
@@ -388,31 +461,55 @@ pub fn group_tools_by_server<'a>(
 
     let mut rows: Vec<ToolServerBytes> = totals
         .into_iter()
-        .map(|(server, (tools, bytes))| ToolServerBytes { server, tools, bytes })
+        .map(|((kind, server), (tools, bytes))| ToolServerBytes {
+            server: server.to_string(),
+            kind,
+            tools,
+            bytes,
+        })
         .collect();
 
-    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.server.cmp(&b.server)));
+    rows.sort_by(|a, b| {
+        b.bytes
+            .cmp(&a.bytes)
+            .then_with(|| a.server.cmp(&b.server))
+            .then_with(|| a.kind.cmp(&b.kind))
+    });
     rows
 }
 
-/// Bytes del array `tools` que no pertenecen a ninguna herramienta: los
-/// corchetes y las comas separadoras. `tools_bytes - sum(bytes por
-/// servidor)`.
+/// Bytes del array `tools` que no se atribuyen a ninguna fila de
+/// `by_server`. `tools_bytes - sum(bytes por servidor)`.
+///
+/// TRES contribuyentes distintos caen acá, no uno solo:
+/// 1. Estructura JSON del array en sí: los corchetes `[` `]` y las comas
+///    separadoras entre elementos (aplica a los cuatro dialectos).
+/// 2. Envoltorios sin atribución propia: en Gemini, [`Provider::tool_entries`]
+///    mide las declaraciones INDIVIDUALES (`functionDeclarations[i]`), nunca
+///    el objeto wrapper que las contiene (`{"functionDeclarations": [...]}`).
+///    Los bytes de la clave `"functionDeclarations"`, sus corchetes de array
+///    propios y las llaves `{...}` de cada wrapper no pertenecen a ninguna
+///    declaración individual y por lo tanto no están en `by_server`: caen
+///    acá. Anthropic/OpenAI no tienen este contribuyente porque cada
+///    herramienta ES el elemento del array `tools`, sin wrapper intermedio.
+/// 3. Herramientas huérfanas: una entrada sin `name` (o con `name` no-string)
+///    se omite por completo en [`Provider::tool_entries`] (ver su contrato:
+///    nunca se atribuye a [`NATIVE_TOOLS_LABEL`] para no inflarlo con datos
+///    ajenos), así que sus bytes tampoco están en `by_server` y también
+///    quedan absorbidos acá.
 ///
 /// NO puede ir legítimamente negativo: `by_server` se construye midiendo
 /// FRAGMENTOS del mismo array cuyo total serializado es `tools_bytes` (cada
-/// herramienta individual pesa menos que el array completo que la
-/// contiene), así que la resta siempre debería dar `>= 0`. Aun así usamos
+/// fragmento individual pesa menos que el array completo que la contiene),
+/// así que la resta siempre debería dar `>= 0`. Aun así usamos
 /// `saturating_sub` en vez de una resta directa: preferimos devolver `0` a
 /// entrar en pánico si algún día esa invariante se rompe (p. ej. un cambio
 /// futuro que mida `by_server` con otra fuente de bytes que no sea
 /// `tools_bytes`).
 ///
-/// NOTA: si alguna herramienta se omitió por no tener `name` (ver
-/// [`Provider::tool_entries`]), sus bytes tampoco están en `by_server`, así
-/// que quedan absorbidos acá junto con corchetes y comas: en ese caso este
-/// número deja de ser *solo* "estructura JSON". Se documenta la asimetría,
-/// no se fuerza a que sean números distintos.
+/// La aritmética no cambia por documentar estos tres contribuyentes: sigue
+/// siendo la misma resta de siempre, solo se precisa QUÉ compone el
+/// resultado.
 #[allow(dead_code)]
 pub fn tools_overhead_bytes(tools_bytes: usize, by_server: &[ToolServerBytes]) -> usize {
     let attributed: usize = by_server.iter().map(|s| s.bytes).sum();
@@ -691,6 +788,92 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].server, "alpha");
         assert_eq!(rows[1].server, "zebra");
+    }
+
+    /// `classify` distingue por tipo, no solo por segmento: un servidor MCP
+    /// cuyo nombre coincide textualmente con un sentinel sigue siendo `Mcp`.
+    #[test]
+    fn classify_distingue_kind_de_string_de_display() {
+        assert_eq!(
+            classify("mcp__claude_ai_Gmail__search_threads"),
+            (ToolServerKind::Mcp, "claude_ai_Gmail")
+        );
+        assert_eq!(classify("Read"), (ToolServerKind::Native, NATIVE_TOOLS_LABEL));
+        // Un servidor MCP llamado literalmente "(native)" es Mcp, NUNCA Native.
+        assert_eq!(
+            classify("mcp__(native)__thing"),
+            (ToolServerKind::Mcp, "(native)")
+        );
+        // Mismo razonamiento con el sentinel de desborde.
+        assert_eq!(
+            classify("mcp__(others)__thing"),
+            (ToolServerKind::Mcp, "(others)")
+        );
+    }
+
+    /// PRUEBA DE MORDIDA (bug real, no hipotético): un servidor MCP cuyo
+    /// segmento es literalmente el sentinel de nativas (`(native)`) NO debe
+    /// fusionarse con el bucket de herramientas nativas genuinas. Antes del
+    /// fix, ambas entradas colapsaban en una sola fila porque
+    /// `group_tools_by_server` keyeaba por la cadena de display, no por tipo
+    /// de origen (verificado: este test FALLA contra el código pre-fix con
+    /// `rows.len() == 1`). Con el fix, deben ser DOS filas con el mismo
+    /// `server` mostrado pero `kind` distinto.
+    #[test]
+    fn group_tools_by_server_native_y_mcp_homonimo_no_colisionan() {
+        let read = serde_json::json!({"name": "Read"});
+        let homonimo = serde_json::json!({"name": "mcp__(native)__thing"});
+        let entries = vec![("Read", &read), ("mcp__(native)__thing", &homonimo)];
+
+        let rows = group_tools_by_server(entries.into_iter());
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "un servidor MCP llamado (native) no debe fusionarse con el bucket nativo genuino"
+        );
+        assert!(rows.iter().all(|r| r.server == NATIVE_TOOLS_LABEL));
+        assert!(rows.iter().any(|r| r.kind == ToolServerKind::Native));
+        assert!(rows.iter().any(|r| r.kind == ToolServerKind::Mcp));
+    }
+
+    /// Mismo bug, versión `(others)`: un servidor MCP real llamado
+    /// literalmente `(others)` (tracked individualmente, sin desbordar) y un
+    /// desborde GENUINO (un servidor 33.° distinto tras agotar el cupo) no
+    /// deben fusionarse solo porque ambos muestran `"(others)"` como
+    /// `server`. Antes del fix colapsaban en una sola fila (misma clave de
+    /// `String` para ambos); con el fix son dos filas con `kind` distinto.
+    #[test]
+    fn group_tools_by_server_others_literal_y_desborde_genuino_no_colisionan() {
+        let literal_others = serde_json::json!({"name": "mcp__(others)__x"});
+        let mut entries: Vec<(&str, &Value)> = vec![("mcp__(others)__x", &literal_others)];
+
+        // 31 servidores reales más para completar el cupo de 32 junto con el
+        // servidor literal "(others)" de arriba.
+        let names: Vec<String> = (0..31).map(|i| format!("mcp__srv{i:02}__tool")).collect();
+        let values: Vec<Value> = (0..31).map(|i| serde_json::json!({"n": i})).collect();
+        entries.extend(names.iter().zip(values.iter()).map(|(n, v)| (n.as_str(), v)));
+
+        // Servidor 33.°, distinto de todos los anteriores: cupo ya agotado
+        // (32 trackeados), así que desborda genuinamente a `Others`.
+        let overflow_tool = serde_json::json!({"name": "mcp__overflow_srv__tool"});
+        entries.push(("mcp__overflow_srv__tool", &overflow_tool));
+
+        let rows = group_tools_by_server(entries.into_iter());
+
+        // 32 trackeados individualmente (incluye el literal "(others)") + 1
+        // bucket de desborde genuino.
+        assert_eq!(rows.len(), MAX_TOOL_SERVERS + 1);
+
+        let others_rows: Vec<&ToolServerBytes> =
+            rows.iter().filter(|r| r.server == OTHERS_LABEL).collect();
+        assert_eq!(
+            others_rows.len(),
+            2,
+            "el servidor MCP literal (others) y el desborde genuino deben ser filas separadas"
+        );
+        assert!(others_rows.iter().any(|r| r.kind == ToolServerKind::Mcp));
+        assert!(others_rows.iter().any(|r| r.kind == ToolServerKind::Others));
     }
 
     /// Más de `MAX_TOOL_SERVERS` servidores distintos: el desborde colapsa
