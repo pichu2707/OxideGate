@@ -10,7 +10,7 @@
 //! (`tools` + `system`) y las llamadas repetidas paguen `cache_read` (0.1x)
 //! en vez de tarifa plena. Ver `docs/optimizer-prompt-cache.md`.
 use super::{
-    array_field, fingerprint, measure_key, measure_other, model_and_stream_from_body,
+    array_field, fingerprint, measure_key, measure_other, model_and_stream_from_value, parse_body,
     split_history_and_last_turn, ContextBreakdown, Incoming, Outgoing, Provider, Usage,
 };
 use crate::config::AppConfig;
@@ -28,16 +28,29 @@ impl Provider for Anthropic {
         "anthropic"
     }
 
-    /// Arma el request hacia `{anthropic}/messages`. Lee `model`/`stream` para
-    /// la métrica y, si `cfg.force_prompt_cache` está activo, intenta inyectar
-    /// un breakpoint de `cache_control` (ver [`force_cache_control`]).
+    /// Arma el request hacia `{anthropic}/messages`. Parsea el body UNA sola
+    /// vez ([`parse_body`]) y reutiliza el `Value` resultante para leer
+    /// `model`/`stream`, calcular `context` ([`Provider::decompose`]) y, si
+    /// `cfg.force_prompt_cache` está activo, intentar inyectar un breakpoint
+    /// de `cache_control` (ver [`force_cache_control`]) — nunca vuelve a
+    /// llamar a `serde_json::from_slice` sobre los bytes crudos.
+    ///
+    /// `prompt_hash`/`prompt_bytes` se calculan siempre sobre `incoming.body`
+    /// ORIGINAL (antes de parsear o mutar nada): son la huella y el tamaño
+    /// del body tal como llegó del cliente, no del JSON canónico.
     fn prepare(&self, incoming: Incoming, cfg: &AppConfig) -> Outgoing {
-        let (model, stream) = model_and_stream_from_body(&incoming.body);
         let prompt_hash = fingerprint(&incoming.body);
         let prompt_bytes = incoming.body.len();
+        let parsed = parse_body(&incoming.body);
+
+        let (model, stream) = parsed
+            .as_ref()
+            .map(model_and_stream_from_value)
+            .unwrap_or((None, false));
+        let context = parsed.as_ref().and_then(|v| self.decompose(v));
 
         let (body, cache_control_forced) = if cfg.force_prompt_cache {
-            force_cache_control(incoming.body)
+            force_cache_control(incoming.body, parsed)
         } else {
             (incoming.body, false)
         };
@@ -52,6 +65,7 @@ impl Provider for Anthropic {
             prompt_bytes,
             body,
             cache_control_forced,
+            context,
         }
     }
 
@@ -132,8 +146,12 @@ impl Provider for Anthropic {
 /// Si el body no es JSON válido —o es JSON válido pero no un objeto (array,
 /// string, número…), que no es indexable— se reenvía intacto y
 /// `forced = false` (preferimos no medir/mutar a romper el request).
-fn force_cache_control(raw: Vec<u8>) -> (Vec<u8>, bool) {
-    let Ok(mut value) = serde_json::from_slice::<Value>(&raw) else {
+///
+/// Toma `raw` (para poder devolverlo intacto sin reserializar cuando no hay
+/// mutación) y `parsed`, el `Value` que YA parseó `prepare` a partir de
+/// `raw`: esta función nunca vuelve a llamar a `serde_json::from_slice`.
+fn force_cache_control(raw: Vec<u8>, parsed: Option<Value>) -> (Vec<u8>, bool) {
+    let Some(mut value) = parsed else {
         return (raw, false);
     };
 
@@ -279,8 +297,11 @@ mod tests {
         assert_eq!(out.body, original_body);
     }
 
-    /// Con la palanca apagada (default), no se inyecta nada aunque el body
-    /// no traiga ningún `cache_control`.
+    /// REGRESIÓN de bytes: con la palanca apagada (default), el body
+    /// reenviado debe ser BYTE-IDÉNTICO al original — ni siquiera pasa por
+    /// una vuelta de reserializado, aunque `prepare` sí parsea el body para
+    /// leer `model`/`stream`/`context`. Guarda la invariante 3 del contrato
+    /// de `prepare`: parsear no es reserializar.
     #[test]
     fn does_not_inject_when_flag_disabled() {
         let cfg = test_config(false);
@@ -295,8 +316,9 @@ mod tests {
         assert_eq!(out.body, original_body);
     }
 
-    /// Body no-JSON: `prepare` no debe romper, solo reenviar intacto y
-    /// marcar `cache_control_forced = false`.
+    /// Body no-JSON: `prepare` no debe romper, solo reenviar intacto, marcar
+    /// `cache_control_forced = false` y dejar `context` en `None` (no hay
+    /// `Value` del que calcular ningún desglose).
     #[test]
     fn does_not_inject_on_invalid_json_body() {
         let cfg = test_config(true);
@@ -307,6 +329,7 @@ mod tests {
 
         assert!(!out.cache_control_forced);
         assert_eq!(out.body, original_body);
+        assert_eq!(out.context, None);
     }
 
     /// Body JSON VÁLIDO pero no-objeto (array/escalar): no es indexable por
@@ -323,7 +346,57 @@ mod tests {
 
             assert!(!out.cache_control_forced, "body {body} no debe forzar caché");
             assert_eq!(out.body, original_body, "body {body} debe reenviarse intacto");
+            assert_eq!(out.context, None, "body {body} no debe producir desglose");
         }
+    }
+
+    /// `prepare` con un body Anthropic válido debe producir un `context`
+    /// `Some`, y con números CONCRETOS calculados a mano sobre el fixture
+    /// (no solo consistencia interna: `measured_bytes` podría "cerrar" con
+    /// los cinco baldes aunque los cinco estuvieran mal en la misma
+    /// dirección). Los tamaños esperados se obtuvieron con
+    /// `serde_json::to_vec` fuera de este test sobre cada fragmento:
+    /// `"hola"` → 6 bytes, `[]` → 2 bytes,
+    /// `{"role":"user","content":"hi"}` → 30 bytes,
+    /// `"claude-3-5-sonnet"` → 19 bytes.
+    #[test]
+    fn prepare_produce_context_con_numeros_concretos() {
+        let cfg = test_config(false);
+        let incoming = incoming_with_body(
+            r#"{"model":"claude-3-5-sonnet","system":"hola","tools":[],"messages":[{"role":"user","content":"hi"}]}"#,
+        );
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+        let bd = out.context.expect("body válido debe producir contexto");
+
+        assert_eq!(bd.system_bytes, 6);
+        assert_eq!(bd.tools_bytes, 2);
+        assert_eq!(bd.history_bytes, 0);
+        assert_eq!(bd.last_turn_bytes, 30);
+        assert_eq!(bd.other_bytes, 19);
+        assert_eq!(bd.messages_count, 1);
+        // Consistencia interna, a mayores del chequeo contra números concretos.
+        assert_eq!(bd.measured_bytes, 57);
+        let ratio = bd.context_tax_ratio().expect("measured_bytes > 0");
+        assert!((ratio - (8.0 / 57.0)).abs() < 1e-9);
+    }
+
+    /// El refactor de "parsear una vez" no debe alterar `prompt_hash`: se
+    /// calcula siempre sobre los bytes ORIGINALES, nunca sobre el `Value`
+    /// parseado o reserializado. Lo verificamos calculando la huella de forma
+    /// independiente (con la misma función pública) y comparándola contra la
+    /// que produjo `prepare`.
+    #[test]
+    fn prepare_prompt_hash_se_calcula_sobre_bytes_originales() {
+        let cfg = test_config(false);
+        let raw = r#"{"model":"claude-3-5-sonnet","system":"hola","messages":[]}"#;
+        let incoming = incoming_with_body(raw);
+        let expected_hash = fingerprint(raw.as_bytes());
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert_eq!(out.prompt_hash, expected_hash);
+        assert_eq!(out.prompt_bytes, raw.len());
     }
 
     /// Body realista: `system` string, `tools` con un esquema, y 3 mensajes.

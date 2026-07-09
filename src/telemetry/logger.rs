@@ -7,6 +7,7 @@
 //! para que `/stats` y `/requests` puedan leer, respectivamente, la
 //! agregación y el detalle reciente en vivo sin tocar el JSONL. Así el I/O de
 //! log NUNCA se suma a la latencia que le devolvemos a gentle-ai.
+use crate::provider::ContextBreakdown;
 use crate::telemetry::{RecentRequests, StatsRegistry};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -72,6 +73,96 @@ pub struct RequestMetric {
     /// Velocidad de generación (tokens de salida por segundo). `None` si no
     /// tenemos tokens o el tramo de generación fue nulo.
     pub tokens_per_sec: Option<f64>,
+
+    // --- Desglose de contexto (ver `provider::ContextBreakdown`) ---
+    /// Bytes del prompt de sistema. MEDIDOS EN BYTES, nunca tokens (longitud
+    /// de re-serializar el fragmento con `serde_json::to_vec`, JSON canónico,
+    /// no bytes de wire). `None` si `Provider::decompose` no pudo calcular
+    /// nada (body no parseó como JSON o no era un objeto).
+    pub context_system_bytes: Option<usize>,
+    /// Bytes de los esquemas de herramientas. Mismo contrato de medición que
+    /// `context_system_bytes`.
+    pub context_tools_bytes: Option<usize>,
+    /// Bytes del historial (todos los mensajes menos el último). Mismo
+    /// contrato de medición que `context_system_bytes`.
+    pub context_history_bytes: Option<usize>,
+    /// Bytes del último mensaje (el turno nuevo). Mismo contrato de medición
+    /// que `context_system_bytes`.
+    pub context_last_turn_bytes: Option<usize>,
+    /// Bytes del resto de campos de control a nivel raíz (`model`,
+    /// `temperature`, `max_tokens`…). Mismo contrato de medición que
+    /// `context_system_bytes`.
+    pub context_other_bytes: Option<usize>,
+    /// Suma de los cinco campos de contexto anteriores. DIFIERE levemente de
+    /// `prompt_bytes` (que sí es el tamaño exacto sobre el cable): este es el
+    /// tamaño del JSON canónico re-serializado, no el de los bytes que
+    /// realmente mandó el cliente. Nunca combinar `context_measured_bytes`
+    /// con `prompt_bytes` en un mismo cociente.
+    pub context_measured_bytes: Option<usize>,
+    /// Número de mensajes del historial completo (incluyendo el último).
+    pub context_messages_count: Option<usize>,
+    /// `(system + tools + history) / measured`: fracción del body que es
+    /// prefijo estable (ver `ContextBreakdown::context_tax_ratio`).
+    ///
+    /// ASIMETRÍA A PROPÓSITO: cuando `context_measured_bytes` es `Some(0)`,
+    /// esta ratio es `None` (no hay nada de qué sacar fracción, evitamos una
+    /// división por cero), mientras que los siete campos en bytes de arriba
+    /// SÍ quedan en `Some(0)` (sabemos con certeza que no midieron nada). No
+    /// es una inconsistencia: son dos preguntas distintas ("¿cuánto medimos?"
+    /// vs. "¿qué fracción es prefijo estable?").
+    pub context_tax_ratio: Option<f64>,
+    /// Microsegundos que `middleware::proxy::run` pasó DENTRO de
+    /// `Provider::prepare` (parseo del body + `decompose` + mutación
+    /// opcional del body). `u64` en MICROsegundos, no `f64` en milisegundos:
+    /// a esta magnitud (típicamente decenas a cientos de µs) redondear a ms
+    /// como flotante borraría la señal.
+    ///
+    /// NO incluye: leer el body del socket (eso pasa ANTES de `prepare`, en
+    /// `run`), ni el round-trip hacia el proveedor upstream (eso pasa
+    /// DESPUÉS, en `send_and_meter`). Es, a propósito, el costo propio del
+    /// proxy — la primera vez que OxideGate se mide a sí mismo.
+    pub prepare_us: u64,
+}
+
+/// Tupla de los 8 campos `context_*` en el mismo orden en que aparecen en
+/// [`RequestMetric`]: `(system_bytes, tools_bytes, history_bytes,
+/// last_turn_bytes, other_bytes, measured_bytes, messages_count,
+/// tax_ratio)`. Existe solo para que [`flatten_context_breakdown`] tenga un
+/// tipo de retorno nombrado (en vez de una tupla de 8 elementos inline, que
+/// `clippy::type_complexity` rechaza).
+pub(crate) type ContextFieldsTuple = (
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    Option<usize>,
+    Option<f64>,
+);
+
+/// Aplana un [`ContextBreakdown`] opcional en la tupla de 8 campos que
+/// exige [`RequestMetric`] (ver el contrato de medición completo en
+/// [`ContextBreakdown`]). `None` en la entrada ⇒ los 8 campos en `None`: no
+/// hay nada que aplanar porque el body no parseó como JSON o no era un
+/// objeto. Es el único lugar que sabe mapear `ContextBreakdown` a la forma
+/// plana de la métrica; `middleware::proxy` (camino de error de upstream) y
+/// `telemetry::metered` (camino de streaming) llaman a esta función en vez
+/// de repetir la lógica de aplanado cada uno por su cuenta.
+pub(crate) fn flatten_context_breakdown(context: Option<&ContextBreakdown>) -> ContextFieldsTuple {
+    match context {
+        Some(c) => (
+            Some(c.system_bytes),
+            Some(c.tools_bytes),
+            Some(c.history_bytes),
+            Some(c.last_turn_bytes),
+            Some(c.other_bytes),
+            Some(c.measured_bytes),
+            Some(c.messages_count),
+            c.context_tax_ratio(),
+        ),
+        None => (None, None, None, None, None, None, None, None),
+    }
 }
 
 /// Handle clonable que los handlers usan para emitir métricas sin bloquear.

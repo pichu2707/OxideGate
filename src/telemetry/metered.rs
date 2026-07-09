@@ -12,7 +12,8 @@
 //! el cliente se desconecta a media respuesta (vía `Drop`). Este módulo es
 //! mecánica PURA de medición: no conoce el dialecto de ningún proveedor
 //! concreto, solo el trait [`Provider`].
-use crate::provider::{Provider, Usage};
+use crate::provider::{ContextBreakdown, Provider, Usage};
+use crate::telemetry::logger::flatten_context_breakdown;
 use crate::telemetry::pricing;
 use crate::telemetry::{RequestMetric, TelemetrySink};
 use bytes::Bytes;
@@ -39,6 +40,15 @@ pub struct MetricBase {
     /// en el body saliente (palanca A del optimizador). Nace en `Outgoing` y
     /// viaja intacto hasta la métrica final.
     pub cache_control_forced: bool,
+    /// Desglose del body por componente, calculado por `provider.prepare`
+    /// (`Outgoing::context`). `None` si el body no parseó como JSON o no era
+    /// un objeto. Se aplana a los ocho campos `context_*` de `RequestMetric`
+    /// recién en [`MeteredBody::emit`], vía
+    /// [`flatten_context_breakdown`](crate::telemetry::logger::flatten_context_breakdown).
+    pub context: Option<ContextBreakdown>,
+    /// Microsegundos que `middleware::proxy::run` pasó dentro de
+    /// `provider.prepare(...)`. Viaja intacto hasta `RequestMetric::prepare_us`.
+    pub prepare_us: u64,
     /// Proveedor dueño del dialecto de esta respuesta: la extracción del
     /// `usage` se delega íntegramente en él, así este módulo no necesita
     /// saber nada de ningún proveedor concreto.
@@ -189,6 +199,17 @@ impl MeteredBody {
             _ => None,
         };
 
+        let (
+            context_system_bytes,
+            context_tools_bytes,
+            context_history_bytes,
+            context_last_turn_bytes,
+            context_other_bytes,
+            context_measured_bytes,
+            context_messages_count,
+            context_tax_ratio,
+        ) = flatten_context_breakdown(self.base.context.as_ref());
+
         self.sink.record(RequestMetric {
             timestamp: self.base.timestamp.clone(),
             route: self.base.route.clone(),
@@ -207,6 +228,15 @@ impl MeteredBody {
             ttft_ms: self.ttft_ms,
             total_ms,
             tokens_per_sec,
+            context_system_bytes,
+            context_tools_bytes,
+            context_history_bytes,
+            context_last_turn_bytes,
+            context_other_bytes,
+            context_measured_bytes,
+            context_messages_count,
+            context_tax_ratio,
+            prepare_us: self.base.prepare_us,
         });
     }
 }

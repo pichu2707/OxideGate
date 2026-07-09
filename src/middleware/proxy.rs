@@ -10,6 +10,7 @@
 //! coste sin tocar el camino crítico.
 use crate::provider::{self, Incoming, Outgoing, Provider};
 use crate::state::AppState;
+use crate::telemetry::logger::flatten_context_breakdown;
 use crate::telemetry::{MeteredBody, MetricBase, RequestMetric};
 use axum::{
     body::Body,
@@ -69,9 +70,16 @@ async fn run(prov: &'static dyn Provider, State(state): State<Arc<AppState>>, re
         query,
         body: raw,
     };
-    let out = prov.prepare(incoming, &state.config);
 
-    send_and_meter(prov, state, &parts.headers, out, start).await
+    // `prepare_us` mide EXCLUSIVAMENTE el trabajo propio del proxy dentro de
+    // `prepare` (parseo del body, `decompose`, mutación opcional): no incluye
+    // ni la lectura del body del socket (ya ocurrió arriba) ni el
+    // round-trip hacia el proveedor (ocurre después, en `send_and_meter`).
+    let prepare_start = Instant::now();
+    let out = prov.prepare(incoming, &state.config);
+    let prepare_us = prepare_start.elapsed().as_micros() as u64;
+
+    send_and_meter(prov, state, &parts.headers, out, start, prepare_us).await
 }
 
 /// Reenvía la petición ya resuelta al proveedor y envuelve la respuesta con la
@@ -83,6 +91,7 @@ async fn send_and_meter(
     req_headers: &HeaderMap,
     out: Outgoing,
     start: Instant,
+    prepare_us: u64,
 ) -> Response {
     // Reconstruimos la petición copiando las cabeceras originales (auth,
     // content-type, anthropic-version, x-goog-api-key…).
@@ -107,6 +116,17 @@ async fn send_and_meter(
         Err(e) => {
             // No perdemos el evento: registramos el fallo de upstream con lo que
             // sabemos, aunque no haya tokens ni respuesta que medir.
+            let (
+                context_system_bytes,
+                context_tools_bytes,
+                context_history_bytes,
+                context_last_turn_bytes,
+                context_other_bytes,
+                context_measured_bytes,
+                context_messages_count,
+                context_tax_ratio,
+            ) = flatten_context_breakdown(out.context.as_ref());
+
             state.telemetry.record(RequestMetric {
                 timestamp: chrono::Utc::now().to_rfc3339(),
                 route: out.route,
@@ -125,6 +145,15 @@ async fn send_and_meter(
                 ttft_ms: None,
                 total_ms: start.elapsed().as_secs_f64() * 1000.0,
                 tokens_per_sec: None,
+                context_system_bytes,
+                context_tools_bytes,
+                context_history_bytes,
+                context_last_turn_bytes,
+                context_other_bytes,
+                context_measured_bytes,
+                context_messages_count,
+                context_tax_ratio,
+                prepare_us,
             });
             return plain_error(
                 StatusCode::BAD_GATEWAY,
@@ -146,6 +175,8 @@ async fn send_and_meter(
         prompt_bytes: out.prompt_bytes,
         status: status.as_u16(),
         cache_control_forced: out.cache_control_forced,
+        context: out.context,
+        prepare_us,
         provider: prov,
     };
 

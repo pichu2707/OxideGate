@@ -4,7 +4,7 @@
 //! que preservar path + query originales (que llevan `alt=sse` y a veces la
 //! API key) al reenviar hacia el host de Gemini.
 use super::{
-    array_field, fingerprint, measure_key, measure_other, split_history_and_last_turn,
+    array_field, fingerprint, measure_key, measure_other, parse_body, split_history_and_last_turn,
     ContextBreakdown, Incoming, Outgoing, Provider, Usage,
 };
 use crate::config::AppConfig;
@@ -23,8 +23,18 @@ impl Provider for Gemini {
     /// Preserva path y query originales sobre el host de Gemini. No muta el
     /// body: Gemini ya reporta `usageMetadata` por defecto en el stream SSE,
     /// no hay nada que inyectar.
+    ///
+    /// COSTO NUEVO Y CONSCIENTE: a diferencia de Anthropic/OpenAI, Gemini no
+    /// necesitaba parsear el body para nada (modelo y `stream` viven en el
+    /// path). Para calcular `context` acá SÍ hace falta parsearlo una vez
+    /// ([`parse_body`]): es un costo de CPU nuevo en este camino, agregado a
+    /// propósito para tener el mismo desglose que el resto de proveedores. Si
+    /// el body no parsea como JSON (o no es un objeto), `context` queda en
+    /// `None` y el body se reenvía intacto igual que siempre: el parseo es
+    /// de solo lectura, nunca reserializa ni muta nada acá.
     fn prepare(&self, incoming: Incoming, cfg: &AppConfig) -> Outgoing {
         let (model, stream) = parse_gemini_path(&incoming.path);
+        let context = parse_body(&incoming.body).and_then(|v| self.decompose(&v));
 
         let mut url = format!("{}{}", cfg.target_gemini_url, incoming.path);
         if let Some(query) = &incoming.query {
@@ -44,6 +54,7 @@ impl Provider for Gemini {
             // La caché de Gemini se gestiona aparte (implícita o explícita
             // vía `cachedContent`), no con esta palanca: no aplica acá.
             cache_control_forced: false,
+            context,
         }
     }
 
@@ -246,5 +257,105 @@ mod tests {
     fn decompose_none_en_body_no_objeto() {
         let body: Value = serde_json::from_str(r#"[1,2,3]"#).unwrap();
         assert_eq!(GEMINI.decompose(&body), None);
+    }
+
+    /// Construye un `AppConfig` mínimo para los tests de `prepare`, sin pasar
+    /// por `AppConfig::load()` (que lee variables de entorno del proceso).
+    fn test_config() -> AppConfig {
+        AppConfig {
+            local_port: 8080,
+            target_openai_url: "https://api.openai.com/v1".to_string(),
+            target_anthropic_url: "https://api.anthropic.com/v1".to_string(),
+            target_gemini_url: "https://generativelanguage.googleapis.com".to_string(),
+            storage_dir: std::path::PathBuf::from("/tmp/oxidegate-test"),
+            force_prompt_cache: false,
+        }
+    }
+
+    fn incoming_with_body(path: &str, body: &str) -> Incoming {
+        Incoming {
+            path: path.to_string(),
+            query: None,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    /// REGRESIÓN de bytes (invariante 3): Gemini nunca muta el body, así que
+    /// aunque `prepare` ahora lo parsea (costo nuevo, ver doc de `prepare`)
+    /// para calcular `context`, el body reenviado debe seguir siendo
+    /// BYTE-IDÉNTICO al original.
+    #[test]
+    fn prepare_no_muta_el_body() {
+        let cfg = test_config();
+        let incoming = incoming_with_body(
+            "/v1beta/models/gemini-1.5-flash:generateContent",
+            r#"{"contents":[{"role":"user","parts":[{"text":"hola"}]}]}"#,
+        );
+        let original_body = incoming.body.clone();
+
+        let out = GEMINI.prepare(incoming, &cfg);
+
+        assert_eq!(out.body, original_body);
+    }
+
+    /// Body no-JSON: `prepare` no debe romper, reenvía intacto y deja
+    /// `context` en `None` (modelo/stream siguen viniendo del path, no del
+    /// body, así que no se ven afectados).
+    #[test]
+    fn prepare_body_no_json_no_panica() {
+        let cfg = test_config();
+        let incoming = incoming_with_body(
+            "/v1beta/models/gemini-1.5-flash:generateContent",
+            "esto no es JSON",
+        );
+        let original_body = incoming.body.clone();
+
+        let out = GEMINI.prepare(incoming, &cfg);
+
+        assert_eq!(out.body, original_body);
+        assert_eq!(out.context, None);
+        assert_eq!(out.model.as_deref(), Some("gemini-1.5-flash"));
+    }
+
+    /// `prepare` con un body Gemini válido produce un `context` `Some` con
+    /// números CONCRETOS (no solo consistencia interna), calculados a mano
+    /// con `serde_json::to_vec` sobre cada fragmento del fixture:
+    /// `{"parts":[{"text":"be helpful"}]}` → 33 bytes,
+    /// `{"role":"user","parts":[{"text":"hi"}]}` → 39 bytes.
+    #[test]
+    fn prepare_produce_context_con_numeros_concretos() {
+        let cfg = test_config();
+        let incoming = incoming_with_body(
+            "/v1beta/models/gemini-1.5-flash:generateContent",
+            r#"{"systemInstruction":{"parts":[{"text":"be helpful"}]},"contents":[{"role":"user","parts":[{"text":"hi"}]}]}"#,
+        );
+
+        let out = GEMINI.prepare(incoming, &cfg);
+        let bd = out.context.expect("body válido debe producir contexto");
+
+        assert_eq!(bd.system_bytes, 33);
+        assert_eq!(bd.tools_bytes, 0);
+        assert_eq!(bd.history_bytes, 0);
+        assert_eq!(bd.last_turn_bytes, 39);
+        assert_eq!(bd.other_bytes, 0);
+        assert_eq!(bd.messages_count, 1);
+        assert_eq!(bd.measured_bytes, 72);
+    }
+
+    /// El refactor de "parsear una vez" no debe alterar `prompt_hash`.
+    #[test]
+    fn prepare_prompt_hash_se_calcula_sobre_bytes_originales() {
+        let cfg = test_config();
+        let raw = r#"{"contents":[]}"#;
+        let incoming = incoming_with_body(
+            "/v1beta/models/gemini-1.5-flash:generateContent",
+            raw,
+        );
+        let expected_hash = fingerprint(raw.as_bytes());
+
+        let out = GEMINI.prepare(incoming, &cfg);
+
+        assert_eq!(out.prompt_hash, expected_hash);
+        assert_eq!(out.prompt_bytes, raw.len());
     }
 }

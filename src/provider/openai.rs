@@ -9,8 +9,8 @@
 //!   clientes modernos como Codex). Ya reporta `usage` en el evento
 //!   `response.completed` sin pedir nada: no inyecta.
 use super::{
-    array_field, fingerprint, measure_key, measure_other, measure_value, model_and_stream_from_body,
-    split_history_and_last_turn, ContextBreakdown, Incoming, Outgoing, Provider, Usage,
+    array_field, fingerprint, measure_key, measure_other, measure_value, model_and_stream_from_value,
+    parse_body, split_history_and_last_turn, ContextBreakdown, Incoming, Outgoing, Provider, Usage,
 };
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -29,16 +29,27 @@ impl Provider for OpenAiChat {
         "openai"
     }
 
-    /// Arma el request hacia `{openai}/chat/completions`. Si el body pide
-    /// streaming, inyecta `stream_options.include_usage = true` para que el
-    /// chunk final traiga `usage`.
+    /// Arma el request hacia `{openai}/chat/completions`. Parsea el body UNA
+    /// sola vez ([`parse_body`]) y reutiliza el `Value` para leer
+    /// `model`/`stream`, calcular `context` y, si el body pide streaming,
+    /// inyectar `stream_options.include_usage = true` (ver
+    /// [`inject_include_usage`]) para que el chunk final traiga `usage`.
+    ///
+    /// `prompt_hash`/`prompt_bytes` se calculan siempre sobre `incoming.body`
+    /// ORIGINAL, nunca sobre el `Value` parseado.
     fn prepare(&self, incoming: Incoming, cfg: &AppConfig) -> Outgoing {
         let prompt_hash = fingerprint(&incoming.body);
         let prompt_bytes = incoming.body.len();
-        let (model, stream) = model_and_stream_from_body(&incoming.body);
+        let parsed = parse_body(&incoming.body);
+
+        let (model, stream) = parsed
+            .as_ref()
+            .map(model_and_stream_from_value)
+            .unwrap_or((None, false));
+        let context = parsed.as_ref().and_then(|v| self.decompose(v));
 
         let body = if stream {
-            inject_include_usage(incoming.body)
+            inject_include_usage(incoming.body, parsed)
         } else {
             incoming.body
         };
@@ -55,6 +66,7 @@ impl Provider for OpenAiChat {
             // OpenAI cachea el prefijo estable de forma automática (no hace
             // falta ningún breakpoint explícito): esta palanca no aplica acá.
             cache_control_forced: false,
+            context,
         }
     }
 
@@ -119,11 +131,20 @@ impl Provider for OpenAiResponses {
 
     /// Arma el request hacia `{openai}/responses`. Modelo y `stream` van en
     /// el body igual que en Chat Completions, pero acá NO se inyecta nada:
-    /// la Responses API ya manda `usage` por su cuenta.
+    /// la Responses API ya manda `usage` por su cuenta. Parsea el body UNA
+    /// sola vez ([`parse_body`]) y reutiliza el `Value` para `model`/`stream`
+    /// y `context`; el body reenviado es siempre `incoming.body` intacto (no
+    /// hay mutación en esta variante).
     fn prepare(&self, incoming: Incoming, cfg: &AppConfig) -> Outgoing {
         let prompt_hash = fingerprint(&incoming.body);
         let prompt_bytes = incoming.body.len();
-        let (model, stream) = model_and_stream_from_body(&incoming.body);
+        let parsed = parse_body(&incoming.body);
+
+        let (model, stream) = parsed
+            .as_ref()
+            .map(model_and_stream_from_value)
+            .unwrap_or((None, false));
+        let context = parsed.as_ref().and_then(|v| self.decompose(v));
 
         Outgoing {
             url: format!("{}/responses", cfg.target_openai_url),
@@ -136,6 +157,7 @@ impl Provider for OpenAiResponses {
             body: incoming.body,
             // Ídem: caché automática del lado de OpenAI, no aplica.
             cache_control_forced: false,
+            context,
         }
     }
 
@@ -183,12 +205,20 @@ impl Provider for OpenAiResponses {
 }
 
 /// Inyecta `stream_options.include_usage = true` en el body JSON. Si el body
-/// no es JSON válido, lo devuelve intacto (sin tokens exactos, pero sin
-/// romper el request: preferimos reenviar a fallar).
-fn inject_include_usage(raw: Vec<u8>) -> Vec<u8> {
-    let Ok(mut value) = serde_json::from_slice::<Value>(&raw) else {
+/// no es JSON válido, o es JSON válido pero no un objeto (array, string,
+/// número…, no indexable por clave), lo devuelve intacto (sin tokens
+/// exactos, pero sin romper el request ni arriesgar panic: preferimos
+/// reenviar a fallar).
+///
+/// Toma `parsed`, el `Value` que YA parseó `prepare` a partir de `raw`: esta
+/// función nunca vuelve a llamar a `serde_json::from_slice`.
+fn inject_include_usage(raw: Vec<u8>, parsed: Option<Value>) -> Vec<u8> {
+    let Some(mut value) = parsed else {
         return raw;
     };
+    if !value.is_object() {
+        return raw;
+    }
     value["stream_options"]["include_usage"] = Value::Bool(true);
     serde_json::to_vec(&value).unwrap_or(raw)
 }
@@ -489,5 +519,169 @@ mod tests {
     fn decompose_responses_none_en_body_no_objeto() {
         let body: Value = serde_json::from_str("42").unwrap();
         assert_eq!(OPENAI_RESPONSES.decompose(&body), None);
+    }
+
+    /// Construye un `AppConfig` mínimo para los tests de `prepare`, sin pasar
+    /// por `AppConfig::load()` (que lee variables de entorno del proceso).
+    fn test_config() -> AppConfig {
+        AppConfig {
+            local_port: 8080,
+            target_openai_url: "https://api.openai.com/v1".to_string(),
+            target_anthropic_url: "https://api.anthropic.com/v1".to_string(),
+            target_gemini_url: "https://generativelanguage.googleapis.com".to_string(),
+            storage_dir: std::path::PathBuf::from("/tmp/oxidegate-test"),
+            force_prompt_cache: false,
+        }
+    }
+
+    fn incoming_with_body(body: &str) -> Incoming {
+        Incoming {
+            path: "/v1/chat/completions".to_string(),
+            query: None,
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    /// REGRESIÓN de bytes (Chat Completions, invariante 3): con `stream`
+    /// ausente/`false` no hay mutación posible (`inject_include_usage` ni se
+    /// invoca), así que el body reenviado debe ser BYTE-IDÉNTICO al
+    /// original, aunque `prepare` sí lo haya parseado para leer
+    /// `model`/`context`.
+    #[test]
+    fn chat_prepare_no_muta_body_sin_stream() {
+        let cfg = test_config();
+        let incoming = incoming_with_body(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"hola"}]}"#,
+        );
+        let original_body = incoming.body.clone();
+
+        let out = OPENAI_CHAT.prepare(incoming, &cfg);
+
+        assert!(!out.stream);
+        assert_eq!(out.body, original_body);
+    }
+
+    /// Body no-JSON en Chat Completions: `prepare` no debe romper, reenvía
+    /// intacto y deja `context` en `None`.
+    #[test]
+    fn chat_prepare_body_no_json_no_panica() {
+        let cfg = test_config();
+        let incoming = incoming_with_body("esto no es JSON");
+        let original_body = incoming.body.clone();
+
+        let out = OPENAI_CHAT.prepare(incoming, &cfg);
+
+        assert_eq!(out.body, original_body);
+        assert_eq!(out.context, None);
+        assert!(!out.stream);
+        assert_eq!(out.model, None);
+    }
+
+    /// `prepare` con `stream: true` SÍ debe inyectar `stream_options.include_usage`,
+    /// y por lo tanto el body reenviado difiere del original (mutación
+    /// deliberada, la única excepción a la invariante de bytes intactos).
+    #[test]
+    fn chat_prepare_inyecta_include_usage_con_stream() {
+        let cfg = test_config();
+        let incoming = incoming_with_body(
+            r#"{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hola"}]}"#,
+        );
+
+        let out = OPENAI_CHAT.prepare(incoming, &cfg);
+
+        assert!(out.stream);
+        let body: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    /// `prepare` con un body Chat Completions válido produce un `context`
+    /// `Some` con números CONCRETOS (no solo consistencia interna),
+    /// calculados a mano con `serde_json::to_vec` sobre cada fragmento del
+    /// fixture: mensaje `system` → 38 bytes, mensaje `user` → 30 bytes,
+    /// `tools: []` → 2 bytes, `"gpt-4o"` → 8 bytes.
+    #[test]
+    fn chat_prepare_produce_context_con_numeros_concretos() {
+        let cfg = test_config();
+        let incoming = incoming_with_body(
+            r#"{"model":"gpt-4o","tools":[],"messages":[{"role":"system","content":"be brief"},{"role":"user","content":"hi"}]}"#,
+        );
+
+        let out = OPENAI_CHAT.prepare(incoming, &cfg);
+        let bd = out.context.expect("body válido debe producir contexto");
+
+        assert_eq!(bd.system_bytes, 38);
+        assert_eq!(bd.tools_bytes, 2);
+        assert_eq!(bd.history_bytes, 0);
+        assert_eq!(bd.last_turn_bytes, 30);
+        assert_eq!(bd.other_bytes, 8);
+        assert_eq!(bd.messages_count, 2);
+        assert_eq!(bd.measured_bytes, 78);
+    }
+
+    /// El refactor de "parsear una vez" no debe alterar `prompt_hash`: se
+    /// calcula siempre sobre los bytes originales.
+    #[test]
+    fn chat_prepare_prompt_hash_se_calcula_sobre_bytes_originales() {
+        let cfg = test_config();
+        let raw = r#"{"model":"gpt-4o","messages":[]}"#;
+        let incoming = incoming_with_body(raw);
+        let expected_hash = fingerprint(raw.as_bytes());
+
+        let out = OPENAI_CHAT.prepare(incoming, &cfg);
+
+        assert_eq!(out.prompt_hash, expected_hash);
+        assert_eq!(out.prompt_bytes, raw.len());
+    }
+
+    /// REGRESIÓN de bytes (Responses API, invariante 3): esta variante nunca
+    /// muta el body, así que el reenviado debe ser SIEMPRE byte-idéntico al
+    /// original, con o sin streaming.
+    #[test]
+    fn responses_prepare_nunca_muta_body() {
+        let cfg = test_config();
+        let incoming = incoming_with_body(
+            r#"{"model":"gpt-4o","stream":true,"input":"hola"}"#,
+        );
+        let original_body = incoming.body.clone();
+
+        let out = OPENAI_RESPONSES.prepare(incoming, &cfg);
+
+        assert_eq!(out.body, original_body);
+    }
+
+    /// Body no-JSON en Responses: `prepare` no debe romper, reenvía intacto
+    /// y deja `context` en `None`.
+    #[test]
+    fn responses_prepare_body_no_json_no_panica() {
+        let cfg = test_config();
+        let incoming = incoming_with_body("esto no es JSON");
+        let original_body = incoming.body.clone();
+
+        let out = OPENAI_RESPONSES.prepare(incoming, &cfg);
+
+        assert_eq!(out.body, original_body);
+        assert_eq!(out.context, None);
+    }
+
+    /// `prepare` con un body Responses válido (`input` string) produce un
+    /// `context` `Some` con números CONCRETOS: `"be helpful"` → 12 bytes,
+    /// `"explain the builder pattern"` → 29 bytes, `"gpt-4o"` → 8 bytes.
+    #[test]
+    fn responses_prepare_produce_context_con_numeros_concretos() {
+        let cfg = test_config();
+        let incoming = incoming_with_body(
+            r#"{"model":"gpt-4o","instructions":"be helpful","input":"explain the builder pattern"}"#,
+        );
+
+        let out = OPENAI_RESPONSES.prepare(incoming, &cfg);
+        let bd = out.context.expect("body válido debe producir contexto");
+
+        assert_eq!(bd.system_bytes, 12);
+        assert_eq!(bd.tools_bytes, 0);
+        assert_eq!(bd.history_bytes, 0);
+        assert_eq!(bd.last_turn_bytes, 29);
+        assert_eq!(bd.other_bytes, 8);
+        assert_eq!(bd.messages_count, 1);
+        assert_eq!(bd.measured_bytes, 49);
     }
 }

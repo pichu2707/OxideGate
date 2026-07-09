@@ -331,6 +331,15 @@ mod tests {
             ttft_ms: Some(50.0),
             total_ms: 100.0,
             tokens_per_sec: Some(20.0),
+            context_system_bytes: None,
+            context_tools_bytes: None,
+            context_history_bytes: None,
+            context_last_turn_bytes: None,
+            context_other_bytes: None,
+            context_measured_bytes: None,
+            context_messages_count: None,
+            context_tax_ratio: None,
+            prepare_us: 0,
         }
     }
 

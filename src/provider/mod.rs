@@ -66,6 +66,12 @@ pub struct Outgoing {
     /// `cache_read_tokens` resultantes. `false` en el resto de los
     /// proveedores y en cualquier caso donde Anthropic no haya mutado nada.
     pub cache_control_forced: bool,
+    /// Desglose del body por componente (ver [`ContextBreakdown`]), calculado
+    /// UNA sola vez en `prepare` a partir del mismo `Value` ya parseado que se
+    /// usó para leer `model`/`stream` (y, si corresponde, para mutar el
+    /// body). `None` si el body no parseó como JSON o no era un objeto: viaja
+    /// tal cual hasta la métrica final.
+    pub context: Option<ContextBreakdown>,
 }
 
 /// Acumulador de tokens medidos desde la respuesta del proveedor.
@@ -123,15 +129,11 @@ pub struct Usage {
 ///    de la misma manera; nunca hay que mezclar `measured_bytes` con
 ///    `prompt_bytes` en un mismo cociente.
 ///
-/// NOTA DE ALCANCE: este tipo y `Provider::decompose` son, a propósito, el
-/// límite de ESTA porción de trabajo: describen y calculan el desglose por
-/// proveedor pero todavía no se conectan a `RequestMetric`, `/requests` ni
-/// `/stats` (esa integración es una porción separada). Por eso el binario en
-/// producción todavía no los invoca fuera de los tests; no es código
-/// abandonado, es la superficie pública que consumirá la próxima porción. Los
-/// `#[allow(dead_code)]` de esta sección documentan justamente eso.
+/// Se calcula en `Provider::prepare` a partir del `Value` ya parseado del
+/// body (una sola vez por request, ver [`parse_body`]) y viaja aplanado hasta
+/// `RequestMetric` (`context_system_bytes`, `context_tools_bytes`, …, ver
+/// `telemetry::logger`).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Default)]
-#[allow(dead_code)]
 pub struct ContextBreakdown {
     /// Bytes del prompt de sistema / instrucciones.
     pub system_bytes: usize,
@@ -171,7 +173,14 @@ impl ContextBreakdown {
     /// y preferimos un hueco honesto a un cero falso) o si el cociente
     /// resultante no es finito (guarda defensiva; con `usize` no debería
     /// ocurrir, pero no confiamos en eso silenciosamente).
-    #[allow(dead_code)] // ver "nota de alcance" en el doc de `ContextBreakdown`
+    ///
+    /// NOTA DE ASIMETRÍA: cuando `measured_bytes == 0`, esta ratio es `None`
+    /// mientras que los siete campos en bytes de `ContextBreakdown` quedan en
+    /// `Some(0)` una vez aplanados en `RequestMetric` (ver
+    /// `telemetry::logger::flatten_context_breakdown`). Es correcto y a
+    /// propósito: "no medimos nada" (bytes en cero, sabido con certeza) es
+    /// distinto de "no podemos calcular una fracción" (`None`, división por
+    /// cero evitada).
     pub fn context_tax_ratio(&self) -> Option<f64> {
         if self.measured_bytes == 0 {
             return None;
@@ -187,7 +196,6 @@ impl ContextBreakdown {
 /// canónico, no bytes de wire. Serializar puede fallar solo por errores de
 /// tipos no soportados por `serde_json` (no aplica a `Value`, que siempre
 /// serializa); igual no arriesgamos panic y devolvemos 0 en ese caso.
-#[allow(dead_code)] // ver "nota de alcance" en el doc de `ContextBreakdown`
 pub(crate) fn measure_value(value: &Value) -> usize {
     serde_json::to_vec(value).map(|b| b.len()).unwrap_or(0)
 }
@@ -195,7 +203,6 @@ pub(crate) fn measure_value(value: &Value) -> usize {
 /// Bytes de la clave `key` dentro de `obj`, o `0` si la clave no está
 /// presente. Usado para los campos "todo o nada" del desglose (`system`,
 /// `tools`, `instructions`, `systemInstruction`).
-#[allow(dead_code)] // ver "nota de alcance" en el doc de `ContextBreakdown`
 pub(crate) fn measure_key(obj: &serde_json::Map<String, Value>, key: &str) -> usize {
     obj.get(key).map(measure_value).unwrap_or(0)
 }
@@ -203,7 +210,6 @@ pub(crate) fn measure_key(obj: &serde_json::Map<String, Value>, key: &str) -> us
 /// Suma en bytes de todas las claves de `obj` EXCEPTO las listadas en
 /// `exclude`. Cubre el campo `other_bytes` del desglose: todo lo que no es
 /// system/tools/historial (model, temperature, max_tokens, top_p…).
-#[allow(dead_code)] // ver "nota de alcance" en el doc de `ContextBreakdown`
 pub(crate) fn measure_other(obj: &serde_json::Map<String, Value>, exclude: &[&str]) -> usize {
     obj.iter()
         .filter(|(k, _)| !exclude.contains(&k.as_str()))
@@ -222,7 +228,6 @@ pub(crate) fn measure_other(obj: &serde_json::Map<String, Value>, exclude: &[&st
 /// Genérico sobre cualquier iterador de referencias a `Value` para que sirva
 /// tanto con un slice directo (`&[Value]`) como con una selección filtrada
 /// (p. ej. los mensajes de OpenAI Chat que no son `system`/`developer`).
-#[allow(dead_code)] // ver "nota de alcance" en el doc de `ContextBreakdown`
 pub(crate) fn split_history_and_last_turn<'a, I>(items: I) -> (usize, usize, usize)
 where
     I: IntoIterator<Item = &'a Value>,
@@ -242,7 +247,6 @@ where
 /// devuelve un slice vacío en vez de entrar en pánico. Cubre `messages`
 /// (Anthropic, OpenAI Chat), `contents` (Gemini) e `input`-como-array
 /// (OpenAI Responses).
-#[allow(dead_code)] // ver "nota de alcance" en el doc de `ContextBreakdown`
 pub(crate) fn array_field<'a>(obj: &'a serde_json::Map<String, Value>, key: &str) -> &'a [Value] {
     match obj.get(key) {
         Some(Value::Array(items)) => items.as_slice(),
@@ -283,7 +287,9 @@ pub trait Provider: Send + Sync {
     /// re-serializa los fragmentos que necesita medir (`system`, `tools`,
     /// cada mensaje del historial): el costo es proporcional al tamaño de
     /// esos fragmentos, no al del body entero más de lo necesario.
-    #[allow(dead_code)] // ver "nota de alcance" en el doc de `ContextBreakdown`
+    ///
+    /// `body` debe ser el `Value` que ya devolvió [`parse_body`] para este
+    /// mismo request: `decompose` nunca vuelve a parsear bytes crudos.
     fn decompose(&self, body: &Value) -> Option<ContextBreakdown>;
 }
 
@@ -297,18 +303,38 @@ pub fn fingerprint(bytes: &[u8]) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// Lee `model` y `stream` de un body JSON (formato Anthropic messages,
-/// OpenAI chat/completions y OpenAI Responses comparten esta forma). Si el
-/// body no es JSON válido, devuelve `(None, false)`: el proveedor reenvía el
-/// body intacto y no se miden tokens de ese request.
-pub(crate) fn model_and_stream_from_body(raw: &[u8]) -> (Option<String>, bool) {
-    match serde_json::from_slice::<Value>(raw) {
-        Ok(v) => (
-            v.get("model").and_then(|m| m.as_str()).map(str::to_string),
-            v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false),
-        ),
-        Err(_) => (None, false),
-    }
+/// Parsea el body crudo a un `Value` JSON. Punto de entrada ÚNICO para pasar
+/// de bytes a `Value` en el camino de `prepare`: cada proveedor lo llama
+/// EXACTAMENTE UNA VEZ por request, y reutiliza el `Value` resultante (por
+/// referencia) para leer `model`/`stream`, para `decompose` y, si hace falta
+/// mutar el body (Anthropic `force_cache_control`, OpenAI `stream_options`),
+/// para esa mutación también. `None` si `raw` no es JSON válido; nunca hace
+/// panic.
+///
+/// El tipo de retorno (`Option<Value>`, no `&[u8]`) es lo que hace estructural
+/// evitar un segundo parseo accidental: una vez que se tiene el `Value`, ya
+/// no hace falta volver a tocar los bytes crudos para nada relacionado con
+/// modelo/stream/desglose/mutación. Esto NO es una garantía del compilador:
+/// nada impide que un `prepare` futuro llame a `parse_body` una segunda vez
+/// sobre el mismo `raw`; la garantía es de diseño (un solo `let parsed =
+/// parse_body(...)` por `prepare`, reutilizado por referencia), no de tipos.
+pub(crate) fn parse_body(raw: &[u8]) -> Option<Value> {
+    serde_json::from_slice::<Value>(raw).ok()
+}
+
+/// Lee `model` y `stream` de un `Value` YA PARSEADO (formato Anthropic
+/// messages, OpenAI chat/completions y OpenAI Responses comparten esta
+/// forma). Si `value` no trae esas claves (o no es un objeto), cada campo
+/// cae a su default (`None`/`false`); nunca hace panic.
+///
+/// Toma `&Value`, no bytes crudos: el parseo ya ocurrió en [`parse_body`].
+/// Cuando `parse_body` devuelve `None` (body no-JSON), el llamador usa
+/// `(None, false)` directamente sin invocar esta función.
+pub(crate) fn model_and_stream_from_value(value: &Value) -> (Option<String>, bool) {
+    (
+        value.get("model").and_then(|m| m.as_str()).map(str::to_string),
+        value.get("stream").and_then(|s| s.as_bool()).unwrap_or(false),
+    )
 }
 
 #[cfg(test)]

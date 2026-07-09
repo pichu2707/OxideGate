@@ -66,6 +66,36 @@ pub struct RecentRequest {
     pub ttft_ms: Option<f64>,
     /// Latencia total en ms, desde el request hasta el cierre de la respuesta.
     pub total_ms: f64,
+
+    // --- Desglose de contexto (ver `provider::ContextBreakdown` y
+    //     `telemetry::logger::RequestMetric`) ---
+    /// Bytes del prompt de sistema. BYTES, nunca tokens (re-serialización
+    /// canónica JSON). `None` si no se pudo calcular el desglose.
+    pub context_system_bytes: Option<usize>,
+    /// Bytes de los esquemas de herramientas.
+    pub context_tools_bytes: Option<usize>,
+    /// Bytes del historial (todos los mensajes menos el último).
+    pub context_history_bytes: Option<usize>,
+    /// Bytes del último mensaje (el turno nuevo).
+    pub context_last_turn_bytes: Option<usize>,
+    /// Bytes del resto de campos de control a nivel raíz.
+    pub context_other_bytes: Option<usize>,
+    /// Suma de los cinco campos de contexto anteriores. Mismo contrato de
+    /// medición que en `RequestMetric::context_measured_bytes`: es tamaño de
+    /// JSON canónico re-serializado, no tamaño de wire. Este tipo ni siquiera
+    /// expone `prompt_bytes` (ver invariante de privacidad del módulo), así
+    /// que no hay ningún otro campo con el que pueda confundirse o mezclarse.
+    pub context_measured_bytes: Option<usize>,
+    /// Número de mensajes del historial completo (incluyendo el último).
+    pub context_messages_count: Option<usize>,
+    /// `(system + tools + history) / measured`. `None` si `measured` es cero
+    /// o si no se pudo calcular el desglose (asimetría documentada en
+    /// `ContextBreakdown::context_tax_ratio`).
+    pub context_tax_ratio: Option<f64>,
+    /// Microsegundos que el proxy pasó dentro de `Provider::prepare`
+    /// (parseo, `decompose` y mutación opcional del body). No incluye la
+    /// lectura del body del socket ni el round-trip upstream.
+    pub prepare_us: u64,
 }
 
 impl From<&RequestMetric> for RecentRequest {
@@ -88,6 +118,15 @@ impl From<&RequestMetric> for RecentRequest {
             cache_control_forced: m.cache_control_forced,
             ttft_ms: m.ttft_ms,
             total_ms: m.total_ms,
+            context_system_bytes: m.context_system_bytes,
+            context_tools_bytes: m.context_tools_bytes,
+            context_history_bytes: m.context_history_bytes,
+            context_last_turn_bytes: m.context_last_turn_bytes,
+            context_other_bytes: m.context_other_bytes,
+            context_measured_bytes: m.context_measured_bytes,
+            context_messages_count: m.context_messages_count,
+            context_tax_ratio: m.context_tax_ratio,
+            prepare_us: m.prepare_us,
         }
     }
 }
@@ -151,6 +190,15 @@ mod tests {
             ttft_ms: Some(50.0),
             total_ms: 100.0,
             tokens_per_sec: Some(20.0),
+            context_system_bytes: Some(10),
+            context_tools_bytes: Some(5),
+            context_history_bytes: Some(15),
+            context_last_turn_bytes: Some(20),
+            context_other_bytes: Some(2),
+            context_measured_bytes: Some(52),
+            context_messages_count: Some(3),
+            context_tax_ratio: Some(30.0 / 52.0),
+            prepare_us: 42,
         }
     }
 
@@ -207,6 +255,14 @@ mod tests {
         m.ttft_ms = None;
         m.cache_control_forced = true;
         m.status = 500;
+        m.context_system_bytes = None;
+        m.context_tools_bytes = None;
+        m.context_history_bytes = None;
+        m.context_last_turn_bytes = None;
+        m.context_other_bytes = None;
+        m.context_measured_bytes = None;
+        m.context_messages_count = None;
+        m.context_tax_ratio = None;
 
         let mut recent = RecentRequests::default();
         recent.ingest(&m);
@@ -227,5 +283,34 @@ mod tests {
         assert!(row.cache_control_forced);
         assert_eq!(row.ttft_ms, None);
         assert_eq!(row.total_ms, 100.0);
+        assert_eq!(row.context_system_bytes, None);
+        assert_eq!(row.context_tools_bytes, None);
+        assert_eq!(row.context_history_bytes, None);
+        assert_eq!(row.context_last_turn_bytes, None);
+        assert_eq!(row.context_other_bytes, None);
+        assert_eq!(row.context_measured_bytes, None);
+        assert_eq!(row.context_messages_count, None);
+        assert_eq!(row.context_tax_ratio, None);
+        assert_eq!(row.prepare_us, 42);
+    }
+
+    /// Cuando SÍ hay desglose calculado, la proyección debe copiarlo fiel
+    /// campo a campo (no solo el caso `None`).
+    #[test]
+    fn proyeccion_copia_campos_de_contexto_cuando_hay_desglose() {
+        let m = base_metric("t1");
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+
+        let row = &recent.snapshot()[0];
+        assert_eq!(row.context_system_bytes, Some(10));
+        assert_eq!(row.context_tools_bytes, Some(5));
+        assert_eq!(row.context_history_bytes, Some(15));
+        assert_eq!(row.context_last_turn_bytes, Some(20));
+        assert_eq!(row.context_other_bytes, Some(2));
+        assert_eq!(row.context_measured_bytes, Some(52));
+        assert_eq!(row.context_messages_count, Some(3));
+        assert_eq!(row.context_tax_ratio, Some(30.0 / 52.0));
+        assert_eq!(row.prepare_us, 42);
     }
 }
