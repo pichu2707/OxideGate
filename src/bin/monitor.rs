@@ -38,6 +38,9 @@
 //!   p         mostrar/ocultar el panel de requests recientes (outliers)
 //!   c         ciclar la vista de columnas del panel de requests
 //!             (Latency ⇄ Context); no-op si el panel está oculto (`p`)
+//!   s         mostrar/ocultar el panel de "tools por servidor" (desglose
+//!             de bytes de herramientas MCP, con delta contra el baseline
+//!             marcado con `b`); INDEPENDIENTE de `p`/`c`
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -48,7 +51,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
 use ratatui::{Frame, Terminal};
 use serde::Deserialize;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Stdout};
 use std::time::{Duration, Instant};
 
@@ -204,6 +207,8 @@ fn run_once(url: &str, requests_url: &str) {
             println!();
             println!("--- vista: context ---");
             print_context_table(&rows);
+            println!();
+            print_tools_table(&rows);
         }
         Err(e) => {
             println!("/requests no disponible en {requests_url} ({e}) — puede ser una build del proxy anterior a este endpoint");
@@ -344,6 +349,50 @@ struct RequestRow {
     /// medición que nadie hizo: este proyecto prefiere un hueco honesto a un
     /// cero falso.
     prepare_us: Option<u64>,
+
+    /// Desglose de `context_tools_bytes` por servidor MCP declarante (ver
+    /// [`ToolServerRow`] y `provider::ToolServerBytes` del lado del proxy).
+    /// Mismo contrato `None`/`Some` que el resto de los campos opcionales de
+    /// este struct, con una distinción CRÍTICA entre sus dos estados no-`None`:
+    ///
+    /// - `None`: el body no parseó como objeto JSON (no se pudo ni intentar
+    ///   calcular el desglose), o el proxy es de una build anterior a este
+    ///   campo y ni siquiera manda la clave.
+    /// - `Some(vec![])`: el body SÍ parseó, pero no declaraba `tools`
+    ///   (ausente, no-array, o array vacío) — es un dato real de "cero
+    ///   servidores", no un hueco.
+    ///
+    /// Confundir ambos estados llevaría a elegir la fila equivocada como
+    /// fuente del panel de tools por servidor (ver [`find_tools_source_row`]),
+    /// por eso NUNCA se colapsan entre sí.
+    tools_by_server: Option<Vec<ToolServerRow>>,
+    /// Bytes de `tools` no atribuidos a ningún servidor (ver
+    /// `provider::tools_overhead_bytes` del lado del proxy: brackets/comas
+    /// del array, wrapper de Gemini, herramientas huérfanas sin `name`
+    /// válido). Mismo contrato `None`/`Some` que `tools_by_server`.
+    tools_overhead_bytes: Option<usize>,
+}
+
+/// Fila del desglose de `tools` por servidor: espejo local y liviano de
+/// `provider::ToolServerBytes` (ver ese tipo en el proxy para el contrato
+/// completo). A diferencia del original, `kind` viaja como `String` plana en
+/// vez de espejar el enum `provider::ToolServerKind`: el monitor solo
+/// MUESTRA este valor (llega ya serializado en minúsculas —
+/// `"native"`/`"mcp"`/`"others"` — vía `#[serde(rename_all = "lowercase")]`
+/// del lado del proxy), nunca decide nada en base a qué variante es.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct ToolServerRow {
+    /// Etiqueta de display del servidor (`(native)`, `claude_ai_Gmail`, …).
+    /// Ver la nota de `provider::ToolServerBytes::server` sobre por qué este
+    /// nombre por sí solo no alcanza para distinguir cubos (para eso está
+    /// `kind`).
+    server: String,
+    /// `"native"` / `"mcp"` / `"others"`, tal cual lo serializa el proxy.
+    kind: String,
+    /// Cantidad de herramientas atribuidas a este servidor.
+    tools: usize,
+    /// Suma de bytes de las herramientas de este servidor.
+    bytes: usize,
 }
 
 /// Hace el GET a `/requests` y parsea el array de filas (orden cronológico,
@@ -712,6 +761,133 @@ fn compute_window_delta(baseline: &RawCounters, current: &RawCounters, elapsed_s
 }
 
 // ---------------------------------------------------------------------------
+// Panel "tools por servidor" (tecla `s`) — funciones puras, testeables sin
+// terminal ni HTTP de por medio
+// ---------------------------------------------------------------------------
+
+/// Encuentra la fila MÁS RECIENTE de `rows` cuyo `tools_by_server` sea
+/// `Some` y no vacío. `rows` llega en orden cronológico (más viejo primero,
+/// igual que el buffer del proxy — ver `RecentRequests::snapshot`), así que
+/// se recorre desde el final hacia el principio.
+///
+/// Una fila con `tools_by_server: Some(vec![])` NO califica: declara
+/// explícitamente que esa petición puntual no tenía herramientas, y usarla
+/// como "la fuente" del panel confundiría "sin tools en ESTA request" con
+/// "sin dato en absoluto". Se sigue buscando hacia atrás hasta encontrar una
+/// fila con datos reales, o se agota el buffer y se devuelve `None`.
+fn find_tools_source_row(rows: &[RequestRow]) -> Option<&RequestRow> {
+    rows.iter().rev().find(|r| r.tools_by_server.as_ref().is_some_and(|v| !v.is_empty()))
+}
+
+/// Fila de un servidor ya combinada con su delta contra el baseline (o sin
+/// baseline). Resultado de [`diff_against_baseline`]: lo que consumen tanto
+/// la TUI (`draw_tools_panel`) como `--once` (`print_tools_table`) para
+/// pintar la columna `Δ baseline`.
+#[derive(Debug, Clone, PartialEq)]
+struct ServerDiffRow {
+    server: String,
+    /// `"-"` para un servidor que existía en el baseline pero desapareció
+    /// ahora: no hay ninguna fila [`ToolServerRow`] viva de la que sacar su
+    /// tipo actual.
+    kind: String,
+    tools: usize,
+    bytes: usize,
+    /// `current_bytes - baseline_bytes` para este servidor. `None`
+    /// ÚNICAMENTE cuando no hay baseline marcado en absoluto (`baseline` es
+    /// `None` completo en [`diff_against_baseline`]). Si el baseline SÍ
+    /// existe pero este servidor puntual no estaba en él, el delta es el
+    /// valor POSITIVO completo de `bytes` (nunca `None`): apareció después
+    /// de marcar el baseline.
+    delta: Option<i64>,
+}
+
+/// Calcula, por servidor, el delta de bytes contra un baseline capturado con
+/// la tecla `b` (ver `App::mark_baseline`). Función PURA: no conoce
+/// ratatui, no hace I/O — acá es donde vive la lógica más propensa a bugs
+/// sutiles de todo este panel, por eso se testea aparte y en profundidad.
+///
+/// - `baseline: None` (nunca se marcó uno): TODAS las filas de `current` se
+///   devuelven con `delta: None`, EN SU MISMO ORDEN ORIGINAL — esta función
+///   nunca reordena `current` (el proxy ya lo entrega bytes DESC).
+/// - `baseline: Some(_)`: cada servidor de `current` lleva
+///   `current_bytes - baseline_bytes` (baseline implícito `0` si el servidor
+///   no estaba ahí: apareció después de marcarlo).
+/// - Un servidor presente en el BASELINE pero AUSENTE de `current` (el
+///   usuario lo desconectó) se agrega como fila SINTÉTICA con `bytes: 0`,
+///   `tools: 0`, `kind: "-"` y delta `0 - baseline_bytes` (negativo). Esta es
+///   la señal de ÉXITO del flujo `b` → desactivar servidor → reiniciar
+///   cliente: un servidor que desaparece del todo tiene que seguir siendo
+///   VISIBLE en el panel — una fila que directamente desaparece es
+///   indistinguible de "no cambió nada".
+///
+/// Orden del resultado: primero las filas de `current` en su orden ORIGINAL
+/// (nunca reordenadas); después las filas sintéticas de servidores
+/// desaparecidos, ordenadas por bytes de baseline DESCENDENTE (el que más
+/// pesaba se lista primero — es la fila que más le importa al usuario) y, en
+/// empate, por nombre de servidor (para que el orden sea determinístico
+/// entre corridas).
+fn diff_against_baseline(current: &[ToolServerRow], baseline: Option<&BTreeMap<String, usize>>) -> Vec<ServerDiffRow> {
+    let mut result: Vec<ServerDiffRow> = current
+        .iter()
+        .map(|row| {
+            let delta = baseline.map(|b| row.bytes as i64 - *b.get(&row.server).unwrap_or(&0) as i64);
+            ServerDiffRow { server: row.server.clone(), kind: row.kind.clone(), tools: row.tools, bytes: row.bytes, delta }
+        })
+        .collect();
+
+    if let Some(baseline) = baseline {
+        let mut disappeared: Vec<(&String, &usize)> =
+            baseline.iter().filter(|(name, _)| !current.iter().any(|r| &r.server == *name)).collect();
+        disappeared.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+
+        for (name, bytes) in disappeared {
+            result.push(ServerDiffRow {
+                server: name.clone(),
+                kind: "-".to_string(),
+                tools: 0,
+                bytes: 0,
+                delta: Some(-(*bytes as i64)),
+            });
+        }
+    }
+
+    result
+}
+
+/// Celda de `% de tools`: `bytes / tools_bytes * 100` con un decimal, o `-`
+/// si `tools_bytes` es `None` o `0` (denominador desconocido o indefinido —
+/// nunca se imprime `0.0` para un dato que en realidad no se pudo calcular,
+/// mismo criterio que [`opt_tax_ratio`]).
+fn tool_pct_of_total(bytes: usize, tools_bytes: Option<usize>) -> String {
+    match tools_bytes {
+        Some(total) if total > 0 => format!("{:.1}", bytes as f64 / total as f64 * 100.0),
+        _ => "-".to_string(),
+    }
+}
+
+/// Celda de `Δ baseline`: signo explícito (`+`/`-`) seguido de
+/// [`format_bytes`] del valor absoluto. `-` si no hay baseline marcado
+/// (`delta` es `None`). Un delta de exactamente `0` se muestra como `"0 B"`
+/// SIN signo: es un dato real (el servidor no cambió), no un hueco.
+fn format_delta_bytes(delta: Option<i64>) -> String {
+    match delta {
+        None => "-".to_string(),
+        Some(0) => "0 B".to_string(),
+        Some(d) if d < 0 => format!("-{}", format_bytes(d.unsigned_abs() as usize)),
+        Some(d) => format!("+{}", format_bytes(d as usize)),
+    }
+}
+
+/// Celdas de una fila del panel "tools por servidor", en el mismo orden que
+/// las columnas documentadas (`servidor`, `kind`, `tools`, `bytes`, `% de
+/// tools`, `Δ baseline`). Reusada por la TUI (`draw_tools_panel`) y por
+/// `--once` (`print_tools_table`) para que ninguna de las dos diverja en qué
+/// muestra cada columna.
+fn tools_row_cells(d: &ServerDiffRow, tools_bytes: Option<usize>) -> Vec<String> {
+    vec![d.server.clone(), d.kind.clone(), d.tools.to_string(), format_bytes(d.bytes), tool_pct_of_total(d.bytes, tools_bytes), format_delta_bytes(d.delta)]
+}
+
+// ---------------------------------------------------------------------------
 // Vista de columnas del panel de requests recientes
 // ---------------------------------------------------------------------------
 
@@ -763,6 +939,14 @@ impl RequestsView {
 struct Baseline {
     at: Instant,
     by_key: HashMap<ModelKey, RawCounters>,
+    /// Foto de `tools_by_server` (servidor → bytes) de la fila fuente del
+    /// panel de tools por servidor (ver [`find_tools_source_row`]) vigente
+    /// en el instante en que se marcó el baseline. `None` si en ese momento
+    /// no había ninguna fila fuente disponible (proxy viejo, o ninguna
+    /// petición reciente declaraba tools todavía) — no hay nada que
+    /// fotografiar, así que el panel de tools queda sin baseline hasta que
+    /// se vuelva a marcar con datos disponibles.
+    tools_by_server: Option<BTreeMap<String, usize>>,
 }
 
 /// Historial acotado de un modelo para los sparklines.
@@ -809,6 +993,10 @@ struct App {
     /// Ver [`RequestsView`] y [`App::cycle_requests_view`] para el
     /// contrato de qué pasa cuando el panel está oculto.
     requests_view: RequestsView,
+    /// Visibilidad del panel de "tools por servidor", toggleable con `s`.
+    /// INDEPENDIENTE de `show_requests_panel` y de `requests_view`: las tres
+    /// teclas (`p`, `c`, `s`) controlan estados ortogonales entre sí.
+    show_tools_panel: bool,
 }
 
 impl App {
@@ -825,6 +1013,7 @@ impl App {
             requests_status: "esperando el primer poll...".to_string(),
             show_requests_panel: true,
             requests_view: RequestsView::Latency,
+            show_tools_panel: true,
         }
     }
 
@@ -915,14 +1104,32 @@ impl App {
         }
     }
 
+    /// Alterna la visibilidad del panel de "tools por servidor" (tecla `s`).
+    /// INDEPENDIENTE de [`Self::toggle_requests_panel`]: apagar/prender uno
+    /// no toca el estado del otro.
+    fn toggle_tools_panel(&mut self) {
+        self.show_tools_panel = !self.show_tools_panel;
+    }
+
     /// Marca el baseline en el instante actual con los contadores crudos de
-    /// cada modelo visible ahora mismo.
+    /// cada modelo visible ahora mismo, Y TAMBIÉN con una foto de
+    /// `tools_by_server` (servidor → bytes) de la fila fuente vigente del
+    /// panel de tools por servidor (ver [`find_tools_source_row`]). Esta
+    /// segunda foto es lo que permite calcular `Δ baseline` en ese panel
+    /// (ver [`diff_against_baseline`]); si no hay fila fuente disponible en
+    /// este instante, queda en `None` sin impedir que el resto del baseline
+    /// (los contadores de `/stats`) se marque igual.
     fn mark_baseline(&mut self) {
         let mut by_key = HashMap::new();
         for r in &self.latest {
             by_key.insert(key_of(r), RawCounters::from_row(r));
         }
-        self.baseline = Some(Baseline { at: Instant::now(), by_key });
+
+        let tools_by_server = find_tools_source_row(&self.recent_requests).and_then(|r| r.tools_by_server.as_ref()).map(
+            |servers| servers.iter().map(|s| (s.server.clone(), s.bytes)).collect::<BTreeMap<_, _>>(),
+        );
+
+        self.baseline = Some(Baseline { at: Instant::now(), by_key, tools_by_server });
     }
 
     fn reset_baseline(&mut self) {
@@ -997,6 +1204,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, url: &str, request
                     KeyCode::Down => app.select_next(),
                     KeyCode::Char('p') => app.toggle_requests_panel(),
                     KeyCode::Char('c') => app.cycle_requests_view(),
+                    KeyCode::Char('s') => app.toggle_tools_panel(),
                     _ => {}
                 }
             }
@@ -1015,11 +1223,26 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, url: &str, request
 // UI
 // ---------------------------------------------------------------------------
 
+/// Arma el layout vertical y despacha cada panel a su `chunk`.
+///
+/// Dos paneles son toggleables de forma INDEPENDIENTE (`p` para requests
+/// recientes, `s` para tools por servidor): cuando uno está oculto, no se
+/// reserva su espacio, para que los paneles fijos no se vean apretados sin
+/// necesidad. Eso da CUATRO combinaciones de visibilidad posibles (ninguno,
+/// solo uno, solo el otro, ambos).
+///
+/// Para que las cuatro queden cubiertas sin lógica especial por caso (y sin
+/// el riesgo de indexar un `chunks[i]` que no exista si algún día se agrega
+/// un tercer panel toggleable), el índice de cada chunk se calcula avanzando
+/// un contador (`idx`) a medida que cada panel opcional se agrega a
+/// `constraints` y se dibuja — nunca se hardcodea una posición fija. La
+/// longitud de `chunks` es SIEMPRE igual a la de `constraints`
+/// (`Layout::split` lo garantiza), así que `idx` nunca puede quedar fuera de
+/// rango mientras el código que empuja a `constraints` y el que incrementa
+/// `idx` avancen en el mismo orden — que es exactamente lo que hace esta
+/// función.
 fn ui(f: &mut Frame, app: &App) {
     let area = f.area();
-    // El panel de requests recientes es toggleable (tecla `p`): cuando está
-    // oculto, no reservamos su espacio para que los paneles fijos (header,
-    // antes/después, sparklines) no se vean apretados sin necesidad.
     let mut constraints = vec![
         Constraint::Length(3), // header
         Constraint::Min(5),    // tabla principal
@@ -1028,6 +1251,9 @@ fn ui(f: &mut Frame, app: &App) {
     ];
     if app.show_requests_panel {
         constraints.push(Constraint::Length(12)); // requests recientes + leyenda
+    }
+    if app.show_tools_panel {
+        constraints.push(Constraint::Length(10)); // tools por servidor
     }
     constraints.push(Constraint::Length(1)); // footer
 
@@ -1038,19 +1264,22 @@ fn ui(f: &mut Frame, app: &App) {
     draw_before_after(f, chunks[2], app);
     draw_sparklines(f, chunks[3], app);
 
-    let footer_idx = if app.show_requests_panel {
-        draw_requests_panel(f, chunks[4], app);
-        5
-    } else {
-        4
-    };
-    draw_footer(f, chunks[footer_idx]);
+    let mut idx = 4;
+    if app.show_requests_panel {
+        draw_requests_panel(f, chunks[idx], app);
+        idx += 1;
+    }
+    if app.show_tools_panel {
+        draw_tools_panel(f, chunks[idx], app);
+        idx += 1;
+    }
+    draw_footer(f, chunks[idx]);
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let baseline_age = match &app.baseline {
         Some(b) => format!("baseline hace {}s", b.at.elapsed().as_secs()),
-        None => "sin baseline — apretá 'b'".to_string(),
+        None => "sin baseline — pulse 'b'".to_string(),
     };
 
     let text = vec![
@@ -1131,7 +1360,7 @@ fn draw_before_after(f: &mut Frame, area: Rect, app: &App) {
                 d.error_rate * 100.0
             )),
         ],
-        (Some(_), None) => vec![Line::from("sin baseline (o el modelo no existía al marcarlo) — apretá 'b'")],
+        (Some(_), None) => vec![Line::from("sin baseline (o el modelo no existía al marcarlo) — pulse 'b'")],
         (None, _) => vec![Line::from("sin modelo seleccionado todavía")],
     };
 
@@ -1247,6 +1476,106 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
         ));
         f.render_widget(legend, legend_area);
     }
+}
+
+/// Panel de "tools por servidor" (tecla `s`), INDEPENDIENTE del panel de
+/// requests recientes (`p`/`c`): ambos se muestran u ocultan por separado y
+/// ninguno de los dos afecta el estado del otro.
+///
+/// Fuente de datos: la fila MÁS RECIENTE de `app.recent_requests` cuyo
+/// `tools_by_server` sea `Some` y no vacío — ver [`find_tools_source_row`].
+/// Si ninguna fila califica (proxy anterior a este campo, o ninguna
+/// petición reciente declaró tools todavía), se muestra una única línea
+/// explicativa; nunca una caja vacía ni un panic.
+///
+/// El delta contra el baseline (columna `Δ baseline`) sale de
+/// [`diff_against_baseline`], función PURA testeada aparte: acá solo se
+/// formatea su resultado vía [`tools_row_cells`].
+fn draw_tools_panel(f: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let Some(source) = find_tools_source_row(&app.recent_requests) else {
+        let block = Block::default().borders(Borders::ALL).title(" tools por servidor ");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.height > 0 && inner.width > 0 {
+            let text = Line::from(
+                "sin desglose de tools todavía (proxy anterior a este slice, o ninguna petición reciente declara tools)",
+            );
+            f.render_widget(Paragraph::new(text), inner);
+        }
+        return;
+    };
+
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " tools por servidor · fuente {} {} ",
+        format_time(&source.timestamp),
+        source.model.as_deref().unwrap_or("-"),
+    ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // `find_tools_source_row` garantiza `Some` no vacío: este `expect` nunca
+    // debería fallar, pero preferimos documentarlo explícitamente en vez de
+    // un `unwrap()` mudo.
+    let servers = source.tools_by_server.as_ref().expect("find_tools_source_row garantiza tools_by_server Some no vacío");
+    let baseline_map = app.baseline.as_ref().and_then(|b| b.tools_by_server.as_ref());
+    let diffs = diff_against_baseline(servers, baseline_map);
+
+    let header = Row::new(vec!["servidor", "kind", "tools", "bytes", "% tools", "Δ baseline"])
+        .style(Style::default().add_modifier(Modifier::BOLD));
+
+    let mut rows: Vec<Row> = diffs.iter().map(|d| Row::new(tools_row_cells(d, source.context_tools_bytes))).collect();
+
+    // Separador visual antes de las filas de resumen: distingue "detalle por
+    // servidor" de "totales de la petición completa".
+    rows.push(Row::new(vec!["·".repeat(8); 6]));
+
+    rows.push(Row::new(vec![
+        "overhead".to_string(),
+        "-".to_string(),
+        "-".to_string(),
+        opt_bytes(source.tools_overhead_bytes),
+        "-".to_string(),
+        "-".to_string(),
+    ]));
+
+    // El delta TOTAL es la cifra que responde "¿cuánto bajé en total?": solo
+    // tiene sentido si HAY baseline marcado, y se calcula sumando los deltas
+    // ya resueltos por servidor (que a su vez ya incluyen a los
+    // desaparecidos con su delta negativo completo).
+    let total_delta = baseline_map.map(|_| diffs.iter().map(|d| d.delta.unwrap_or(0)).sum::<i64>());
+    rows.push(
+        Row::new(vec![
+            "TOTAL".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            opt_bytes(source.context_tools_bytes),
+            "-".to_string(),
+            format_delta_bytes(total_delta),
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD)),
+    );
+
+    let widths = [
+        Constraint::Length(26),
+        Constraint::Length(7),
+        Constraint::Length(6),
+        Constraint::Length(10),
+        Constraint::Length(9),
+        Constraint::Length(12),
+    ];
+
+    // Si hay más filas (servidores + separador + overhead + TOTAL) que
+    // espacio vertical disponible, `ratatui::Table` recorta las que no
+    // entran sin panickear — mismo comportamiento (documentado) que ya usa
+    // `draw_requests_panel` para columnas angostas.
+    f.render_widget(Table::new(rows, widths).header(header), inner);
 }
 
 /// Header de columnas del panel/tabla de requests, según la vista activa.
@@ -1536,9 +1865,51 @@ fn print_context_table(rows: &[RequestRow]) {
     );
 }
 
+/// Imprime la tabla de "tools por servidor" en texto plano (modo `--once`).
+/// Mismo pipeline que la TUI (`find_tools_source_row` +
+/// `diff_against_baseline` + `tools_row_cells`), para que ninguna de las dos
+/// vistas diverja en qué calcula o muestra. En `--once` NUNCA hay baseline
+/// marcado (no hay sesión interactiva en la que apretar `b`), así que la
+/// columna `Δ baseline` sale siempre `-` — se documenta explícitamente en la
+/// salida para que no se lea como un bug.
+fn print_tools_table(rows: &[RequestRow]) {
+    println!("--- vista: tools por servidor ---");
+
+    let Some(source) = find_tools_source_row(rows) else {
+        println!("(sin desglose de tools disponible: proxy anterior a este slice, o ninguna fila declara tools)");
+        return;
+    };
+
+    println!("fuente: {} · modelo {}", format_time(&source.timestamp), source.model.as_deref().unwrap_or("-"));
+
+    // `find_tools_source_row` garantiza `Some` no vacío.
+    let servers = source.tools_by_server.as_ref().expect("find_tools_source_row garantiza tools_by_server Some no vacío");
+    let diffs = diff_against_baseline(servers, None);
+
+    println!("{:<26} {:<7} {:>6} {:>10} {:>9} {:>12}", "SERVIDOR", "KIND", "TOOLS", "BYTES", "% tools", "Δ baseline");
+    for d in &diffs {
+        let cells = tools_row_cells(d, source.context_tools_bytes);
+        println!("{:<26} {:<7} {:>6} {:>10} {:>9} {:>12}", cells[0], cells[1], cells[2], cells[3], cells[4], cells[5]);
+    }
+    println!("{:-<26} {:-<7} {:-<6} {:-<10} {:-<9} {:-<12}", "", "", "", "", "", "");
+    println!(
+        "{:<26} {:<7} {:>6} {:>10} {:>9} {:>12}",
+        "overhead",
+        "-",
+        "-",
+        opt_bytes(source.tools_overhead_bytes),
+        "-",
+        "-"
+    );
+    println!("{:<26} {:<7} {:>6} {:>10} {:>9} {:>12}", "TOTAL", "-", "-", opt_bytes(source.context_tools_bytes), "-", "-");
+    println!(
+        "nota: sum(servidores) + overhead == bytes (array `tools`: brackets/comas, wrapper de Gemini, herramientas huérfanas)"
+    );
+}
+
 fn draw_footer(f: &mut Frame, area: Rect) {
     let text = Line::from(
-        "q salir · b marcar baseline · r reset · ↑/↓ elegir modelo · p mostrar/ocultar requests · c vista latency/context",
+        "q salir · b marcar baseline · r reset · ↑/↓ elegir modelo · p requests · c vista latency/context · s tools por servidor",
     );
     f.render_widget(Paragraph::new(text), area);
 }
@@ -1734,6 +2105,8 @@ mod tests {
             context_messages_count: Some(12),
             context_tax_ratio: Some(0.9994),
             prepare_us: Some(850),
+            tools_by_server: None,
+            tools_overhead_bytes: None,
         }
     }
 
@@ -2076,5 +2449,248 @@ mod tests {
         assert_eq!(row.context_system_bytes, None);
         assert_eq!(row.context_tax_ratio, None);
         assert_eq!(row.prepare_us, Some(12));
+    }
+
+    // -----------------------------------------------------------------
+    // RequestRow — nuevos campos tools_by_server / tools_overhead_bytes
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn request_row_deserializa_tools_by_server_presente() {
+        let json = r#"{
+            "timestamp": "2026-07-09T14:02:11.483Z",
+            "route": "/v1/messages",
+            "upstream": "anthropic",
+            "model": "claude-opus-4-1",
+            "stream": true,
+            "status": 200,
+            "input_tokens": 5000,
+            "output_tokens": 412,
+            "cache_read_tokens": 4200,
+            "cache_write_tokens": 0,
+            "cost_estimate_usd": 0.0891,
+            "cache_control_forced": false,
+            "ttft_ms": 780.4,
+            "total_ms": 3210.9,
+            "context_tools_bytes": 159080,
+            "tools_by_server": [
+                {"server": "(native)", "kind": "native", "tools": 29, "bytes": 86168},
+                {"server": "claude_ai_Gmail", "kind": "mcp", "tools": 13, "bytes": 24321}
+            ],
+            "tools_overhead_bytes": 77
+        }"#;
+
+        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar con tools_by_server presente");
+
+        let servers = row.tools_by_server.expect("debe traer el desglose");
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].server, "(native)");
+        assert_eq!(servers[0].kind, "native");
+        assert_eq!(servers[0].tools, 29);
+        assert_eq!(servers[0].bytes, 86_168);
+        assert_eq!(row.tools_overhead_bytes, Some(77));
+    }
+
+    #[test]
+    fn request_row_deserializa_sin_tools_by_server_build_vieja() {
+        // Proxy anterior a este slice: ni `tools_by_server` ni
+        // `tools_overhead_bytes` viajan en el JSON. Deben caer en `None`,
+        // igual que el resto de los campos `Option` de este struct, sin
+        // panickear ni fallar la deserialización de la fila entera.
+        let json = r#"{
+            "timestamp": "2024-01-01T00:00:00Z",
+            "route": "/v1/messages",
+            "upstream": "anthropic",
+            "model": "claude-opus-4",
+            "stream": true,
+            "status": 200,
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_tokens": null,
+            "cache_write_tokens": null,
+            "cost_estimate_usd": null,
+            "cache_control_forced": false,
+            "ttft_ms": null,
+            "total_ms": 100.0
+        }"#;
+
+        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar sin los campos de tools");
+
+        assert_eq!(row.tools_by_server, None);
+        assert_eq!(row.tools_overhead_bytes, None);
+    }
+
+    // -----------------------------------------------------------------
+    // find_tools_source_row / diff_against_baseline — panel "tools por
+    // servidor" (tecla `s`)
+    // -----------------------------------------------------------------
+
+    fn tool_row(server: &str, kind: &str, tools: usize, bytes: usize) -> ToolServerRow {
+        ToolServerRow { server: server.to_string(), kind: kind.to_string(), tools, bytes }
+    }
+
+    /// Variante de `req` (arriba) que además permite fijar `tools_by_server`,
+    /// para los tests de [`find_tools_source_row`].
+    fn req_with_tools(timestamp: &str, tools_by_server: Option<Vec<ToolServerRow>>) -> RequestRow {
+        let mut r = req("anthropic", "claude-opus-4", 200, Some(10.0), 100.0, Some(50), Some(10));
+        r.timestamp = timestamp.to_string();
+        r.tools_by_server = tools_by_server;
+        r
+    }
+
+    #[test]
+    fn find_tools_source_row_ninguna_fila_califica_devuelve_none() {
+        let rows = vec![req_with_tools("t1", None), req_with_tools("t2", Some(vec![]))];
+        assert!(find_tools_source_row(&rows).is_none());
+    }
+
+    #[test]
+    fn find_tools_source_row_salta_some_vacio_y_elige_la_fila_mas_vieja_con_datos() {
+        // t1 tiene datos reales; t2 es la fila MÁS RECIENTE pero declara
+        // Some(vec![]) — no califica porque "declara sin tools" no es lo
+        // mismo que "sin dato". Debe elegirse t1, no t2.
+        let rows = vec![
+            req_with_tools("t1", Some(vec![tool_row("(native)", "native", 29, 86_168)])),
+            req_with_tools("t2", Some(vec![])),
+        ];
+
+        let source = find_tools_source_row(&rows).expect("t1 califica como fuente");
+        assert_eq!(source.timestamp, "t1");
+    }
+
+    #[test]
+    fn find_tools_source_row_elige_la_mas_nueva_entre_varias_con_datos() {
+        let rows = vec![
+            req_with_tools("t1", Some(vec![tool_row("(native)", "native", 29, 86_168)])),
+            req_with_tools("t2", Some(vec![tool_row("(native)", "native", 30, 90_000)])),
+        ];
+
+        let source = find_tools_source_row(&rows).expect("hay filas con datos");
+        assert_eq!(source.timestamp, "t2");
+    }
+
+    #[test]
+    fn diff_against_baseline_sin_baseline_todos_los_deltas_son_none() {
+        let current = vec![tool_row("(native)", "native", 29, 86_168), tool_row("claude_ai_Gmail", "mcp", 13, 24_321)];
+
+        let diffs = diff_against_baseline(&current, None);
+
+        assert_eq!(diffs.len(), 2);
+        assert!(diffs.iter().all(|d| d.delta.is_none()));
+    }
+
+    #[test]
+    fn diff_against_baseline_servidor_desaparecido_aparece_con_bytes_cero_y_delta_negativo() {
+        let current = vec![tool_row("(native)", "native", 29, 86_168)];
+        let mut baseline = BTreeMap::new();
+        baseline.insert("(native)".to_string(), 86_168usize);
+        baseline.insert("claude_ai_Google_Calendar".to_string(), 21_034usize);
+
+        let diffs = diff_against_baseline(&current, Some(&baseline));
+
+        let disappeared =
+            diffs.iter().find(|d| d.server == "claude_ai_Google_Calendar").expect("debe seguir apareciendo como fila");
+        assert_eq!(disappeared.bytes, 0);
+        assert_eq!(disappeared.tools, 0);
+        assert_eq!(disappeared.kind, "-");
+        assert_eq!(disappeared.delta, Some(-21_034));
+    }
+
+    #[test]
+    fn diff_against_baseline_servidor_nuevo_tiene_delta_positivo_completo() {
+        let current = vec![tool_row("(native)", "native", 29, 86_168), tool_row("plugin_engram_engram", "mcp", 18, 17_737)];
+        let mut baseline = BTreeMap::new();
+        baseline.insert("(native)".to_string(), 86_168usize);
+
+        let diffs = diff_against_baseline(&current, Some(&baseline));
+
+        let new_server = diffs.iter().find(|d| d.server == "plugin_engram_engram").expect("debe estar presente");
+        assert_eq!(new_server.delta, Some(17_737));
+    }
+
+    #[test]
+    fn diff_against_baseline_servidor_sin_cambios_tiene_delta_cero() {
+        let current = vec![tool_row("(native)", "native", 29, 86_168)];
+        let mut baseline = BTreeMap::new();
+        baseline.insert("(native)".to_string(), 86_168usize);
+
+        let diffs = diff_against_baseline(&current, Some(&baseline));
+
+        assert_eq!(diffs[0].delta, Some(0));
+    }
+
+    #[test]
+    fn diff_against_baseline_orden_presentes_primero_en_orden_original_luego_desaparecidos() {
+        // `current` llega bytes DESC (orden real del proxy): la función NO
+        // debe reordenarlo. Los servidores desaparecidos van DESPUÉS, y entre
+        // ELLOS se ordenan por bytes de baseline DESCENDENTE.
+        let current = vec![tool_row("(native)", "native", 29, 86_168), tool_row("claude_ai_Gmail", "mcp", 13, 24_321)];
+        let mut baseline = BTreeMap::new();
+        baseline.insert("(native)".to_string(), 86_168usize);
+        baseline.insert("claude_ai_Gmail".to_string(), 24_321usize);
+        baseline.insert("claude_ai_Google_Calendar".to_string(), 21_034usize);
+        baseline.insert("claude_ai_Google_Drive".to_string(), 9_743usize);
+
+        let diffs = diff_against_baseline(&current, Some(&baseline));
+
+        let names: Vec<&str> = diffs.iter().map(|d| d.server.as_str()).collect();
+        assert_eq!(names, vec!["(native)", "claude_ai_Gmail", "claude_ai_Google_Calendar", "claude_ai_Google_Drive"]);
+    }
+
+    #[test]
+    fn tool_pct_of_total_none_o_cero_da_guion_nunca_cero_coma_cero() {
+        assert_eq!(tool_pct_of_total(1000, None), "-");
+        assert_eq!(tool_pct_of_total(0, Some(0)), "-");
+    }
+
+    #[test]
+    fn tool_pct_of_total_calcula_porcentaje() {
+        assert_eq!(tool_pct_of_total(24_321, Some(159_080)), "15.3");
+    }
+
+    #[test]
+    fn format_delta_bytes_casos() {
+        assert_eq!(format_delta_bytes(None), "-");
+        assert_eq!(format_delta_bytes(Some(0)), "0 B");
+        assert_eq!(format_delta_bytes(Some(-55_098)), "-55.1 kB");
+        assert_eq!(format_delta_bytes(Some(1_200)), "+1.2 kB");
+    }
+
+    // -----------------------------------------------------------------
+    // App — panel de tools por servidor: toggle independiente y baseline
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn show_tools_panel_arranca_visible_y_es_independiente_del_panel_de_requests() {
+        let mut app = App::new("http://x".to_string());
+        assert!(app.show_tools_panel);
+        assert!(app.show_requests_panel);
+
+        app.toggle_tools_panel();
+        assert!(!app.show_tools_panel);
+        // Apagar `s` no debe afectar `p`.
+        assert!(app.show_requests_panel);
+    }
+
+    #[test]
+    fn mark_baseline_toma_foto_de_tools_by_server_de_la_fila_fuente() {
+        let mut app = App::new("http://x".to_string());
+        app.recent_requests = vec![req_with_tools("t1", Some(vec![tool_row("(native)", "native", 29, 86_168)]))];
+
+        app.mark_baseline();
+
+        let baseline = app.baseline.as_ref().expect("mark_baseline debe crear un baseline");
+        let tools_baseline = baseline.tools_by_server.as_ref().expect("debe tomar la foto de tools_by_server");
+        assert_eq!(tools_baseline.get("(native)"), Some(&86_168));
+    }
+
+    #[test]
+    fn mark_baseline_sin_fila_fuente_deja_tools_by_server_en_none() {
+        let mut app = App::new("http://x".to_string());
+        // recent_requests vacío: no hay fila fuente que fotografiar.
+        app.mark_baseline();
+
+        let baseline = app.baseline.as_ref().expect("mark_baseline debe crear un baseline igual");
+        assert!(baseline.tools_by_server.is_none());
     }
 }

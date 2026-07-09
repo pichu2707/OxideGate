@@ -131,12 +131,16 @@ haya o no autenticación de por medio.
 | `context_messages_count` | Cantidad de mensajes del historial completo (incluyendo el último) | Sube con la conversación; útil para correlacionar contra `context_history_bytes` |
 | `context_tax_ratio` | `(context_system_bytes + context_tools_bytes + context_history_bytes) / context_measured_bytes` | Cercano a `1.0` (100%) ⇒ casi todo el body de esta petición es contexto YA enviado antes, no turno nuevo — la "tasa" que se paga por repetir contexto en cada request |
 | `prepare_us` | Microsegundos que el proxy pasó dentro de `Provider::prepare` (parseo del body + `decompose` + mutación opcional, p. ej. inyectar `cache_control`) | Ver la nota sobre qué NO incluye, más abajo |
+| `tools_by_server` | Desglose de `context_tools_bytes` por servidor MCP declarante: `[{server, kind, tools, bytes}, …]`, ordenado por `bytes` descendente | `null` si el body no parseó como objeto (o build anterior a este campo); `[]` si SÍ parseó pero no declaraba `tools` — son estados DISTINTOS, ver §4.2 |
+| `tools_overhead_bytes` | Bytes de `tools` no atribuidos a ningún servidor (brackets/comas del array, wrapper de Gemini, herramientas huérfanas) | `null` en los mismos casos que `tools_by_server` es `null`; `sum(tools_by_server[].bytes) + tools_overhead_bytes == context_tools_bytes` siempre que ambos sean no-nulos |
 
 Ninguno de los campos de latencia/coste/identidad es nuevo: todos ya existían
-en `RequestMetric` (Nivel 1). Los campos `context_*` y `prepare_us` sí son
-nuevos — provienen del desglose de contexto (`provider::ContextBreakdown`) y
-de instrumentar `Provider::prepare`. Este endpoint sigue sin medir nada por
-su cuenta: solo expone en vivo lo que `RequestMetric` ya mide.
+en `RequestMetric` (Nivel 1). Los campos `context_*`, `prepare_us`,
+`tools_by_server` y `tools_overhead_bytes` sí son nuevos — provienen del
+desglose de contexto (`provider::ContextBreakdown`), de instrumentar
+`Provider::prepare`, y del desglose de herramientas por servidor
+(`provider::ToolServerBytes`) respectivamente. Este endpoint sigue sin medir
+nada por su cuenta: solo expone en vivo lo que `RequestMetric` ya mide.
 
 ### 4.1. Tres precisiones que hay que leer antes de usar estos campos
 
@@ -161,6 +165,60 @@ su cuenta: solo expone en vivo lo que `RequestMetric` ya mide.
 
 Ver `docs/monitor-tui.md` §7.3 para cómo el monitor presenta estos campos en
 la vista `Context` del panel de requests recientes.
+
+### 4.2. `tools_by_server`: el único campo no-plano de esta fila, y por qué
+
+Todos los demás campos de `/requests` son escalares (`number`, `string`,
+`boolean`, o `null`). `tools_by_server` es la excepción: un array de objetos,
+uno por servidor MCP que declaró herramientas en el body. La razón es que su
+cardinalidad depende enteramente del cliente que hizo el request — uno sin
+ningún MCP conectado declara cero servidores; uno con cuatro conectados (como
+en el tráfico real medido en `docs/monitor-tui.md` §8) declara cuatro filas.
+Aplanar esto a columnas fijas (`server_1`, `server_2`, …) no es viable
+porque no hay un tope fijo de servidores por request — `provider::MAX_TOOL_SERVERS`
+(32) es un límite de trackeo interno, no un contrato de forma para este
+endpoint.
+
+Cada elemento trae:
+
+| Campo | Qué es |
+|---|---|
+| `server` | Etiqueta de display del servidor (`(native)` para herramientas nativas, `claude_ai_Gmail`, `plugin_engram_engram`, …) |
+| `kind` | `"native"` / `"mcp"` / `"others"` — el tipo de cubo, en minúsculas |
+| `tools` | Cantidad de herramientas atribuidas a este servidor |
+| `bytes` | Suma de bytes de las herramientas de este servidor |
+
+**`tools` y `bytes` son conteos y BYTES, nunca tokens** — mismo contrato de
+medición que `context_tools_bytes` (§4.1): se miden re-serializando el
+fragmento JSON de cada herramienta, sin tokenización de por medio.
+
+**Nunca se exponen nombres de herramienta individuales.** Solo la etiqueta
+del servidor y conteos agregados viajan por este endpoint — la misma
+invariante de privacidad del §3 (`prompt_hash`/`prompt_bytes` nunca se
+exponen) se extiende acá: el nombre de una herramienta puntual, o un
+fragmento de su `input_schema`/`description`, tampoco sale por HTTP.
+
+**`null` vs. `[]` son estados DISTINTOS, no intercambiables:**
+
+| Valor | Qué significa |
+|---|---|
+| `null` | El body de esta petición no parseó como objeto JSON — no se pudo ni intentar calcular el desglose. Mismo caso que `context_tools_bytes: null` |
+| `[]` | El body SÍ parseó como objeto, pero no declaraba ningún `tools` (ausente, no-array, o array vacío) — se pudo calcular, y el resultado es "cero servidores" |
+
+Confundir ambos llevaría a leer "sin dato" donde en realidad hay un dato real
+de "sin herramientas". El monitor (`docs/monitor-tui.md` §8.1) respeta esta
+distinción al elegir la fila fuente del panel de tools por servidor: una fila
+`[]` no califica como fuente, con el mismo criterio de "no es lo mismo que no
+tener dato".
+
+**La reconciliación siempre cierra:** `sum(tools_by_server[].bytes) +
+tools_overhead_bytes == context_tools_bytes`, cuando los tres son no-nulos.
+El overhead absorbe los brackets/comas del array `tools` en sí, el wrapper
+`{"functionDeclarations": [...]}` que usa Gemini (sin equivalente en
+Anthropic/OpenAI, donde cada herramienta ES el elemento del array, sin
+wrapper), y herramientas huérfanas sin `name` válido. Ver
+`provider::tools_overhead_bytes` en el proxy para el detalle completo de los
+tres contribuyentes.
 
 ---
 

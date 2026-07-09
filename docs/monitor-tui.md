@@ -114,6 +114,7 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
 | `↑` / `↓` | Elegir el modelo (fila resaltada, afecta el panel ANTES/DESPUÉS y los sparklines) |
 | `p` | Mostrar/ocultar el panel de requests recientes (ver §7) |
 | `c` | Ciclar la vista de columnas del panel de requests recientes — `Latency` ⇄ `Context` (ver §7.1). **No-op si el panel está oculto**: no cambia nada mientras `p` lo tenga escondido |
+| `s` | Mostrar/ocultar el panel de tools por servidor (ver §8). **INDEPENDIENTE** de `p`/`c`: ninguna de las tres teclas afecta el estado de las otras |
 
 ## 5. Layout de la pantalla
 
@@ -130,7 +131,11 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
 5. **Panel de requests recientes** (toggleable con `p`, ver §7): las últimas
    peticiones individuales, más nueva arriba, con marcadores de outlier, en
    una de dos vistas cicladas con `c` (`Latency` o `Context`, ver §7.1).
-6. **Footer**: recordatorio de teclas.
+6. **Panel de tools por servidor** (toggleable con `s`, ver §8): desglose de
+   bytes de herramientas por servidor MCP de la petición más reciente que
+   los declare, con delta contra el baseline. Independiente del panel
+   anterior — cualquier combinación de `p`/`s` visibles u ocultos es válida.
+7. **Footer**: recordatorio de teclas.
 
 ## 6. Enhance del snapshot (`ModelStatsRow`)
 
@@ -295,18 +300,135 @@ anterior puede no tenerlo todavía. Si el fetch falla, el monitor:
   sparklines) funcionando con total normalidad, porque el poll de `/stats` y
   el de `/requests` son independientes entre sí.
 
-## 8. Dónde vive cada cosa
+## 8. Panel de tools por servidor (`s`)
+
+Consume el mismo `GET /requests` que el panel de requests recientes (§7),
+pero mira un campo distinto: `tools_by_server` (desglose de
+`context_tools_bytes` por servidor MCP — ver `docs/telemetry-per-request.md`
+§4.2 para el contrato completo del campo). Responde una pregunta que el
+panel de requests no responde por sí solo: *"¿cuánto de mi contexto es un
+servidor MCP que ni uso, y cuánto bajaría si lo desconecto?"*
+
+Se alterna con la tecla `s`, **INDEPENDIENTE** de `p` (panel de requests) y
+de `c` (columnas de ese panel): las tres teclas controlan estados
+ortogonales, cualquier combinación de visibilidad es válida.
+
+### 8.1. Fuente de datos
+
+El panel no promedia ni acumula nada: toma la fila MÁS RECIENTE de
+`/requests` cuyo `tools_by_server` sea no-nulo y no vacío, y muestra
+exactamente esa fila. El título del panel indica `HH:MM:SS` y modelo de esa
+fila fuente, para que quede claro a qué petición puntual corresponde el
+desglose.
+
+Si ninguna fila califica — proxy de una build anterior a este campo, o
+ninguna petición reciente declaró herramientas — el panel muestra una única
+línea explicativa en vez de una caja vacía.
+
+Una fila con `tools_by_server: []` (declaró explícitamente cero servidores)
+NO califica como fuente: es un dato real, pero no el que este panel necesita
+mostrar (ver la distinción `null` vs. `[]` en `docs/telemetry-per-request.md`
+§4.2). El panel sigue buscando hacia atrás hasta encontrar una fila con
+desglose real.
+
+### 8.2. Columnas
+
+| Columna | Qué muestra |
+|---|---|
+| `servidor` | Etiqueta de display del servidor (`(native)`, `claude_ai_Gmail`, …) |
+| `kind` | `native` / `mcp` / `others` |
+| `tools` | Cantidad de herramientas de ese servidor |
+| `bytes` | Bytes de ese servidor, formato compacto (`format_bytes`, decimal) |
+| `% tools` | `bytes / context_tools_bytes * 100`, un decimal. `-` si `context_tools_bytes` es `null` (**nunca** `0.0`) |
+| `Δ baseline` | Ver §8.3 |
+
+Las filas llegan en el MISMO orden en que el proxy entrega `tools_by_server`
+(bytes descendente) — el panel no reordena.
+
+Dos filas de resumen cierran la tabla, separadas visualmente del detalle por
+servidor:
+
+| Fila | Qué muestra |
+|---|---|
+| `overhead` | `tools_overhead_bytes`: brackets/comas del array, wrapper de Gemini, herramientas huérfanas — ver `docs/telemetry-per-request.md` §4.2 |
+| `TOTAL` | `context_tools_bytes` — y, en la columna `Δ baseline`, el delta TOTAL agregado (la cifra que responde "¿cuánto bajé en total?") |
+
+Se cumple siempre: `sum(bytes de cada servidor) + overhead == TOTAL`.
+
+### 8.3. `Δ baseline` — el punto de este panel
+
+Extiende el baseline que ya existe (tecla `b`, §3): al marcarlo, además de
+los contadores de `/stats`, el monitor también saca una foto de
+`tools_by_server` (servidor → bytes) de la fila fuente vigente en ese
+instante (§8.1). `r` borra ambas fotos a la vez.
+
+Flujo completo:
+
+1. Con el cliente conectado a todos sus servidores MCP de siempre, apretá
+   `b`. El panel de tools por servidor congela esa foto.
+2. Reiniciá tu cliente **sin** el servidor MCP que querés dejar de pagar en
+   cada request (p. ej. sacando Google Calendar de tu config de MCP).
+3. Generá una petición nueva. El panel se actualiza con la fila fuente más
+   reciente.
+4. Mirá la columna `Δ baseline`: el servidor que sacaste aparece con
+   `bytes: 0 B`, `tools: 0` y su delta NEGATIVO completo (p. ej.
+   `-21.0 kB`) — sigue LISTADO, no desaparece de la tabla. Un servidor que
+   simplemente deja de aparecer no dice nada por sí solo; uno que aparece con
+   `0 B` y un delta negativo enorme es la confirmación visual de que la
+   palanca funcionó.
+5. La fila `TOTAL` da la cifra agregada (p. ej. `-55.1 kB`): cuánto bajó el
+   contexto total de herramientas por request, de una sola vez.
+
+Reglas de signo y de aparición/desaparición:
+
+- Servidor sin cambios ⇒ delta `0 B` (no `-`: es un dato real, no un hueco).
+- Servidor nuevo (no estaba en el baseline) ⇒ delta POSITIVO completo, igual
+  a sus bytes actuales.
+- Servidor desaparecido (estaba en el baseline, ya no está) ⇒ fila sintética
+  con `bytes: 0`, `tools: 0`, delta NEGATIVO completo — listada DESPUÉS de
+  los servidores presentes, ordenada entre sí por peso de baseline
+  descendente.
+- Sin baseline marcado ⇒ toda la columna `Δ baseline` (fila por fila y
+  `TOTAL`) se muestra `-`.
+
+La lógica de este cálculo vive en `diff_against_baseline` (`src/bin/monitor.rs`),
+función PURA sin dependencias de ratatui ni de HTTP, testeada exhaustivamente
+por separado (casos: sin baseline, servidor aparecido, desaparecido, sin
+cambios, y el orden del resultado).
+
+### 8.4. Cómo leer las señales
+
+- **`(native)` domina el total** ⇒ ese es el PISO que no baja por más
+  servidores MCP que desconectes: son las herramientas propias del cliente,
+  no de un MCP. Ninguna palanca de configuración de MCP toca este número.
+- **Un servidor `mcp` grande que nunca aparece invocado en tu tráfico real**
+  (cruzalo con el panel de requests, §7, para ver qué herramientas se llaman
+  de hecho) ⇒ candidato directo a sacar de la config de MCP del proyecto:
+  pagás sus bytes en TODAS las requests, lo uses o no.
+- **Un servidor con delta negativo grande y sostenido tras `b` + reinicio del
+  cliente** ⇒ la palanca funcionó; es la confirmación que este panel existe
+  para dar.
+
+### 8.5. Modo headless (`--once`)
+
+Igual que las vistas `Latency`/`Context` del panel de requests, `--once`
+imprime esta tabla en texto plano (misma fuente, mismas columnas). La
+columna `Δ baseline` sale siempre `-`: no hay sesión interactiva en la que
+apretar `b`.
+
+## 9. Dónde vive cada cosa
 
 | Archivo | Responsabilidad |
 |---|---|
 | `src/telemetry/stats.rs` | `ModelStatsRow` con sumas/counts crudas (además de promedios) — sin cambios de comportamiento, solo más campos expuestos |
 | `src/telemetry/recent.rs` | `RecentRequests` — buffer FIFO acotado de las últimas 200 peticiones individuales |
 | `src/middleware/requests.rs` | `handle_requests` — el handler HTTP de `GET /requests` |
-| `src/bin/monitor.rs` | Binario TUI independiente: fetch por HTTP de `/stats` y `/requests`, estado (baseline, historial, selección, buffer de requests), detección de outliers y cálculo de delta de ventana (funciones puras testeadas aparte), render con `ratatui` |
+| `src/provider/mod.rs` | `ToolServerBytes`/`ToolServerKind` — el contrato de tipos del proxy que `RequestRow`/`ToolServerRow` (en `src/bin/monitor.rs`) espejan para el desglose de `tools_by_server` |
+| `src/bin/monitor.rs` | Binario TUI independiente: fetch por HTTP de `/stats` y `/requests`, estado (baseline, historial, selección, buffer de requests), detección de outliers, cálculo de delta de ventana y de delta de tools por servidor (funciones puras testeadas aparte), render con `ratatui` |
 | `docs/telemetry-by-model.md` | Contrato del endpoint `GET /stats` que este monitor consume |
-| `docs/telemetry-per-request.md` | Contrato del endpoint `GET /requests` que alimenta el panel de detalle |
+| `docs/telemetry-per-request.md` | Contrato del endpoint `GET /requests` que alimenta el panel de detalle y el panel de tools por servidor |
 
-## 9. Límites conocidos
+## 10. Límites conocidos
 
 - **El fetch de `/requests` (y el de `/stats`) es bloqueante, en el mismo
   hilo que dibuja la TUI y lee el teclado.** Ambos usan
