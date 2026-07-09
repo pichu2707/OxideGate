@@ -2,11 +2,12 @@
 //!
 //! El handler solo hace `sink.record(...)` (un `send` a un canal, no bloquea).
 //! Una task en background serializa a JSONL y escribe a disco, y de paso
-//! alimenta el [`StatsRegistry`](crate::telemetry::stats::StatsRegistry)
-//! compartido para que `/stats` pueda leer la agregación en vivo sin tocar el
-//! JSONL. Así el I/O de log NUNCA se suma a la latencia que le devolvemos a
-//! gentle-ai.
-use crate::telemetry::StatsRegistry;
+//! alimenta el [`StatsRegistry`](crate::telemetry::stats::StatsRegistry) y el
+//! [`RecentRequests`](crate::telemetry::recent::RecentRequests) compartidos
+//! para que `/stats` y `/requests` puedan leer, respectivamente, la
+//! agregación y el detalle reciente en vivo sin tocar el JSONL. Así el I/O de
+//! log NUNCA se suma a la latencia que le devolvemos a gentle-ai.
+use crate::telemetry::{RecentRequests, StatsRegistry};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -81,6 +82,10 @@ pub struct TelemetrySink {
     /// task de drenaje que escribe el JSONL. Se comparte con el handler de
     /// `/stats` vía `stats()`.
     stats: Arc<RwLock<StatsRegistry>>,
+    /// Buffer en vivo de los últimos N requests individuales, alimentado por
+    /// la misma task de drenaje. Se comparte con el handler de `/requests`
+    /// vía `recent()`.
+    recent: Arc<RwLock<RecentRequests>>,
 }
 
 impl TelemetrySink {
@@ -89,6 +94,8 @@ impl TelemetrySink {
         let (tx, mut rx) = mpsc::unbounded_channel::<RequestMetric>();
         let stats = Arc::new(RwLock::new(StatsRegistry::default()));
         let stats_writer = Arc::clone(&stats);
+        let recent = Arc::new(RwLock::new(RecentRequests::default()));
+        let recent_writer = Arc::clone(&recent);
 
         let mut path = storage_dir;
         path.push("telemetry.jsonl");
@@ -124,6 +131,13 @@ impl TelemetrySink {
                     registry.ingest(&metric);
                 }
 
+                {
+                    let mut recent = recent_writer
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    recent.ingest(&metric);
+                }
+
                 if let Ok(mut line) = serde_json::to_string(&metric) {
                     line.push('\n');
                     if let Err(e) = file.write_all(line.as_bytes()).await {
@@ -133,7 +147,7 @@ impl TelemetrySink {
             }
         });
 
-        Self { tx, stats }
+        Self { tx, stats, recent }
     }
 
     /// No bloquea: si el canal se cerró, descartamos la métrica en silencio.
@@ -145,5 +159,12 @@ impl TelemetrySink {
     /// `/stats` lea un snapshot sin pasar por el canal ni por disco.
     pub fn stats(&self) -> Arc<RwLock<StatsRegistry>> {
         Arc::clone(&self.stats)
+    }
+
+    /// Handle compartido al buffer de requests recientes, para que el
+    /// handler de `/requests` lea un snapshot sin pasar por el canal ni por
+    /// disco.
+    pub fn recent(&self) -> Arc<RwLock<RecentRequests>> {
+        Arc::clone(&self.recent)
     }
 }

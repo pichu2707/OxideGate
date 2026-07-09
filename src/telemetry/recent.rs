@@ -1,0 +1,231 @@
+//! Ring buffer de los últimos N requests atendidos, en detalle individual.
+//!
+//! `RequestMetric` ya trae el detalle por request, pero hoy ese detalle solo
+//! llega a `telemetry.jsonl`: no hay forma de ver en vivo qué pasó en una
+//! petición puntual sin leer el archivo. Este módulo guarda una proyección
+//! compacta de las últimas [`RECENT_CAPACITY`] métricas en memoria, para que
+//! un consumidor (el monitor TUI, hoy; cualquier vista futura) pueda detectar
+//! requests ATÍPICOS (outliers de latencia, coste o tokens) sin tocar disco.
+//!
+//! INVARIANTE CRÍTICA: `prompt_hash` NUNCA se expone acá. Igual que
+//! documenta [`middleware::stats`](crate::middleware::stats) para los
+//! agregados, esta vista tampoco filtra huellas individuales de prompt: solo
+//! expone los campos de coste/latencia/identidad de ruta que ya son
+//! públicamente inofensivos.
+//!
+//! Es PURO: no conoce axum ni ningún framework HTTP, solo `RequestMetric`. El
+//! handler que lo expone por HTTP vive en `middleware::requests`.
+use crate::telemetry::logger::RequestMetric;
+use serde::Serialize;
+use std::collections::VecDeque;
+
+/// Cantidad máxima de requests individuales que se recuerdan en memoria.
+///
+/// Una vez alcanzado el tope, cada `ingest` nuevo desaloja el request MÁS
+/// VIEJO (FIFO), así el buffer siempre refleja una ventana reciente y acotada
+/// sin crecer sin límite en un servidor de larga vida.
+pub const RECENT_CAPACITY: usize = 200;
+
+/// Proyección compacta de un [`RequestMetric`] para exposición en vivo.
+///
+/// Copia fielmente los campos de identidad, coste y latencia de la métrica
+/// original, PERO deliberadamente omite `prompt_hash` y `prompt_bytes`: el
+/// primero por la invariante de privacidad (ninguna huella individual sale
+/// de este módulo), el segundo porque es un detalle de implementación del
+/// tamaño del body que no aporta a detectar outliers.
+///
+/// No calcula nada derivado (sin `gen_ms`, sin tokens/s, sin lógica de
+/// outlier): eso es responsabilidad de la vista que consuma el snapshot.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentRequest {
+    /// Instante en que se emitió la métrica original (RFC 3339, UTC).
+    pub timestamp: String,
+    /// Ruta local del proxy que atendió el request (`/v1/messages`, …).
+    pub route: String,
+    /// Proveedor destino (`anthropic`, `openai`).
+    pub upstream: String,
+    /// Modelo solicitado. `None` si no venía en el body del request.
+    pub model: Option<String>,
+    /// `true` si el cliente pidió respuesta en streaming (SSE).
+    pub stream: bool,
+    /// Código de estado HTTP devuelto al cliente.
+    pub status: u16,
+    /// Tokens de entrada exactos, tal como los reporta el proveedor.
+    pub input_tokens: Option<u64>,
+    /// Tokens de salida exactos, tal como los reporta el proveedor.
+    pub output_tokens: Option<u64>,
+    /// Tokens servidos desde caché (lectura). `None` si no se midió.
+    pub cache_read_tokens: Option<u64>,
+    /// Tokens escritos a caché (creación). `None` si el proveedor no lo reporta.
+    pub cache_write_tokens: Option<u64>,
+    /// Coste estimado en USD según la tabla de precios. `None` si no calculable.
+    pub cost_estimate_usd: Option<f64>,
+    /// `true` si OxideGate inyectó el breakpoint de `cache_control` en este request.
+    pub cache_control_forced: bool,
+    /// Time To First Token en ms. `None` si no aplica (p. ej. sin streaming).
+    pub ttft_ms: Option<f64>,
+    /// Latencia total en ms, desde el request hasta el cierre de la respuesta.
+    pub total_ms: f64,
+}
+
+impl From<&RequestMetric> for RecentRequest {
+    /// Copia campo a campo desde `RequestMetric`, excluyendo `prompt_hash` y
+    /// `prompt_bytes` a propósito (ver invariante de privacidad en el header
+    /// del módulo).
+    fn from(m: &RequestMetric) -> Self {
+        Self {
+            timestamp: m.timestamp.clone(),
+            route: m.route.clone(),
+            upstream: m.upstream.clone(),
+            model: m.model.clone(),
+            stream: m.stream,
+            status: m.status,
+            input_tokens: m.input_tokens,
+            output_tokens: m.output_tokens,
+            cache_read_tokens: m.cache_read_tokens,
+            cache_write_tokens: m.cache_write_tokens,
+            cost_estimate_usd: m.cost_estimate_usd,
+            cache_control_forced: m.cache_control_forced,
+            ttft_ms: m.ttft_ms,
+            total_ms: m.total_ms,
+        }
+    }
+}
+
+/// Buffer en memoria de los últimos [`RECENT_CAPACITY`] requests.
+///
+/// Vive detrás de un `Arc<RwLock<_>>` compartido entre la task de drenaje
+/// (que llama `ingest`) y el handler de `/requests` (que llama `snapshot`),
+/// exactamente igual que [`StatsRegistry`](crate::telemetry::stats::StatsRegistry).
+/// Este tipo en sí mismo no sabe nada de locks ni de axum.
+#[derive(Debug, Default)]
+pub struct RecentRequests {
+    buffer: VecDeque<RecentRequest>,
+}
+
+impl RecentRequests {
+    /// Incorpora una métrica al buffer, proyectándola a [`RecentRequest`].
+    ///
+    /// El request nuevo se agrega al final (orden cronológico: más viejo
+    /// primero, más nuevo al final). Si al agregar se supera
+    /// [`RECENT_CAPACITY`], se desaloja el request MÁS VIEJO (`pop_front`)
+    /// para mantener el tope de memoria constante.
+    pub fn ingest(&mut self, m: &RequestMetric) {
+        self.buffer.push_back(RecentRequest::from(m));
+        if self.buffer.len() > RECENT_CAPACITY {
+            self.buffer.pop_front();
+        }
+    }
+
+    /// Construye una copia del estado actual del buffer, en orden
+    /// cronológico (más viejo primero, más nuevo al final). El consumidor
+    /// decide si quiere invertir el orden para mostrar "más reciente arriba":
+    /// esta función no toma esa decisión de presentación.
+    pub fn snapshot(&self) -> Vec<RecentRequest> {
+        self.buffer.iter().cloned().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Construye una métrica mínima, variando el `timestamp` para poder
+    /// distinguir requests entre sí en los asserts de orden.
+    fn base_metric(timestamp: &str) -> RequestMetric {
+        RequestMetric {
+            timestamp: timestamp.to_string(),
+            route: "/v1/messages".to_string(),
+            upstream: "anthropic".to_string(),
+            model: Some("claude-opus-4".to_string()),
+            prompt_hash: "0000000000000001".to_string(),
+            stream: false,
+            prompt_bytes: 100,
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_estimate_usd: Some(0.01),
+            cache_control_forced: false,
+            status: 200,
+            ttft_ms: Some(50.0),
+            total_ms: 100.0,
+            tokens_per_sec: Some(20.0),
+        }
+    }
+
+    #[test]
+    fn ingest_preserva_orden_cronologico() {
+        let mut recent = RecentRequests::default();
+        recent.ingest(&base_metric("t1"));
+        recent.ingest(&base_metric("t2"));
+        recent.ingest(&base_metric("t3"));
+
+        let snapshot = recent.snapshot();
+        let timestamps: Vec<&str> = snapshot.iter().map(|r| r.timestamp.as_str()).collect();
+        assert_eq!(timestamps, vec!["t1", "t2", "t3"]);
+    }
+
+    #[test]
+    fn buffer_topea_en_capacidad_y_desaloja_el_mas_viejo() {
+        let mut recent = RecentRequests::default();
+        for i in 0..(RECENT_CAPACITY + 10) {
+            recent.ingest(&base_metric(&format!("t{i}")));
+        }
+
+        let snapshot = recent.snapshot();
+        assert_eq!(snapshot.len(), RECENT_CAPACITY);
+        // El más viejo que sobrevive es "t10" (se desalojaron t0..t9).
+        assert_eq!(snapshot.first().unwrap().timestamp, "t10");
+        // El más nuevo es el último ingestado.
+        assert_eq!(
+            snapshot.last().unwrap().timestamp,
+            format!("t{}", RECENT_CAPACITY + 9)
+        );
+    }
+
+    #[test]
+    fn snapshot_devuelve_una_copia_independiente() {
+        let mut recent = RecentRequests::default();
+        recent.ingest(&base_metric("t1"));
+
+        let snapshot = recent.snapshot();
+        recent.ingest(&base_metric("t2"));
+
+        // El snapshot tomado antes del segundo ingest no debe verse afectado.
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(recent.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn proyeccion_copia_campos_fielmente_incluyendo_none() {
+        let mut m = base_metric("t1");
+        m.model = None;
+        m.cache_read_tokens = None;
+        m.cache_write_tokens = None;
+        m.cost_estimate_usd = None;
+        m.ttft_ms = None;
+        m.cache_control_forced = true;
+        m.status = 500;
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+
+        let snapshot = recent.snapshot();
+        let row = &snapshot[0];
+        assert_eq!(row.timestamp, "t1");
+        assert_eq!(row.route, "/v1/messages");
+        assert_eq!(row.upstream, "anthropic");
+        assert_eq!(row.model, None);
+        assert!(!row.stream);
+        assert_eq!(row.status, 500);
+        assert_eq!(row.input_tokens, Some(10));
+        assert_eq!(row.output_tokens, Some(5));
+        assert_eq!(row.cache_read_tokens, None);
+        assert_eq!(row.cache_write_tokens, None);
+        assert_eq!(row.cost_estimate_usd, None);
+        assert!(row.cache_control_forced);
+        assert_eq!(row.ttft_ms, None);
+        assert_eq!(row.total_ms, 100.0);
+    }
+}

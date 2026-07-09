@@ -70,6 +70,9 @@ async fn main() {
         )
         // Agregación en vivo por (proveedor, modelo): qué optimizar ahora.
         .route("/stats", get(middleware::stats::handle_stats))
+        // Detalle en vivo de los últimos requests individuales: qué request
+        // puntual es atípico (outlier de coste/latencia).
+        .route("/requests", get(middleware::requests::handle_requests))
         .with_state(Arc::new(state));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
@@ -77,5 +80,6 @@ async fn main() {
 
     println!("🛰️  Escuchando en http://{addr}");
     println!("📊 Estadísticas en vivo por modelo en http://{addr}/stats");
+    println!("🧾 Últimos requests en vivo en http://{addr}/requests");
     axum::serve(listener, app).await.unwrap();
 }
