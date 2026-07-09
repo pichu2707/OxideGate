@@ -81,13 +81,52 @@ JSON por petición), fuera del camino crítico del request.
 El monitor es la forma de comprobar que una optimización sirve:
 
 1. Levantá el proxy **sin** la optimización y mandá tráfico.
-2. En el monitor, apretá **`b`** para marcar el *baseline*.
+2. En el monitor, pulse **`b`** para marcar el *baseline*.
 3. Reiniciá el proxy con la optimización (p. ej. `OXIDEGATE_FORCE_CACHE=true`).
 4. Mirá el panel **Δ desde baseline**: el `cache-hit` subiendo, el coste/token
    bajando, los `tok/s` — el "después" limpio, sin que el "antes" lo diluya.
 
-Teclas: `q` salir · `b` baseline · `r` reset · ↑/↓ elegir modelo.
+Teclas: `q` salir · `b` baseline · `r` reset · ↑/↓ elegir modelo ·
+`p` panel por petición · `c` cambiar de vista (latencia / contexto).
 `cargo run --bin monitor -- --once` da la foto en texto plano (headless).
+
+---
+
+## Bajar el impuesto de contexto
+
+La primera optimización que reveló la medición no está en el código de este
+repo: está en la configuración del cliente. Los esquemas de herramientas son
+el grueso del body, se reenvían enteros en cada turno y no decrecen nunca.
+
+Medido con este mismo proxy, sonda idéntica, comparando peticiones del mismo
+tamaño de historial:
+
+| Configuración | `tools` | Ahorro |
+|---|---|---|
+| 4 servidores MCP (Gmail, Drive, Calendar, Engram) | 159.100 B | — |
+| Solo Engram | 103.701 B | **−55.399 B por petición** |
+| Ningún MCP (piso de herramientas nativas) | 86.198 B | −72.902 B |
+
+Los tres conectores de Google cuestan el 76% del peaje de MCP y no se usan
+para nada en un proxy de Rust. Este repo trae `.claude/mcp-lean.json` con solo
+Engram:
+
+```sh
+claude --strict-mcp-config --mcp-config .claude/mcp-lean.json
+```
+
+Dos advertencias que cuestan caro si se ignoran:
+
+- **El archivo por sí solo no hace nada.** Hace falta `--strict-mcp-config`,
+  porque los conectores de Google vienen de la cuenta de claude.ai, no de un
+  archivo local: una config de proyecto SUMA servidores, no los quita.
+- **No lo llames `.mcp.json`.** Ese nombre se auto-carga, y entonces Engram
+  quedaría cargado dos veces (el del plugin y el del archivo) además de los
+  tres de Google. Peor que no hacer nada.
+
+El efecto se comprueba con el propio monitor: tecla `p`, luego `c`, y se
+observa la columna `tools`. Es el circuito completo — la medición señala la
+oportunidad, la configuración la ejecuta, el monitor comprueba que sirvió.
 
 ---
 
