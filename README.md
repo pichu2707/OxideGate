@@ -35,7 +35,7 @@ El proyecto tiene **tres binarios**: `oxidegate` (el proxy), `monitor` (el
 dashboard) y `bench` (barrida de benchmark controlada).
 
 ```sh
-# 1. Levantar el proxy. Por defecto escucha en 8080; usá OXIDEGATE_PORT si está
+# 1. Levantar el proxy. Por defecto escucha en 8080; use OXIDEGATE_PORT si está
 #    ocupado (en la máquina de desarrollo se usa 8899).
 OXIDEGATE_PORT=8899 cargo run --bin oxidegate
 
@@ -83,7 +83,7 @@ El monitor es la forma de comprobar que una optimización sirve:
 1. Levante el proxy **sin** la optimización y mande tráfico.
 2. En el monitor, pulse **`b`** para marcar el *baseline*.
 3. Reinicie el proxy con la optimización (p. ej. `OXIDEGATE_FORCE_CACHE=true`).
-4. Mirá el panel **Δ desde baseline**: el `cache-hit` subiendo, el coste/token
+4. Observe el panel **Δ desde baseline**: el `cache-hit` subiendo, el coste/token
    bajando, los `tok/s` — el "después" limpio, sin que el "antes" lo diluya.
 
 Teclas: `q` salir · `b` baseline · `r` reset · ↑/↓ elegir modelo ·
@@ -127,6 +127,32 @@ Dos advertencias que cuestan caro si se ignoran:
 El efecto se comprueba con el propio monitor: tecla `p`, luego `c`, y se
 observa la columna `tools`. Es el circuito completo — la medición señala la
 oportunidad, la configuración la ejecuta, el monitor comprueba que sirvió.
+
+### La segunda palanca: `--tools`, no `--disallowedTools`
+
+> **Advertencia que conviene no ignorar: `--disallowedTools` NO reduce el
+> body.** Es una puerta de permiso, no de payload: el esquema completo de
+> la herramienta se sigue enviando y se sigue pagando en cada turno, el
+> modelo lo sigue leyendo; lo único que cambia es que tiene prohibido
+> ejecutarla. Medido: `--disallowedTools "Bash" "Edit" "Write"` ahorra
+> −421 B sobre 86.198 B de `tools` (0,5%). La palanca que sí controla el
+> array de esquemas es `--tools <lista>`: con ella, los mismos 86.198 B
+> bajan a 4.371 B (−94,9%) usando solo `Read` y `Bash`. Detalle completo
+> y las cuatro sondas en [`docs/context-tax.md`](docs/context-tax.md) §5.
+
+Apilando las dos palancas (config de MCP + `--tools`) sobre el mismo probe:
+
+```
+  Claude Code, sin cambios          224.653 B
+  + --strict-mcp-config, sin MCP    149.221 B   (-33,6%)
+  + --tools Read,Bash                51.540 B   (-77,1%)
+```
+
+El 77% del body es removible SI la tarea no necesita más que leer y correr
+comandos. El costo es real: sin `Edit`, `Write` ni delegación a subagentes,
+un agente así no puede editar código ni buscar por patrón. Es el trade-off
+de tener un agente con capacidad de actuar, no algo para desactivar sin
+pensarlo — pero no toda tarea necesita esa capacidad completa.
 
 ---
 
@@ -172,7 +198,11 @@ por función con su contrato) y **responsabilidad única estricta** por módulo.
 ## Roadmap
 
 **Hecho** ✅ — telemetría Nivel 1, adaptadores por proveedor, coste cache-aware,
-Palanca A (forzado de caché), agregación por modelo (`/stats`), monitor TUI.
+Palanca A (forzado de caché), agregación por modelo (`/stats`), monitor TUI,
+**decomposición de `prompt_bytes` por componente** (`system` / `tools` /
+historial / turno actual, campos `context_*_bytes` en `RequestMetric`) —
+usada para medir el efecto de `--tools` en
+[`docs/context-tax.md`](docs/context-tax.md) §5.
 
 **Descartado** ⛔ (con evidencia, para tráfico conversacional)
 - **Palanca B — dedup por `prompt_hash`.** Medido contra tráfico real de
@@ -185,10 +215,6 @@ Palanca A (forzado de caché), agregación por modelo (`/stats`), monitor TUI.
   (reintentos, CI, batch, fan-out de subagentes).
 
 **Pendiente**
-- **Decomponer `prompt_bytes` por componente** (`system` / `tools` /
-  historial / turno actual) en vez de un número plano — es el paso que falta
-  para responder "de lo que pago, cuánto es trabajo y cuánto es ceremonia".
-  Ver [`docs/context-tax.md`](docs/context-tax.md) §8.
 - **Segunda barrida de benchmark** con output largo (throughput de generación).
 - **Endurecer `telemetry.jsonl`** para reabrirlo si se rota o se borra.
 - **Precios reales por modelo** — deuda archivada: los ratios de caché ya son

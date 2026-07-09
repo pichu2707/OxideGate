@@ -429,7 +429,7 @@ Flujo completo:
    cada request (p. ej. sacando Google Calendar de la config de MCP).
 3. Genere una petición nueva. El panel se actualiza con la fila fuente más
    reciente.
-4. Mirá la columna `Δ baseline`: el servidor que sacaste aparece con
+4. Observe la columna `Δ baseline`: el servidor retirado aparece con
    `bytes: 0 B`, `tools: 0` y su delta NEGATIVO completo (p. ej.
    `-21.0 kB`) — sigue LISTADO, no desaparece de la tabla. Un servidor que
    simplemente deja de aparecer no dice nada por sí solo; uno que aparece con

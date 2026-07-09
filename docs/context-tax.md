@@ -86,7 +86,7 @@ pensando**, no latencia de máquina.
   atacar el otro 18%.
 - **TTFT varía 17× sin explicación identificada**: rango 347–5,888 ms.
   Ninguna variable medida (bytes subidos, hora del día, tamaño de prefijo)
-  explica esa dispersión por sí sola — ver hipótesis descartada en §7 sobre
+  explica esa dispersión por sí sola — ver hipótesis descartada en §8 sobre
   el pool de conexiones.
 - **La subida de bytes queda descartada como cuello de botella.** Media de
   280,764 bytes por request: eso son ~7 ms de transferencia en fibra y ~225
@@ -106,7 +106,7 @@ pensando**, no latencia de máquina.
 
 - **Un `429` en el conjunto.** El request de las 11:38:30 fue rechazado por
   rate limit. Es la señal que de verdad importa cuando el cliente se
-  autentica con una suscripción plana (ver §5): ahí el techo no lo pone el
+  autentica con una suscripción plana (ver §7): ahí el techo no lo pone el
   gasto, lo pone la cuota.
 
 ---
@@ -136,12 +136,80 @@ medido en el wire por OxideGate:
   el piso ya es 61,566 tokens. Atribuible a definiciones de herramientas,
   servidores MCP conectados, el índice de skills, y el `CLAUDE.md` global
   del usuario (34,922 bytes, ~8,730 tokens) — ese archivo solo explica una
-  fracción del crecimiento, el resto es superficie de herramientas/MCP que
-  no se decompone hoy (ver §8).
+  fracción del crecimiento; el resto es superficie de herramientas/MCP, que
+  §5 y §9 sí decomponen (esta sección quedó escrita antes de esa
+  descomposición).
 
 ---
 
-## 5. La memoria persistente no es compresión, es una inyección
+## 5. `--tools` contra `--disallowedTools`: dos palancas que no hacen lo mismo
+
+Cuatro sondas, misma orden (`claude -p "Responde solo: ok"`), todas con
+`--strict-mcp-config` (para aislar las herramientas nativas del harness de
+cualquier servidor MCP) y todas comparadas con `context_messages_count = 2`
+idéntico — la misma regla metodológica que en §4: solo se compara lo
+comparable.
+
+| sonda | `tools` (bytes) | nº herramientas | body medido (bytes) | `prepare_us` |
+|---|---|---|---|---|
+| A) `--strict-mcp-config` (nativas completas) | 86,198 | 29 | 149,221 | 4,774 |
+| B) A + `--disallowedTools "Bash" "Edit" "Write"` | 85,777 | 28 | 148,800 | 5,284 |
+| C) A + `--tools "Read" "Bash"` | 4,371 | 2 | 51,540 | 2,322 |
+| D) A + `--tools ""` | 2 | 0 | 47,171 | 2,989 |
+
+**Hallazgo 1 — la trampa conceptual, y por qué se dice primero.**
+`--disallowedTools` no ahorra prácticamente nada: −421 B, un 0.5% del body.
+Es una puerta de **permiso**, no de **payload**. El esquema completo de la
+herramienta se sigue mandando en cada turno, se sigue pagando y el modelo lo
+sigue leyendo; lo único que cambia es que tiene prohibido ejecutarla. Mucha
+gente asume que negar una herramienta ahorra tokens. No es así. Es del tipo
+de creencia que sobrevive años porque nadie la mide.
+
+**Hallazgo 2 — `--tools` es la palanca real.**
+`--tools <lista>` controla el array de esquemas en sí: −94.9% (86,198 B →
+4,371 B; 29 herramientas → 2). Con `--tools ""` el array queda en 2 bytes —
+los corchetes del array vacío, exactamente lo que predice el helper
+`tools_overhead_bytes` para una lista vacía (ver `src/provider/mod.rs`); es
+una validación cruzada de ese helper, no un número nuevo. Efectos
+colaterales: `system` baja de 8,843 B a 8,673 B (el system prompt referencia
+las herramientas disponibles), y `prepare_us` baja de 4,774 a 2,322 µs.
+
+**Hallazgo 3 — el techo, apilando las dos palancas.**
+
+| paso | body medido (bytes) | ahorro |
+|---|---|---|
+| Claude Code, sin cambios | 224,653 | — |
+| + `--strict-mcp-config` (sin ningún servidor MCP, piso nativo) | 149,221 | −33.6% |
+| + `--tools Read,Bash` | 51,540 | −77.1% |
+
+> **Corrección de etiqueta (para no arrastrar un error).** El paso
+> intermedio de esta tabla mide `--strict-mcp-config` **sin ningún servidor
+> MCP cargado** — la misma sonda A de arriba —, no
+> `.claude/mcp-lean.json`. Ese archivo carga Engram (ver
+> `.claude/mcp-lean.json`), y cargar Engram **suma** bytes de `tools` en vez
+> de restarlos: la fila "Solo Engram" de la tabla de MCP en el README mide
+> 103,701 B de `tools`, más que los 86,198 B del piso nativo sin MCP. Si el
+> paso real fuera `.claude/mcp-lean.json`, el body total sería MAYOR a
+> 149,221 B, no menor. El 77% de la sección "El ceiling" es, entonces, MCP
+> completamente apagado + selección de herramientas, no "MCP mínimo".
+
+El 77.1% final del body es removible SI la tarea no necesita esas
+herramientas.
+
+**Hallazgo 4 — el trade-off, sin edulcorar.**
+Un agente con solo `Read` y `Bash` no puede editar, buscar por patrón, ni
+delegar a subagentes. Esos 86 kB de sonda A son el precio de la CAPACIDAD DE
+ACTUAR. Cuando la tarea los necesita, ese peaje es el costo de tener un
+agente, no grasa. Pero no toda tarea los necesita: un revisor que solo lee y
+grepea, o un explorador de código, no tiene motivo para cargar 29 esquemas.
+Vale la ironía: las definiciones de subagentes de este mismo workflow
+(`jd-judge-a`, `Explore`) YA restringen sus herramientas — la palanca estaba
+activa y nadie sabía cuánto valía. Cada subagente de solo lectura ahorra del
+orden de 80 kB de prefijo en CADA UNO de sus turnos.
+
+---
+
+## 6. La memoria persistente no es compresión, es una inyección
 
 Un sistema de memoria persistente (p. ej. Engram) **no reduce** el contexto
 que se envía: **lo aumenta**. El protocolo de instrucciones en `CLAUDE.md`,
@@ -168,7 +236,7 @@ contexto de memoria al principio de cada sesión.
 
 ---
 
-## 6. La salvedad del costo nocional
+## 7. La salvedad del costo nocional
 
 El tráfico medido acá se autentica vía **OAuth de Claude Max** — una
 suscripción plana, no facturación por token. `cost_estimate_usd` es
@@ -180,7 +248,7 @@ output), no para leerlos como una factura real.
 
 ---
 
-## 7. Hipótesis descartadas (para que nadie las reintente)
+## 8. Hipótesis descartadas (para que nadie las reintente)
 
 Documentarlas cuesta tan poco como la sección de hallazgos y ahorra volver
 a investigar lo mismo:
@@ -205,18 +273,30 @@ a investigar lo mismo:
 
 ---
 
-## 8. Lo que OxideGate no puede ver hoy, y por qué existe este documento
+## 9. Lo que OxideGate no podía ver, y por qué existe este documento
 
-`prompt_bytes` es un número plano, único. El proxy tiene el body completo
-del request en sus manos, pero nunca lo decompone. La siguiente feature
-natural es partir ese body por componente (`system` / `tools` / historial /
-turno actual) para que la pregunta que motiva todo este documento —
-**"de lo que pago, ¿cuánto es trabajo y cuánto es ceremonia?"** — se pueda
-responder con datos, no con estimaciones como el `CLAUDE.md` de §4-§5.
+> **Corrección de estado.** Esta sección decía, en una versión anterior de
+> este documento, que descomponer `prompt_bytes` por componente era "la
+> siguiente feature natural" — pendiente. Ya no lo es: `context_system_bytes`,
+> `context_tools_bytes`, `context_history_bytes`, `context_last_turn_bytes` y
+> `context_other_bytes` existen hoy en `RequestMetric`
+> (`src/provider/mod.rs`, `src/middleware/proxy.rs`) y están en cada fila de
+> `telemetry.jsonl`. §5 de este mismo documento es la primera vez que se
+> explotan para un hallazgo. Se deja la sección para que quede registrado
+> qué preguntaba este documento ANTES de tener esa descomposición, y para no
+> perpetuar el "pendiente" en el README (ver ahí, sección Roadmap).
+
+`prompt_bytes` seguía siendo, hasta esa descomposición, un número plano,
+único: el proxy tenía el body completo del request en sus manos, pero no lo
+partía por componente. Partirlo (`system` / `tools` / historial / turno
+actual) era el paso que faltaba para que la pregunta que motiva todo este
+documento — **"de lo que pago, ¿cuánto es trabajo y cuánto es ceremonia?"**
+— se pudiera responder con datos, no con estimaciones como el `CLAUDE.md` de
+§4/§6.
 
 ---
 
-## 9. Relación con Metronous
+## 10. Relación con Metronous
 
 [Metronous](https://github.com/kiosvantra/metronous) es complementario, no
 competidor — mide en una capa distinta. Metronous vive **adentro del
@@ -232,7 +312,7 @@ dos lo expone todavía.
 
 ---
 
-## 10. Fuentes de estos números
+## 11. Fuentes de estos números
 
 Todo lo de §2–§4 sale de filas reales de
 `~/.config/oxidegate/telemetry.jsonl` filtradas por
@@ -243,3 +323,11 @@ Todo lo de §2–§4 sale de filas reales de
 posible detectar redundancia (§2, y ver `docs/optimizer-dedup.md`) se
 calcula en `provider::fingerprint`, sobre `incoming.body` — el body
 ORIGINAL, antes de cualquier mutación del proveedor.
+
+Los números de §5 (las cuatro sondas de `--tools`/`--disallowedTools`, la
+tabla del techo apilado) salen de las cuatro últimas filas de ese mismo
+`telemetry.jsonl` al 2026-07-09, capturadas entre 16:06:19 y 16:06:35 UTC —
+sin pasar por `pricing.rs`, porque son campos crudos de bytes y microsegundos
+(`context_tools_bytes`, `context_measured_bytes`, `prepare_us`), no cálculos
+de costo. Se verificaron byte a byte contra ese archivo antes de publicarse
+acá.
