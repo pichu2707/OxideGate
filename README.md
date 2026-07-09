@@ -128,6 +128,11 @@ El efecto se comprueba con el propio monitor: tecla `p`, luego `c`, y se
 observa la columna `tools`. Es el circuito completo — la medición señala la
 oportunidad, la configuración la ejecuta, el monitor comprueba que sirvió.
 
+Fuera de la TUI, [`oxidegate-lens`](https://github.com/pichu2707/oxidegate-lens)
+imprime el mismo desglose en una tabla, con el ahorro por petición de cada
+servidor MCP. Es un proyecto aparte que solo **lee** `GET /stats` y
+`GET /requests`: la medición vive acá, la presentación allá.
+
 ### La segunda palanca: `--tools`, no `--disallowedTools`
 
 > **Advertencia que conviene no ignorar: `--disallowedTools` NO reduce el
