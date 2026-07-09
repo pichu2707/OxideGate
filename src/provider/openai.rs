@@ -122,6 +122,43 @@ impl Provider for OpenAiChat {
             messages_count,
         })
     }
+
+    /// Herramientas de `/v1/chat/completions`: `tools[]`, cada una
+    /// `{type:"function", function:{name,...}}` ⇒ nombre en
+    /// `tool["function"]["name"]` (ANIDADO bajo `function`, a diferencia de
+    /// Responses). Si `tools` está AUSENTE, se tolera el array legado
+    /// `functions[]` (nombre en `f["name"]`, sin anidar) que algunos
+    /// clientes viejos todavía mandan.
+    ///
+    /// PRECEDENCIA: si `tools` está presente (aunque sea `[]`), se usa
+    /// EXCLUSIVAMENTE `tools` y `functions` se ignora por completo, aunque
+    /// también esté presente en el body (ambos dialectos no deberían
+    /// coexistir en un request real, pero si pasara, `tools` es el vigente).
+    fn tool_entries<'a>(&self, body: &'a Value) -> Option<Vec<(&'a str, &'a Value)>> {
+        let obj = body.as_object()?;
+        if let Some(tools) = obj.get("tools") {
+            let tools = tools.as_array()?;
+            return Some(
+                tools
+                    .iter()
+                    .filter_map(|tool| {
+                        let name = tool.get("function")?.get("name")?.as_str()?;
+                        Some((name, tool))
+                    })
+                    .collect(),
+            );
+        }
+        let functions = obj.get("functions")?.as_array()?;
+        Some(
+            functions
+                .iter()
+                .filter_map(|f| {
+                    let name = f.get("name")?.as_str()?;
+                    Some((name, f))
+                })
+                .collect(),
+        )
+    }
 }
 
 impl Provider for OpenAiResponses {
@@ -202,6 +239,26 @@ impl Provider for OpenAiResponses {
             messages_count,
         })
     }
+
+    /// Herramientas de `/v1/responses`: `tools[]`, cada una
+    /// `{type:"function", name, parameters,...}` ⇒ nombre en `tool["name"]`
+    /// PLANO (a diferencia de Chat Completions, que lo anida bajo
+    /// `function`). Esta asimetría entre las dos APIs de OpenAI es real, no
+    /// un error de tipeo: está confirmada contra la forma del dialecto que
+    /// ya usa `decompose` en esta misma variante (`input`/`instructions`
+    /// también viven planos acá, sin anidar).
+    fn tool_entries<'a>(&self, body: &'a Value) -> Option<Vec<(&'a str, &'a Value)>> {
+        let tools = body.as_object()?.get("tools")?.as_array()?;
+        Some(
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    let name = tool.get("name")?.as_str()?;
+                    Some((name, tool))
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Inyecta `stream_options.include_usage = true` en el body JSON. Si el body
@@ -259,6 +316,7 @@ fn extract_openai_usage(value: &Value, usage: &mut Usage) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::NATIVE_TOOLS_LABEL;
 
     /// OpenAI (con include_usage) manda el `usage` en el chunk final, con
     /// `prompt_tokens`/`completion_tokens` y `choices` vacío.
@@ -683,5 +741,120 @@ mod tests {
         assert_eq!(bd.other_bytes, 8);
         assert_eq!(bd.messages_count, 1);
         assert_eq!(bd.measured_bytes, 49);
+    }
+
+    /// Chat Completions: body realista con mezcla de herramienta nativa y
+    /// dos de un mismo servidor MCP. Bytes esperados calculados a mano con
+    /// `measure_value` sobre los nodos del fixture (no recomputando con
+    /// `group_tools_by_server`, que es lo que se está probando).
+    #[test]
+    fn chat_tools_by_server_fixture_realista() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "gpt-4o",
+                "tools": [
+                    {"type": "function", "function": {"name": "Read", "description": "lee"}},
+                    {"type": "function", "function": {"name": "mcp__claude_ai_Gmail__search_threads", "description": "busca"}},
+                    {"type": "function", "function": {"name": "mcp__claude_ai_Gmail__get_message", "description": "trae"}}
+                ],
+                "messages": [{"role": "user", "content": "hola"}]
+            }"#,
+        )
+        .unwrap();
+        let tools = body["tools"].as_array().unwrap();
+
+        let by_server = OPENAI_CHAT.tools_by_server(&body);
+
+        let native = by_server
+            .iter()
+            .find(|s| s.server == NATIVE_TOOLS_LABEL)
+            .expect("debe existir el bucket nativo");
+        assert_eq!(native.tools, 1);
+        assert_eq!(native.bytes, measure_value(&tools[0]));
+
+        let gmail = by_server
+            .iter()
+            .find(|s| s.server == "claude_ai_Gmail")
+            .expect("debe existir el bucket de Gmail");
+        assert_eq!(gmail.tools, 2);
+        assert_eq!(
+            gmail.bytes,
+            measure_value(&tools[1]) + measure_value(&tools[2])
+        );
+    }
+
+    /// Responses API: body realista con mezcla de herramienta nativa y dos
+    /// de un mismo servidor MCP, con el nombre PLANO (`tool["name"]`, sin
+    /// anidar bajo `function`).
+    #[test]
+    fn responses_tools_by_server_fixture_realista() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "gpt-4o",
+                "tools": [
+                    {"type": "function", "name": "Read", "parameters": {}},
+                    {"type": "function", "name": "mcp__claude_ai_Google_Drive__search_files", "parameters": {}},
+                    {"type": "function", "name": "mcp__claude_ai_Google_Drive__list_recent_files", "parameters": {}}
+                ],
+                "input": "hola"
+            }"#,
+        )
+        .unwrap();
+        let tools = body["tools"].as_array().unwrap();
+
+        let by_server = OPENAI_RESPONSES.tools_by_server(&body);
+
+        let native = by_server
+            .iter()
+            .find(|s| s.server == NATIVE_TOOLS_LABEL)
+            .expect("debe existir el bucket nativo");
+        assert_eq!(native.tools, 1);
+        assert_eq!(native.bytes, measure_value(&tools[0]));
+
+        let drive = by_server
+            .iter()
+            .find(|s| s.server == "claude_ai_Google_Drive")
+            .expect("debe existir el bucket de Drive");
+        assert_eq!(drive.tools, 2);
+        assert_eq!(
+            drive.bytes,
+            measure_value(&tools[1]) + measure_value(&tools[2])
+        );
+    }
+
+    /// Sin `tools`, se tolera el array legado `functions[]` (nombre PLANO,
+    /// sin anidar bajo `function`).
+    #[test]
+    fn chat_tool_entries_legacy_functions_cuando_tools_ausente() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "gpt-4o",
+                "functions": [{"name": "Read"}, {"name": "mcp__srv__tool"}]
+            }"#,
+        )
+        .unwrap();
+
+        let entries = OPENAI_CHAT.tool_entries(&body).expect("functions presente");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "Read");
+        assert_eq!(entries[1].0, "mcp__srv__tool");
+    }
+
+    /// Si AMBOS `tools` y `functions` están presentes, `tools` tiene
+    /// precedencia absoluta: `functions` se ignora por completo.
+    #[test]
+    fn chat_tool_entries_tools_tiene_precedencia_sobre_functions() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "gpt-4o",
+                "tools": [{"type": "function", "function": {"name": "Write"}}],
+                "functions": [{"name": "Read"}]
+            }"#,
+        )
+        .unwrap();
+
+        let entries = OPENAI_CHAT.tool_entries(&body).expect("tools presente");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "Write");
     }
 }

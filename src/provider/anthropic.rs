@@ -130,6 +130,23 @@ impl Provider for Anthropic {
             messages_count,
         })
     }
+
+    /// Herramientas de `/v1/messages`: `tools[]`, nombre en `tool["name"]`.
+    /// Cada entrada mide el objeto COMPLETO de la herramienta (`name` +
+    /// `description` + `input_schema`), no solo el nombre: es la unidad que
+    /// realmente pesa en el body.
+    fn tool_entries<'a>(&self, body: &'a Value) -> Option<Vec<(&'a str, &'a Value)>> {
+        let tools = body.as_object()?.get("tools")?.as_array()?;
+        Some(
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    let name = tool.get("name")?.as_str()?;
+                    Some((name, tool))
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Palanca A del optimizador: si el body es JSON válido y NO trae ya ningún
@@ -185,7 +202,7 @@ fn has_cache_control(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::measure_value;
+    use super::super::{measure_value, NATIVE_TOOLS_LABEL};
 
     /// Anthropic manda el input en `message_start` y el output acumulado en
     /// `message_delta`. Extraer ambos eventos por separado debe dejar los
@@ -501,5 +518,58 @@ mod tests {
         .unwrap();
         let bd = ANTHROPIC.decompose(&body).expect("body es objeto");
         assert_eq!(bd.tools_bytes, 0);
+    }
+
+    /// Body realista con mezcla de herramientas nativas y de dos servidores
+    /// MCP distintos. Los bytes esperados de cada bucket se calculan a mano
+    /// con `measure_value` sobre los nodos del fixture, NO recomputando con
+    /// `group_tools_by_server` (que es justo lo que se está probando): una
+    /// aserción tautológica no valdría nada.
+    #[test]
+    fn tools_by_server_fixture_realista_con_nativas_y_mcp() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "claude-3-5-sonnet",
+                "tools": [
+                    {"name": "Read", "description": "lee un archivo"},
+                    {"name": "Write", "description": "escribe un archivo"},
+                    {"name": "mcp__claude_ai_Gmail__search_threads", "description": "busca hilos"},
+                    {"name": "mcp__claude_ai_Gmail__get_message", "description": "trae un mensaje"},
+                    {"name": "mcp__claude_ai_Google_Calendar__list_events", "description": "lista eventos"}
+                ],
+                "messages": [{"role": "user", "content": "hola"}]
+            }"#,
+        )
+        .unwrap();
+        let tools = body["tools"].as_array().unwrap();
+
+        let by_server = ANTHROPIC.tools_by_server(&body);
+
+        let native = by_server
+            .iter()
+            .find(|s| s.server == NATIVE_TOOLS_LABEL)
+            .expect("debe existir el bucket nativo");
+        assert_eq!(native.tools, 2);
+        assert_eq!(
+            native.bytes,
+            measure_value(&tools[0]) + measure_value(&tools[1])
+        );
+
+        let gmail = by_server
+            .iter()
+            .find(|s| s.server == "claude_ai_Gmail")
+            .expect("debe existir el bucket de Gmail");
+        assert_eq!(gmail.tools, 2);
+        assert_eq!(
+            gmail.bytes,
+            measure_value(&tools[2]) + measure_value(&tools[3])
+        );
+
+        let calendar = by_server
+            .iter()
+            .find(|s| s.server == "claude_ai_Google_Calendar")
+            .expect("debe existir el bucket de Calendar");
+        assert_eq!(calendar.tools, 1);
+        assert_eq!(calendar.bytes, measure_value(&tools[4]));
     }
 }

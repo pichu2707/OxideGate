@@ -15,6 +15,7 @@ use crate::config::AppConfig;
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 pub use anthropic::ANTHROPIC;
@@ -254,6 +255,170 @@ pub(crate) fn array_field<'a>(obj: &'a serde_json::Map<String, Value>, key: &str
     }
 }
 
+// NOTA DE ALCANCE (todo este bloque, hasta `tools_overhead_bytes`): este
+// slice entrega SOLO la lógica pura de agrupar herramientas por servidor
+// MCP, probada exhaustivamente más abajo. Conectarla a la métrica final
+// (`telemetry::logger`/`RequestMetric`) es un slice DELIBERADAMENTE
+// separado, fuera de alcance acá (ver instrucciones del cambio: no se toca
+// `src/telemetry/` ni `src/middleware/` en este slice). Como este crate es
+// SOLO binario (no hay `[lib]` en `Cargo.toml`), `pub` no exime a estos
+// ítems de `dead_code`: la alcanzabilidad se mide desde `main()`, no desde
+// una API pública de librería. `#[allow(dead_code)]` es la señal explícita
+// y visible de "todavía sin consumidor, a propósito"; se retira en el
+// slice de wiring.
+#[allow(dead_code)]
+/// Etiqueta para herramientas NATIVAS: nombres que no siguen el patrón
+/// `mcp__<server>__<tool>`, o que empiezan con `mcp__` pero no tienen un
+/// segundo separador `__` válido (ver [`server_of`]). Un `name` faltante o
+/// no-string NUNCA cae acá: se omite en [`Provider::tool_entries`] antes de
+/// llegar a este punto, para no inflar el bucket nativo con datos ajenos.
+const NATIVE_TOOLS_LABEL: &str = "(native)";
+
+#[allow(dead_code)]
+/// Etiqueta del bucket de desborde de [`group_tools_by_server`]: servidores
+/// MCP distintos que aparecen después de agotar el cupo [`MAX_TOOL_SERVERS`].
+const OTHERS_LABEL: &str = "(others)";
+
+/// Tope de servidores MCP distintos que [`group_tools_by_server`] trackea de
+/// forma INDIVIDUAL dentro de un mismo request.
+///
+/// El body es entrada controlada por quien llama al proxy: cualquier cliente
+/// puede mandar nombres de herramienta arbitrarios, y agrupar en un
+/// `HashMap` keyeado por un substring de ese body — sin cota — es un vector
+/// de crecimiento de memoria en el camino crítico del request. Mismo
+/// espíritu que `MAX_DISTINCT_PROMPTS_PER_MODEL` en `telemetry::stats`:
+/// preferimos una cota honesta y documentada a un OOM.
+///
+/// A diferencia de aquel cap (que SATURA: deja de admitir huellas nuevas y
+/// marca el resultado como cota inferior), acá el desborde SIGUE contándose:
+/// todo servidor más allá del cupo colapsa en un único bucket
+/// [`OTHERS_LABEL`], así que la cantidad de herramientas y los bytes
+/// reportados por [`group_tools_by_server`] siempre suman el total exacto de
+/// la entrada — se pierde el desglose fino más allá del cupo, nunca un byte
+/// ni una herramienta.
+#[allow(dead_code)]
+const MAX_TOOL_SERVERS: usize = 32;
+
+/// Bytes de las herramientas del body agrupadas por servidor MCP que las
+/// declara. Ver [`Provider::tools_by_server`] y [`group_tools_by_server`].
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolServerBytes {
+    /// Servidor propietario. `mcp__claude_ai_Gmail` -> `claude_ai_Gmail`.
+    /// Las herramientas nativas (sin prefijo `mcp__`) caen en `NATIVE_TOOLS_LABEL`.
+    pub server: String,
+    /// Cantidad de herramientas atribuidas a este servidor.
+    pub tools: usize,
+    /// Suma de los bytes de cada herramienta de este servidor.
+    pub bytes: usize,
+}
+
+/// Servidor MCP dueño de `tool_name`, o [`NATIVE_TOOLS_LABEL`] si no se
+/// reconoce ninguno. Pura: no mide bytes, solo clasifica el nombre.
+///
+/// Los nombres de herramienta MCP siguen el patrón `mcp__<server>__<tool>`.
+/// El nombre de la herramienta en sí puede contener `__` (p. ej.
+/// `mcp__srv__do__thing`, donde la herramienta es `do__thing`), así que NO
+/// alcanza con partir por TODOS los `__`: hace falta el equivalente de
+/// `splitn(3, "__")`, donde el primer segmento debe ser literalmente
+/// `"mcp"`, el segundo es el servidor, y el tercero es "todo lo demás" (la
+/// herramienta, sin volver a partir aunque contenga `__`).
+///
+/// Casos borde, decididos y probados en `tests::server_of_casos_borde`:
+/// - `"mcp__"` (no hay tercer segmento tras el segundo `__`): nativa.
+/// - `"mcp__srv"` (sin segundo `__` en absoluto): nativa. Un nombre que
+///   empieza con `mcp__` pero no tiene un segundo separador NO es un nombre
+///   MCP válido (mismo caso que el `mcp__weird` del contrato de la tarea).
+/// - `"mcp__srv__"` (segundo `__` SÍ presente, herramienta vacía): SÍ cuenta
+///   como MCP válido, servidor `"srv"`, herramienta `""`. El separador está
+///   presente; que el nombre de la herramienta quede vacío no invalida al
+///   servidor.
+/// - `"__x__y"` (no empieza con el literal `mcp__`, el primer segmento antes
+///   del primer `__` es la cadena vacía, no `"mcp"`): nativa.
+/// - `""`: nativa (no hay ni siquiera un primer segmento `"mcp"`).
+#[allow(dead_code)]
+pub fn server_of(tool_name: &str) -> &str {
+    let mut segments = tool_name.splitn(3, "__");
+    match (segments.next(), segments.next(), segments.next()) {
+        (Some("mcp"), Some(server), Some(_)) if !server.is_empty() => server,
+        _ => NATIVE_TOOLS_LABEL,
+    }
+}
+
+/// Agrupa herramientas por servidor MCP, midiendo cada una con
+/// [`measure_value`]. Compartido por los cuatro dialectos: una vez que cada
+/// proveedor produce sus `(nombre, valor)` vía [`Provider::tool_entries`], el
+/// agrupamiento es idéntico para todos — no hay conocimiento de dialecto acá
+/// adentro.
+///
+/// Orden de salida DETERMINÍSTICO: bytes DESCENDENTE, empatando por nombre de
+/// servidor ASCENDENTE. Los tests dependen de este orden, y también lo hará
+/// cualquier UI futura que liste estos totales.
+///
+/// Cupo: hasta [`MAX_TOOL_SERVERS`] servidores se trackean de forma
+/// individual (por orden de aparición); el resto colapsa en
+/// [`OTHERS_LABEL`]. La cantidad de herramientas y la suma de bytes del
+/// resultado siempre suman exactamente el total de la entrada (ver
+/// [`MAX_TOOL_SERVERS`] para la comparación con el cap de
+/// `telemetry::stats`).
+///
+/// Toma un iterador de referencias (nunca clona `body` ni los `Value` de
+/// cada herramienta): el costo es proporcional a los fragmentos que mide,
+/// no al body entero.
+#[allow(dead_code)]
+pub fn group_tools_by_server<'a>(
+    entries: impl Iterator<Item = (&'a str, &'a Value)>,
+) -> Vec<ToolServerBytes> {
+    let mut totals: HashMap<String, (usize, usize)> = HashMap::new();
+
+    for (name, value) in entries {
+        let bytes = measure_value(value);
+        let raw_server = server_of(name);
+
+        let key = if totals.contains_key(raw_server) || totals.len() < MAX_TOOL_SERVERS {
+            raw_server.to_string()
+        } else {
+            OTHERS_LABEL.to_string()
+        };
+
+        let entry = totals.entry(key).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += bytes;
+    }
+
+    let mut rows: Vec<ToolServerBytes> = totals
+        .into_iter()
+        .map(|(server, (tools, bytes))| ToolServerBytes { server, tools, bytes })
+        .collect();
+
+    rows.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.server.cmp(&b.server)));
+    rows
+}
+
+/// Bytes del array `tools` que no pertenecen a ninguna herramienta: los
+/// corchetes y las comas separadoras. `tools_bytes - sum(bytes por
+/// servidor)`.
+///
+/// NO puede ir legítimamente negativo: `by_server` se construye midiendo
+/// FRAGMENTOS del mismo array cuyo total serializado es `tools_bytes` (cada
+/// herramienta individual pesa menos que el array completo que la
+/// contiene), así que la resta siempre debería dar `>= 0`. Aun así usamos
+/// `saturating_sub` en vez de una resta directa: preferimos devolver `0` a
+/// entrar en pánico si algún día esa invariante se rompe (p. ej. un cambio
+/// futuro que mida `by_server` con otra fuente de bytes que no sea
+/// `tools_bytes`).
+///
+/// NOTA: si alguna herramienta se omitió por no tener `name` (ver
+/// [`Provider::tool_entries`]), sus bytes tampoco están en `by_server`, así
+/// que quedan absorbidos acá junto con corchetes y comas: en ese caso este
+/// número deja de ser *solo* "estructura JSON". Se documenta la asimetría,
+/// no se fuerza a que sean números distintos.
+#[allow(dead_code)]
+pub fn tools_overhead_bytes(tools_bytes: usize, by_server: &[ToolServerBytes]) -> usize {
+    let attributed: usize = by_server.iter().map(|s| s.bytes).sum();
+    tools_bytes.saturating_sub(attributed)
+}
+
 /// Contrato que debe cumplir cada proveedor: dueño de ambas puntas del
 /// dialecto, la ida (armar el request saliente) y la vuelta (leer el
 /// `usage` de la respuesta).
@@ -291,6 +456,50 @@ pub trait Provider: Send + Sync {
     /// `body` debe ser el `Value` que ya devolvió [`parse_body`] para este
     /// mismo request: `decompose` nunca vuelve a parsear bytes crudos.
     fn decompose(&self, body: &Value) -> Option<ContextBreakdown>;
+
+    /// Devuelve `(nombre, valor)` de cada herramienta declarada en el body.
+    /// `None` si el body no es un objeto o el dialecto no declara
+    /// herramientas.
+    ///
+    /// Sin implementación por defecto A PROPÓSITO (mismo criterio que
+    /// `decompose`): cada proveedor sabe dónde viven sus nombres de
+    /// herramienta (`tools[].name`, `tools[].function.name`,
+    /// `functionDeclarations[].name`…) y debe decidirlo conscientemente. Un
+    /// default que devolviera `None` en silencio dejaría pasar un proveedor
+    /// nuevo sin desglose por servidor y nadie lo notaría hasta mirar los
+    /// números en producción.
+    ///
+    /// CONTRATO sobre `tools` ausente vs. vacío: `tools` ausente ⇒ `None`
+    /// (el dialecto no declaró NADA de herramientas para este request).
+    /// `tools: []` ⇒ `Some(vec![])` (SÍ declaró herramientas, son cero): no
+    /// son el mismo caso y no deben confundirse.
+    ///
+    /// Una herramienta sin `name` (o con `name` que no es string) se OMITE
+    /// de la lista devuelta, nunca se atribuye a [`NATIVE_TOOLS_LABEL`]:
+    /// atribuirla ahí inflaría el bucket nativo con datos que no le
+    /// pertenecen.
+    ///
+    /// Nunca clona `body`: toma `&Value` y devuelve referencias con el mismo
+    /// lifetime, igual que el resto de las funciones de este módulo.
+    #[allow(dead_code)]
+    fn tool_entries<'a>(&self, body: &'a Value) -> Option<Vec<(&'a str, &'a Value)>>;
+
+    /// Desglosa `tools` por servidor MCP. Vacío si el body no declara
+    /// herramientas (`tool_entries` devuelve `None`).
+    ///
+    /// Implementación por defecto SÍ disponible (a diferencia de
+    /// `decompose` y `tool_entries`): una vez que el proveedor dice DÓNDE
+    /// están sus herramientas, agruparlas por servidor es exactamente la
+    /// misma operación para los cuatro dialectos
+    /// ([`group_tools_by_server`]) — no hay conocimiento de dialecto que
+    /// decidir acá.
+    #[allow(dead_code)]
+    fn tools_by_server(&self, body: &Value) -> Vec<ToolServerBytes> {
+        match self.tool_entries(body) {
+            Some(entries) => group_tools_by_server(entries.into_iter()),
+            None => Vec::new(),
+        }
+    }
 }
 
 /// Huella no criptográfica (hash de 64 bits en hex) del body del request.
@@ -429,5 +638,180 @@ mod tests {
         let obj = obj.as_object().unwrap();
         assert!(array_field(obj, "messages").is_empty());
         assert!(array_field(obj, "ausente").is_empty());
+    }
+
+    /// `server_of` sobre todos los casos borde documentados: presencia y
+    /// ausencia del segundo separador `__`, nombre que empieza con `mcp__`
+    /// pero le falta un segmento, cadena vacía, y una herramienta cuyo
+    /// nombre propio contiene `__` (debe ignorarse para la clasificación:
+    /// el tercer segmento de `splitn(3, "__")` no se vuelve a partir).
+    #[test]
+    fn server_of_casos_borde() {
+        assert_eq!(
+            server_of("mcp__claude_ai_Gmail__search_threads"),
+            "claude_ai_Gmail"
+        );
+        // El nombre de la herramienta contiene "__": debe ir entero al
+        // tercer segmento, sin afectar la detección del servidor.
+        assert_eq!(server_of("mcp__srv__do__thing"), "srv");
+        assert_eq!(server_of("Read"), NATIVE_TOOLS_LABEL);
+        assert_eq!(server_of("mcp__"), NATIVE_TOOLS_LABEL);
+        assert_eq!(server_of("mcp__srv"), NATIVE_TOOLS_LABEL);
+        // Segundo "__" SÍ presente (aunque la herramienta quede vacía): es
+        // un nombre MCP válido con servidor "srv".
+        assert_eq!(server_of("mcp__srv__"), "srv");
+        assert_eq!(server_of("__x__y"), NATIVE_TOOLS_LABEL);
+        assert_eq!(server_of(""), NATIVE_TOOLS_LABEL);
+    }
+
+    /// Iterador vacío ⇒ vector vacío, sin panic.
+    #[test]
+    fn group_tools_by_server_vacio_para_iterador_vacio() {
+        let entries: Vec<(&str, &Value)> = vec![];
+        assert!(group_tools_by_server(entries.into_iter()).is_empty());
+    }
+
+    /// Orden determinístico: bytes descendente y, en caso de empate,
+    /// servidor ascendente. Se fuerza el empate con dos nombres de la MISMA
+    /// longitud ("zebra"/"alpha", 5 letras cada uno) y el mismo padding, y
+    /// se verifica primero que en efecto midieron igual (para que el test
+    /// no dependa de una casualidad no verificada).
+    #[test]
+    fn group_tools_by_server_orden_deterministico_con_empate() {
+        let tool_zebra = serde_json::json!({"name": "mcp__zebra__x", "padding": "1234"});
+        let tool_alpha = serde_json::json!({"name": "mcp__alpha__y", "padding": "1234"});
+        assert_eq!(measure_value(&tool_zebra), measure_value(&tool_alpha));
+
+        let entries = vec![
+            ("mcp__zebra__x", &tool_zebra),
+            ("mcp__alpha__y", &tool_alpha),
+        ];
+        let rows = group_tools_by_server(entries.into_iter());
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].server, "alpha");
+        assert_eq!(rows[1].server, "zebra");
+    }
+
+    /// Más de `MAX_TOOL_SERVERS` servidores distintos: el desborde colapsa
+    /// en `OTHERS_LABEL`, pero la cantidad de herramientas y la suma de
+    /// bytes deben seguir cerrando exactamente con el total de la entrada
+    /// (nunca se pierde un byte ni una herramienta, solo el desglose fino).
+    #[test]
+    fn group_tools_by_server_desborda_a_others_con_40_servidores() {
+        let names: Vec<String> = (0..40).map(|i| format!("mcp__srv{i:02}__tool")).collect();
+        let values: Vec<Value> = (0..40).map(|i| serde_json::json!({"n": i})).collect();
+        let entries: Vec<(&str, &Value)> = names
+            .iter()
+            .zip(values.iter())
+            .map(|(n, v)| (n.as_str(), v))
+            .collect();
+
+        let total_tools = entries.len();
+        let total_bytes: usize = entries.iter().map(|(_, v)| measure_value(v)).sum();
+
+        let rows = group_tools_by_server(entries.into_iter());
+
+        // 32 servidores reales trackeados individualmente + 1 bucket de
+        // desborde para los 8 restantes.
+        assert_eq!(rows.len(), MAX_TOOL_SERVERS + 1);
+        let others = rows
+            .iter()
+            .find(|r| r.server == OTHERS_LABEL)
+            .expect("debe existir el bucket de desborde");
+        assert_eq!(others.tools, 40 - MAX_TOOL_SERVERS);
+
+        let summed_tools: usize = rows.iter().map(|r| r.tools).sum();
+        let summed_bytes: usize = rows.iter().map(|r| r.bytes).sum();
+        assert_eq!(summed_tools, total_tools);
+        assert_eq!(summed_bytes, total_bytes);
+    }
+
+    /// `tools` ausente ⇒ `None`; `tools: []` ⇒ `Some(vec![])`. Son casos
+    /// DISTINTOS y no deben confundirse: el primero es "el dialecto no dijo
+    /// nada de herramientas", el segundo es "sí dijo, y son cero".
+    #[test]
+    fn tool_entries_ausente_da_none_pero_vacio_da_some_vacio() {
+        let sin_tools: Value = serde_json::from_str(r#"{"model": "x"}"#).unwrap();
+        assert_eq!(ANTHROPIC.tool_entries(&sin_tools), None);
+
+        let tools_vacio: Value = serde_json::from_str(r#"{"tools": []}"#).unwrap();
+        assert_eq!(ANTHROPIC.tool_entries(&tools_vacio), Some(vec![]));
+
+        let tools_no_array: Value = serde_json::from_str(r#"{"tools": "no es un array"}"#).unwrap();
+        assert_eq!(ANTHROPIC.tool_entries(&tools_no_array), None);
+
+        let no_objeto: Value = serde_json::from_str("[1,2,3]").unwrap();
+        assert_eq!(ANTHROPIC.tool_entries(&no_objeto), None);
+    }
+
+    /// `tools_by_server` sobre un body sin herramientas o no-objeto debe
+    /// devolver un vector vacío, nunca panic.
+    #[test]
+    fn tools_by_server_vacio_cuando_no_hay_tools() {
+        let sin_tools: Value = serde_json::from_str(r#"{"model": "x"}"#).unwrap();
+        assert!(ANTHROPIC.tools_by_server(&sin_tools).is_empty());
+
+        let no_objeto: Value = serde_json::from_str("[1,2,3]").unwrap();
+        assert!(ANTHROPIC.tools_by_server(&no_objeto).is_empty());
+    }
+
+    /// Una herramienta sin `name` (o con `name` no-string) debe omitirse por
+    /// completo: ni cuenta como entrada de `tool_entries`, ni infla el
+    /// bucket `NATIVE_TOOLS_LABEL`.
+    #[test]
+    fn tool_entries_omite_herramienta_sin_name() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "tools": [
+                    {"name": "Read"},
+                    {"description": "sin name, debe omitirse"},
+                    {"name": 42}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let entries = ANTHROPIC.tool_entries(&body).expect("tools es un array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "Read");
+
+        let by_server = ANTHROPIC.tools_by_server(&body);
+        let native = by_server
+            .iter()
+            .find(|s| s.server == NATIVE_TOOLS_LABEL)
+            .expect("debe existir el bucket nativo");
+        assert_eq!(
+            native.tools, 1,
+            "las herramientas sin name no deben inflar el bucket nativo"
+        );
+    }
+
+    /// `tools_overhead_bytes` sobre un body Anthropic realista: debe ser
+    /// positivo (los corchetes y comas del array SÍ pesan algo) y cerrar
+    /// exactamente con `tools_bytes - sum(bytes por servidor)`.
+    #[test]
+    fn tools_overhead_bytes_positivo_y_exacto_en_body_realista() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "claude-3-5-sonnet",
+                "tools": [
+                    {"name": "Read", "description": "lee un archivo"},
+                    {"name": "Write", "description": "escribe un archivo"},
+                    {"name": "mcp__claude_ai_Gmail__search_threads", "description": "busca hilos"},
+                    {"name": "mcp__claude_ai_Gmail__get_message", "description": "trae un mensaje"}
+                ],
+                "messages": [{"role": "user", "content": "hola"}]
+            }"#,
+        )
+        .unwrap();
+
+        let bd = ANTHROPIC.decompose(&body).expect("body es objeto");
+        let by_server = ANTHROPIC.tools_by_server(&body);
+        let overhead = tools_overhead_bytes(bd.tools_bytes, &by_server);
+
+        let sum: usize = by_server.iter().map(|s| s.bytes).sum();
+        assert!(overhead > 0);
+        assert_eq!(overhead, bd.tools_bytes - sum);
     }
 }

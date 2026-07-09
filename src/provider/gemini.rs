@@ -108,6 +108,30 @@ impl Provider for Gemini {
             messages_count,
         })
     }
+
+    /// Herramientas de Gemini: `tools[]`, cada elemento
+    /// `{functionDeclarations:[{name,...}]}`. Las entradas medidas son las
+    /// declaraciones INDIVIDUALES (`functionDeclarations[i]`), no el
+    /// wrapper que las contiene: cada declaración es la unidad que un
+    /// servidor MCP registraría como una herramienta propia.
+    ///
+    /// Un elemento de `tools[]` sin `functionDeclarations` (o con un valor
+    /// que no es array) se OMITE por completo, sin afectar al resto de los
+    /// elementos.
+    fn tool_entries<'a>(&self, body: &'a Value) -> Option<Vec<(&'a str, &'a Value)>> {
+        let tools = body.as_object()?.get("tools")?.as_array()?;
+        Some(
+            tools
+                .iter()
+                .filter_map(|wrapper| wrapper.get("functionDeclarations").and_then(Value::as_array))
+                .flatten()
+                .filter_map(|decl| {
+                    let name = decl.get("name")?.as_str()?;
+                    Some((name, decl))
+                })
+                .collect(),
+        )
+    }
 }
 
 /// Extrae `(modelo, es_stream)` del path de Gemini.
@@ -128,7 +152,7 @@ fn parse_gemini_path(path: &str) -> (Option<String>, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::measure_value;
+    use super::super::{measure_value, NATIVE_TOOLS_LABEL};
     use super::*;
 
     /// Gemini (`alt=sse`) manda `usageMetadata` con otros nombres de campo,
@@ -357,5 +381,70 @@ mod tests {
 
         assert_eq!(out.prompt_hash, expected_hash);
         assert_eq!(out.prompt_bytes, raw.len());
+    }
+
+    /// Body realista con mezcla de herramienta nativa y dos de un mismo
+    /// servidor MCP, repartidas entre dos wrappers `functionDeclarations`
+    /// distintos. Bytes esperados calculados a mano con `measure_value`
+    /// sobre las declaraciones del fixture (no recomputando con
+    /// `group_tools_by_server`, que es lo que se está probando).
+    #[test]
+    fn tools_by_server_fixture_realista_con_nativas_y_mcp() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "tools": [
+                    {"functionDeclarations": [
+                        {"name": "Read", "description": "lee"},
+                        {"name": "mcp__claude_ai_Google_Calendar__list_events", "description": "lista"}
+                    ]},
+                    {"functionDeclarations": [
+                        {"name": "mcp__claude_ai_Google_Calendar__create_event", "description": "crea"}
+                    ]}
+                ],
+                "contents": [{"role": "user", "parts": [{"text": "hola"}]}]
+            }"#,
+        )
+        .unwrap();
+        let decl_0 = &body["tools"][0]["functionDeclarations"];
+        let decl_1 = &body["tools"][1]["functionDeclarations"];
+
+        let by_server = GEMINI.tools_by_server(&body);
+
+        let native = by_server
+            .iter()
+            .find(|s| s.server == NATIVE_TOOLS_LABEL)
+            .expect("debe existir el bucket nativo");
+        assert_eq!(native.tools, 1);
+        assert_eq!(native.bytes, measure_value(&decl_0[0]));
+
+        let calendar = by_server
+            .iter()
+            .find(|s| s.server == "claude_ai_Google_Calendar")
+            .expect("debe existir el bucket de Calendar");
+        assert_eq!(calendar.tools, 2);
+        assert_eq!(
+            calendar.bytes,
+            measure_value(&decl_0[1]) + measure_value(&decl_1[0])
+        );
+    }
+
+    /// Un elemento de `tools[]` sin `functionDeclarations` (o con un valor
+    /// que no es array) se omite por completo, sin afectar al resto.
+    #[test]
+    fn tool_entries_omite_wrapper_sin_function_declarations_validas() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "tools": [
+                    {"functionDeclarations": [{"name": "Read"}]},
+                    {"otroCampo": true},
+                    {"functionDeclarations": "no es un array"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let entries = GEMINI.tool_entries(&body).expect("tools es un array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "Read");
     }
 }
