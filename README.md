@@ -25,6 +25,7 @@ impacto **en vivo**, comparando el antes y el después.
 | **Optimizador · Palanca A** | Fuerza el prompt caching de Anthropic (inyecta `cache_control`) para clientes que no cachean. Detrás de un flag, apagado por defecto. | ✅ |
 | **Agregación por modelo** | `GET /stats` devuelve, en vivo, señales por `(proveedor, modelo)`: cache-hit, redundancia, coste, latencias. | ✅ |
 | **Monitor TUI** | Dashboard de terminal en tiempo real con vista **antes/después** (baseline) para ver el impacto de cada optimización. | ✅ |
+| **Detalle por request** | `GET /requests` + panel `p` del monitor: las últimas 200 peticiones individuales en vivo, con detección de outliers (error, cache-miss, TTFT lento, generación lenta). | ✅ |
 
 ---
 
@@ -58,6 +59,7 @@ OXIDEGATE_PORT=8899 cargo run --bin monitor
 | `POST /v1/responses` | OpenAI (Responses API) |
 | `POST /v1beta/*` | Google Gemini |
 | `GET  /stats` | Agregación por modelo (JSON) |
+| `GET  /requests` | Últimas 200 peticiones individuales, en vivo (JSON) |
 
 ### Variables de entorno
 
@@ -66,7 +68,8 @@ OXIDEGATE_PORT=8899 cargo run --bin monitor
 | `OXIDEGATE_PORT` | Puerto local del proxy (y del monitor) | `8080` |
 | `ANTHROPIC_API_BASE` / `OPENAI_API_BASE` / `GEMINI_API_BASE` | Host de cada proveedor | API pública de cada uno |
 | `OXIDEGATE_FORCE_CACHE` | Palanca A: fuerza el prompt caching de Anthropic | `false` (apagado) |
-| `OXIDEGATE_STATS_URL` | URL que consulta el monitor | `http://127.0.0.1:{OXIDEGATE_PORT}/stats` |
+| `OXIDEGATE_STATS_URL` | URL que consulta el monitor para `/stats` | `http://127.0.0.1:{OXIDEGATE_PORT}/stats` |
+| `OXIDEGATE_REQUESTS_URL` | URL que consulta el monitor para `/requests` | derivada de `OXIDEGATE_STATS_URL` (sufijo `/stats` → `/requests`), o `http://127.0.0.1:{OXIDEGATE_PORT}/requests` |
 
 La telemetría se escribe en `~/.config/oxidegate/telemetry.jsonl` (una línea
 JSON por petición), fuera del camino crítico del request.
@@ -120,6 +123,7 @@ por función con su contrato) y **responsabilidad única estricta** por módulo.
 | [`docs/optimizer-prompt-cache.md`](docs/optimizer-prompt-cache.md) | Palanca A: forzado de prompt caching de Anthropic |
 | [`docs/optimizer-dedup.md`](docs/optimizer-dedup.md) | Palanca B: dedup de respuestas por `prompt_hash` (diseño) |
 | [`docs/telemetry-by-model.md`](docs/telemetry-by-model.md) | El endpoint `GET /stats` y qué señala cada métrica |
+| [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) | El endpoint `GET /requests`: detalle en vivo por petición, la invariante de privacidad y el límite de 200 filas |
 | [`docs/monitor-tui.md`](docs/monitor-tui.md) | El monitor de terminal en tiempo real |
 | [`docs/benchmark.md`](docs/benchmark.md) | El harness de benchmark (`bench`) |
 
