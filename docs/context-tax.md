@@ -122,23 +122,82 @@ medido en el wire por OxideGate:
 | directorio de OxideGate (proyecto real) | 83,719 | 224,533 | 2,961 ms |
 | **delta** | **+22,153 (+36%)** | +55,711 | +1,593 ms |
 
-- `input_tokens` fue **idéntico** (7,368) en ambos casos. Toda la diferencia
-  vive en el prefijo cacheado (`cache_write_tokens`), no en el input medido
-  — confirma que el overhead de estar "dentro del proyecto" es 100% contexto
-  de herramientas/memoria, cero contenido de la tarea.
-- **Salvedad honesta sobre el TTFT:** esta comparación es n=1 por escenario.
-  Es consistente en dirección con un `cache_write` más grande (más para
-  escribir, más tarda en confirmarse), pero **no está probado** con
-  repeticiones — no se afirma causalidad, solo correlación observada una vez.
+> ### CORRECCIÓN — este delta es un ARTEFACTO, no un hallazgo
+>
+> La tabla de arriba se conserva como registro de lo que se midió, pero su
+> lectura original era **falsa** y se refuta más abajo. Se dejó a la vista, en
+> lugar de borrarla, porque el error importa tanto como el dato.
+>
+> La conclusión que se sacó entonces —"estar dentro del proyecto cuesta 22,153
+> tokens de contexto de memoria y registro de skills"— **no se sostiene**. El
+> experimento tenía n=1 por escenario y no controlaba la variable que en
+> realidad cambiaba: **cuántos servidores MCP se cargaron en cada corrida**.
+>
+> Verificación posterior, con dos métodos independientes:
+>
+> 1. **Captura directa de ambos bodies** con un sumidero HTTP local, comparados
+>    componente a componente:
+>
+>    | componente | vacío | proyecto | delta |
+>    |---|---|---|---|
+>    | `system` | 8,339 B | 8,928 B | **+589 B** |
+>    | `tools` | 159,874 B | 159,874 B | 0 |
+>    | `messages` | 56,515 B | 56,515 B | 0 |
+>
+>    `tools` y `messages` son **idénticos byte a byte**. La única diferencia
+>    real de estar dentro del proyecto son **589 bytes** de `system`.
+>
+> 2. **Cuatro corridas repetidas** en el mismo directorio vacío, a través del
+>    proxy: las cuatro cargaron los 4 servidores MCP y dieron `tools = 159,100 B`,
+>    igual que el proyecto. El delta original desapareció.
+>
+> Los ~55,700 bytes de diferencia de la primera medición coinciden, dentro del
+> error de re-serialización, con el costo de los tres conectores de Google
+> (55,127 B — ver §5). En aquella corrida no se cargaron en el directorio vacío
+> y sí en el proyecto. Se atribuyó a la memoria del proyecto una causa que era,
+> simplemente, tres servidores MCP.
+>
+> **Lección metodológica:** un experimento de n=1 no distingue una causa de una
+> coincidencia. Antes de atribuir un delta, hay que repetirlo y controlar las
+> variables que no se están mirando.
+
+Lo que sí quedó verificado de esta sección:
+
+- `input_tokens` fue **idéntico** (7,368) en ambos casos: toda la diferencia
+  vive en el prefijo, no en el contenido de la tarea.
+- **Salvedad sobre el TTFT:** n=1 por escenario, **no probado** con
+  repeticiones. No se afirma causalidad.
 - **El piso del harness creció ~8.8× desde la última medición en este mismo
-  proyecto.** Un benchmark anterior había registrado un overhead de ~7,000
-  tokens; hoy, en un directorio **vacío** (sin nada de OxideGate todavía),
-  el piso ya es 61,566 tokens. Atribuible a definiciones de herramientas,
-  servidores MCP conectados, el índice de skills, y el `CLAUDE.md` global
-  del usuario (34,922 bytes, ~8,730 tokens) — ese archivo solo explica una
-  fracción del crecimiento; el resto es superficie de herramientas/MCP, que
-  §5 y §9 sí decomponen (esta sección quedó escrita antes de esa
-  descomposición).
+  proyecto.** Un benchmark anterior había registrado ~7,000 tokens de overhead;
+  hoy, en un directorio **vacío**, el piso ya es 61,566 tokens. Ese crecimiento
+  sí es real, y §5 y §9 lo decomponen: la superficie de herramientas es la
+  causa dominante.
+
+### 4.1. Qué hay realmente dentro del prefijo
+
+Descomposición del body capturado (225,798 B), por bloque:
+
+| bloque | bytes | % del body |
+|---|---|---|
+| `tools` (76 esquemas) | 159,874 | 70.8% |
+| `CLAUDE.md` global, inyectado como `<system-reminder>` en `messages[0]` | 35,140 | 15.6% |
+| volcado del hook `SessionStart` de Engram, en `messages[1]` | 19,668 | 8.7% |
+| `system` (prompt del harness) | 8,928 | 4.0% |
+| **el mensaje del usuario** | **75** | **0.03%** |
+
+Dos observaciones que cuestan dinero:
+
+- El `CLAUDE.md` global (34,922 bytes en disco) **no viaja en el bloque
+  `system`**, como sería intuitivo, sino envuelto en un `<system-reminder>`
+  dentro del primer mensaje del usuario. Buscarlo en `system` lleva a
+  conclusiones equivocadas.
+- El protocolo de Engram se vuelca **entero al arrancar la sesión**, use el
+  agente la memoria o no. Es carga ansiosa: entra al prefijo y se relee en cada
+  turno posterior. Una carga perezosa —solo el índice, y búsqueda bajo
+  demanda— es la palanca obvia sobre esos 19,668 bytes.
+
+Juntos, `CLAUDE.md` y el hook de Engram son **54,808 bytes: el 24.3% del body**,
+pagados en cada petición de cada turno.
 
 ---
 
