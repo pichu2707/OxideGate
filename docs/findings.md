@@ -87,6 +87,7 @@ Descartados con evidencia, para que nadie los repita.
 | Subida de bytes y overhead del propio proxy | ~280 KB por request son ~7 ms de transferencia en fibra. `prepare_us` (el tiempo que OxideGate pasa dentro de `prepare`) va de 43 µs con un body minúsculo a 15.135 µs con uno de 450 kB: entre 0,04 y 15 milisegundos, frente a un TTFT medio de 2.097 ms. Es el 0,67% de una petición típica. Ninguno de los dos explica la dispersión del TTFT | `docs/context-tax.md` §3 |
 | El tiempo de generación del modelo | 82% del tiempo "ocupado" de una petición es el modelo generando tokens. Un proxy se sienta en el medio del wire; no puede acelerar eso | `docs/context-tax.md` §3 |
 | Fast mode (`speed: "fast"`) como palanca disponible | Existe, está documentada y ataca precisamente ese 82%. Pero **requiere créditos de API**: con suscripción plana (Max), `/fast` pide créditos y no se activa. No es una palanca que se pueda accionar sin cambiar de modelo de facturación | `docs/speed.md` §3 |
+| `--exclude-dynamic-system-prompt-sections` como palanca de tamaño | Es una **reubicación, no una reducción**: mueve ~3,5 kB de secciones per-máquina (cwd, env, git status, rutas de memoria) de `system` a `messages`; el neto del body baja solo 330 B (0,22%). Su beneficio real —caché compartida entre usuarios— es inerte para un único usuario, mismo patrón que la Palanca A | `docs/context-tax.md` §5.1 |
 
 > **Dónde vive la evidencia.** Estas cifras están medidas, pero su evidencia
 > cruda no está versionada en el repositorio, así que conviene decir dónde

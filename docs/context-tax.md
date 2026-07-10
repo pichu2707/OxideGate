@@ -266,6 +266,62 @@ Vale la ironía: las definiciones de subagentes de este mismo workflow
 activa y nadie sabía cuánto valía. Cada subagente de solo lectura ahorra del
 orden de 80 kB de prefijo en CADA UNO de sus turnos.
 
+### 5.1. `--exclude-dynamic-system-prompt-sections`: una reubicación, no una reducción
+
+El flag `--exclude-dynamic-system-prompt-sections` (default `false`) promete,
+según su propia ayuda, "mover las secciones per-máquina (cwd, env info, rutas
+de memoria, git status) del system prompt al primer mensaje de usuario" para
+"mejorar la reutilización de caché entre usuarios". La pregunta que hay que
+medir no es si funciona —lo hace—, sino **si achica el body o solo cambia de
+lugar unos bytes**.
+
+Dos sondas idénticas (`claude -p "Responde solo: ok"`, ambas con
+`--strict-mcp-config` para congelar la superficie de herramientas), medidas en
+la misma corrida del 2026-07-10 para que el delta sea limpio. La única
+variable es el flag:
+
+| componente | SIN flag | CON flag | delta |
+|---|---|---|---|
+| `context_system_bytes` | 6.923 | 3.409 | **−3.514** |
+| `context_history_bytes` (`messages`) | 36.046 | 39.230 | **+3.184** |
+| `context_tools_bytes` | 86.198 | 86.198 | 0 |
+| `context_last_turn_bytes` | 17.781 | 17.781 | 0 |
+| `context_other_bytes` | 353 | 353 | 0 |
+| **`prompt_bytes` (body total)** | **147.432** | **147.102** | **−330 (−0,22%)** |
+
+**Hallazgo 1 — el flag hace exactamente lo que dice.** Los ~3,5 kB de
+secciones per-máquina salieron de `system` (−3.514 B) y reaparecieron en
+`messages` (+3.184 B). El efecto es inequívoco: no es ruido de
+re-serialización, es la reubicación anunciada. (Cross-check: `tools` quedó en
+86.198 B, idéntico byte a byte a la sonda A de §5 —la misma superficie nativa
+sin MCP—, lo que confirma que `--strict-mcp-config` congeló esa variable.)
+
+**Hallazgo 2 — como palanca de TAMAÑO, es ruido.** El neto que de verdad
+desaparece del body son **330 bytes: un 0,22%**. El flag no está pensado para
+achicar el prefijo, y no lo achica de forma apreciable. Mover bytes de un
+bloque a otro no ahorra window de contexto, ni prefill, ni rate limit: el
+modelo sigue tokenizando la misma cantidad de texto.
+
+**Hallazgo 3 — el beneficio real (cacheabilidad) es cross-usuario, y aquí es
+inerte.** El propósito del flag es que el bloque `system` quede idéntico entre
+máquinas y usuarios distintos, para que compartan el mismo prefijo cacheado.
+Para un **único usuario** no hay con quién compartir esa caché. Es el mismo
+patrón que la Palanca A del optimizador de prompt cache
+(`docs/optimizer-prompt-cache.md` §6): mecanismo correcto, apuntando a un
+escenario que este uso no tiene.
+
+Queda un posible beneficio **local** sin medir: entre sesiones del mismo
+usuario, si cambia el `cwd` o el `git status`, mantenerlos fuera de `system`
+deja ese bloque estable entre corridas y podría alargar el cache-hit. Pero eso
+choca con la misma tenaza que la Palanca A —no se puede verificar que Anthropic
+honre el prefijo sin créditos de API (ver `docs/optimizer-prompt-cache.md`
+§6.2)—, así que se anota como mecanismo plausible, **no medido**.
+
+> **Salvedad de n.** n=1 por escenario. A diferencia del TTFT (§3, §8), esto no
+> es una medición ruidosa sino la composición de un body **determinista** dado
+> el mismo input; la reubicación (−3.514 / +3.184) es demasiado nítida para ser
+> azar. No se afirma nada de latencia a partir de estas dos sondas.
+
 ---
 
 ## 6. La memoria persistente no es compresión, es una inyección
