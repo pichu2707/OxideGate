@@ -65,7 +65,7 @@ cada request.
 | Configuración de MCP: `.claude/mcp-lean.json` + `--strict-mcp-config` | Elimina 55.098 B/petición de tres conectores de Google que no se usan en este repo | El archivo por sí solo no hace nada: hace falta el flag, porque una config de proyecto SUMA servidores, no los quita |
 | `--tools <lista>` | Recorta 94,9% del array de esquemas | `--disallowedTools` NO sirve para esto — solo ahorra 0,5%, porque es una puerta de permiso, no de payload |
 | Techo apilado sobre la misma sonda | 224.653 B (sin cambios) → 149.221 B (+ `--strict-mcp-config`) → 51.540 B (+ `--tools Read,Bash`), −77,1% total | El trade es real: un agente así no edita, no busca por patrón ni delega a subagentes |
-| `CLAUDE.md` lean | Medido: ahorra 29.867 B por petición (−13,3%). El 85,1% de ese archivo describe flujos que se invocan, no reglas que se obedecen | **No es una palanca lista.** Se midió el byte, no el comportamiento. Adoptarlo sin crear antes las skills a las que apunta perdería las reglas en silencio: el agente dejaría de delegar y de guardar en memoria sin avisar |
+| `CLAUDE.md` lean | Medido en el cable: −29.509 B por petición (34.922 B → 5.738 B en disco, −83,6%; el ahorro cae entero en `context_history_bytes`). El 85,1% del archivo era flujo, no regla | **Menos cara de lo que se temía, pero no gratis.** De las dos conductas de riesgo, **delegar sobrevivió al lean** (2/2 vs 2/2: un puntero de una línea bastó, refuta "deja de delegar"). El guardado proactivo NO se pudo medir: ni el `CLAUDE.md` completo lo dispara en modo `-p` de un turno (0/3), así que el A/B no tiene baseline. Falta una sesión interactiva. Detalle: `docs/optimizer-claude-md.md` |
 | `--effort low` | −20,0% tokens de salida y −22,0% de reloj de pared en una tarea de razonamiento (n=3 pares, rangos sin solape). Y **sin coste de exactitud**: 45/45 = 100% en high y en low sobre 25 problemas de respuesta cerrada (90 peticiones), pese a que `low` generó un 26,6% menos | **No acelera: recorta.** El `tok/s` no se mueve (rangos solapados). El coste en calidad, que se dejó sin medir, resultó **cero sobre razonamiento de respuesta cerrada** — pero exactitud no es toda la calidad: tareas abiertas (código, diseño) y problemas por encima del techo probado siguen sin medir. En tareas que no razonan, la palanca no hace nada |
 
 Detalle completo y las cuatro sondas: `docs/context-tax.md` §5. La única
@@ -241,6 +241,7 @@ Ideas registradas, no implementadas:
 ## Ver también
 
 - `docs/context-tax.md` — la descomposición medida de costo y latencia de una sesión real
+- `docs/optimizer-claude-md.md` — la palanca del `CLAUDE.md` lean: byte medido en el cable y A/B de comportamiento
 - `docs/optimizer-dedup.md` — por qué se descartó la Palanca B, en detalle
 - `docs/telemetry-per-request.md` — el endpoint que expone el desglose de contexto por petición
 - `docs/monitor-tui.md` — el detector `TRUNC` y el resto de marcadores de outlier
