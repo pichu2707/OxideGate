@@ -116,9 +116,69 @@ verá nada, y quien mida sobre una tarea que no requiere razonar tampoco.
 > estaba abierta. Para medir `effort` hace falta una tarea que obligue a
 > razonar.
 
-El precio no es cero: menos pensamiento es menos razonamiento. En tareas
-sensibles a la calidad, el 22% de tiempo se paga con la profundidad de la
-respuesta. Esto no se ha medido aquí y no se afirma.
+El precio no es cero: menos pensamiento es menos razonamiento. La pregunta —si
+ese 22% de tiempo se paga en calidad de la respuesta— se dejó explícitamente
+sin medir en la primera versión de esta página. Ya está medida para
+razonamiento de respuesta cerrada, y el resultado está en §3.2. El resumen: en
+ese tipo de tarea, no se detectó coste de exactitud; en tareas abiertas, sigue
+sin medir.
+
+### 3.2. ¿Cuesta calidad el `--effort low`? — MEDIDO para respuesta cerrada, y no
+
+§3.1 probó que `--effort low` recorta la generación. Lo que dejó abierto es si
+esa poda de pensamiento **empeora la respuesta**. Medirlo exige un criterio de
+calidad que no sea una impresión, así que la tarea de prueba se restringió a
+problemas de razonamiento con **una respuesta objetiva verificable**: la
+calidad se vuelve **exactitud** (acierto/fallo contra un ground-truth), no un
+juicio de gusto. Cada ground-truth se calculó por fuerza bruta antes de correr
+las sondas — si la respuesta "correcta" está mal, el experimento entero se
+corrompe.
+
+Dos baterías, cada problema corrido en `high` y en `low` (misma sonda,
+`--strict-mcp-config`, intercaladas para que cualquier deriva temporal afecte a
+ambas por igual), corregidas automáticamente contra el ground-truth:
+
+| batería | qué mide | HIGH | LOW |
+|---|---|---|---|
+| 1 — rutina (15 problemas, incluye trampas system-1: bat-and-ball, ovejas, máquinas) | ¿el modelo cae en atajos si piensa menos? | 15/15 | 15/15 |
+| 2 — duros (10 problemas × 3 reps: `3^27 mod 100`, `2^2024 mod 1000`, SEND+MORE=MONEY, conteos por inclusión-exclusión…) | ¿el cómputo sostenido se resiente sin pensamiento? | 30/30 | 30/30 |
+| **total (25 problemas, 90 peticiones)** | | **45/45 (100%)** | **45/45 (100%)** |
+
+**Hallazgo 1 — cero coste de exactitud, y la palanca SÍ actuó.** No es el falso
+null de §3.1. Allí la palanca no tenía sobre qué actuar (prosa: 0,1% de
+diferencia de tokens). Aquí actuó de sobra —agregando las 90 peticiones, `low`
+generó un **−26,6%** de `output_tokens` y tardó un **−17,6%** de `total_ms`,
+con el `tok/s` solapado (87,4 frente a 84,0), consistente con §3.1—. Pensó
+demostrablemente menos y **no falló ni uno** de los 25 problemas. Cero
+divergencia entre condiciones.
+
+**Hallazgo 2 — dos límites que impiden generalizar a "la calidad no baja".**
+
+1. **Exactitud no es toda la calidad.** Esto mide problemas con UNA respuesta
+   correcta. No mide profundidad en tareas abiertas —código sobre specs
+   ambiguas, diseño, cobertura de edge cases—, que es donde "calidad" no es un
+   único valor verificable. Esa dimensión, la que más importa para trabajo de
+   agente, este método no la toca.
+2. **Efecto techo.** Ni los problemas duros rompieron a Opus 4.8 a `low`. No se
+   encontró un problema *limpiamente corregible* lo bastante difícil como para
+   separar las dos condiciones. La banda donde `low` empezaría a fallar más que
+   `high` —si existe— está por encima de lo probado aquí, o en las dimensiones
+   subjetivas del límite anterior.
+
+**Consecuencia práctica, sin sobrevender.** Para razonamiento rutinario y de
+respuesta cerrada, `--effort low` es ~27% menos generación por el mismo
+acierto: gratis en esa banda. Reservar `high` tiene sentido para lo que este
+experimento no pudo medir —tareas abiertas y problemas más allá del techo
+probado—, no para el conteo o la deducción de cada día. Lo que NO se puede
+seguir afirmando es que `low` "recorta profundidad" como coste general: sobre
+lo medido, no lo hizo.
+
+> **Salvedad de método.** Batería 1 con n=1 por problema, batería 2 con n=3. El
+> 100%/100% con varianza cero significa que no apareció ni un caso borderline,
+> no que el intervalo de confianza sea estrecho por potencia estadística. Un
+> resultado de "no se detectó diferencia" no es "se probó que no existe": es que
+> no la hubo en 25 problemas que abarcan de lo trivial a teoría de números de
+> varios pasos.
 
 **Fast mode (`speed: "fast"`)**. Documentado por Anthropic: hasta ~2,5×
 más tokens por segundo de salida, a precio premium, sobre Opus 4.8 y 4.7.
@@ -225,6 +285,7 @@ Dos reglas metodológicas más, ambas aprendidas a base de medir mal:
 | Hilos paralelos | compran reloj de pared, lo pagan en tokens de prefijo por hilo | `docs/context-tax.md` §3, `docs/findings.md` §E |
 | `--effort low`, como acelerador | no acelera: el `tok/s` se solapa (64–68 frente a 66–68, n=3). Recorta un 20% de tokens generados, y de ahí sale el 22% de reloj | esta página, §3.1 |
 | `--effort low` en tareas sin razonamiento | 1.374 frente a 1.376 tokens de salida: la palanca no tiene sobre qué actuar | esta página, §3.1 |
+| `--effort low` como pérdida de exactitud (en respuesta cerrada) | 45/45 = 100% en ambas condiciones sobre 25 problemas, pese a un −26,6% de generación en `low`. No se detectó coste — con el techo y el límite de "exactitud ≠ calidad abierta" anotados | esta página, §3.2 |
 
 ---
 
