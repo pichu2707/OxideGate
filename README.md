@@ -41,28 +41,28 @@ dashboard de terminal). Hay un tercero, `oxidegate-bench`, que es una barrida de
 benchmark para desarrollo y **no se instala**: no tiene nada que hacer en el PATH
 de nadie.
 
-Desde el código, si preferís: `cargo run --bin oxidegate`.
+Desde el código, si prefieres: `cargo run --bin oxidegate`.
 
 ---
 
 ## Arranque rápido
 
 ```sh
-# 1. Levantar el proxy. Por defecto escucha en 8080; usá OXIDEGATE_PORT si ese
+# 1. Levantar el proxy. Por defecto escucha en 8080; usa OXIDEGATE_PORT si ese
 #    puerto está ocupado — lo está más a menudo de lo que parece.
 OXIDEGATE_PORT=8899 oxidegate
 
 # 2. Apuntar tu cliente a OxideGate en vez de al proveedor:
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8899
 
-# 3. Usá tu agente como siempre. OxideGate reenvía la petición INTACTA y la mide
+# 3. Usa tu agente como siempre. OxideGate reenvía la petición INTACTA y la mide
 #    de paso. Después:
 curl 127.0.0.1:8899/stats     # agregado por modelo
 oxidegate-monitor             # o el dashboard en vivo (misma OXIDEGATE_PORT)
 ```
 
 > **`ANTHROPIC_BASE_URL` va SIN `/v1`.** El cliente le agrega la ruta él mismo
-> (`/v1/messages`). Si le ponés el `/v1`, la petición sale a `/v1/v1/messages` y
+> (`/v1/messages`). Si le pones el `/v1`, la petición sale a `/v1/v1/messages` y
 > el proxy devuelve **404**. Es el error más fácil de cometer y el más difícil de
 > diagnosticar, porque parece que la herramienta no funciona.
 
@@ -159,7 +159,7 @@ oportunidad, la configuración la ejecuta, el monitor comprueba que sirvió.
 Fuera de la TUI, [`oxidegate-lens`](https://github.com/pichu2707/oxidegate-lens)
 imprime el mismo desglose en una tabla, con el ahorro por petición de cada
 servidor MCP. Es un proyecto aparte que solo **lee** `GET /stats` y
-`GET /requests`: la medición vive acá, la presentación allá.
+`GET /requests`: la medición vive aquí, la presentación allá.
 
 ### La segunda palanca: `--tools`, no `--disallowedTools`
 

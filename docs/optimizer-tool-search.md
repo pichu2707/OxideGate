@@ -209,7 +209,7 @@ impuesto de contexto, Claude Code **deja de diferir y carga todo de golpe** —
 creando el impuesto que se venía a medir. Efecto observador puro: el instrumento
 produce el fenómeno.
 
-Hasta acá era una cita. Ahora es un experimento.
+Hasta aquí era una cita. Ahora es un experimento.
 
 ### 3.1. El A/B con servidor sonda — de "ausente" a "retenido", con prueba
 
@@ -250,8 +250,8 @@ harness los retuvo, y hay una conexión confirmada que lo prueba.
    término del AND es verdadero y el resultado es falso, el segundo término
    tiene que ser falso: la tool de búsqueda no está.
 3. **Exactamente UNA tool nativa trae `defer_loading: true` en el brazo con
-   diferido activo.** Esto está **sin explicar**. No se teoriza acá por qué:
-   se deja como hecho medido y abierto. Una futura corrida que aísle esa tool
+   diferido activo.** Esto está **sin explicar**. No se teoriza aquí por qué:
+   se deja como hecho medido y abierto. Una futura ejecución que aísle esa tool
    específica podría explicarlo; hasta entonces, este documento prefiere una
    pregunta abierta honesta a una historia plausible sin evidencia.
 
@@ -279,9 +279,9 @@ prompt que **obliga** al modelo a invocar `probe_marker`.
 
 **Distinguir retención de latencia de conexión.** Un servidor puede faltar en el
 cable por dos razones muy distintas, y este experimento las separa: un servidor
-que **aparece cuando lo necesitás** estaba **retenido**; uno que aparece **solo
+que **aparece cuando lo necesitas** estaba **retenido**; uno que aparece **solo
 con el paso de los turnos** (los conectores HTTP remotos tardan en conectar)
-estaba **conectando**. Medido: en una corrida de control, `claude_ai_*` no está
+estaba **conectando**. Medido: en una ejecución de control, `claude_ai_*` no está
 en la petición #1 y sí en la #3, siete segundos después, sin que nadie los pida.
 **Ausencia no implica retención**, y ningún consumidor de esta telemetría puede
 afirmar la causa de una ausencia desde una sola petición.
@@ -333,7 +333,7 @@ diferido de Claude Code es un mecanismo enteramente distinto, propio del
 harness, que decide qué mandar en el body ANTES de que salga — no una
 instancia del primitivo de §2 corriendo del lado del cliente. La única marca
 `defer_loading` medida (conclusión 3) es un dato aislado, no evidencia de que
-el mecanismo de §2 esté en juego acá.
+el mecanismo de §2 esté en juego aquí.
 
 ### 3.2. Los dos mecanismos NO son el mismo
 
@@ -369,7 +369,7 @@ presencia del proxy** — ahora confirmado con control.
 
 El número no está mal; **la línea base sí**. Desconectar los MCP con el proxy
 puesto sí baja los bytes — pero **quitar el proxy los baja igual, y encima
-conservás los servidores**. Un usuario podría amputar capacidades reales para
+conservas los servidores**. Un usuario podría amputar capacidades reales para
 "ahorrar" bytes que introdujo el medidor.
 
 Lo mismo vale para las filas `native`: la lente afirma que *"no se quitan
@@ -419,7 +419,7 @@ puede leer la configuración de MCP del cliente (los servidores que el usuario
 efectivamente registró) y compararla contra lo que `tools_by_server` reporta
 que llegó al cable. Declarado-vs-llegado es exactamente la comparación que el
 proxy no puede hacer por sí solo — el proxy mide el cable; `oxidegate-lens`
-conoce el otro lado. Esta sección documenta el límite; no lo resuelve acá.
+conoce el otro lado. Esta sección documenta el límite; no lo resuelve aquí.
 
 ---
 

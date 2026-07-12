@@ -222,7 +222,7 @@ campo con una afirmación de bytes-no-enviados.
 **Nunca se exponen nombres de herramienta individuales.** Solo la etiqueta
 del servidor y conteos agregados viajan por este endpoint — la misma
 invariante de privacidad del §3 (`prompt_hash`/`prompt_bytes` nunca se
-exponen) se extiende acá: el nombre de una herramienta puntual, o un
+exponen) se extiende aquí: el nombre de una herramienta puntual, o un
 fragmento de su `input_schema`/`description`, tampoco sale por HTTP.
 
 **`null` vs. `[]` son estados DISTINTOS, no intercambiables:**
