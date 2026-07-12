@@ -32,8 +32,8 @@ impacto **en vivo**, comparando el antes y el después.
 
 ## Arranque rápido
 
-El proyecto tiene **tres binarios**: `oxidegate` (el proxy), `monitor` (el
-dashboard) y `bench` (barrida de benchmark controlada).
+El proyecto tiene **tres binarios**: `oxidegate` (el proxy), `oxidegate-monitor`
+(el dashboard) y `oxidegate-bench` (barrida de benchmark controlada).
 
 ```sh
 # 1. Levantar el proxy. Por defecto escucha en 8080; use OXIDEGATE_PORT si está
@@ -48,7 +48,7 @@ OXIDEGATE_PORT=8899 cargo run --bin oxidegate
 curl localhost:8899/stats
 
 # 4. O el monitor de terminal en tiempo real (misma OXIDEGATE_PORT que el proxy):
-OXIDEGATE_PORT=8899 cargo run --bin monitor
+OXIDEGATE_PORT=8899 cargo run --bin oxidegate-monitor
 ```
 
 ### Rutas espejo
@@ -89,7 +89,7 @@ El monitor es la forma de comprobar que una optimización sirve:
 
 Teclas: `q` salir · `b` baseline · `r` reset · ↑/↓ elegir modelo ·
 `p` panel por petición · `c` cambiar de vista (latencia / contexto).
-`cargo run --bin monitor -- --once` da la foto en texto plano (headless).
+`cargo run --bin oxidegate-monitor -- --once` da la foto en texto plano (headless).
 
 ---
 

@@ -3,6 +3,22 @@ name = "oxidegate"
 version = "0.1.0"
 edition = "2024"
 
+# Los binarios se declaran a mano: la autodetección de Cargo los llamaría
+# `monitor` y `bench`, nombres demasiado genéricos para instalarse en el PATH
+# del usuario (`cargo install`, formula de Homebrew). El prefijo `oxidegate-`
+# los mantiene inconfundibles.
+[[bin]]
+name = "oxidegate"
+path = "src/main.rs"
+
+[[bin]]
+name = "oxidegate-monitor"
+path = "src/bin/monitor.rs"
+
+[[bin]]
+name = "oxidegate-bench"
+path = "src/bin/bench.rs"
+
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
 axum = { version = "0.7", features = ["macros"] }

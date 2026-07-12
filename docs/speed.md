@@ -247,7 +247,7 @@ con la razón escrita en el código (`src/provider/openai.rs`,
 ## 5. Cómo medir el antes/después
 
 1. Levante el proxy: `OXIDEGATE_PORT=8899 cargo run --bin oxidegate`
-2. Levante el monitor en otra terminal: `OXIDEGATE_PORT=8899 cargo run --bin monitor`
+2. Levante el monitor en otra terminal: `OXIDEGATE_PORT=8899 cargo run --bin oxidegate-monitor`
 3. Apunte el cliente al proxy: `ANTHROPIC_BASE_URL=http://localhost:8899 claude`
 4. Genere tráfico normal y pulse `b` en el monitor para marcar el baseline.
 5. Active la palanca: reinicie con `--effort low` (o `/fast`, si dispone de

@@ -14,7 +14,7 @@
 //! caen en la misma telemetría y entran al mismo reporte.
 //!
 //! Uso:
-//!   OXIDEGATE_PORT=8899 GEMINI_API_KEY=... OPENAI_API_KEY=... cargo run --bin bench
+//!   OXIDEGATE_PORT=8899 GEMINI_API_KEY=... OPENAI_API_KEY=... cargo run --bin oxidegate-bench
 //!
 //! Las keys se leen de un archivo `.env` en la raíz (cargado con dotenvy) o del
 //! entorno. Variables:

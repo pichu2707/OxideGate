@@ -49,7 +49,7 @@ GEMINI_MODEL=gemini-2.5-flash
 Con OxideGate corriendo:
 
 ```bash
-OXIDEGATE_PORT=8899 cargo run --bin bench
+OXIDEGATE_PORT=8899 cargo run --bin oxidegate-bench
 ```
 
 Variables (todas opcionales salvo al menos una key):

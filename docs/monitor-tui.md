@@ -24,14 +24,14 @@ avisa en pantalla y sigue reintentando cada poll.
 ## 2. Cómo se lanza
 
 ```bash
-cargo run --bin monitor
+cargo run --bin oxidegate-monitor
 ```
 
 O ya compilado:
 
 ```bash
-cargo build --release --bin monitor
-./target/release/monitor
+cargo build --release --bin oxidegate-monitor
+./target/release/oxidegate-monitor
 ```
 
 ### URL del endpoint
@@ -45,19 +45,19 @@ En orden de prioridad:
 
 ```bash
 # proxy en el puerto default
-cargo run --bin monitor
+cargo run --bin oxidegate-monitor
 
 # proxy en otro puerto
-OXIDEGATE_PORT=8899 cargo run --bin monitor
+OXIDEGATE_PORT=8899 cargo run --bin oxidegate-monitor
 
 # URL explícita
-cargo run --bin monitor -- --url http://127.0.0.1:8899/stats
+cargo run --bin oxidegate-monitor -- --url http://127.0.0.1:8899/stats
 ```
 
 ### Modo headless: `--once`
 
 ```bash
-cargo run --bin monitor -- --once
+cargo run --bin oxidegate-monitor -- --once
 ```
 
 Hace UN solo fetch de `/stats` y otro de `/requests`, e imprime todo en texto
