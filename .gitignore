@@ -1,3 +1,9 @@
 /target
 
 .env
+
+# Presentaciones: se distribuyen como assets de GitHub Releases, no por git
+presentations/
+
+# Metadata del tooling de agentes (hash + fecha; se regenera sola)
+.atl/
