@@ -29,6 +29,16 @@
 //! cortas de un enum documentado por el proveedor (`"low"`, `"fast"`…),
 //! nunca contenido de prompt — no comprometen la invariante de privacidad de
 //! arriba.
+//!
+//! EXCEPCIÓN A LA INVARIANTE: `client`. Es el único campo de esta estructura que
+//! NO lo calcula el proxy — es el `User-Agent` crudo del cliente, sin sanear,
+//! solo recortado a 200 caracteres. Lo elige quien llama, no nosotros. La capa
+//! HTTP acota el daño (`HeaderValue` rechaza bytes de control, y `to_str()`
+//! rechaza todo byte ≥ 0x80, así que no hay escapes de terminal ni saltos de
+//! línea que rompan el JSONL), pero el contenido en sí es de terceros y viaja
+//! tanto por `GET /requests` como al `telemetry.jsonl` en texto plano. Léase
+//! `docs/telemetry-per-request.md` §4.3 antes de exponer este endpoint fuera de
+//! localhost.
 use crate::provider::ToolServerBytes;
 use crate::telemetry::logger::RequestMetric;
 use serde::Serialize;
@@ -63,6 +73,10 @@ pub struct RecentRequest {
     pub model: Option<String>,
     /// `true` si el cliente pidió respuesta en streaming (SSE).
     pub stream: bool,
+    /// `User-Agent` del cliente que originó el request. Ver
+    /// `telemetry::logger::RequestMetric::client` para el contrato completo
+    /// (crudo, topeado en longitud). `None` si el header no vino.
+    pub client: Option<String>,
     /// Código de estado HTTP devuelto al cliente.
     pub status: u16,
     /// Tokens de entrada exactos, tal como los reporta el proveedor.
@@ -155,6 +169,7 @@ impl From<&RequestMetric> for RecentRequest {
             upstream: m.upstream.clone(),
             model: m.model.clone(),
             stream: m.stream,
+            client: m.client.clone(),
             status: m.status,
             input_tokens: m.input_tokens,
             output_tokens: m.output_tokens,
@@ -230,6 +245,7 @@ mod tests {
             model: Some("claude-opus-4".to_string()),
             prompt_hash: "0000000000000001".to_string(),
             stream: false,
+            client: Some("claude-cli/1.2.3 (external, cli)".to_string()),
             prompt_bytes: 100,
             input_tokens: Some(10),
             output_tokens: Some(5),
@@ -257,6 +273,7 @@ mod tests {
                 kind: crate::provider::ToolServerKind::Mcp,
                 tools: 2,
                 bytes: 30,
+                deferred_tools: 0,
             }]),
             tools_overhead_bytes: Some(4),
             prepare_us: 42,
@@ -310,6 +327,7 @@ mod tests {
     fn proyeccion_copia_campos_fielmente_incluyendo_none() {
         let mut m = base_metric("t1");
         m.model = None;
+        m.client = None;
         m.cache_read_tokens = None;
         m.cache_write_tokens = None;
         m.cost_estimate_usd = None;
@@ -337,6 +355,7 @@ mod tests {
         assert_eq!(row.upstream, "anthropic");
         assert_eq!(row.model, None);
         assert!(!row.stream);
+        assert_eq!(row.client, None);
         assert_eq!(row.status, 500);
         assert_eq!(row.input_tokens, Some(10));
         assert_eq!(row.output_tokens, Some(5));
@@ -383,6 +402,7 @@ mod tests {
                 kind: crate::provider::ToolServerKind::Mcp,
                 tools: 2,
                 bytes: 30,
+                deferred_tools: 0,
             }])
         );
         assert_eq!(row.tools_overhead_bytes, Some(4));
@@ -492,5 +512,38 @@ mod tests {
         let parsed_recent: serde_json::Value = serde_json::from_str(&recent_json).unwrap();
         assert!(parsed_recent["tools_by_server"].is_null());
         assert!(parsed_recent["tools_overhead_bytes"].is_null());
+    }
+
+    /// Con `client` presente, tanto `RequestMetric` como su proyección
+    /// `RecentRequest` deben serializarlo con el valor exacto — mismo patrón
+    /// que `round_trip_serde_con_effort_y_speed_presentes`.
+    #[test]
+    fn round_trip_serde_con_client_presente() {
+        let m = base_metric("t1");
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+        let row = &recent.snapshot()[0];
+        let json = serde_json::to_string(row).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["client"], "claude-cli/1.2.3 (external, cli)");
+    }
+
+    /// Con `client` ausente (`None`, el caso de un cliente que no manda
+    /// `User-Agent` o cuyo header no era UTF-8 válido), debe serializar a
+    /// `null`, nunca desaparecer del JSON ni fallar.
+    #[test]
+    fn round_trip_serde_con_client_none() {
+        let mut m = base_metric("t1");
+        m.client = None;
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+        let row = &recent.snapshot()[0];
+        let json = serde_json::to_string(row).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert!(parsed["client"].is_null());
     }
 }

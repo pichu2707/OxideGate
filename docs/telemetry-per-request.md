@@ -104,6 +104,12 @@ Esto mirroriza la misma invariante que ya documenta
 `src/middleware/stats.rs`: el proxy no expone huellas de prompt por HTTP,
 haya o no autenticación de por medio.
 
+**Esta invariante cubre huellas de prompt, no el campo `client`.** El campo
+`client` (§4, §4.3) es un caso aparte: no es una huella de prompt, pero
+tampoco es un dato que el proxy calcule — es el `User-Agent` del cliente,
+reenviado crudo. Ver §4.3 antes de exponer este endpoint fuera de
+`127.0.0.1` o de compartir `telemetry.jsonl`.
+
 ---
 
 ## 4. Qué señala cada campo
@@ -115,6 +121,7 @@ haya o no autenticación de por medio.
 | `upstream` | Proveedor destino (`anthropic`, `openai`, …) | Junto con `model`, la clave de agrupación para comparar contra pares |
 | `model` | Modelo solicitado, o `null` si no venía en el body | Un `null` sostenido en el tiempo suele indicar clientes mal configurados |
 | `stream` | `true` si el cliente pidió SSE | Sin streaming, `ttft_ms` no aplica — ver `total_ms` en su lugar |
+| `client` | `User-Agent` del request entrante, CRUDO (sin normalizar), topeado a 200 caracteres. `null` si el header no vino o no era UTF-8 válido | Distingue un harness que YA difiere tools MCP por su cuenta (Claude Code sin caer al fallback de carga upfront) de uno genuinamente eager — ver `docs/optimizer-tool-search.md` §3. **Léase §4.3 antes de exponer este campo**: a diferencia del resto de esta tabla, es contenido controlado por el cliente, no una propiedad que el proxy calcula |
 | `status` | Código HTTP devuelto al cliente | `>= 400` es la señal de error más barata de todas: no necesita comparación con nada |
 | `input_tokens` / `output_tokens` | Tokens exactos reportados por el proveedor | `null` si el proveedor no los reportó (p. ej. request fallido antes de leer `usage`) |
 | `cache_read_tokens` / `cache_write_tokens` | Tokens servidos o escritos a caché | Una fila con `cache_read_tokens` en `0`/`null` en medio de una conversación larga que sí cachea es un miss caro y aislado |
@@ -131,7 +138,7 @@ haya o no autenticación de por medio.
 | `context_messages_count` | Cantidad de mensajes del historial completo (incluyendo el último) | Sube con la conversación; útil para correlacionar contra `context_history_bytes` |
 | `context_tax_ratio` | `(context_system_bytes + context_tools_bytes + context_history_bytes) / context_measured_bytes` | Cercano a `1.0` (100%) ⇒ casi todo el body de esta petición es contexto YA enviado antes, no turno nuevo — la "tasa" que se paga por repetir contexto en cada request |
 | `prepare_us` | Microsegundos que el proxy pasó dentro de `Provider::prepare` (parseo del body + `decompose` + mutación opcional, p. ej. inyectar `cache_control`) | Ver la nota sobre qué NO incluye, más abajo |
-| `tools_by_server` | Desglose de `context_tools_bytes` por servidor MCP declarante: `[{server, kind, tools, bytes}, …]`, ordenado por `bytes` descendente | `null` si el body no parseó como objeto (o build anterior a este campo); `[]` si SÍ parseó pero no declaraba `tools` — son estados DISTINTOS, ver §4.2 |
+| `tools_by_server` | Desglose de `context_tools_bytes` por servidor MCP declarante: `[{server, kind, tools, bytes, deferred_tools}, …]`, ordenado por `bytes` descendente | `null` si el body no parseó como objeto (o build anterior a este campo); `[]` si SÍ parseó pero no declaraba `tools` — son estados DISTINTOS, ver §4.2. `deferred_tools` (por elemento) es la fuente de verdad POR SERVIDOR de cuánto está diferido, ver §4.2 |
 | `tools_overhead_bytes` | Bytes de `tools` no atribuidos a ningún servidor (brackets/comas del array, wrapper de Gemini, herramientas huérfanas) | `null` en los mismos casos que `tools_by_server` es `null`; `sum(tools_by_server[].bytes) + tools_overhead_bytes == context_tools_bytes` siempre que ambos sean no-nulos |
 
 Ninguno de los campos de latencia/coste/identidad es nuevo: todos ya existían
@@ -187,10 +194,30 @@ Cada elemento trae:
 | `kind` | `"native"` / `"mcp"` / `"others"` — el tipo de cubo, en minúsculas |
 | `tools` | Cantidad de herramientas atribuidas a este servidor |
 | `bytes` | Suma de bytes de las herramientas de este servidor |
+| `deferred_tools` | Cuántas de `tools` traían `defer_loading: true` en su propia definición dentro del body ENTRANTE. `0` en `openai`/`gemini` (el campo no existe en esos dialectos) |
 
 **`tools` y `bytes` son conteos y BYTES, nunca tokens** — mismo contrato de
 medición que `context_tools_bytes` (§4.1): se miden re-serializando el
 fragmento JSON de cada herramienta, sin tokenización de por medio.
+
+**`deferred_tools` es la fuente de verdad POR SERVIDOR de cuánto diferido
+hay.** Un consumidor que lea `deferred_tools` por elemento obtiene una
+afirmación exacta sobre ESE servidor, nunca sobre el body completo:
+
+- `deferred_tools == tools` → ese servidor está totalmente diferido.
+- `deferred_tools == 0` → ese servidor no difirió NADA — sus `bytes` son
+  reales y desconectables.
+- `0 < deferred_tools < tools` → diferido parcial, el caso que antes era
+  invisible (ver `docs/optimizer-tool-search.md`, defecto de revisión
+  adversarial ronda 3).
+
+**DOMINIO: tokens de contexto, no bytes de cable.** `deferred_tools` registra
+si la definición trae la marca `defer_loading` en el body ENTRANTE — nunca
+cuántos bytes viajaron por el cable de ESTE request. El mecanismo de la API
+de Anthropic AÑADE los esquemas descubiertos al final del prompt, no los
+retiene (`docs/optimizer-tool-search.md` §2.2): una definición marcada con
+`defer_loading: true` sigue viajando completa en `tools`. No mezclar este
+campo con una afirmación de bytes-no-enviados.
 
 **Nunca se exponen nombres de herramienta individuales.** Solo la etiqueta
 del servidor y conteos agregados viajan por este endpoint — la misma
@@ -219,6 +246,42 @@ Anthropic/OpenAI, donde cada herramienta ES el elemento del array, sin
 wrapper), y herramientas huérfanas sin `name` válido. Ver
 `provider::tools_overhead_bytes` en el proxy para el detalle completo de los
 tres contribuyentes.
+
+---
+
+### 4.3. `client`: el único campo de esta fila que NO es una medición del proxy
+
+Todo lo demás en esta tabla es algo que OxideGate **calculó** a partir del
+body (bytes, tokens, latencia) o **decidió** (`cache_control_forced`).
+`client` es distinto: es el header `User-Agent`
+reenviado **tal cual llegó**, con el único filtro de un tope de 200
+caracteres (`middleware::proxy::MAX_CLIENT_LEN`) — sin sanitizar, sin
+escapar, sin validar formato. Cualquier proceso que hable HTTP puede mandar
+lo que quiera ahí.
+
+Eso tiene dos consecuencias concretas para quien exponga este endpoint:
+
+- **Viaja crudo hasta `GET /requests`.** Sin autenticación de por medio (el
+  proxy bindea en `127.0.0.1`, igual que el resto de los endpoints), ese
+  string sale exactamente como llegó.
+- **Viaja crudo hasta `telemetry.jsonl`, en texto plano.** El campo se
+  persiste en disco sin cifrar y sin sanitizar, línea a línea, indefinidamente
+  (no hay rotación ni expiración documentada en este slice).
+
+**La tensión con la invariante del §3.** El §3 de este documento dice que
+`RecentRequest` "no expone huellas de prompt" y describe el resto de sus
+campos como "públicamente inofensivos". Esa descripción es correcta para
+`route`, `status`, `upstream` o los campos `context_*`: son propiedades que
+el proxy DERIVA del tráfico, no contenido que el cliente eligió mandar en
+texto libre. `client` no encaja en esa categoría — es la única excepción, y
+este documento prefiere decirlo explícitamente en vez de dejar que la frase
+"públicamente inofensivo" del §3 lo cubra por generalización implícita.
+
+En la práctica, el riesgo es acotado (un `User-Agent` no suele llevar datos
+sensibles, y el tope de 200 caracteres limita el radio de un log-injection
+grosero), pero es un riesgo de una clase distinta al resto de la tabla, y
+quien decida exponer `GET /requests` o compartir `telemetry.jsonl` fuera del
+host donde corre el proxy debería saberlo antes de hacerlo, no después.
 
 ---
 

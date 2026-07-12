@@ -38,6 +38,19 @@ pub struct RequestMetric {
     pub prompt_hash: String,
     /// `true` si el cliente pidió respuesta en streaming (SSE).
     pub stream: bool,
+    /// `User-Agent` del cliente que originó el request, crudo (sin
+    /// normalizar) salvo un tope de longitud (ver
+    /// `middleware::proxy::client_of`). Claude Code se identifica con algo
+    /// como `claude-cli/1.2.3 (external, cli)`; otros harnesses mandan su
+    /// propia cadena. `None` si el header no vino o no era UTF-8 válido.
+    ///
+    /// Es la pieza que faltaba para distinguir un harness que YA difiere
+    /// tools MCP por su cuenta (Claude Code, cuando no cae al fallback de
+    /// carga upfront) de uno genuinamente eager (ver
+    /// `docs/optimizer-tool-search.md` §3): antes de este campo, "este
+    /// tráfico era Claude Code" solo se podía INFERIR por los nombres de
+    /// servidor MCP declarados, nunca confirmarse.
+    pub client: Option<String>,
 
     // --- Coste ---
     /// Tamaño en bytes del body del request (sombra barata del tamaño real).

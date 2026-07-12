@@ -21,6 +21,27 @@ use axum::{
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Tope de longitud (en caracteres) para el `User-Agent` capturado en la
+/// métrica. El valor se guarda CRUDO (sin normalizar: Claude Code se
+/// identifica con algo como `claude-cli/1.2.3 (external, cli)`, cada harness
+/// manda su propia cadena) pero un valor absurdamente largo volvería
+/// ilegible una fila de `telemetry.jsonl`, así que se corta acá.
+const MAX_CLIENT_LEN: usize = 200;
+
+/// Lee el header `User-Agent` del request entrante, tal cual, con el tope de
+/// longitud de [`MAX_CLIENT_LEN`] aplicado por CARACTERES (no por bytes, para
+/// no partir un UTF-8 multibyte a la mitad). `None` si el header está ausente
+/// o no es UTF-8 válido: preferimos un hueco honesto a un panic o un
+/// placeholder inventado.
+fn client_of(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(header::USER_AGENT)?.to_str().ok()?;
+    if value.chars().count() > MAX_CLIENT_LEN {
+        Some(value.chars().take(MAX_CLIENT_LEN).collect())
+    } else {
+        Some(value.to_string())
+    }
+}
+
 /// `POST /v1/chat/completions` → proveedor OpenAI (Chat Completions).
 pub async fn handle_openai_route(state: State<Arc<AppState>>, req: Request) -> Response {
     run(&provider::OPENAI_CHAT, state, req).await
@@ -93,6 +114,11 @@ async fn send_and_meter(
     start: Instant,
     prepare_us: u64,
 ) -> Response {
+    // Capturado ANTES de reenviar: identifica qué harness originó el
+    // request (ver `client_of`). No se muta ni se usa para decidir nada acá,
+    // solo viaja hasta la métrica.
+    let client = client_of(req_headers);
+
     // Reconstruimos la petición copiando las cabeceras originales (auth,
     // content-type, anthropic-version, x-goog-api-key…).
     let mut outbound = state.http.post(&out.url).body(out.body);
@@ -139,6 +165,11 @@ async fn send_and_meter(
                 model: out.model,
                 prompt_hash: out.prompt_hash,
                 stream: out.stream,
+                // Movemos `client` acá sin clonar: esta rama SIEMPRE hace
+                // `return` antes de llegar al uso de más abajo (éxito), así
+                // que ambos usos son mutuamente excluyentes en tiempo de
+                // ejecución y el análisis de flujo del compilador lo permite.
+                client,
                 prompt_bytes: out.prompt_bytes,
                 input_tokens: None,
                 output_tokens: None,
@@ -182,6 +213,7 @@ async fn send_and_meter(
         model: out.model,
         prompt_hash: out.prompt_hash,
         stream: out.stream,
+        client,
         prompt_bytes: out.prompt_bytes,
         status: status.as_u16(),
         cache_control_forced: out.cache_control_forced,

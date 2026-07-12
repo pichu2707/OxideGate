@@ -42,6 +42,10 @@ pub struct MetricBase {
     pub stream: bool,
     pub prompt_bytes: usize,
     pub status: u16,
+    /// `User-Agent` del cliente, leído de los headers del request entrante
+    /// ANTES de que exista ningún `Outgoing` (`middleware::proxy::client_of`).
+    /// Viaja intacto hasta `RequestMetric::client`.
+    pub client: Option<String>,
     /// `true` si `provider.prepare` inyectó un breakpoint de `cache_control`
     /// en el body saliente (palanca A del optimizador). Nace en `Outgoing` y
     /// viaja intacto hasta la métrica final.
@@ -250,6 +254,7 @@ impl MeteredBody {
             model: self.base.model.clone(),
             prompt_hash: self.base.prompt_hash.clone(),
             stream: self.base.stream,
+            client: self.base.client.clone(),
             prompt_bytes: self.base.prompt_bytes,
             input_tokens: self.scanner.usage.input_tokens,
             output_tokens: self.scanner.usage.output_tokens,

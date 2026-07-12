@@ -320,6 +320,7 @@ mod tests {
             model: Some(model.to_string()),
             prompt_hash: "0000000000000001".to_string(),
             stream: false,
+            client: None,
             prompt_bytes: 100,
             input_tokens: Some(10),
             output_tokens: Some(5),
