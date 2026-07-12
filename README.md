@@ -30,26 +30,53 @@ impacto **en vivo**, comparando el antes y el después.
 
 ---
 
-## Arranque rápido
-
-El proyecto tiene **tres binarios**: `oxidegate` (el proxy), `oxidegate-monitor`
-(el dashboard) y `oxidegate-bench` (barrida de benchmark controlada).
+## Instalación
 
 ```sh
-# 1. Levantar el proxy. Por defecto escucha en 8080; use OXIDEGATE_PORT si está
-#    ocupado (en la máquina de desarrollo se usa 8899).
-OXIDEGATE_PORT=8899 cargo run --bin oxidegate
-
-# 2. Apuntar tu cliente a OxideGate en vez de al proveedor, p. ej.:
-#    ANTHROPIC_BASE_URL=http://localhost:8899/v1
-#    (OxideGate reenvía la petición intacta y la mide de paso.)
-
-# 3. Ver la telemetría agregada por modelo, en vivo:
-curl localhost:8899/stats
-
-# 4. O el monitor de terminal en tiempo real (misma OXIDEGATE_PORT que el proxy):
-OXIDEGATE_PORT=8899 cargo run --bin oxidegate-monitor
+brew install pichu2707/tap/oxidegate
 ```
+
+Instala dos ejecutables: **`oxidegate`** (el proxy) y **`oxidegate-monitor`** (el
+dashboard de terminal). Hay un tercero, `oxidegate-bench`, que es una barrida de
+benchmark para desarrollo y **no se instala**: no tiene nada que hacer en el PATH
+de nadie.
+
+Desde el código, si preferís: `cargo run --bin oxidegate`.
+
+---
+
+## Arranque rápido
+
+```sh
+# 1. Levantar el proxy. Por defecto escucha en 8080; usá OXIDEGATE_PORT si ese
+#    puerto está ocupado — lo está más a menudo de lo que parece.
+OXIDEGATE_PORT=8899 oxidegate
+
+# 2. Apuntar tu cliente a OxideGate en vez de al proveedor:
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8899
+
+# 3. Usá tu agente como siempre. OxideGate reenvía la petición INTACTA y la mide
+#    de paso. Después:
+curl 127.0.0.1:8899/stats     # agregado por modelo
+oxidegate-monitor             # o el dashboard en vivo (misma OXIDEGATE_PORT)
+```
+
+> **`ANTHROPIC_BASE_URL` va SIN `/v1`.** El cliente le agrega la ruta él mismo
+> (`/v1/messages`). Si le ponés el `/v1`, la petición sale a `/v1/v1/messages` y
+> el proxy devuelve **404**. Es el error más fácil de cometer y el más difícil de
+> diagnosticar, porque parece que la herramienta no funciona.
+
+### Y una advertencia que te debemos por adelantado
+
+Poner **cualquier** `ANTHROPIC_BASE_URL` que no sea el de Anthropic hace que
+Claude Code **deje de diferir sus esquemas MCP** y los mande todos de golpe.
+OxideGate es uno de esos base URL. Es decir: **parte de los bytes que vas a ver
+medidos existen porque el medidor está en el camino.**
+
+No es una hipótesis: está medido con grupo de control y servidor sonda en
+[`docs/optimizer-tool-search.md`](docs/optimizer-tool-search.md) §3.
+[`oxidegate-lens`](https://github.com/pichu2707/oxidegate-lens) te lo dice en el
+propio reporte, en vez de venderte un ahorro que no existe.
 
 ### Rutas espejo
 
