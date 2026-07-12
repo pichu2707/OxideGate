@@ -1095,6 +1095,53 @@ mod tests {
         );
     }
 
+    /// PIN DE BYTES (`docs/optimizer-tool-search.md` §2.3): marcar una tool
+    /// con `defer_loading: true` CUESTA bytes, nunca los ahorra. Medido en el
+    /// cable, byte a byte, tres veces de forma independiente: la resta entre
+    /// la misma tool con y sin la marca da exactamente 21 —
+    /// `len(",\"defer_loading\":true") == 21`. El servidor primitivo ANEXA la
+    /// marca a una definición que sigue viajando completa; no la retiene.
+    ///
+    /// Este test compara la MISMA tool servida por `group_tools_by_server`
+    /// con y sin la clave, sobre el campo `bytes` (no `n_bytes` de telemetría,
+    /// pero el mismo camino de medición: `measure_value` vía
+    /// `serde_json::to_vec`, dominio bytes-de-cable). Si algún día la
+    /// contabilidad empezara a EXCLUIR del conteo las tools diferidas (el
+    /// error de categoría que este proyecto ya corrigió una vez: un hecho de
+    /// dominio-tokens contaminando un número de dominio-bytes), este test
+    /// tiene que fallar.
+    #[test]
+    fn deferred_tools_marca_defer_loading_suma_21_bytes_y_nunca_los_resta() {
+        let sin_marcar = serde_json::json!({"name": "mcp__srv__tool", "description": "algo"});
+        let mut con_marca = sin_marcar.clone();
+        con_marca["defer_loading"] = serde_json::json!(true);
+
+        let entries_sin: Vec<(&str, &Value)> = vec![("mcp__srv__tool", &sin_marcar)];
+        let entries_con: Vec<(&str, &Value)> = vec![("mcp__srv__tool", &con_marca)];
+
+        let rows_sin = group_tools_by_server(entries_sin.into_iter());
+        let rows_con = group_tools_by_server(entries_con.into_iter());
+
+        assert_eq!(rows_sin.len(), 1);
+        assert_eq!(rows_con.len(), 1);
+        assert_eq!(rows_sin[0].deferred_tools, 0, "sin la marca: deferred_tools debe dar 0");
+        assert_eq!(rows_con[0].deferred_tools, 1, "con la marca: deferred_tools debe dar 1");
+
+        let bytes_sin = rows_sin[0].bytes;
+        let bytes_con = rows_con[0].bytes;
+
+        assert!(
+            bytes_con >= bytes_sin,
+            "defer_loading NUNCA debe reducir los bytes de un servidor: marca, no retiene \
+             (bytes_con={bytes_con}, bytes_sin={bytes_sin})"
+        );
+        assert_eq!(
+            bytes_con - bytes_sin,
+            21,
+            "marcar defer_loading debe sumar EXACTAMENTE 21 bytes — len(',\"defer_loading\":true')"
+        );
+    }
+
     /// `tools` ausente ⇒ `None`; `tools: []` ⇒ `Some(vec![])`. Son casos
     /// DISTINTOS y no deben confundirse: el primero es "el dialecto no dijo
     /// nada de herramientas", el segundo es "sí dijo, y son cero".
