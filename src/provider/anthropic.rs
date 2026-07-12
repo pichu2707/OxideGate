@@ -697,6 +697,50 @@ mod tests {
         assert_eq!(out.tools_overhead_bytes, expected_tools_bytes - expected_sum);
     }
 
+    /// EXTREMO A EXTREMO por `prepare`: un body real con un servidor MCP
+    /// totalmente diferido y OTRO servidor MCP sin diferir nada.
+    /// `tools_by_server[i].deferred_tools`, por servidor, tiene que
+    /// distinguir al servidor que no difirió nada del que sí
+    /// (`docs/optimizer-tool-search.md`, defecto de revisión adversarial
+    /// ronda 3).
+    #[test]
+    fn prepare_deferred_tools_por_servidor_en_body_mixto() {
+        let cfg = test_config(false);
+        let incoming = incoming_with_body(
+            r#"{
+                "model": "claude-opus-4",
+                "tools": [
+                    {"type": "tool_search_tool_bm25_20251119", "name": "tool_search_tool_bm25"},
+                    {"name": "mcp__servidor_diferido__x", "defer_loading": true},
+                    {"name": "mcp__servidor_diferido__y", "defer_loading": true},
+                    {"name": "mcp__servidor_completo__z", "description": "esquema completo"}
+                ],
+                "messages": []
+            }"#,
+        );
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        let diferido = out
+            .tools_by_server
+            .iter()
+            .find(|s| s.server == "servidor_diferido")
+            .expect("servidor_diferido presente");
+        assert_eq!(diferido.tools, 2);
+        assert_eq!(diferido.deferred_tools, 2, "totalmente diferido");
+
+        let completo = out
+            .tools_by_server
+            .iter()
+            .find(|s| s.server == "servidor_completo")
+            .expect("servidor_completo presente");
+        assert_eq!(completo.tools, 1);
+        assert_eq!(
+            completo.deferred_tools, 0,
+            "NADA diferido: sus bytes son reales y desconectables"
+        );
+    }
+
     /// Body no-JSON: `prepare` no debe romper; `tools_by_server` vacío,
     /// `tools_overhead_bytes` en cero, y el body reenviado BYTE-IDÉNTICO al
     /// original (mismo criterio que ya vale para `context`).
@@ -811,4 +855,5 @@ mod tests {
         ANTHROPIC.extract_usage(&without_speed, &mut usage_sin_speed);
         assert_eq!(usage_sin_speed.speed, None);
     }
+
 }

@@ -462,6 +462,11 @@ mod tests {
             calendar.bytes,
             measure_value(&decl_0[1]) + measure_value(&decl_1[0])
         );
+
+        // `defer_loading` no existe en el dialecto de Gemini (primitivo
+        // exclusivo de la API de Anthropic, docs/optimizer-tool-search.md
+        // §8): ningún bucket debe reportar diferido.
+        assert!(by_server.iter().all(|s| s.deferred_tools == 0));
     }
 
     /// Un elemento de `tools[]` sin `functionDeclarations` (o con un valor

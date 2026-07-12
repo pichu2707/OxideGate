@@ -13,9 +13,9 @@
 //! promedio histórico completo.
 //!
 //! Uso:
-//!   cargo run --bin monitor              # TUI interactiva
-//!   cargo run --bin monitor -- --once    # snapshot de texto plano y sale
-//!   cargo run --bin monitor -- --url http://127.0.0.1:8080/stats
+//!   cargo run --bin oxidegate-monitor              # TUI interactiva
+//!   cargo run --bin oxidegate-monitor -- --once    # snapshot de texto plano y sale
+//!   cargo run --bin oxidegate-monitor -- --url http://127.0.0.1:8080/stats
 //!
 //! URL del endpoint de agregados (en orden de prioridad):
 //!   1. flag `--url <url>`
@@ -314,6 +314,11 @@ struct RequestRow {
     upstream: String,
     model: Option<String>,
     stream: bool,
+    /// `User-Agent` del cliente que originó el request. Espejo de
+    /// `RecentRequest::client` (`src/telemetry/recent.rs`): crudo, topeado en
+    /// longitud del lado del proxy, nunca clasificado ni interpretado acá.
+    /// `None` si el header no vino.
+    client: Option<String>,
     status: u16,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
@@ -409,6 +414,21 @@ struct ToolServerRow {
     tools: usize,
     /// Suma de bytes de las herramientas de este servidor.
     bytes: usize,
+    /// Cuántas de `tools` traían `defer_loading: true` en el body ENTRANTE.
+    /// Espejo de `provider::ToolServerBytes::deferred_tools`: es la fuente de
+    /// verdad POR SERVIDOR. `deferred_tools == tools` ⇒ servidor totalmente
+    /// diferido; `== 0` ⇒ nada diferido (sus `bytes` son reales y
+    /// desconectables); en el medio ⇒ diferido parcial.
+    ///
+    /// `Option<usize>`, NO `usize` con `#[serde(default)]`: un proxy de build
+    /// anterior a este campo manda la fila de `tools_by_server` SIN esta
+    /// clave. Con `#[serde(default)]` sobre un `usize` eso caería en `0` —
+    /// indistinguible de un proxy que SÍ midió y confirmó "nada diferido". Es
+    /// el mismo criterio que ya siguen el resto de los campos opcionales de
+    /// este archivo (p. ej. `RequestRow::prepare_us`): `None` es "el proxy no
+    /// lo informó", `Some(0)` es "lo midió y dio cero" — nunca se colapsan
+    /// entre sí. Ver `deferred_cell` para cómo se renderiza el tercer estado.
+    deferred_tools: Option<usize>,
 }
 
 /// Hace el GET a `/requests` y parsea el array de filas (orden cronológico,
@@ -961,6 +981,13 @@ struct ServerDiffRow {
     kind: String,
     tools: usize,
     bytes: usize,
+    /// Espejo de `ToolServerRow::deferred_tools`: `None` cuando el proxy no
+    /// mandó este dato (build anterior al campo), `Some(n)` cuando sí lo
+    /// midió. `None` también para las filas SINTÉTICAS de servidores
+    /// desaparecidos: no hay datos vivos de qué diferir, y sintetizar un
+    /// `Some(0)` inventaría una medición que nunca ocurrió para ese servidor
+    /// en `current`.
+    deferred_tools: Option<usize>,
     /// `current_bytes - baseline_bytes` para este servidor. `None`
     /// ÚNICAMENTE cuando no hay baseline marcado en absoluto (`baseline` es
     /// `None` completo en [`diff_against_baseline`]). Si el baseline SÍ
@@ -1000,7 +1027,14 @@ fn diff_against_baseline(current: &[ToolServerRow], baseline: Option<&BTreeMap<S
         .iter()
         .map(|row| {
             let delta = baseline.map(|b| row.bytes as i64 - *b.get(&row.server).unwrap_or(&0) as i64);
-            ServerDiffRow { server: row.server.clone(), kind: row.kind.clone(), tools: row.tools, bytes: row.bytes, delta }
+            ServerDiffRow {
+                server: row.server.clone(),
+                kind: row.kind.clone(),
+                tools: row.tools,
+                bytes: row.bytes,
+                deferred_tools: row.deferred_tools,
+                delta,
+            }
         })
         .collect();
 
@@ -1015,6 +1049,7 @@ fn diff_against_baseline(current: &[ToolServerRow], baseline: Option<&BTreeMap<S
                 kind: "-".to_string(),
                 tools: 0,
                 bytes: 0,
+                deferred_tools: None,
                 delta: Some(-(*bytes as i64)),
             });
         }
@@ -1047,13 +1082,44 @@ fn format_delta_bytes(delta: Option<i64>) -> String {
     }
 }
 
+/// Celda `deferred`: `"<deferred_tools>/<tools>"` (p. ej. `"3/3"` totalmente
+/// diferido, `"0/5"` nada diferido, `"2/5"` diferido parcial — ver
+/// `provider::ToolServerBytes::deferred_tools`). `"-"` para las filas
+/// sintéticas de servidores desaparecidos (`tools == 0`, ver
+/// `diff_against_baseline`): no hay tools vivas de las que mostrar fracción.
+///
+/// TERCER ESTADO — `"?"`: `d.tools > 0` pero `d.deferred_tools` es `None`
+/// (proxy de build anterior a este campo, ver `ToolServerRow::deferred_tools`).
+/// NUNCA se muestra `"0/N"` en este caso: `0/N` es una afirmación medida de
+/// "nada diferido, bytes reales y desconectables", y usarla para un dato
+/// ausente sería exactamente el defecto que este tipo existe para evitar
+/// (absent ≠ zero).
+fn deferred_cell(d: &ServerDiffRow) -> String {
+    if d.tools == 0 {
+        "-".to_string()
+    } else {
+        match d.deferred_tools {
+            Some(deferred) => format!("{deferred}/{}", d.tools),
+            None => "?".to_string(),
+        }
+    }
+}
+
 /// Celdas de una fila del panel "tools por servidor", en el mismo orden que
-/// las columnas documentadas (`servidor`, `kind`, `tools`, `bytes`, `% de
-/// tools`, `Δ baseline`). Reusada por la TUI (`draw_tools_panel`) y por
-/// `--once` (`print_tools_table`) para que ninguna de las dos diverja en qué
-/// muestra cada columna.
+/// las columnas documentadas (`servidor`, `kind`, `tools`, `deferred`,
+/// `bytes`, `% de tools`, `Δ baseline`). Reusada por la TUI
+/// (`draw_tools_panel`) y por `--once` (`print_tools_table`) para que
+/// ninguna de las dos diverja en qué muestra cada columna.
 fn tools_row_cells(d: &ServerDiffRow, tools_bytes: Option<usize>) -> Vec<String> {
-    vec![d.server.clone(), d.kind.clone(), d.tools.to_string(), format_bytes(d.bytes), tool_pct_of_total(d.bytes, tools_bytes), format_delta_bytes(d.delta)]
+    vec![
+        d.server.clone(),
+        d.kind.clone(),
+        d.tools.to_string(),
+        deferred_cell(d),
+        format_bytes(d.bytes),
+        tool_pct_of_total(d.bytes, tools_bytes),
+        format_delta_bytes(d.delta),
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -1082,8 +1148,15 @@ enum RequestsView {
     Latency,
     /// Columnas del desglose de bytes de contexto (`tools`, `history`,
     /// `system`, `last_turn`, `other`, `total`, `tax%`, `B/tok`, `prep_us`,
-    /// `msgs`). `B/tok` es [`bytes_per_token`]: bytes medidos por token de
-    /// prompt, el denominador correcto según dialecto de `upstream`.
+    /// `msgs`), más `cliente` (`RequestRow::client`). `B/tok` es
+    /// [`bytes_per_token`]: bytes medidos por token de prompt, el
+    /// denominador correcto según dialecto de `upstream`. `cliente` va ACÁ y
+    /// no en `Latency` porque el caso que motiva es correlacionar un salto
+    /// en `tools`/`total` con atribución de cliente (`docs/optimizer-tool-search.md`
+    /// §3): un harness que rompe su propio diferido de tools al pasar por un
+    /// `ANTHROPIC_BASE_URL` no-first-party es la firma del impuesto de
+    /// contexto que el proxy induce por su propia presencia, no una anomalía
+    /// sin explicación.
     Context,
 }
 
@@ -1704,17 +1777,18 @@ fn draw_tools_panel(f: &mut Frame, area: Rect, app: &App) {
     let baseline_map = app.baseline.as_ref().and_then(|b| b.tools_by_server.as_ref());
     let diffs = diff_against_baseline(servers, baseline_map);
 
-    let header = Row::new(vec!["servidor", "kind", "tools", "bytes", "% tools", "Δ baseline"])
+    let header = Row::new(vec!["servidor", "kind", "tools", "deferred", "bytes", "% tools", "Δ baseline"])
         .style(Style::default().add_modifier(Modifier::BOLD));
 
     let mut rows: Vec<Row> = diffs.iter().map(|d| Row::new(tools_row_cells(d, source.context_tools_bytes))).collect();
 
     // Separador visual antes de las filas de resumen: distingue "detalle por
     // servidor" de "totales de la petición completa".
-    rows.push(Row::new(vec!["·".repeat(8); 6]));
+    rows.push(Row::new(vec!["·".repeat(8); 7]));
 
     rows.push(Row::new(vec![
         "overhead".to_string(),
+        "-".to_string(),
         "-".to_string(),
         "-".to_string(),
         opt_bytes(source.tools_overhead_bytes),
@@ -1732,6 +1806,7 @@ fn draw_tools_panel(f: &mut Frame, area: Rect, app: &App) {
             "TOTAL".to_string(),
             "-".to_string(),
             "-".to_string(),
+            "-".to_string(),
             opt_bytes(source.context_tools_bytes),
             "-".to_string(),
             format_delta_bytes(total_delta),
@@ -1743,6 +1818,7 @@ fn draw_tools_panel(f: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(26),
         Constraint::Length(7),
         Constraint::Length(6),
+        Constraint::Length(9),
         Constraint::Length(10),
         Constraint::Length(9),
         Constraint::Length(12),
@@ -1768,7 +1844,7 @@ fn requests_table_header<'a>(view: RequestsView) -> Row<'a> {
         RequestsView::Context => {
             vec![
                 "hora", "modelo", "msgs", "tools", "history", "system", "last_turn", "other", "total", "tax%", "B/tok", "prep_us",
-                "outlier",
+                "cliente", "outlier",
             ]
         }
     };
@@ -1812,6 +1888,7 @@ fn requests_table_widths(view: RequestsView) -> Vec<Constraint> {
             Constraint::Length(6),
             Constraint::Length(7),
             Constraint::Length(8),
+            Constraint::Length(18),
             Constraint::Length(14),
         ],
     }
@@ -1853,6 +1930,7 @@ fn requests_row_cells(view: RequestsView, r: &RequestRow) -> Vec<String> {
             opt_tax_ratio(r.context_tax_ratio),
             opt_fixed(bytes_per_token(r), 1),
             opt_u64(r.prepare_us),
+            truncate_client(r.client.as_deref()),
         ],
     }
 }
@@ -1881,6 +1959,28 @@ fn truncate_model(model: Option<&str>) -> String {
         Some(m) if m.chars().count() <= MODEL_DISPLAY_MAX => m.to_string(),
         Some(m) => {
             let head: String = m.chars().take(MODEL_DISPLAY_MAX.saturating_sub(1)).collect();
+            format!("{head}…")
+        }
+    }
+}
+
+/// Máximo de caracteres para el `User-Agent` en la columna `cliente`, para no
+/// romper el ancho fijo de columna. A diferencia de [`truncate_model`], acá
+/// no hay clasificación posible: el string es crudo y NUNCA se reinterpreta
+/// (p. ej. no se intenta mapear a "Claude Code" / "OpenCode" a partir del
+/// prefijo) — un cliente no reconocido se ve truncado, no adivinado.
+const CLIENT_DISPLAY_MAX: usize = 18;
+
+/// Trunca el `User-Agent` crudo a [`CLIENT_DISPLAY_MAX`] caracteres. `None`
+/// se muestra como `-`, nunca como string vacío — mismo criterio que
+/// [`truncate_model`], del que este helper es un duplicado deliberado (columna
+/// distinta, ancho distinto, mismo patrón de truncado).
+fn truncate_client(client: Option<&str>) -> String {
+    match client {
+        None => "-".to_string(),
+        Some(c) if c.chars().count() <= CLIENT_DISPLAY_MAX => c.to_string(),
+        Some(c) => {
+            let head: String = c.chars().take(CLIENT_DISPLAY_MAX.saturating_sub(1)).collect();
             format!("{head}…")
         }
     }
@@ -2065,13 +2165,14 @@ fn print_context_table(rows: &[RequestRow]) {
     let outliers = classify_outliers(rows);
 
     println!(
-        "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<14}",
-        "HORA", "MODELO", "msgs", "tools", "history", "system", "last_turn", "other", "total", "tax%", "B/tok", "prep_us", "outlier"
+        "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<18} {:<14}",
+        "HORA", "MODELO", "msgs", "tools", "history", "system", "last_turn", "other", "total", "tax%", "B/tok", "prep_us", "cliente",
+        "outlier"
     );
     for (i, r) in rows.iter().enumerate().rev() {
         let cells = requests_row_cells(RequestsView::Context, r);
         println!(
-            "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<14}",
+            "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<18} {:<14}",
             cells[0],
             cells[1],
             cells[2],
@@ -2084,6 +2185,7 @@ fn print_context_table(rows: &[RequestRow]) {
             cells[9],
             cells[10],
             cells[11],
+            cells[12],
             marker_text(&outliers[i]),
         );
     }
@@ -2095,6 +2197,9 @@ fn print_context_table(rows: &[RequestRow]) {
     );
     println!(
         "nota: B/tok = total_bytes / prompt_tokens_total (denominador según dialecto, ver docs/monitor-tui.md §7.3.1); TRUNC = mismo total de tokens que otra fila con bodies que difieren >= 10% (tope de contexto probado, no estadística)"
+    );
+    println!(
+        "nota: cliente = User-Agent crudo (truncado, ver docs/telemetry-per-request.md)"
     );
 }
 
@@ -2119,24 +2224,43 @@ fn print_tools_table(rows: &[RequestRow]) {
     let servers = source.tools_by_server.as_ref().expect("find_tools_source_row garantiza tools_by_server Some no vacío");
     let diffs = diff_against_baseline(servers, None);
 
-    println!("{:<26} {:<7} {:>6} {:>10} {:>9} {:>12}", "SERVIDOR", "KIND", "TOOLS", "BYTES", "% tools", "Δ baseline");
+    println!(
+        "{:<26} {:<7} {:>6} {:>9} {:>10} {:>9} {:>12}",
+        "SERVIDOR", "KIND", "TOOLS", "DEFERRED", "BYTES", "% tools", "Δ baseline"
+    );
     for d in &diffs {
         let cells = tools_row_cells(d, source.context_tools_bytes);
-        println!("{:<26} {:<7} {:>6} {:>10} {:>9} {:>12}", cells[0], cells[1], cells[2], cells[3], cells[4], cells[5]);
+        println!(
+            "{:<26} {:<7} {:>6} {:>9} {:>10} {:>9} {:>12}",
+            cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6]
+        );
     }
-    println!("{:-<26} {:-<7} {:-<6} {:-<10} {:-<9} {:-<12}", "", "", "", "", "", "");
+    println!("{:-<26} {:-<7} {:-<6} {:-<9} {:-<10} {:-<9} {:-<12}", "", "", "", "", "", "", "");
     println!(
-        "{:<26} {:<7} {:>6} {:>10} {:>9} {:>12}",
+        "{:<26} {:<7} {:>6} {:>9} {:>10} {:>9} {:>12}",
         "overhead",
+        "-",
         "-",
         "-",
         opt_bytes(source.tools_overhead_bytes),
         "-",
         "-"
     );
-    println!("{:<26} {:<7} {:>6} {:>10} {:>9} {:>12}", "TOTAL", "-", "-", opt_bytes(source.context_tools_bytes), "-", "-");
+    println!(
+        "{:<26} {:<7} {:>6} {:>9} {:>10} {:>9} {:>12}",
+        "TOTAL",
+        "-",
+        "-",
+        "-",
+        opt_bytes(source.context_tools_bytes),
+        "-",
+        "-"
+    );
     println!(
         "nota: sum(servidores) + overhead == bytes (array `tools`: brackets/comas, wrapper de Gemini, herramientas huérfanas)"
+    );
+    println!(
+        "nota: deferred = deferred_tools/tools por servidor (ver docs/optimizer-tool-search.md) — 0/N: nada diferido, bytes reales y desconectables; N/N: totalmente diferido; en el medio: parcial; \"?\": el proxy no midió este dato (build anterior a este campo) — dato AUSENTE, no confundir con 0/N medido"
     );
 }
 
@@ -2320,6 +2444,7 @@ mod tests {
             upstream: upstream.to_string(),
             model: Some(model.to_string()),
             stream: true,
+            client: Some("claude-cli/2.1.207 (external, sdk-cli)".to_string()),
             status,
             input_tokens: Some(100),
             output_tokens,
@@ -2656,6 +2781,42 @@ mod tests {
         assert_eq!(cells[10], "2.7");
     }
 
+    /// `cliente` (índice 12) de la vista Context debe surfacear
+    /// `RequestRow::client` — el defecto que este test previene: el TUI
+    /// espejaba `RecentRequest` campo a campo pero nunca sumó este, así que
+    /// un salto de bytes inducido por el proxy (Claude Code cayendo a carga
+    /// eager) quedaba sin atribución en el panel.
+    #[test]
+    fn requests_row_cells_context_surface_client() {
+        let mut r = req("anthropic", "claude-opus-4", 200, Some(10.0), 100.0, Some(50), Some(10));
+        r.client = Some("claude-cli/2.1.207 (external, sdk-cli)".to_string());
+
+        let cells = requests_row_cells(RequestsView::Context, &r);
+
+        assert_eq!(cells[12], "claude-cli/2.1.20…");
+    }
+
+    /// `client: None` debe leerse como `-`, NUNCA como string vacío ni como
+    /// una clasificación inventada ("desconocido", "otro"…): un cliente sin
+    /// `User-Agent` es un dato ausente, no una categoría.
+    #[test]
+    fn requests_row_cells_context_client_none_es_guion() {
+        let mut r = req("anthropic", "claude-opus-4", 200, Some(10.0), 100.0, Some(50), Some(10));
+        r.client = None;
+
+        let cells = requests_row_cells(RequestsView::Context, &r);
+
+        assert_eq!(cells[12], "-");
+    }
+
+    /// `truncate_client` no debe truncar un `User-Agent` que ya entra en
+    /// [`CLIENT_DISPLAY_MAX`] caracteres — mismo criterio que
+    /// [`truncate_model`] para strings cortos.
+    #[test]
+    fn truncate_client_no_trunca_si_entra() {
+        assert_eq!(truncate_client(Some("curl/8.0")), "curl/8.0");
+    }
+
     #[test]
     fn classify_truncation_compone_con_otro_marcador_en_la_misma_fila() {
         // Truncated debe convivir con otro OutlierKind en la misma fila
@@ -2936,7 +3097,51 @@ mod tests {
         assert_eq!(servers[0].kind, "native");
         assert_eq!(servers[0].tools, 29);
         assert_eq!(servers[0].bytes, 86_168);
+        // Fixture de un proxy anterior a `deferred_tools`: la clave ni
+        // siquiera viaja en el JSON. Con `Option<usize>` eso debe caer en
+        // `None` (AUSENTE), NUNCA en `Some(0)`: un `Some(0)` afirmaría que el
+        // proxy midió y confirmó "nada diferido", cuando en realidad nunca
+        // midió nada — la fila entera sigue deserializando sin romper.
+        assert_eq!(servers[0].deferred_tools, None);
+        assert_eq!(servers[1].deferred_tools, None);
         assert_eq!(row.tools_overhead_bytes, Some(77));
+    }
+
+    /// Proxy YA con `deferred_tools` en el wire: debe deserializar el valor
+    /// tal cual, no solo caer al default de la build vieja de arriba.
+    #[test]
+    fn request_row_deserializa_deferred_tools_presente() {
+        let json = r#"{
+            "timestamp": "2026-07-12T10:00:00Z",
+            "route": "/v1/messages",
+            "upstream": "anthropic",
+            "model": "claude-opus-4-1",
+            "stream": true,
+            "status": 200,
+            "input_tokens": 5000,
+            "output_tokens": 412,
+            "cache_read_tokens": null,
+            "cache_write_tokens": null,
+            "cost_estimate_usd": 0.0891,
+            "cache_control_forced": false,
+            "ttft_ms": 780.4,
+            "total_ms": 3210.9,
+            "context_tools_bytes": 159080,
+            "tools_by_server": [
+                {"server": "claude_ai_Gmail", "kind": "mcp", "tools": 3, "bytes": 6000, "deferred_tools": 3},
+                {"server": "claude_ai_Google_Calendar", "kind": "mcp", "tools": 4, "bytes": 8000, "deferred_tools": 0}
+            ],
+            "tools_overhead_bytes": 77
+        }"#;
+
+        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar con deferred_tools presente");
+
+        let servers = row.tools_by_server.expect("debe traer el desglose");
+        let gmail = servers.iter().find(|s| s.server == "claude_ai_Gmail").expect("Gmail presente");
+        assert_eq!(gmail.deferred_tools, Some(3), "servidor totalmente diferido: deferred_tools == tools");
+
+        let calendar = servers.iter().find(|s| s.server == "claude_ai_Google_Calendar").expect("Calendar presente");
+        assert_eq!(calendar.deferred_tools, Some(0), "servidor NADA diferido: sus bytes son reales y desconectables");
     }
 
     #[test]
@@ -2974,7 +3179,14 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn tool_row(server: &str, kind: &str, tools: usize, bytes: usize) -> ToolServerRow {
-        ToolServerRow { server: server.to_string(), kind: kind.to_string(), tools, bytes }
+        ToolServerRow { server: server.to_string(), kind: kind.to_string(), tools, bytes, deferred_tools: Some(0) }
+    }
+
+    /// Variante de [`tool_row`] que además fija `deferred_tools`, para los
+    /// tests que necesitan un servidor con diferido parcial o total (no solo
+    /// el `Some(0)` por defecto de la variante simple).
+    fn tool_row_deferred(server: &str, kind: &str, tools: usize, bytes: usize, deferred_tools: usize) -> ToolServerRow {
+        ToolServerRow { server: server.to_string(), kind: kind.to_string(), tools, bytes, deferred_tools: Some(deferred_tools) }
     }
 
     /// Variante de `req` (arriba) que además permite fijar `tools_by_server`,
@@ -3102,6 +3314,66 @@ mod tests {
         assert_eq!(format_delta_bytes(Some(0)), "0 B");
         assert_eq!(format_delta_bytes(Some(-55_098)), "-55.1 kB");
         assert_eq!(format_delta_bytes(Some(1_200)), "+1.2 kB");
+    }
+
+    /// `deferred_tools` sobrevive `diff_against_baseline` y se refleja en la
+    /// celda `deferred` de `tools_row_cells`: los tres casos que motivan el
+    /// campo (totalmente diferido, nada diferido, diferido parcial).
+    #[test]
+    fn diff_against_baseline_preserva_deferred_tools_y_deferred_cell_los_formatea() {
+        let current = vec![
+            tool_row_deferred("claude_ai_Gmail", "mcp", 3, 6_000, 3),
+            tool_row_deferred("claude_ai_Google_Calendar", "mcp", 4, 8_000, 0),
+            tool_row_deferred("claude_ai_Google_Drive", "mcp", 5, 10_000, 2),
+        ];
+
+        let diffs = diff_against_baseline(&current, None);
+
+        let gmail = diffs.iter().find(|d| d.server == "claude_ai_Gmail").unwrap();
+        assert_eq!(gmail.deferred_tools, Some(3));
+        assert_eq!(deferred_cell(gmail), "3/3", "totalmente diferido");
+
+        let calendar = diffs.iter().find(|d| d.server == "claude_ai_Google_Calendar").unwrap();
+        assert_eq!(calendar.deferred_tools, Some(0));
+        assert_eq!(deferred_cell(calendar), "0/4", "nada diferido: bytes reales y desconectables");
+
+        let drive = diffs.iter().find(|d| d.server == "claude_ai_Google_Drive").unwrap();
+        assert_eq!(deferred_cell(drive), "2/5", "diferido parcial");
+    }
+
+    /// Un servidor DESAPARECIDO (fila sintética de `diff_against_baseline`,
+    /// `tools == 0`) debe mostrar `"-"` en la celda `deferred`, no `"0/0"`:
+    /// no hay tools vivas de las que sacar una fracción.
+    #[test]
+    fn deferred_cell_guion_para_servidor_desaparecido() {
+        let current = vec![tool_row("(native)", "native", 29, 86_168)];
+        let mut baseline = BTreeMap::new();
+        baseline.insert("claude_ai_Gmail".to_string(), 6_000usize);
+
+        let diffs = diff_against_baseline(&current, Some(&baseline));
+
+        let disappeared = diffs.iter().find(|d| d.server == "claude_ai_Gmail").unwrap();
+        assert_eq!(deferred_cell(disappeared), "-");
+    }
+
+    /// `deferred_tools: None` (proxy de build anterior a este campo, ver
+    /// `ToolServerRow::deferred_tools`) con `tools > 0` debe mostrar `"?"` en
+    /// la celda `deferred`, NUNCA `"0/N"`: `0/N` es la afirmación medida de
+    /// "nada diferido", y este servidor no tiene ningún dato medido de qué
+    /// diferir — absent ≠ zero.
+    #[test]
+    fn deferred_cell_interrogacion_cuando_deferred_tools_es_none() {
+        let row = ToolServerRow {
+            server: "claude_ai_Gmail".to_string(),
+            kind: "mcp".to_string(),
+            tools: 3,
+            bytes: 6_000,
+            deferred_tools: None,
+        };
+
+        let diffs = diff_against_baseline(&[row], None);
+
+        assert_eq!(deferred_cell(&diffs[0]), "?");
     }
 
     // -----------------------------------------------------------------

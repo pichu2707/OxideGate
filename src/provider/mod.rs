@@ -393,6 +393,31 @@ pub struct ToolServerBytes {
     pub tools: usize,
     /// Suma de los bytes de cada herramienta de este servidor.
     pub bytes: usize,
+    /// Cuántas de las `tools` de ESTE servidor traían `defer_loading: true`
+    /// en su propia definición dentro del body ENTRANTE. OBSERVACIÓN PURA,
+    /// leída tool por tool en [`group_tools_by_server`] — nunca una
+    /// inferencia ni una decisión del proxy (OxideGate no implementa
+    /// todavía la mutación de `defer_loading`, ver
+    /// `docs/optimizer-tool-search.md` §4).
+    ///
+    /// - `deferred_tools == tools`: servidor totalmente diferido.
+    /// - `deferred_tools == 0`: servidor NADA diferido — sus `bytes` son
+    ///   reales y desconectables.
+    /// - `0 < deferred_tools < tools`: diferido PARCIAL.
+    ///
+    /// **DOMINIO: tokens de contexto, no bytes de cable.** Este campo
+    /// registra si la definición trae la marca `defer_loading` — un dato
+    /// sobre lo que el CLIENTE declaró en el body, nunca sobre cuántos bytes
+    /// viajaron por el cable. `defer_loading: true` en una tool no implica
+    /// que sus bytes se hayan ahorrado en el request (el mecanismo de la API
+    /// AÑADE, no retiene — ver `docs/optimizer-tool-search.md` §2.2): la
+    /// definición marcada sigue viajando completa, y el ahorro real (si lo
+    /// hay) es de tokens de contexto en el modelo, no de bytes en el body de
+    /// ESTA petición. Un consumidor que lea `deferred_tools > 0` y concluya
+    /// "estos bytes no viajaron" comete el mismo error que este proyecto ya
+    /// midió y corrigió una vez (`docs/optimizer-tool-search.md` §3.2): no
+    /// mezclar la marca con el ahorro de cable.
+    pub deferred_tools: usize,
 }
 
 /// Clasifica `tool_name` en `(ToolServerKind, servidor_o_sentinel)`. Pura: no
@@ -492,13 +517,27 @@ pub fn server_of(tool_name: &str) -> &str {
 /// construir cada `ToolServerBytes`), nunca dentro del loop por-herramienta:
 /// un body con 76 herramientas de 1 solo servidor hace 1 alocación de
 /// `String`, no 76.
+///
+/// Además de bytes y cantidad, cada tool se inspecciona por su propia clave
+/// `defer_loading` (ver [`ToolServerBytes::deferred_tools`]): si vale
+/// literalmente `true`, cuenta para el servidor al que esa tool pertenece.
+/// Es una lectura genérica sobre CUALQUIER `Value` de tool, sin conocimiento
+/// de dialecto: Anthropic es el único que declara esa clave en la práctica
+/// (`docs/optimizer-tool-search.md` §8), así que en OpenAI/Gemini —cuyas
+/// tools nunca traen `defer_loading`— este conteo da `0` para todos los
+/// servidores, sin necesitar un `if` por proveedor: alcanzado por ausencia
+/// estructural del campo, no por un valor forzado.
 pub fn group_tools_by_server<'a>(
     entries: impl Iterator<Item = (&'a str, &'a Value)>,
 ) -> Vec<ToolServerBytes> {
-    let mut totals: HashMap<(ToolServerKind, &'a str), (usize, usize)> = HashMap::new();
+    let mut totals: HashMap<(ToolServerKind, &'a str), (usize, usize, usize)> = HashMap::new();
 
     for (name, value) in entries {
         let bytes = measure_value(value);
+        let deferred = value
+            .get("defer_loading")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let (kind, raw_server) = classify(name);
 
         let key = if totals.contains_key(&(kind, raw_server)) || totals.len() < MAX_TOOL_SERVERS {
@@ -507,18 +546,22 @@ pub fn group_tools_by_server<'a>(
             (ToolServerKind::Others, OTHERS_LABEL)
         };
 
-        let entry = totals.entry(key).or_insert((0, 0));
+        let entry = totals.entry(key).or_insert((0, 0, 0));
         entry.0 += 1;
         entry.1 += bytes;
+        if deferred {
+            entry.2 += 1;
+        }
     }
 
     let mut rows: Vec<ToolServerBytes> = totals
         .into_iter()
-        .map(|((kind, server), (tools, bytes))| ToolServerBytes {
+        .map(|((kind, server), (tools, bytes, deferred_tools))| ToolServerBytes {
             server: server.to_string(),
             kind,
             tools,
             bytes,
+            deferred_tools,
         })
         .collect();
 
@@ -958,6 +1001,98 @@ mod tests {
         let summed_bytes: usize = rows.iter().map(|r| r.bytes).sum();
         assert_eq!(summed_tools, total_tools);
         assert_eq!(summed_bytes, total_bytes);
+    }
+
+    // -----------------------------------------------------------------
+    // ToolServerBytes::deferred_tools — el campo que corrige la conflación
+    // de un booleano body-wide que este proyecto tuvo y eliminó
+    // (`client_defer_loading`, `docs/optimizer-tool-search.md`, defecto
+    // encontrado en revisión adversarial ronda 3): un booleano body-wide no
+    // puede afirmar nada sobre UN servidor puntual. Estos tres tests son el
+    // contrato mínimo: un servidor totalmente diferido, uno nada diferido, y
+    // el caso que de verdad importa — un body MIXTO donde ambos coexisten.
+    // -----------------------------------------------------------------
+
+    /// Todas las tools de un servidor traen `defer_loading: true`:
+    /// `deferred_tools` debe igualar `tools` exactamente.
+    #[test]
+    fn deferred_tools_servidor_totalmente_diferido() {
+        let entries_json = serde_json::json!([
+            {"name": "mcp__srv__a", "defer_loading": true},
+            {"name": "mcp__srv__b", "defer_loading": true},
+            {"name": "mcp__srv__c", "defer_loading": true}
+        ]);
+        let tools = entries_json.as_array().unwrap();
+        let entries: Vec<(&str, &Value)> = tools
+            .iter()
+            .map(|t| (t.get("name").unwrap().as_str().unwrap(), t))
+            .collect();
+
+        let rows = group_tools_by_server(entries.into_iter());
+
+        assert_eq!(rows.len(), 1);
+        let srv = &rows[0];
+        assert_eq!(srv.server, "srv");
+        assert_eq!(srv.tools, 3);
+        assert_eq!(srv.deferred_tools, 3, "totalmente diferido: deferred_tools == tools");
+    }
+
+    /// Ninguna tool del servidor trae `defer_loading` (ni siquiera la clave
+    /// está presente): `deferred_tools` debe dar `0`, nunca confundirse con
+    /// "no sabemos" — es la lectura de "estos bytes son reales y
+    /// desconectables" que el defecto original le negaba al consumidor.
+    #[test]
+    fn deferred_tools_servidor_nada_diferido() {
+        let entries_json = serde_json::json!([
+            {"name": "mcp__srv__a"},
+            {"name": "mcp__srv__b", "defer_loading": false}
+        ]);
+        let tools = entries_json.as_array().unwrap();
+        let entries: Vec<(&str, &Value)> = tools
+            .iter()
+            .map(|t| (t.get("name").unwrap().as_str().unwrap(), t))
+            .collect();
+
+        let rows = group_tools_by_server(entries.into_iter());
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tools, 2);
+        assert_eq!(rows[0].deferred_tools, 0, "nada diferido: bytes reales y desconectables");
+    }
+
+    /// EL CASO QUE MOTIVA EL CAMPO: un body con DOS servidores MCP donde uno
+    /// difiere sus tools y el otro manda su esquema completo sin diferir
+    /// nada. El booleano body-wide que este proyecto eliminó
+    /// (`client_defer_loading`) daba `true` para el body ENTERO con que UN
+    /// servidor calificara — escondiendo que el servidor B no difirió
+    /// absolutamente nada. Acá se verifica que `deferred_tools` SÍ distingue
+    /// ambos servidores dentro del mismo body, que es la garantía
+    /// estructural que reemplaza al booleano conflacionado.
+    #[test]
+    fn deferred_tools_body_mixto_un_servidor_diferido_y_otro_no() {
+        let entries_json = serde_json::json!([
+            {"name": "mcp__servidor_a__x", "defer_loading": true},
+            {"name": "mcp__servidor_a__y", "defer_loading": true},
+            {"name": "mcp__servidor_b__z", "description": "esquema completo, sin diferir"}
+        ]);
+        let tools = entries_json.as_array().unwrap();
+        let entries: Vec<(&str, &Value)> = tools
+            .iter()
+            .map(|t| (t.get("name").unwrap().as_str().unwrap(), t))
+            .collect();
+
+        let rows = group_tools_by_server(entries.into_iter());
+
+        let server_a = rows.iter().find(|r| r.server == "servidor_a").expect("servidor_a presente");
+        assert_eq!(server_a.tools, 2);
+        assert_eq!(server_a.deferred_tools, 2, "servidor_a: totalmente diferido");
+
+        let server_b = rows.iter().find(|r| r.server == "servidor_b").expect("servidor_b presente");
+        assert_eq!(server_b.tools, 1);
+        assert_eq!(
+            server_b.deferred_tools, 0,
+            "servidor_b: NADA diferido — sus bytes son reales y desconectables, aunque servidor_a sí difiera"
+        );
     }
 
     /// `tools` ausente ⇒ `None`; `tools: []` ⇒ `Some(vec![])`. Son casos

@@ -824,6 +824,12 @@ mod tests {
             gmail.bytes,
             measure_value(&tools[1]) + measure_value(&tools[2])
         );
+
+        // `defer_loading` no existe en el dialecto de OpenAI: ningún bucket
+        // debe reportar diferido, aunque `group_tools_by_server` sea el mismo
+        // código compartido que usa Anthropic (docs/optimizer-tool-search.md
+        // §8 — la palanca es Anthropic-only).
+        assert!(by_server.iter().all(|s| s.deferred_tools == 0));
     }
 
     /// Responses API: body realista con mezcla de herramienta nativa y dos
@@ -863,6 +869,10 @@ mod tests {
             drive.bytes,
             measure_value(&tools[1]) + measure_value(&tools[2])
         );
+
+        // Mismo motivo que en Chat Completions: `defer_loading` no existe en
+        // el dialecto de OpenAI Responses.
+        assert!(by_server.iter().all(|s| s.deferred_tools == 0));
     }
 
     /// Sin `tools`, se tolera el array legado `functions[]` (nombre PLANO,
