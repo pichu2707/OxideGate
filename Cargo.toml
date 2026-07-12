@@ -2,6 +2,7 @@
 name = "oxidegate"
 version = "0.2.0"
 edition = "2024"
+license = "MIT"
 
 # Los binarios se declaran a mano: la autodetección de Cargo los llamaría
 # `monitor` y `bench`, nombres demasiado genéricos para instalarse en el PATH
