@@ -289,7 +289,7 @@ real, para que no se pierda en terminales sin color.
 | `MISS` | `cache_read_tokens` es `None`/`0` mientras **al menos la mitad** de las OTRAS filas del mismo grupo sí tuvieron `cache_read_tokens > 0` | En una conversación larga el prefijo estable debería venir de caché; un miss aislado es caro y, en un promedio, invisible |
 | `TTFT` | `ttft_ms >= media + 2σ` del grupo | TTFT muy por encima de lo normal para ese modelo |
 | `SLOW` | throughput de generación (`output_tokens / (gen_ms / 1000)`) `<= media - 2σ` del grupo | Generación mucho más lenta que el resto del mismo modelo |
-| `TRUNC` | Dentro del mismo grupo `(upstream, modelo)`, esta fila comparte el MISMO `prompt_tokens_total` (§7.3.1) que al menos otra fila, y sus `context_measured_bytes` difieren entre sí en >= 10% (`TRUNCATION_BYTES_DELTA`, fracción del body más grande del par) | El proveedor dejó de contar el prompt al llegar a un tope (`num_ctx` de Ollama, ventana de contexto del modelo, etc.) y lo truncó EN SILENCIO, devolviendo `200 OK` igual — el modelo nunca vio buena parte de lo que se le mandó. **Qué hacer:** subir `OLLAMA_CONTEXT_LENGTH` (o el equivalente del proveedor), o recortar `tools`/`history` — la ventana del modelo local puede ser más chica que el catálogo de herramientas por sí solo |
+| `TRUNC` | Dentro del mismo grupo `(upstream, modelo)`, esta fila comparte el MISMO `prompt_tokens_total` (§7.3.1) que al menos otra fila, y sus `context_measured_bytes` difieren entre sí en >= 5% (`TRUNCATION_BYTES_DELTA`, fracción del body más grande del par) | El proveedor dejó de contar el prompt al llegar a un tope (`num_ctx` de Ollama, ventana de contexto del modelo, etc.) y lo truncó EN SILENCIO, devolviendo `200 OK` igual — el modelo nunca vio buena parte de lo que se le mandó. **Qué hacer:** subir `OLLAMA_CONTEXT_LENGTH` (o el equivalente del proveedor), o recortar `tools`/`history` — la ventana del modelo local puede ser más chica que el catálogo de herramientas por sí solo |
 
 Una fila puede llevar más de un marcador a la vez (p. ej. `ERR+TTFT` o
 `TRUNC+SLOW`): no se colapsa a uno solo porque eso escondería información
@@ -301,9 +301,34 @@ de Anthropic con cache-hit (ver el gotcha de §7.3.1, `input_tokens = 2` con
 un body de 224.653 B). `TRUNC` en cambio prueba algo que NO necesita ninguna
 constante de bytes-por-token: que el MISMO total de tokens aparezca en >= 2
 bodies de tamaño MATERIALMENTE distinto no es casualidad, es la firma de que
-el proveedor dejó de contar. Un grupo donde todos los bodies miden
-prácticamente lo mismo (probes repetidos con el mismo prompt) NO flaggea:
-coincidir en tokens Y en bytes ahí es justamente lo esperado.
+el proveedor dejó de contar.
+
+**Por qué el umbral es una FRACCIÓN del body y no un piso absoluto de
+bytes:** si un body crece en `ΔB` bytes y el total de tokens reportado no se
+mueve, esos tokens que "faltan" son aproximadamente `ΔB / (bytes por
+token)`. Como `total_bytes ≈ (bytes por token) × tokens`, el delta RELATIVO
+de bytes es aproximadamente la fracción del prompt que desapareció sin
+contarse — `(max_bytes - min_bytes) / max_bytes >= 5%` significa
+literalmente "al menos un 5% del prompt se perdió en silencio". Eso escala
+correctamente con el tamaño del body: el ruido de serialización (un UUID, un
+timestamp, un request id) es una fracción cada vez más chica cuanto más
+grande es el prompt — exactamente como se espera de ruido —, mientras que un
+piso absoluto de bytes trataría igual "500 B de ruido en un body de 1 kB"
+que "500 B de ruido en un body de 200 kB", que son señales completamente
+distintas. Un grupo donde todos los bodies miden prácticamente lo mismo
+(probes repetidos con el mismo prompt) NO flaggea: coincidir en tokens Y en
+bytes ahí es justamente lo esperado.
+
+**Calibración de `TRUNCATION_BYTES_DELTA = 0.05`:** el valor original (0.10)
+se fijó mirando un solo caso observado que difería en ~34% (18.955 B vs.
+28.806 B, ambos con `input_tokens = 4095`) y produjo un falso negativo
+medido sobre tráfico real: dos requests de OpenCode contra un Ollama local
+(`llama3.2:3b`, `num_ctx = 4096`) reportaron EXACTAMENTE 4095 tokens de
+prompt con bodies de 77.579 B y 84.161 B — una diferencia real de
+truncamiento del 7,8%, por debajo del 10% exigido, que el detector dejaba
+pasar. `0.05` cubre ambos casos reales observados (7,8% y ~34%) con margen,
+y sigue muy por encima de la banda de ruido de serialización (fracciones de
+punto porcentual).
 
 ### 7.5. Guardas estadísticas (y por qué existen)
 

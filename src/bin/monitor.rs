@@ -462,17 +462,32 @@ const OUTLIER_SIGMA: f64 = 2.0;
 /// como fracción del body MÁS GRANDE del par:
 /// `(max_bytes - min_bytes) / max_bytes >= TRUNCATION_BYTES_DELTA`.
 ///
-/// Por qué 10% y no un valor menor: dos requests con el mismo prompt lógico
-/// casi nunca producen bodies IDÉNTICOS byte a byte (timestamps, IDs,
-/// pequeñas variaciones del último turno) — un umbral demasiado bajo
-/// convertiría esa clase de ruido en falsos positivos de truncamiento. El
-/// caso real que motiva este detector tiene bodies que difieren en ~34%
-/// (18.955 B vs. 28.806 B, ambos con `input_tokens = 4095`), muy por encima
-/// de este piso; 10% alcanza para descartar el ruido sin dejar pasar la
-/// señal real. No es una constante de bytes-por-token (esas SÍ varían por
-/// tokenizer, ver [`bytes_per_token`]): es solo el umbral de "¿este cambio de
-/// tamaño es demasiado grande para ser casualidad?".
-const TRUNCATION_BYTES_DELTA: f64 = 0.10;
+/// Por qué una FRACCIÓN y no un piso absoluto de bytes: si un body crece en
+/// `ΔB` bytes y el total de tokens reportado no se mueve, esos tokens que
+/// "faltan" son aproximadamente `ΔB / (bytes por token)`. Como
+/// `total_bytes ≈ (bytes por token) × tokens`, el DELTA RELATIVO de bytes
+/// es, en consecuencia, aproximadamente la FRACCIÓN del prompt que
+/// desapareció en silencio — `(max_bytes - min_bytes) / max_bytes >= X`
+/// significa literalmente "al menos X del prompt se perdió sin contarse".
+/// Es un enunciado de dominio, no un número mágico, y escala de forma
+/// correcta con el tamaño del body: el ruido de serialización (un UUID, un
+/// timestamp, un request id) es una fracción cada vez más chica cuanto más
+/// grande es el prompt, exactamente como se espera de ruido — mientras que
+/// un piso absoluto de bytes (o de tokens implícitos) no distingue "500 B de
+/// ruido en un body de 1 kB" de "500 B de ruido en un body de 200 kB", que
+/// son señales completamente distintas.
+///
+/// Calibración: el valor anterior (0.10) se fijó mirando un solo caso
+/// observado que difería en ~34% (18.955 B vs. 28.806 B, ambos con
+/// `input_tokens = 4095`) y produjo un FALSO NEGATIVO medido sobre tráfico
+/// real: dos requests de OpenCode contra un Ollama local (`llama3.2:3b`,
+/// `num_ctx = 4096`) reportaron EXACTAMENTE 4095 tokens de prompt con bodies
+/// de 77.579 B y 84.161 B — una diferencia real de truncamiento del 7,8%,
+/// por debajo del 10% exigido, que el detector dejó pasar. `0.05` cubre
+/// ambos casos reales observados (7,8% y ~34%) con margen, y sigue muy por
+/// encima de la banda de ruido de serialización (fracciones de punto
+/// porcentual).
+const TRUNCATION_BYTES_DELTA: f64 = 0.05;
 
 /// Clasificación de una petición respecto a la distribución de SU MISMO
 /// modelo (agrupado por `(upstream, model)`). Una fila puede llevar más de
@@ -498,7 +513,7 @@ pub enum OutlierKind {
     SlowGeneration,
     /// El total de tokens de prompt de esta fila ([`prompt_tokens_total`])
     /// coincide EXACTAMENTE con el de al menos otra fila del mismo grupo,
-    /// mientras sus `context_measured_bytes` difieren en al menos
+    /// mientras sus `context_measured_bytes` difieren entre sí en al menos
     /// [`TRUNCATION_BYTES_DELTA`]. Ver [`classify_truncation`] para el
     /// detector completo.
     ///
@@ -2196,7 +2211,7 @@ fn print_context_table(rows: &[RequestRow]) {
         "nota: tools/history/system/last_turn/other/total son BYTES (kB decimal, no tokens); tax% = (system+tools+history)/total"
     );
     println!(
-        "nota: B/tok = total_bytes / prompt_tokens_total (denominador según dialecto, ver docs/monitor-tui.md §7.3.1); TRUNC = mismo total de tokens que otra fila con bodies que difieren >= 10% (tope de contexto probado, no estadística)"
+        "nota: B/tok = total_bytes / prompt_tokens_total (denominador según dialecto, ver docs/monitor-tui.md §7.3.1); TRUNC = mismo total de tokens que otra fila con bodies que difieren >= 5% (tope de contexto probado, no estadística)"
     );
     println!(
         "nota: cliente = User-Agent crudo (truncado, ver docs/telemetry-per-request.md)"
@@ -2684,6 +2699,73 @@ mod tests {
 
         assert!(result[0].contains(&OutlierKind::Truncated));
         assert!(result[1].contains(&OutlierKind::Truncated));
+    }
+
+    #[test]
+    fn classify_truncation_detecta_el_falso_negativo_del_umbral_fraccional_anterior() {
+        // REGRESIÓN — caso real medido en producción el 2026-07-13 contra un
+        // Ollama local (llama3.2:3b, num_ctx=4096), cliente OpenCode. Dos
+        // filas con EL MISMO input_tokens=4095 (justo el num_ctx) pero bodies
+        // de 77.579 B y 84.161 B: Ollama truncó el prompt en silencio y
+        // devolvió 200 OK igual.
+        //
+        // Este es el par que el detector con TRUNCATION_BYTES_DELTA = 0.10
+        // NO detectaba: (84161-77579)/84161 = 7.8%, por debajo del 10%
+        // exigido — un falso negativo confirmado sobre un truncamiento real.
+        // Fue exactamente este caso el que forzó a recalibrar el umbral de
+        // 0.10 a 0.05 (ver el doc de TRUNCATION_BYTES_DELTA): con 0.05, el
+        // 7.8% de este par SÍ cruza el piso y nunca debe volver a pasar
+        // desapercibido.
+        let rows = vec![
+            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(77_579)),
+            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(84_161)),
+        ];
+
+        let result = classify_outliers(&rows);
+
+        assert!(result[0].contains(&OutlierKind::Truncated));
+        assert!(result[1].contains(&OutlierKind::Truncated));
+    }
+
+    #[test]
+    fn classify_truncation_detecta_delta_grande_en_body_chico() {
+        // Caso del reviewer: bodies chicos (1.000 B y 1.500 B) con EL MISMO
+        // input_tokens, un delta del 33% — inequívocamente truncamiento. Un
+        // piso ABSOLUTO de bytes (o de "tokens implícitos" convertidos con
+        // una cota de B/tok) no escala hacia bodies chicos y puede dejar
+        // pasar justo este caso, que es el más típico de un `num_ctx` chico
+        // de un modelo local. La regla FRACCIONAL sí lo cubre: 500/1500 =
+        // 33,3% >= TRUNCATION_BYTES_DELTA (5%).
+        let rows = vec![
+            req_prompt("openai", "llama3.2:3b", Some(512), None, None, Some(1_000)),
+            req_prompt("openai", "llama3.2:3b", Some(512), None, None, Some(1_500)),
+        ];
+
+        let result = classify_outliers(&rows);
+
+        assert!(result[0].contains(&OutlierKind::Truncated));
+        assert!(result[1].contains(&OutlierKind::Truncated));
+    }
+
+    #[test]
+    fn classify_truncation_no_flaggea_delta_chico_en_body_grande() {
+        // Guard de falso positivo, caso del reviewer: bodies grandes
+        // (199.400 B y 200.000 B) con EL MISMO input_tokens, un delta de
+        // apenas 0.3% — ruido de serialización típico (IDs, timestamps) en
+        // un body grande de un flujo agéntico, NO truncamiento. Un piso
+        // ABSOLUTO de bytes (p. ej. "delta_bytes / 8.0 >= 64", ~512 B) SÍ
+        // flaggearía este par (600 B de delta), un falso positivo. La regla
+        // FRACCIONAL correctamente lo descarta: 600/200000 = 0.3%, muy por
+        // debajo de TRUNCATION_BYTES_DELTA (5%).
+        let rows = vec![
+            req_prompt("openai", "llama3.2:3b", Some(65_000), None, None, Some(199_400)),
+            req_prompt("openai", "llama3.2:3b", Some(65_000), None, None, Some(200_000)),
+        ];
+
+        let result = classify_outliers(&rows);
+
+        assert!(!result[0].contains(&OutlierKind::Truncated));
+        assert!(!result[1].contains(&OutlierKind::Truncated));
     }
 
     #[test]
