@@ -167,7 +167,7 @@ que se disparó una sola vez. Se alterna con la tecla `p`; arranca visible.
 El panel ya tiene ~12 columnas — cramear más ahí lo haría ilegible. En vez de
 eso, el panel tiene **dos vistas mutuamente excluyentes**, cicladas con `c`:
 
-| Vista | Para qué sirve | Es la que ves con... |
+| Vista | Para qué sirve | Se muestra con... |
 |---|---|---|
 | `Latency` (default) | Latencia, tokens y coste por request — la que ya existía | `q`/`b`/`r` recién arrancado el monitor |
 | `Context` | Desglose de bytes de contexto por request: cuánto pesa cada bucket del body (`tools`, `history`, `system`, `last_turn`, `other`) | apretando `c` una vez |
@@ -222,7 +222,7 @@ campos de bytes vienen de `RecentRequest`/`ContextBreakdown` — ver
 | `last_turn` | Bytes del último mensaje, el turno genuinamente nuevo (`context_last_turn_bytes`) | Esto es lo ÚNICO que el usuario "escribió ahora". En tráfico real medido, puede ser tan poco como 0.06% del body — el resto es reenviar lo mismo de siempre |
 | `other` | Bytes del resto de campos de control a nivel raíz (`context_other_bytes`) | Normalmente chico; si crece, revisar qué campos nuevos está mandando el cliente |
 | `total` | Suma de los cinco anteriores (`context_measured_bytes`) — BYTES de JSON canónico re-serializado, **nunca tokens**, y **nunca combinar con el tamaño de wire** (ver `docs/telemetry-per-request.md`) | El tamaño total que el proxy mide por request |
-| `tax%` | `context_tax_ratio * 100`, un decimal — `(system + tools + history) / total` | **Cercano a 100% ⇒ casi todo lo que mandás ya lo habías mandado antes.** Es la "tasa" que pagás por turno solo para repetir contexto; un `tax%` alto con `cache-hit` bajo (ver vista `Latency`/tabla principal) es la peor combinación posible |
+| `tax%` | `context_tax_ratio * 100`, un decimal — `(system + tools + history) / total` | **Cercano a 100% ⇒ casi todo lo enviado ya se había enviado antes.** Es la "tasa" pagada por turno solo para repetir contexto; un `tax%` alto con `cache-hit` bajo (ver vista `Latency`/tabla principal) es la peor combinación posible |
 | `B/tok` | `context_measured_bytes / prompt_tokens_total(fila)`, un decimal — ver §7.3.1 para qué es `prompt_tokens_total` y por qué el denominador NO es siempre `input_tokens` | Un valor **muchas veces más alto que sus vecinos en la misma columna de modelo** es el olfato de que algo se truncó — el marcador `TRUNC` (§7.4) lo CONFIRMA cuando hay >= 2 filas con las que probarlo; `B/tok` es la escotilla de escape para el caso de una sola fila, donde `TRUNC` no puede probar nada |
 | `prep_us` | Microsegundos que el proxy pasó dentro de `Provider::prepare` (parseo + `decompose` + mutación opcional) | Overhead propio de OxideGate, NO incluye leer el body del socket ni el round-trip al proveedor — si esto crece con el tamaño del body, el parseo/decompose es el cuello de botella, no la red |
 | `outlier` | Igual que en `Latency` | — |
@@ -276,7 +276,7 @@ indefinido nunca se colapsa a un número inventado.
 ### 7.4. Marcadores de outlier
 
 Aplican por igual a AMBAS vistas (`Latency` y `Context`): la clasificación de
-outliers no depende de qué columnas estás mirando.
+outliers no depende de qué columnas se estén mirando.
 
 Cada fila se compara solo contra las OTRAS filas del mismo `(upstream,
 model)` — nunca contra el total del panel. El color de fila (rojo si tiene
@@ -458,12 +458,12 @@ cambios, y el orden del resultado).
 ### 8.4. Cómo leer las señales
 
 - **`(native)` domina el total** ⇒ ese es el PISO que no baja por más
-  servidores MCP que desconectes: son las herramientas propias del cliente,
+  servidores MCP que se desconecten: son las herramientas propias del cliente,
   no de un MCP. Ninguna palanca de configuración de MCP toca este número.
-- **Un servidor `mcp` grande que nunca aparece invocado en tu tráfico real**
-  (cruzalo con el panel de requests, §7, para ver qué herramientas se llaman
+- **Un servidor `mcp` grande que nunca aparece invocado en el tráfico real**
+  (cruzarlo con el panel de requests, §7, para ver qué herramientas se llaman
   de hecho) ⇒ candidato directo a sacar de la config de MCP del proyecto:
-  pagás sus bytes en TODAS las requests, lo uses o no.
+  sus bytes se pagan en TODAS las requests, se use o no.
 - **Un servidor con delta negativo grande y sostenido tras `b` + reinicio del
   cliente** ⇒ la palanca funcionó; es la confirmación que este panel existe
   para dar.

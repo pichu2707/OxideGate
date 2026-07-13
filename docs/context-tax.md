@@ -1,4 +1,4 @@
-# El impuesto de contexto — qué pagás realmente en una sesión de agente
+# El impuesto de contexto — qué se paga realmente en una sesión de agente
 
 > Estado: **medido**, no estimado. Todo lo que sigue sale de tráfico real de
 > Claude Code contra `claude-opus-4-8`, capturado por OxideGate en

@@ -23,7 +23,7 @@ con el vocabulario de cada API. Agregar un proveedor o afinar un dato obligaba a
 tocar código entrelazado en sitios distintos.
 
 > **Regla del corte:** un adaptador de verdad posee las DOS puntas del dialecto —
-> el request Y la respuesta. Si solo movés una, el proveedor sigue viviendo a
+> el request Y la respuesta. Si solo se mueve una, el proveedor sigue viviendo a
 > medias en la capa genérica.
 
 ---

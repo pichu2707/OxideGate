@@ -163,8 +163,8 @@ contexto que el agente arrastra en CADA llamada, más el uso de `opus`.
 - **`gemini-2.0-flash` da 404** en algunas keys: usar `GEMINI_MODEL` con uno
   disponible (`gemini-2.5-flash`). Los `gemini-3.x` del CLI son del backend de
   Code Assist, no de la API pública.
-- **No borres `telemetry.jsonl` con OxideGate corriendo**: el server abre el
-  archivo una sola vez al arrancar; si lo borrás, sigue escribiendo al inodo
+- **No borrar `telemetry.jsonl` con OxideGate corriendo**: el server abre el
+  archivo una sola vez al arrancar; si se borra, sigue escribiendo al inodo
   fantasma y las nuevas filas se pierden. El harness usa un offset de filas, así
   que no hace falta borrar nada.
 

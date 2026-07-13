@@ -83,7 +83,7 @@ La tercera es un **control**: la regla se conserva idéntica en ambas variantes,
 así que su propósito es detectar si el lean rompe algo que no debería, no
 discriminar.
 
-### 3.1. Por qué un sandbox, y por qué no se tocó tu `~/.claude`
+### 3.1. Por qué un sandbox, y por qué no se tocó `~/.claude`
 
 El A/B exige alternar el `CLAUDE.md` entre full y lean. Hacerlo sobre el
 `~/.claude/CLAUDE.md` real arriesga exactamente lo que esta palanca teme:

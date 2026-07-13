@@ -279,7 +279,7 @@ prompt que **obliga** al modelo a invocar `probe_marker`.
 
 **Distinguir retención de latencia de conexión.** Un servidor puede faltar en el
 cable por dos razones muy distintas, y este experimento las separa: un servidor
-que **aparece cuando lo necesitas** estaba **retenido**; uno que aparece **solo
+que **aparece cuando se necesita** estaba **retenido**; uno que aparece **solo
 con el paso de los turnos** (los conectores HTTP remotos tardan en conectar)
 estaba **conectando**. Medido: en una ejecución de control, `claude_ai_*` no está
 en la petición #1 y sí en la #3, siete segundos después, sin que nadie los pida.

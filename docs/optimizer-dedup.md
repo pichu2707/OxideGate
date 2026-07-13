@@ -50,8 +50,8 @@ guardada sin tocar al proveedor: **0 tokens, ~0 latencia**. Es el ahorro máximo
 posible — no abaratamos la llamada, la eliminamos.
 
 Ya tenemos la señal para saber si vale la pena: `redundancy_rate` por modelo en
-`GET /stats` (y en el monitor). Si en tu tráfico ronda cero, esta palanca no
-sirve; si es alto, es el mayor win del proyecto. **Medí primero.**
+`GET /stats` (y en el monitor). Si en el tráfico ronda cero, esta palanca no
+sirve; si es alto, es el mayor win del proyecto. **Medir primero.**
 
 ---
 
@@ -124,13 +124,13 @@ colisione una respuesta entre modelos o rutas distintas.
   `AppState`. La lógica de elegibilidad es una **función pura y testeable**
   (recibe stream/temperature/flag → bool), separada del transporte.
 - **Responsabilidad única:** la elegibilidad y el store/serve viven en el
-  optimizador; `proxy.rs` solo pregunta "¿hay hit?" y "guardá esto". El
+  optimizador; `proxy.rs` solo pregunta "¿hay hit?" y "guardar esto". El
   transporte no aprende reglas de caché.
 - **Telemetría — el antes/después:** sumar `served_from_cache: bool` a
   `RequestMetric` (y a la agregación de `/stats`). Un hit servido se registra
   con `total_ms ~0` y `cost 0`: el monitor lo muestra al instante en el panel
-  Δ-baseline. Ese es el circuito completo: `redundancy_rate` te dice dónde hay
-  oportunidad → prendés `OXIDEGATE_DEDUP` → el monitor te muestra el ahorro.
+  Δ-baseline. Ese es el circuito completo: `redundancy_rate` indica dónde hay
+  oportunidad → se activa `OXIDEGATE_DEDUP` → el monitor muestra el ahorro.
 
 ---
 

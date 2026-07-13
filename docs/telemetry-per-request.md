@@ -36,7 +36,7 @@ gentle-ai ──▶ OxideGate ──▶ proveedor
 curl localhost:8899/requests
 ```
 
-(ajustar el puerto al que use tu instancia). Devuelve `200 OK` con
+(ajustar el puerto al que use la instancia). Devuelve `200 OK` con
 `content-type: application/json`, sin autenticación: el proxy bindea en
 `127.0.0.1`, igual que `/stats`.
 
@@ -294,7 +294,7 @@ proceso de larga vida, sin necesidad de configurar nada.
 
 **Esto vive únicamente en RAM.** A diferencia de `telemetry.jsonl`, que
 persiste en disco y sobrevive a un reinicio del proxy, `/requests` se vacía
-por completo cada vez que el proceso de OxideGate se reinicia. Si necesitás
+por completo cada vez que el proceso de OxideGate se reinicia. Si se necesita
 el historial completo, o algo más viejo que las últimas 200 peticiones, la
 única fuente confiable es `telemetry.jsonl`.
 

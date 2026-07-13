@@ -36,7 +36,7 @@ gentle-ai ──▶ OxideGate ──▶ proveedor
 curl localhost:8899/stats
 ```
 
-(ajustar el puerto al que use tu instancia — `8080` por defecto, `8899` si
+(ajustar el puerto al que use la instancia — `8080` por defecto, `8899` si
 está ocupado). Devuelve `200 OK` con `content-type: application/json`, sin
 autenticación: el proxy bindea en `127.0.0.1` y el snapshot no expone
 secretos ni prompts, solo agregados y conteos de huellas.
