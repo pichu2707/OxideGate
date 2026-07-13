@@ -41,6 +41,8 @@
 //!   s         mostrar/ocultar el panel de "tools por servidor" (desglose
 //!             de bytes de herramientas MCP, con delta contra el baseline
 //!             marcado con `b`); INDEPENDIENTE de `p`/`c`
+//!   u         mostrar/ocultar el panel de cuota de suscripción Codex
+//!             (uso de cuota); INDEPENDIENTE de `p`/`c`/`s`
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -209,6 +211,8 @@ fn run_once(url: &str, requests_url: &str) {
             print_context_table(&rows);
             println!();
             print_tools_table(&rows);
+            println!();
+            print_quota_table(&rows);
         }
         Err(e) => {
             println!("/requests no disponible en {requests_url} ({e}) — puede ser una build del proxy anterior a este endpoint");
@@ -398,12 +402,6 @@ struct RequestRow {
     /// `x-codex-*`; `None` para el resto del tráfico (Anthropic, Gemini,
     /// OpenAI vía API key) y para un proxy anterior a esta captura. Fuente
     /// del panel de cuota (tecla `u`, ver [`find_quota_source_row`]).
-    //
-    // `#[allow(dead_code)]` temporal: el consumidor de este campo
-    // (`draw_quota_panel`/`print_quota_table`) llega en el commit siguiente
-    // de esta rebanada — mismo patrón ya usado en este archivo para `route`
-    // y `cache_control_forced`.
-    #[allow(dead_code)]
     codex_quota: Option<CodexQuotaRow>,
 }
 
@@ -1177,13 +1175,7 @@ fn tools_row_cells(d: &ServerDiffRow, tools_bytes: Option<usize>) -> Vec<String>
 
 // ---------------------------------------------------------------------------
 // Panel "cuota codex" (tecla `u`) — funciones puras, testeables sin terminal
-// ni HTTP de por medio.
-//
-// `#[allow(dead_code)]` temporal en toda la sección: el consumidor
-// (`draw_quota_panel`/`print_quota_table`, tecla `u`) llega en el commit
-// siguiente de esta rebanada. Hasta entonces solo los tests ejercitan estas
-// funciones, y `cargo build`/`cargo clippy` sin `--tests` no lo ve — mismo
-// patrón ya usado en este archivo para `RequestRow::route`.
+// ni HTTP de por medio
 // ---------------------------------------------------------------------------
 
 /// Encuentra la fila MÁS RECIENTE de `rows` cuyo `codex_quota` sea `Some`.
@@ -1194,21 +1186,18 @@ fn tools_row_cells(d: &ServerDiffRow, tools_bytes: Option<usize>) -> Vec<String>
 /// análogo del vector vacío que distinguir. `None` si ninguna fila trae
 /// cuota: todo el tráfico del buffer es no-Codex (Anthropic, Gemini, OpenAI
 /// vía API key) o el proxy es anterior a la captura de cuota.
-#[allow(dead_code)]
 fn find_quota_source_row(rows: &[RequestRow]) -> Option<&RequestRow> {
     rows.iter().rev().find(|r| r.codex_quota.is_some())
 }
 
 /// Ancho fijo (en celdas) de la barra de texto de una ventana de cuota
 /// (primaria/secundaria). Calibrado contra el ancho real del panel.
-#[allow(dead_code)]
 const QUOTA_BAR_WIDTH: usize = 14;
 
 /// Barra de texto de bloques llenos (`█`) y vacíos (`·`), proporcional al
 /// porcentaje consumido. `percent` se clampa a `0..=100`: una cabecera
 /// malformada corriente arriba no debería llegar acá, pero un clamp defensivo
 /// es preferible a un `repeat` con overflow.
-#[allow(dead_code)]
 fn quota_bar(percent: u64) -> String {
     let clamped = percent.min(100) as usize;
     let filled = clamped * QUOTA_BAR_WIDTH / 100;
@@ -1223,7 +1212,6 @@ fn quota_bar(percent: u64) -> String {
 /// `source_timestamp` no parsea. `now` se inyecta (no se lee
 /// `chrono::Utc::now()` acá) para que la función sea PURA y testeable con un
 /// reloj fijo.
-#[allow(dead_code)]
 fn quota_reset_remaining(quota: &CodexQuotaRow, source_timestamp: &str, now: i64) -> Option<i64> {
     if let Some(reset_at) = quota.primary_reset_at {
         return Some(reset_at - now);
@@ -1238,7 +1226,6 @@ fn quota_reset_remaining(quota: &CodexQuotaRow, source_timestamp: &str, now: i64
 /// 45m"`). `remaining <= 0` ⇒ `"resetea ahora"` (el reset ya pasó o es
 /// inminente, nunca un contador negativo). `None` ⇒ `"—"`, sin countdown
 /// fabricado.
-#[allow(dead_code)]
 fn format_reset_countdown(remaining: Option<i64>) -> String {
     let Some(remaining) = remaining else { return "—".to_string() };
     if remaining <= 0 {
@@ -1267,7 +1254,6 @@ fn format_reset_countdown(remaining: Option<i64>) -> String {
 ///   algo que la cuenta ni siquiera define agregaría ruido, no información.
 /// - La línea de créditos se OMITE salvo que `credits_has_credits ==
 ///   Some(true)`.
-#[allow(dead_code)]
 fn quota_lines(quota: &CodexQuotaRow, source_timestamp: &str, now: i64) -> Vec<String> {
     let mut lines = Vec::new();
 
@@ -1433,6 +1419,10 @@ struct App {
     /// INDEPENDIENTE de `show_requests_panel` y de `requests_view`: las tres
     /// teclas (`p`, `c`, `s`) controlan estados ortogonales entre sí.
     show_tools_panel: bool,
+    /// Visibilidad del panel de cuota de suscripción Codex, toggleable con
+    /// `u`. INDEPENDIENTE de `p`/`c`/`s`: las cuatro teclas controlan
+    /// estados ortogonales entre sí.
+    show_quota_panel: bool,
 }
 
 impl App {
@@ -1450,6 +1440,7 @@ impl App {
             show_requests_panel: true,
             requests_view: RequestsView::Latency,
             show_tools_panel: true,
+            show_quota_panel: true,
         }
     }
 
@@ -1547,6 +1538,13 @@ impl App {
         self.show_tools_panel = !self.show_tools_panel;
     }
 
+    /// Alterna la visibilidad del panel de cuota de suscripción Codex (tecla
+    /// `u`). INDEPENDIENTE de los demás toggles: apagar/prender uno no toca
+    /// el estado de los otros.
+    fn toggle_quota_panel(&mut self) {
+        self.show_quota_panel = !self.show_quota_panel;
+    }
+
     /// Marca el baseline en el instante actual con los contadores crudos de
     /// cada modelo visible ahora mismo, Y TAMBIÉN con una foto de
     /// `tools_by_server` (servidor → bytes) de la fila fuente vigente del
@@ -1641,6 +1639,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, url: &str, request
                     KeyCode::Char('p') => app.toggle_requests_panel(),
                     KeyCode::Char('c') => app.cycle_requests_view(),
                     KeyCode::Char('s') => app.toggle_tools_panel(),
+                    KeyCode::Char('u') => app.toggle_quota_panel(),
                     _ => {}
                 }
             }
@@ -1661,16 +1660,16 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, url: &str, request
 
 /// Arma el layout vertical y despacha cada panel a su `chunk`.
 ///
-/// Dos paneles son toggleables de forma INDEPENDIENTE (`p` para requests
-/// recientes, `s` para tools por servidor): cuando uno está oculto, no se
-/// reserva su espacio, para que los paneles fijos no se vean apretados sin
-/// necesidad. Eso da CUATRO combinaciones de visibilidad posibles (ninguno,
-/// solo uno, solo el otro, ambos).
+/// Tres paneles son toggleables de forma INDEPENDIENTE (`p` para requests
+/// recientes, `s` para tools por servidor, `u` para cuota Codex): cuando uno
+/// está oculto, no se reserva su espacio, para que los paneles fijos no se
+/// vean apretados sin necesidad. Eso da OCHO combinaciones de visibilidad
+/// posibles.
 ///
-/// Para que las cuatro queden cubiertas sin lógica especial por caso (y sin
-/// el riesgo de indexar un `chunks[i]` que no exista si algún día se agrega
-/// un tercer panel toggleable), el índice de cada chunk se calcula avanzando
-/// un contador (`idx`) a medida que cada panel opcional se agrega a
+/// Para que las ocho queden cubiertas sin lógica especial por caso (y sin el
+/// riesgo de indexar un `chunks[i]` que no exista si algún día se agrega un
+/// cuarto panel toggleable), el índice de cada chunk se calcula avanzando un
+/// contador (`idx`) a medida que cada panel opcional se agrega a
 /// `constraints` y se dibuja — nunca se hardcodea una posición fija. La
 /// longitud de `chunks` es SIEMPRE igual a la de `constraints`
 /// (`Layout::split` lo garantiza), así que `idx` nunca puede quedar fuera de
@@ -1691,6 +1690,9 @@ fn ui(f: &mut Frame, app: &App) {
     if app.show_tools_panel {
         constraints.push(Constraint::Length(10)); // tools por servidor
     }
+    if app.show_quota_panel {
+        constraints.push(Constraint::Length(7)); // cuota codex
+    }
     constraints.push(Constraint::Length(1)); // footer
 
     let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
@@ -1707,6 +1709,10 @@ fn ui(f: &mut Frame, app: &App) {
     }
     if app.show_tools_panel {
         draw_tools_panel(f, chunks[idx], app);
+        idx += 1;
+    }
+    if app.show_quota_panel {
+        draw_quota_panel(f, chunks[idx], app);
         idx += 1;
     }
     draw_footer(f, chunks[idx]);
@@ -2015,6 +2021,49 @@ fn draw_tools_panel(f: &mut Frame, area: Rect, app: &App) {
     // entran sin panickear — mismo comportamiento (documentado) que ya usa
     // `draw_requests_panel` para columnas angostas.
     f.render_widget(Table::new(rows, widths).header(header), inner);
+}
+
+/// Panel de cuota de suscripción Codex (tecla `u`), alimentado por la fila
+/// MÁS RECIENTE de `app.recent_requests` cuyo `codex_quota` sea `Some` — ver
+/// [`find_quota_source_row`]. Un `Paragraph` con borde, no una `Table`: la
+/// cuota es un gauge de líneas de cuenta, no filas por petición (mismo
+/// widget base que [`draw_before_after`]).
+///
+/// Si ninguna fila califica (todo el buffer es tráfico no-Codex, o el proxy
+/// es anterior a la captura de cuota), se muestra una única línea
+/// explicativa dentro del borde; nunca una caja vacía ni un gauge fabricado
+/// en 0%.
+fn draw_quota_panel(f: &mut Frame, area: Rect, app: &App) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    let Some(source) = find_quota_source_row(&app.recent_requests) else {
+        let block = Block::default().borders(Borders::ALL).title(" cuota codex ");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if inner.height > 0 && inner.width > 0 {
+            let text = Line::from(
+                "sin datos de cuota (ninguna petición reciente usó el backend de Codex, o el proxy es anterior a la captura de cuota)",
+            );
+            f.render_widget(Paragraph::new(text), inner);
+        }
+        return;
+    };
+
+    // `find_quota_source_row` garantiza `codex_quota` Some: este `expect`
+    // nunca debería fallar, pero preferimos documentarlo explícitamente en
+    // vez de un `unwrap()` mudo.
+    let quota = source.codex_quota.as_ref().expect("find_quota_source_row garantiza codex_quota Some");
+    let now = chrono::Utc::now().timestamp();
+    let lines: Vec<Line> = quota_lines(quota, &source.timestamp, now).into_iter().map(Line::from).collect();
+
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " cuota codex · fuente {} {} ",
+        format_time(&source.timestamp),
+        source.model.as_deref().unwrap_or("-"),
+    ));
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// Header de columnas del panel/tabla de requests, según la vista activa.
@@ -2450,9 +2499,30 @@ fn print_tools_table(rows: &[RequestRow]) {
     );
 }
 
+/// Imprime el panel de cuota de suscripción Codex en texto plano (modo
+/// `--once`). Mismo pipeline puro que la TUI (`find_quota_source_row` +
+/// `quota_lines`), para que ninguna de las dos vistas diverja en qué
+/// muestra. El countdown usa el mismo `Utc::now()` que la TUI.
+fn print_quota_table(rows: &[RequestRow]) {
+    println!("--- vista: cuota codex ---");
+
+    let Some(source) = find_quota_source_row(rows) else {
+        println!("(sin datos de cuota: ninguna petición reciente usó el backend de Codex, o el proxy es anterior a la captura de cuota)");
+        return;
+    };
+
+    // `find_quota_source_row` garantiza `codex_quota` Some.
+    let quota = source.codex_quota.as_ref().expect("find_quota_source_row garantiza codex_quota Some");
+    println!("fuente: {} · modelo {}", format_time(&source.timestamp), source.model.as_deref().unwrap_or("-"));
+    let now = chrono::Utc::now().timestamp();
+    for line in quota_lines(quota, &source.timestamp, now) {
+        println!("{line}");
+    }
+}
+
 fn draw_footer(f: &mut Frame, area: Rect) {
     let text = Line::from(
-        "q salir · b marcar baseline · r reset · ↑/↓ elegir modelo · p requests · c vista latency/context · s tools por servidor",
+        "q salir · b marcar baseline · r reset · ↑/↓ elegir modelo · p requests · c vista latency/context · s tools por servidor · u cuota codex",
     );
     f.render_widget(Paragraph::new(text), area);
 }
@@ -3643,6 +3713,20 @@ mod tests {
         app.toggle_tools_panel();
         assert!(!app.show_tools_panel);
         // Apagar `s` no debe afectar `p`.
+        assert!(app.show_requests_panel);
+    }
+
+    #[test]
+    fn show_quota_panel_arranca_visible_y_es_independiente_de_los_demas() {
+        let mut app = App::new("http://x".to_string());
+        assert!(app.show_quota_panel);
+        assert!(app.show_tools_panel);
+        assert!(app.show_requests_panel);
+
+        app.toggle_quota_panel();
+        assert!(!app.show_quota_panel);
+        // Apagar `u` no debe afectar `s` ni `p`.
+        assert!(app.show_tools_panel);
         assert!(app.show_requests_panel);
     }
 

@@ -115,6 +115,7 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
 | `p` | Mostrar/ocultar el panel de requests recientes (ver §7) |
 | `c` | Ciclar la vista de columnas del panel de requests recientes — `Latency` ⇄ `Context` (ver §7.1). **No-op si el panel está oculto**: no cambia nada mientras `p` lo tenga escondido |
 | `s` | Mostrar/ocultar el panel de tools por servidor (ver §8). **INDEPENDIENTE** de `p`/`c`: ninguna de las tres teclas afecta el estado de las otras |
+| `u` | Mostrar/ocultar el panel de cuota de suscripción Codex — "uso de cuota" (ver §9). **INDEPENDIENTE** de `p`/`c`/`s` |
 
 ## 5. Layout de la pantalla
 
@@ -135,7 +136,11 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
    bytes de herramientas por servidor MCP de la petición más reciente que
    los declare, con delta contra el baseline. Independiente del panel
    anterior — cualquier combinación de `p`/`s` visibles u ocultos es válida.
-7. **Footer**: recordatorio de teclas.
+7. **Panel de cuota de suscripción Codex** (toggleable con `u`, ver §9):
+   gauge de estado de cuenta (no una tabla por fila) de la petición más
+   reciente que traiga cabeceras `x-codex-*`. Independiente de los paneles
+   anteriores.
+8. **Footer**: recordatorio de teclas.
 
 ## 6. Enhance del snapshot (`ModelStatsRow`)
 
@@ -500,20 +505,87 @@ imprime esta tabla en texto plano (misma fuente, mismas columnas). La
 columna `Δ baseline` sale siempre `-`: no hay sesión interactiva en la que
 apretar `b`.
 
-## 9. Dónde vive cada cosa
+## 9. Panel de cuota de suscripción Codex (`u`)
+
+Consume el mismo `GET /requests` (§7) que los otros paneles de detalle, pero
+mira un campo distinto: `codex_quota` — el estado de cuota de la cuenta en el
+momento de ESA petición puntual, presente únicamente cuando la petición se
+enrutó al backend de Codex vía OAuth (suscripción, no API key). Responde:
+*"¿cuánto me queda de cuota, y cuándo resetea?"*
+
+Se alterna con la tecla `u`, **INDEPENDIENTE** de `p`/`c`/`s`: las cuatro
+teclas controlan estados ortogonales, cualquier combinación de visibilidad es
+válida.
+
+### 9.1. Fuente de datos y por qué es un panel dedicado
+
+La cuota es un gauge a nivel de CUENTA — idéntico para todos los modelos que
+lleguen por el backend de Codex en un instante dado — no una columna más por
+fila. Por eso vive en su propio panel (`Paragraph` con líneas, no una
+`Table`), y no en el ciclo de columnas `c` del panel de requests (§7.1): ese
+ciclo cambia qué columnas se ven POR FILA, y la cuota no tiene filas.
+
+El panel toma la fila MÁS RECIENTE de `/requests` cuyo `codex_quota` sea
+no-nulo (`find_quota_source_row`, `src/bin/monitor.rs`) y muestra
+exactamente esa fila. El título indica `HH:MM:SS` y modelo de esa fila
+fuente. Si ninguna fila califica — todo el tráfico reciente es Anthropic,
+Gemini u OpenAI vía API key, o el proxy es anterior a esta captura — el panel
+muestra una única línea explicativa, nunca una caja vacía ni un gauge al 0%.
+
+### 9.2. Qué muestra
+
+Todo campo ausente se renderiza como `—` o se OMITE por completo; nunca se
+fabrica un `0%` ni un valor por defecto (mismo criterio "ausente ≠ cero" que
+el resto del monitor).
+
+| Línea | Contenido | Regla de ausencia |
+|---|---|---|
+| Plan y límite | `plan: <plan_type> · límite: <active_limit>` | Cada campo `—` si falta |
+| Ventana primaria | Barra de texto (`█`/`·`, ancho fijo) + `<n>% · ventana <minutos>m` | `—` sin barra si `primary_used_percent` es `null` |
+| Ventana secundaria | Igual formato que la primaria | **Se OMITE por completo** si `secondary_window_minutes` es `null`/`0` — en esta cuenta llega vacía, y mostrar `—` para algo que la cuenta ni define sería ruido |
+| Countdown de reset | `resetea en 6d 8h` (dos unidades más significativas, d/h/m) | `resetea ahora` si ya pasó; `—` si no hay ninguna fuente de reset (ver §9.3) |
+| Créditos | `créditos: ilimitados` o `créditos: <balance>` | **Se OMITE** salvo que `credits_has_credits == true` |
+
+### 9.3. Countdown de reset
+
+Prioridad de fuente: `primary_reset_at` (timestamp unix absoluto) si está
+presente; si no, se reconstruye desde el `timestamp` RFC 3339 de la fila
+fuente más `primary_reset_after_seconds` (el valor de esta cabecera es
+relativo al INSTANTE DE CAPTURA, no a ahora). Si ninguna de las dos fuentes
+está disponible, `—` sin countdown fabricado. El "ahora" se calcula con
+`chrono::Utc::now()` en cada redraw (~250 ms): el countdown avanza en vivo
+sin ningún tick adicional.
+
+### 9.4. Separación estricta de `cost_estimate_usd`
+
+El panel no deriva nada de la cuota, ni la mezcla con coste en dólares: la
+cuota es un porcentaje de ventana de un plan de precio fijo, `cost_estimate_usd`
+es un importe calculado para tráfico de API key. Son dos monedas
+independientes en la misma fila — ver `src/telemetry/codex_quota.rs` para la
+garantía estructural completa.
+
+### 9.5. Modo headless (`--once`)
+
+`--once` imprime esta tabla en texto plano después de la de tools por
+servidor (§8.5), con el mismo pipeline puro (`find_quota_source_row` +
+`quota_lines`) y las mismas reglas de ausencia — sin sesión interactiva no
+hay nada que ocultar.
+
+## 10. Dónde vive cada cosa
 
 | Archivo | Responsabilidad |
 |---|---|
 | `src/telemetry/stats.rs` | `ModelStatsRow` con sumas/counts crudas (además de promedios) — sin cambios de comportamiento, solo más campos expuestos |
 | `src/telemetry/recent.rs` | `RecentRequests` — buffer FIFO acotado de las últimas 200 peticiones individuales |
+| `src/telemetry/codex_quota.rs` | `CodexQuota` — captura cruda de las 12 cabeceras `x-codex-*` de cuota de suscripción; `RequestRow::codex_quota`/`CodexQuotaRow` (en `src/bin/monitor.rs`) espejan este contrato para el panel de cuota (§9) |
 | `src/middleware/requests.rs` | `handle_requests` — el handler HTTP de `GET /requests` |
 | `src/provider/mod.rs` | `ToolServerBytes`/`ToolServerKind` — el contrato de tipos del proxy que `RequestRow`/`ToolServerRow` (en `src/bin/monitor.rs`) espejan para el desglose de `tools_by_server` |
-| `src/bin/monitor.rs` | Binario TUI independiente: fetch por HTTP de `/stats` y `/requests`, estado (baseline, historial, selección, buffer de requests), detección de outliers (incluida la detección de truncamiento por tope de tokens, `TRUNC`, ver §7.4), cálculo de delta de ventana y de delta de tools por servidor (funciones puras testeadas aparte), render con `ratatui` |
+| `src/bin/monitor.rs` | Binario TUI independiente: fetch por HTTP de `/stats` y `/requests`, estado (baseline, historial, selección, buffer de requests), detección de outliers (incluida la detección de truncamiento por tope de tokens, `TRUNC`, ver §7.4), cálculo de delta de ventana, de delta de tools por servidor y de gauge de cuota (funciones puras testeadas aparte), render con `ratatui` |
 | `src/telemetry/pricing.rs` (`CacheAccounting`) | Fuente de verdad SERVIDOR-SIDE de la contabilidad de caché por proveedor (`Separate` para Anthropic, `Subset` para OpenAI/Gemini). `prompt_tokens_total` en `src/bin/monitor.rs` (§7.3.1) DUPLICA esta semántica a propósito — el binario `monitor` no puede importarla (el crate no expone `lib.rs`) — así que un cambio acá exige actualizar también `prompt_tokens_total` |
 | `docs/telemetry-by-model.md` | Contrato del endpoint `GET /stats` que este monitor consume |
-| `docs/telemetry-per-request.md` | Contrato del endpoint `GET /requests` que alimenta el panel de detalle y el panel de tools por servidor |
+| `docs/telemetry-per-request.md` | Contrato del endpoint `GET /requests` que alimenta el panel de detalle, el panel de tools por servidor y el panel de cuota |
 
-## 10. Límites conocidos
+## 11. Límites conocidos
 
 - **El fetch de `/requests` (y el de `/stats`) es bloqueante, en el mismo
   hilo que dibuja la TUI y lee el teclado.** Ambos usan
