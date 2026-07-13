@@ -1,0 +1,65 @@
+schema: spec-driven
+
+context: |
+  Tech stack: Rust (edition 2024), Cargo workspace, 3 bins (oxidegate, oxidegate-monitor,
+  oxidegate-bench). Async via tokio + axum. Local measuring proxy for LLM API traffic
+  (Anthropic/OpenAI/Gemini).
+  Architecture: Provider trait (src/provider/*.rs) owns request+usage extraction per
+  provider; pricing.rs is single source of truth for cost; middleware/proxy.rs is a
+  provider-agnostic streaming transport (MeteredBody wraps responses for TTFT/tokens/cost).
+  Testing: cargo test (inline #[cfg(test)] mod tests per module), cargo clippy --all-targets.
+  Strict TDD: disabled (strong regression-test culture, not enforced red-green-refactor).
+  Style: Thorough //! and /// doc comments on every file/function/constant. Comments and
+  prose in this repo are Spanish (neutral/professional, no voseo/regionalisms) per existing
+  convention; code identifiers/UI stay English. Strict single-responsibility per module.
+  Conventional commits, NEVER Co-Authored-By/AI attribution. Honesty principle: unknown
+  cost/usage is null/None, never fabricated.
+
+testing:
+  strict_tdd: false
+  test_command: "cargo test"
+  lint_command: "cargo clippy --all-targets"
+  test_layers:
+    unit: true
+    integration: false
+    e2e: false
+  coverage:
+    available: false
+    command: ""
+  quality:
+    linter: "cargo clippy --all-targets"
+    type_checker: "cargo check (Rust compiler)"
+    formatter: "cargo fmt"
+
+rules:
+  proposal:
+    - Include rollback plan for risky changes
+    - Never invent telemetry numbers; unknown values must stay null/None
+  specs:
+    - Use Given/When/Then for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+  design:
+    - Include sequence diagrams for complex flows
+    - Document architecture decisions with rationale
+    - Respect the Provider trait boundary: provider-specific logic stays in src/provider/*.rs,
+      pricing/cost logic stays in src/telemetry/pricing.rs, transport stays provider-agnostic
+      in src/middleware/proxy.rs
+  tasks:
+    - Group by phase, use hierarchical numbering
+    - Keep tasks completable in one session
+  apply:
+    - Follow existing code patterns
+    - Document every new file/function/constant with //! and /// (thorough, explanatory)
+    - Match existing comment language (Spanish, neutral/professional, no voseo) unless the
+      file is already English
+    - Strict single-responsibility per module
+    - Conventional commits only; never add Co-Authored-By or AI attribution
+    tdd: false
+    test_command: "cargo test"
+  verify:
+    test_command: "cargo test"
+    build_command: "cargo build --all-targets"
+    lint_command: "cargo clippy --all-targets"
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas
