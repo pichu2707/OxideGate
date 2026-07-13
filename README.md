@@ -52,7 +52,8 @@ Desde el código: `cargo run --bin oxidegate`.
 #    puerto está ocupado — lo está más a menudo de lo que parece.
 OXIDEGATE_PORT=8899 oxidegate
 
-# 2. Apuntar el cliente a OxideGate en vez de al proveedor:
+# 2. Apuntar el cliente a OxideGate en vez de al proveedor. Aquí, Claude Code;
+#    para OpenCode, Gemini CLI y OpenAI, ver "Cablear cada cliente" más abajo.
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8899
 
 # 3. Usar el agente como siempre. OxideGate reenvía la petición INTACTA y la mide
@@ -101,6 +102,118 @@ propio reporte, en vez de presentar un ahorro que no existe.
 
 La telemetría se escribe en `~/.config/oxidegate/telemetry.jsonl` (una línea
 JSON por petición), fuera del camino crítico del request.
+
+---
+
+## Cablear cada cliente
+
+OxideGate solo mide **lo que pasa por él**. Cada cliente se redirige apuntando la
+base-URL de su proveedor al puerto local. El proxy reenvía al proveedor real de
+forma transparente, así que la autenticación —API key u OAuth— viaja intacta y
+sigue funcionando igual.
+
+| Cliente | Dónde se configura | Valor | ¿lleva `/v1`? |
+|---|---|---|---|
+| **Claude Code** (incl. Claude Max / OAuth) | `ANTHROPIC_BASE_URL` | `http://127.0.0.1:8899` | **NO** |
+| **Gemini CLI** (`@google/gemini-cli`, API key) | `GOOGLE_GEMINI_BASE_URL` | `http://127.0.0.1:8899` | **NO** |
+| **OpenCode** | `opencode.json` → `provider.*.options.baseURL` | `http://127.0.0.1:8899/v1` | **SÍ** |
+| **SDKs / clientes de OpenAI** | `OPENAI_BASE_URL` / `OPENAI_API_BASE` | `http://127.0.0.1:8899/v1` | **SÍ** |
+
+> **El `/v1` es la trampa, y va en unos sí y en otros no.** Claude Code y el CLI
+> de Gemini construyen la ruta ellos mismos (`/v1/messages`,
+> `/v1beta/models/...`): si se les da la base con `/v1`, la petición sale a
+> `/v1/v1/messages` y el proxy devuelve **404**. Los clientes OpenAI-compatible
+> hacen lo contrario: esperan la base **con** `/v1` y le pegan
+> `/chat/completions` detrás. Un 404 nada más arrancar es, casi siempre, esto.
+
+### Claude Code
+
+```sh
+ANTHROPIC_BASE_URL=http://127.0.0.1:8899 claude
+```
+
+La variable se lee **al arrancar el proceso**: una sesión ya abierta no se puede
+medir a posteriori, hay que relanzarla. Claude Max con OAuth respeta la variable
+igual que una API key (verificado en vivo); levantar dos sesiones de Claude Max a
+la vez dispara `429` por el límite de concurrencia de la suscripción.
+
+> **Los bytes de `tools` que verás aquí están contaminados.** Detrás de un
+> `ANTHROPIC_BASE_URL` no-first-party, Claude Code deja de diferir sus esquemas
+> MCP y los manda todos de golpe — y OxideGate *es* uno de esos base URL. Latencia,
+> tokens, coste, TTFT, cache-hit y `tax%` son reales; el **peso de `tools` es en
+> parte artefacto del propio medidor**. Medido con grupo de control en
+> [`docs/optimizer-tool-search.md`](docs/optimizer-tool-search.md) §3.
+
+### OpenCode
+
+En `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "provider": {
+    "oxidegate": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:8899/v1" },
+      "models": { "claude-opus-4-8": {} }
+    }
+  }
+}
+```
+
+Entra por `/v1/chat/completions`. Ojo con una honestidad que conviene saber: esa
+ruta está **codificada pero sin validar en vivo** (ver
+[`docs/telemetry-level-1.md`](docs/telemetry-level-1.md) §5). Chat Completions no
+manda `usage` en streaming salvo que el request traiga
+`stream_options.include_usage`, y como el cliente no lo pone, **OxideGate lo
+inyecta**: es la única mutación fuera de la Palanca A.
+
+A cambio, OpenCode es **eager** de serie —sus esquemas MCP viajan con proxy y sin
+él—, así que aquí el peso de `tools` **no** es artefacto del medidor: es el coste
+real, y OxideGate solo lo revela.
+
+### Gemini CLI
+
+```sh
+GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:8899 gemini
+```
+
+Entra por la ruta comodín `/v1beta/*`, que preserva path y query (ahí viajan el
+modelo, el `alt=sse` y a veces la propia API key). Los tokens medidos se cruzaron
+contra el resumen *Model Usage* que el propio CLI imprime al cerrar sesión y
+**coincidieron exactamente**, en streaming y sin él, sobre 3 peticiones y 2
+modelos: de los tres proveedores, es el que tiene la validación más fuerte.
+
+### OpenAI (API pública, con API key)
+
+```sh
+export OPENAI_BASE_URL=http://127.0.0.1:8899/v1
+```
+
+- `/v1/responses` (Responses API, la de los clientes modernos): **validado en
+  vivo** con API key real.
+- **Codex con login de ChatGPT no se puede medir.** Autenticado con cuenta (sin
+  API key) pega al backend interno de ChatGPT, no a `api.openai.com`, e **ignora
+  `OPENAI_BASE_URL`**. Redirigirlo exigiría un MITM con CA propio: fuera de
+  alcance. Para medir OpenAI, API pública con API key.
+
+### Y el TUI, en todos los casos
+
+```sh
+OXIDEGATE_PORT=8899 oxidegate-monitor
+```
+
+**El monitor no descubre el puerto: lo lee de `OXIDEGATE_PORT`**, y si no está,
+se va al `8080` por defecto. Si el proxy escucha en 8899 y el monitor mira al
+8080, el resultado es un dashboard **vacío y sin un solo error** — el fallo más
+desconcertante de todos. Mismo puerto en los tres sitios: proxy, cliente y
+monitor. Levantar antes el proxy que el cliente, o el cliente se come un
+*connection refused*.
+
+Con el TUI abierto, el flujo es siempre el mismo sea cual sea el cliente: `p`
+abre el panel por petición, `c` cambia a la vista de contexto (`tools`,
+`history`, `system`, `last_turn`, `tax%`), y `b` marca el baseline para comparar
+un antes y un después. Detalle completo en
+[`docs/monitor-tui.md`](docs/monitor-tui.md).
 
 ---
 
