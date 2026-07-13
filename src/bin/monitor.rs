@@ -392,6 +392,19 @@ struct RequestRow {
     /// del array, wrapper de Gemini, herramientas huérfanas sin `name`
     /// válido). Mismo contrato `None`/`Some` que `tools_by_server`.
     tools_overhead_bytes: Option<usize>,
+    /// Estado de cuota de suscripción Codex de esta petición puntual (ver
+    /// [`CodexQuotaRow`]). `Some` únicamente si la petición se enrutó al
+    /// backend de Codex vía OAuth y el upstream mandó al menos una cabecera
+    /// `x-codex-*`; `None` para el resto del tráfico (Anthropic, Gemini,
+    /// OpenAI vía API key) y para un proxy anterior a esta captura. Fuente
+    /// del panel de cuota (tecla `u`, ver [`find_quota_source_row`]).
+    //
+    // `#[allow(dead_code)]` temporal: el consumidor de este campo
+    // (`draw_quota_panel`/`print_quota_table`) llega en el commit siguiente
+    // de esta rebanada — mismo patrón ya usado en este archivo para `route`
+    // y `cache_control_forced`.
+    #[allow(dead_code)]
+    codex_quota: Option<CodexQuotaRow>,
 }
 
 /// Fila del desglose de `tools` por servidor: espejo local y liviano de
@@ -429,6 +442,31 @@ struct ToolServerRow {
     /// lo informó", `Some(0)` es "lo midió y dio cero" — nunca se colapsan
     /// entre sí. Ver `deferred_cell` para cómo se renderiza el tercer estado.
     deferred_tools: Option<usize>,
+}
+
+/// Espejo local de [`CodexQuota`](../../src/telemetry/codex_quota.rs) (12
+/// campos, mismo contrato de saneo: cabecera ausente/vacía/malformada →
+/// `None`, nunca un `0`/`""` fabricado). El monitor es un binario
+/// independiente sin `lib.rs` que importar, así que redefine el struct con
+/// los mismos nombres y tipos — ver `RecentRequest::codex_quota`
+/// (`src/telemetry/recent.rs`) y `telemetry::codex_quota::CodexQuota` para el
+/// contrato completo campo a campo, incluida la separación estricta respecto
+/// de `cost_estimate_usd` (cuota y dólares nunca se mezclan). Fuente del
+/// panel de cuota, tecla `u` (ver [`find_quota_source_row`]).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct CodexQuotaRow {
+    plan_type: Option<String>,
+    active_limit: Option<String>,
+    credits_balance: Option<String>,
+    primary_used_percent: Option<u64>,
+    secondary_used_percent: Option<u64>,
+    primary_window_minutes: Option<u64>,
+    secondary_window_minutes: Option<u64>,
+    primary_reset_after_seconds: Option<u64>,
+    primary_reset_at: Option<i64>,
+    secondary_reset_at: Option<i64>,
+    credits_has_credits: Option<bool>,
+    credits_unlimited: Option<bool>,
 }
 
 /// Hace el GET a `/requests` y parsea el array de filas (orden cronológico,
@@ -1135,6 +1173,139 @@ fn tools_row_cells(d: &ServerDiffRow, tools_bytes: Option<usize>) -> Vec<String>
         tool_pct_of_total(d.bytes, tools_bytes),
         format_delta_bytes(d.delta),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// Panel "cuota codex" (tecla `u`) — funciones puras, testeables sin terminal
+// ni HTTP de por medio.
+//
+// `#[allow(dead_code)]` temporal en toda la sección: el consumidor
+// (`draw_quota_panel`/`print_quota_table`, tecla `u`) llega en el commit
+// siguiente de esta rebanada. Hasta entonces solo los tests ejercitan estas
+// funciones, y `cargo build`/`cargo clippy` sin `--tests` no lo ve — mismo
+// patrón ya usado en este archivo para `RequestRow::route`.
+// ---------------------------------------------------------------------------
+
+/// Encuentra la fila MÁS RECIENTE de `rows` cuyo `codex_quota` sea `Some`.
+/// `rows` llega en orden cronológico (más viejo primero, igual que el buffer
+/// del proxy), así que se recorre desde el final. A diferencia de
+/// [`find_tools_source_row`], acá `Some(_)` SIEMPRE califica: un
+/// `CodexQuotaRow` presente ES el estado de cuota completo, no hay un
+/// análogo del vector vacío que distinguir. `None` si ninguna fila trae
+/// cuota: todo el tráfico del buffer es no-Codex (Anthropic, Gemini, OpenAI
+/// vía API key) o el proxy es anterior a la captura de cuota.
+#[allow(dead_code)]
+fn find_quota_source_row(rows: &[RequestRow]) -> Option<&RequestRow> {
+    rows.iter().rev().find(|r| r.codex_quota.is_some())
+}
+
+/// Ancho fijo (en celdas) de la barra de texto de una ventana de cuota
+/// (primaria/secundaria). Calibrado contra el ancho real del panel.
+#[allow(dead_code)]
+const QUOTA_BAR_WIDTH: usize = 14;
+
+/// Barra de texto de bloques llenos (`█`) y vacíos (`·`), proporcional al
+/// porcentaje consumido. `percent` se clampa a `0..=100`: una cabecera
+/// malformada corriente arriba no debería llegar acá, pero un clamp defensivo
+/// es preferible a un `repeat` con overflow.
+#[allow(dead_code)]
+fn quota_bar(percent: u64) -> String {
+    let clamped = percent.min(100) as usize;
+    let filled = clamped * QUOTA_BAR_WIDTH / 100;
+    format!("{}{}", "█".repeat(filled), "·".repeat(QUOTA_BAR_WIDTH - filled))
+}
+
+/// Segundos restantes hasta el reset de la ventana primaria, con la
+/// prioridad de fuente documentada en el diseño: `primary_reset_at`
+/// (absoluto) primero; si falta, `source_timestamp` (RFC 3339 de la fila
+/// fuente) más `primary_reset_after_seconds` reconstruido a instante
+/// absoluto. `None` si ninguna de las dos fuentes está disponible, o si
+/// `source_timestamp` no parsea. `now` se inyecta (no se lee
+/// `chrono::Utc::now()` acá) para que la función sea PURA y testeable con un
+/// reloj fijo.
+#[allow(dead_code)]
+fn quota_reset_remaining(quota: &CodexQuotaRow, source_timestamp: &str, now: i64) -> Option<i64> {
+    if let Some(reset_at) = quota.primary_reset_at {
+        return Some(reset_at - now);
+    }
+    let after = quota.primary_reset_after_seconds?;
+    let base = chrono::DateTime::parse_from_rfc3339(source_timestamp).ok()?.timestamp();
+    Some(base + after as i64 - now)
+}
+
+/// Formatea segundos restantes como texto humano de las dos unidades más
+/// significativas (`"resetea en 6d 8h"`, `"resetea en 3h 12m"`, `"resetea en
+/// 45m"`). `remaining <= 0` ⇒ `"resetea ahora"` (el reset ya pasó o es
+/// inminente, nunca un contador negativo). `None` ⇒ `"—"`, sin countdown
+/// fabricado.
+#[allow(dead_code)]
+fn format_reset_countdown(remaining: Option<i64>) -> String {
+    let Some(remaining) = remaining else { return "—".to_string() };
+    if remaining <= 0 {
+        return "resetea ahora".to_string();
+    }
+    let days = remaining / 86_400;
+    let hours = (remaining % 86_400) / 3_600;
+    let minutes = (remaining % 3_600) / 60;
+    if days > 0 {
+        format!("resetea en {days}d {hours}h")
+    } else if hours > 0 {
+        format!("resetea en {hours}h {minutes}m")
+    } else {
+        format!("resetea en {minutes}m")
+    }
+}
+
+/// Construye las líneas de texto del panel de cuota, en el orden de render
+/// documentado en el diseño. Reusada por la TUI (`draw_quota_panel`) y por
+/// `--once` (`print_quota_table`) para que ninguna de las dos diverja en qué
+/// muestra. Regla de honestidad transversal: todo campo ausente se renderiza
+/// como `—` o se OMITE por completo — nunca un `0%` ni un valor fabricado.
+///
+/// - La ventana secundaria se OMITE si `secondary_window_minutes` es
+///   `None`/`0`: en el tráfico observado llega vacía, y mostrar `—` para
+///   algo que la cuenta ni siquiera define agregaría ruido, no información.
+/// - La línea de créditos se OMITE salvo que `credits_has_credits ==
+///   Some(true)`.
+#[allow(dead_code)]
+fn quota_lines(quota: &CodexQuotaRow, source_timestamp: &str, now: i64) -> Vec<String> {
+    let mut lines = Vec::new();
+
+    lines.push(format!(
+        "plan: {} · límite: {}",
+        quota.plan_type.as_deref().unwrap_or("—"),
+        quota.active_limit.as_deref().unwrap_or("—"),
+    ));
+
+    match quota.primary_used_percent {
+        Some(pct) => {
+            let window = quota.primary_window_minutes.map(|m| format!("{m}m")).unwrap_or_else(|| "—".to_string());
+            lines.push(format!("primaria: {} {pct}% · ventana {window}", quota_bar(pct)));
+        }
+        None => lines.push("primaria: —".to_string()),
+    }
+
+    if quota.secondary_window_minutes.is_some_and(|m| m > 0) {
+        match quota.secondary_used_percent {
+            Some(pct) => {
+                let window = quota.secondary_window_minutes.map(|m| format!("{m}m")).unwrap_or_else(|| "—".to_string());
+                lines.push(format!("secundaria: {} {pct}% · ventana {window}", quota_bar(pct)));
+            }
+            None => lines.push("secundaria: —".to_string()),
+        }
+    }
+
+    lines.push(format_reset_countdown(quota_reset_remaining(quota, source_timestamp, now)));
+
+    if quota.credits_has_credits == Some(true) {
+        if quota.credits_unlimited == Some(true) {
+            lines.push("créditos: ilimitados".to_string());
+        } else {
+            lines.push(format!("créditos: {}", quota.credits_balance.as_deref().unwrap_or("—")));
+        }
+    }
+
+    lines
 }
 
 // ---------------------------------------------------------------------------
@@ -2483,6 +2654,7 @@ mod tests {
             prepare_us: Some(850),
             tools_by_server: None,
             tools_overhead_bytes: None,
+            codex_quota: None,
         }
     }
 
@@ -3494,6 +3666,249 @@ mod tests {
 
         let baseline = app.baseline.as_ref().expect("mark_baseline debe crear un baseline igual");
         assert!(baseline.tools_by_server.is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // find_quota_source_row / quota_bar / countdown / quota_lines — panel
+    // de cuota Codex (tecla `u`)
+    // -----------------------------------------------------------------
+
+    /// Fixture de `CodexQuotaRow` con todos los campos presentes, para los
+    /// tests que no necesitan variar ningún campo puntual.
+    fn full_quota() -> CodexQuotaRow {
+        CodexQuotaRow {
+            plan_type: Some("plus".to_string()),
+            active_limit: Some("primary".to_string()),
+            credits_balance: Some("42".to_string()),
+            primary_used_percent: Some(4),
+            secondary_used_percent: Some(0),
+            primary_window_minutes: Some(300),
+            secondary_window_minutes: Some(0),
+            primary_reset_after_seconds: Some(3_600),
+            primary_reset_at: Some(1_000_000),
+            secondary_reset_at: None,
+            credits_has_credits: Some(true),
+            credits_unlimited: Some(false),
+        }
+    }
+
+    /// Variante de `req` que además permite fijar `codex_quota`, para los
+    /// tests de [`find_quota_source_row`] y de render.
+    fn req_with_quota(timestamp: &str, codex_quota: Option<CodexQuotaRow>) -> RequestRow {
+        let mut r = req("openai", "gpt-5.5", 200, Some(10.0), 100.0, Some(50), None);
+        r.timestamp = timestamp.to_string();
+        r.codex_quota = codex_quota;
+        r
+    }
+
+    #[test]
+    fn find_quota_source_row_elige_la_fila_mas_reciente_con_dato() {
+        let rows =
+            vec![req_with_quota("t1", Some(full_quota())), req_with_quota("t2", None), req_with_quota("t3", Some(full_quota()))];
+
+        let source = find_quota_source_row(&rows).expect("t3 califica como fuente");
+        assert_eq!(source.timestamp, "t3");
+    }
+
+    #[test]
+    fn find_quota_source_row_ninguna_fila_califica_devuelve_none() {
+        let rows = vec![req_with_quota("t1", None), req_with_quota("t2", None)];
+        assert!(find_quota_source_row(&rows).is_none());
+    }
+
+    #[test]
+    fn find_quota_source_row_salta_filas_none_mas_nuevas_y_usa_la_ultima_con_dato() {
+        // t2 es la fila MÁS RECIENTE pero no trae cuota (tráfico no-Codex
+        // intercalado): la fuente debe seguir siendo t1.
+        let rows = vec![req_with_quota("t1", Some(full_quota())), req_with_quota("t2", None)];
+
+        let source = find_quota_source_row(&rows).expect("t1 califica como fuente");
+        assert_eq!(source.timestamp, "t1");
+    }
+
+    #[test]
+    fn quota_bar_extremos_todo_vacio_o_todo_lleno() {
+        assert_eq!(quota_bar(0), "·".repeat(QUOTA_BAR_WIDTH));
+        assert_eq!(quota_bar(100), "█".repeat(QUOTA_BAR_WIDTH));
+    }
+
+    #[test]
+    fn quota_bar_relleno_proporcional_al_porcentaje() {
+        let bar = quota_bar(4);
+        let expected_filled = 4 * QUOTA_BAR_WIDTH / 100;
+        assert_eq!(bar.chars().filter(|&c| c == '█').count(), expected_filled);
+        assert_eq!(bar.chars().count(), QUOTA_BAR_WIDTH);
+    }
+
+    #[test]
+    fn quota_bar_clampa_valores_mayores_a_cien() {
+        assert_eq!(quota_bar(150), quota_bar(100));
+    }
+
+    #[test]
+    fn format_reset_countdown_none_da_guion() {
+        assert_eq!(format_reset_countdown(None), "—");
+    }
+
+    #[test]
+    fn format_reset_countdown_remaining_no_positivo_resetea_ahora() {
+        assert_eq!(format_reset_countdown(Some(0)), "resetea ahora");
+        assert_eq!(format_reset_countdown(Some(-10)), "resetea ahora");
+    }
+
+    #[test]
+    fn format_reset_countdown_descompone_dias_y_horas() {
+        let remaining = 6 * 86_400 + 8 * 3_600;
+        assert_eq!(format_reset_countdown(Some(remaining)), "resetea en 6d 8h");
+    }
+
+    #[test]
+    fn format_reset_countdown_descompone_horas_y_minutos_sin_dias() {
+        let remaining = 3 * 3_600 + 12 * 60;
+        assert_eq!(format_reset_countdown(Some(remaining)), "resetea en 3h 12m");
+    }
+
+    #[test]
+    fn format_reset_countdown_solo_minutos_sin_horas_ni_dias() {
+        assert_eq!(format_reset_countdown(Some(45 * 60)), "resetea en 45m");
+    }
+
+    #[test]
+    fn quota_reset_remaining_prefiere_reset_at_absoluto() {
+        let mut quota = full_quota();
+        quota.primary_reset_at = Some(1_000_500);
+        quota.primary_reset_after_seconds = Some(999_999); // no debe usarse
+        let remaining = quota_reset_remaining(&quota, "2024-01-01T00:00:00Z", 1_000_000);
+        assert_eq!(remaining, Some(500));
+    }
+
+    #[test]
+    fn quota_reset_remaining_fallback_a_timestamp_mas_after_seconds() {
+        let mut quota = full_quota();
+        quota.primary_reset_at = None;
+        quota.primary_reset_after_seconds = Some(3_600);
+        let timestamp = "2024-01-01T00:00:00Z";
+        let base = chrono::DateTime::parse_from_rfc3339(timestamp).unwrap().timestamp();
+        let remaining = quota_reset_remaining(&quota, timestamp, base + 1_000);
+        assert_eq!(remaining, Some(3_600 - 1_000));
+    }
+
+    #[test]
+    fn quota_reset_remaining_none_si_ambas_fuentes_faltan() {
+        let mut quota = full_quota();
+        quota.primary_reset_at = None;
+        quota.primary_reset_after_seconds = None;
+        assert_eq!(quota_reset_remaining(&quota, "2024-01-01T00:00:00Z", 0), None);
+    }
+
+    #[test]
+    fn quota_lines_oculta_secundaria_cuando_window_es_cero_o_ausente() {
+        let mut quota = full_quota();
+        quota.secondary_window_minutes = Some(0);
+        let lines = quota_lines(&quota, "2024-01-01T00:00:00Z", 1_000_000);
+        assert!(!lines.iter().any(|l| l.starts_with("secundaria")));
+
+        quota.secondary_window_minutes = None;
+        let lines = quota_lines(&quota, "2024-01-01T00:00:00Z", 1_000_000);
+        assert!(!lines.iter().any(|l| l.starts_with("secundaria")));
+    }
+
+    #[test]
+    fn quota_lines_muestra_secundaria_cuando_window_mayor_a_cero() {
+        let mut quota = full_quota();
+        quota.secondary_window_minutes = Some(10_080);
+        quota.secondary_used_percent = Some(12);
+        let lines = quota_lines(&quota, "2024-01-01T00:00:00Z", 1_000_000);
+        assert!(lines.iter().any(|l| l.starts_with("secundaria")));
+    }
+
+    #[test]
+    fn quota_lines_omite_creditos_si_has_credits_no_es_true() {
+        let mut quota = full_quota();
+        quota.credits_has_credits = Some(false);
+        let lines = quota_lines(&quota, "2024-01-01T00:00:00Z", 1_000_000);
+        assert!(!lines.iter().any(|l| l.starts_with("créditos")));
+
+        quota.credits_has_credits = None;
+        let lines = quota_lines(&quota, "2024-01-01T00:00:00Z", 1_000_000);
+        assert!(!lines.iter().any(|l| l.starts_with("créditos")));
+    }
+
+    #[test]
+    fn quota_lines_muestra_ilimitados_cuando_credits_unlimited_true() {
+        let mut quota = full_quota();
+        quota.credits_has_credits = Some(true);
+        quota.credits_unlimited = Some(true);
+        let lines = quota_lines(&quota, "2024-01-01T00:00:00Z", 1_000_000);
+        assert!(lines.iter().any(|l| l == "créditos: ilimitados"));
+    }
+
+    #[test]
+    fn quota_lines_plan_y_limite_ausentes_muestran_guion() {
+        let mut quota = full_quota();
+        quota.plan_type = None;
+        quota.active_limit = None;
+        let lines = quota_lines(&quota, "2024-01-01T00:00:00Z", 1_000_000);
+        assert_eq!(lines[0], "plan: — · límite: —");
+    }
+
+    // -----------------------------------------------------------------
+    // RequestRow — deserialización de codex_quota (presente y ausente)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn request_row_deserializa_codex_quota_presente() {
+        let json = r#"{
+            "timestamp": "2026-07-13T10:00:00Z",
+            "route": "/v1/responses",
+            "upstream": "openai",
+            "model": "gpt-5.5",
+            "stream": true,
+            "status": 200,
+            "cache_control_forced": false,
+            "total_ms": 100.0,
+            "codex_quota": {
+                "plan_type": "plus",
+                "active_limit": "primary",
+                "credits_balance": "42",
+                "primary_used_percent": 4,
+                "secondary_used_percent": 0,
+                "primary_window_minutes": 300,
+                "secondary_window_minutes": 0,
+                "primary_reset_after_seconds": 3600,
+                "primary_reset_at": 1735689600,
+                "secondary_reset_at": null,
+                "credits_has_credits": true,
+                "credits_unlimited": false
+            }
+        }"#;
+
+        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar con codex_quota presente");
+        let quota = row.codex_quota.expect("debe traer la cuota");
+        assert_eq!(quota.plan_type.as_deref(), Some("plus"));
+        assert_eq!(quota.primary_used_percent, Some(4));
+        assert_eq!(quota.secondary_reset_at, None);
+    }
+
+    #[test]
+    fn request_row_deserializa_sin_codex_quota_build_vieja() {
+        // Proxy anterior a esta rebanada: la clave ni siquiera viaja en el
+        // JSON. Debe caer en `None`, sin panickear ni fallar la
+        // deserialización de la fila entera — mismo contrato que
+        // `tools_by_server`/`prepare_us`.
+        let json = r#"{
+            "timestamp": "2024-01-01T00:00:00Z",
+            "route": "/v1/messages",
+            "upstream": "anthropic",
+            "model": "claude-opus-4",
+            "stream": true,
+            "status": 200,
+            "cache_control_forced": false,
+            "total_ms": 100.0
+        }"#;
+
+        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar sin codex_quota");
+        assert_eq!(row.codex_quota, None);
     }
 
     // -----------------------------------------------------------------
