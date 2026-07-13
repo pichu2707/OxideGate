@@ -148,7 +148,7 @@ consecuencia de diseño es directa:
 |---|---|---|---|---|
 | Anthropic | `/v1/messages` | SSE `data:` | `message_start.usage.input_tokens`, `message_delta.usage.output_tokens` | ✅ validado en vivo |
 | OpenAI (Responses) | `/v1/responses` | SSE `data:` | `response.usage.input_tokens`, `output_tokens` | ✅ validado en vivo |
-| OpenAI (Chat) | `/v1/chat/completions` | SSE `data:` | `usage.prompt_tokens`, `usage.completion_tokens` | 🟡 codificado, sin validar en vivo |
+| OpenAI (Chat) | `/v1/chat/completions` | SSE `data:` | `usage.prompt_tokens`, `usage.completion_tokens` | 🟡 validado contra servidor OpenAI-compatible (§5.1); `api.openai.com` pendiente |
 | Gemini | `/v1beta/*` (comodín) | SSE `data:` (`?alt=sse`) | `usageMetadata.promptTokenCount`, `candidatesTokenCount` | ✅ validado en vivo |
 
 ### Detalles por proveedor
@@ -163,8 +163,11 @@ consecuencia de diseño es directa:
     **Validado en vivo** con API key real (`api.openai.com`).
   - **Chat Completions** (`/v1/chat/completions`): **no** manda `usage` en
     streaming salvo que el request traiga `stream_options.include_usage = true`;
-    como el cliente no lo pone, **OxideGate lo inyecta** (única mutación). Sigue
-    codificado pero **sin validar en vivo**.
+    como el cliente no lo pone, **OxideGate lo inyecta** (única mutación).
+    **Validado en vivo con grupo de control** contra un servidor
+    OpenAI-compatible (Ollama), cliente real (OpenCode) — ver §5.1. **Falta**
+    repetirlo contra `api.openai.com` con API key: el mecanismo está probado,
+    el proveedor concreto no.
 - **Codex (login ChatGPT) — callejón cerrado.** Codex autenticado con cuenta
   ChatGPT (`auth_mode: "chatgpt"`, sin API key) pega al **backend interno de
   ChatGPT** (`chatgpt.com/backend-api/...`), NO a `api.openai.com`, e **ignora
@@ -193,6 +196,58 @@ consecuencia de diseño es directa:
 > endpoint, su framing de stream y su mapeo de campos `usage`. Hoy los 3
 > proveedores están incrustados en `proxy.rs` (Gemini entró como *bolt-on*); el
 > adaptador es el refactor limpio ya acordado como siguiente paso.
+
+### 5.1. Chat Completions: la validación con grupo de control
+
+El problema de validar esta ruta es que la afirmación a probar —"OxideGate
+inyecta `stream_options.include_usage` y por eso puede leer los tokens"— no se
+puede comprobar leyendo el `usage` que reporta el propio OxideGate. Eso es un
+círculo, no una prueba.
+
+La salida es que **un servidor OpenAI-compatible no manda `usage` en streaming
+si nadie se lo pide**. Eso convierte la inyección en algo observable desde
+fuera:
+
+| | Petición | Resultado |
+|---|---|---|
+| **Control 1** | Directo al servidor, `stream: true`, SIN `stream_options` | **0 chunks de `usage`** |
+| **Control 2** | Directo al servidor, CON `include_usage` explícito | Llega `usage` en el chunk final |
+| **Test** | Por OxideGate, body SIN `stream_options` | **El cliente VE llegar `usage`** |
+
+Si el cliente nunca pidió `usage` y aun así le llega, solo hay una explicación:
+el proxy lo inyectó en el cable. El control 1 descarta que el servidor lo mande
+por su cuenta.
+
+Queda el segundo eslabón —que el extractor lea bien lo que llegó—, y se cierra
+contrastando contra un lector independiente: los tokens que **el cliente** vio
+en el chunk SSE frente a los que **OxideGate** escribió en `GET /requests`.
+Medido: `29 / 9` en ambos, exacto.
+
+Con cliente real (OpenCode `1.17.18` sobre bun, vía `@ai-sdk/openai-compatible`)
+la ruta responde `200 OK` —la inyección no rompe al cliente— y el `decompose` y
+el `tools_by_server` salen correctos: 37 herramientas nativas, 48.080 B de
+esquemas, `tax%` 99,9.
+
+> **Lo que esto NO prueba.** El servidor de la prueba fue un **Ollama local**
+> (`OPENAI_API_BASE=http://localhost:11434/v1`), no `api.openai.com`. Queda
+> probado el **mecanismo** —inyección, framing SSE, extractor, `decompose`— y
+> queda pendiente que *la API pública de OpenAI* honre la inyección igual. Para
+> eso hace falta una API key de `platform.openai.com`: la suscripción de ChatGPT
+> no sirve, porque su OAuth ignora `OPENAI_BASE_URL` (ver el punto de Codex más
+> arriba).
+
+### 5.2. Efecto colateral: los modelos locales truncan en silencio
+
+La misma prueba destapó algo que no se buscaba. Ollama `llama3.2:3b` corre con
+`num_ctx` 4096 por defecto, y el body de un agente real lo desborda de largo.
+Dos peticiones de OpenCode con bodies **distintos** —77.579 B y 84.161 B—
+reportaron **exactamente 4.095 tokens de prompt las dos**, con `200 OK`. El
+modelo nunca vio la mayor parte de los 48 kB de esquemas de herramientas, y
+nadie avisó.
+
+Es el escenario para el que existe el marcador `TRUNC` del monitor, y la medida
+sirvió para descubrir que su umbral estaba mal calibrado: ver
+[`docs/monitor-tui.md`](monitor-tui.md) §7.4.
 
 ---
 

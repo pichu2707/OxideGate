@@ -160,16 +160,42 @@ En `~/.config/opencode/opencode.json`:
 }
 ```
 
-Entra por `/v1/chat/completions`. Ojo con una honestidad que conviene saber: esa
-ruta está **codificada pero sin validar en vivo** (ver
-[`docs/telemetry-level-1.md`](docs/telemetry-level-1.md) §5). Chat Completions no
-manda `usage` en streaming salvo que el request traiga
-`stream_options.include_usage`, y como el cliente no lo pone, **OxideGate lo
-inyecta**: es la única mutación fuera de la Palanca A.
+Entra por `/v1/chat/completions`. Esa ruta no manda `usage` en streaming salvo
+que el request traiga `stream_options.include_usage`, y como el cliente no lo
+pone, **OxideGate lo inyecta**: es la única mutación fuera de la Palanca A.
+
+**Validado en vivo, con grupo de control** ([`docs/telemetry-level-1.md`](docs/telemetry-level-1.md)
+§5.1): un servidor OpenAI-compatible no manda `usage` si nadie se lo pide, así
+que basta con mandar un body SIN `stream_options` a través del proxy — si al
+cliente le llega `usage` igualmente, el proxy lo inyectó. Llega. Y los tokens que
+vio el cliente coinciden exactamente con los que OxideGate escribió en
+`/requests`. Pendiente: repetirlo contra `api.openai.com` con API key. El
+mecanismo está probado; ese proveedor concreto, no.
 
 A cambio, OpenCode es **eager** de serie —sus esquemas MCP viajan con proxy y sin
 él—, así que aquí el peso de `tools` **no** es artefacto del medidor: es el coste
 real, y OxideGate solo lo revela.
+
+### Modelos locales (Ollama y compatibles)
+
+Cualquier servidor que hable Chat Completions sirve como upstream: basta apuntar
+`OPENAI_API_BASE` a él en vez de a OpenAI.
+
+```sh
+OXIDEGATE_PORT=8899 OPENAI_API_BASE=http://localhost:11434/v1 oxidegate
+```
+
+El cliente (OpenCode, un SDK, `curl`) sigue apuntando a
+`http://127.0.0.1:8899/v1` sin enterarse de nada.
+
+> **Aviso que cuesta caro ignorar: los modelos locales truncan el prompt en
+> silencio.** Ollama corre con `num_ctx` 4096 por defecto, y el body de un agente
+> real lo desborda de largo. Medido aquí: dos peticiones de OpenCode con bodies
+> de 77.579 B y 84.161 B reportaron **exactamente 4.095 tokens de prompt las
+> dos**, con `200 OK`. El modelo nunca vio la mayor parte de los 48 kB de
+> esquemas de herramientas y nadie avisó. El monitor lo marca con `TRUNC`
+> (§7.4 de [`docs/monitor-tui.md`](docs/monitor-tui.md)); la solución es subir
+> `OLLAMA_CONTEXT_LENGTH` o recortar `tools`.
 
 ### Gemini CLI
 
