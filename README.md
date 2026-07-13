@@ -27,6 +27,7 @@ impacto **en vivo**, comparando el antes y el después.
 | **Monitor TUI** | Dashboard de terminal en tiempo real con vista **antes/después** (baseline) para ver el impacto de cada optimización. | ✅ |
 | **Detalle por request** | `GET /requests` + panel `p` del monitor: las últimas 200 peticiones individuales en vivo, con detección de outliers (error, cache-miss, TTFT lento, generación lenta). | ✅ |
 | **Perillas de velocidad** | Captura `requested_effort`, `requested_speed` y `served_speed` (`output_config.effort` y `speed` de Anthropic) por petición, expuestas en `GET /requests` y en el monitor. | ✅ |
+| **Cuota de suscripción (Codex/ChatGPT)** | Mide el tráfico de suscripción por OAuth de ChatGPT —que no se factura por token sino por cuota— parseando las cabeceras `x-codex-*` en un objeto `codex_quota` por petición (`GET /requests`), y lo muestra en el panel `u` del monitor: plan, % de ventana usado y cuenta atrás del reset. Ver [`docs/telemetry-level-1.md`](docs/telemetry-level-1.md) §5.3. | ✅ |
 
 ---
 
@@ -380,7 +381,9 @@ Palanca A (forzado de caché), agregación por modelo (`/stats`), monitor TUI,
 **decomposición de `prompt_bytes` por componente** (`system` / `tools` /
 historial / turno actual, campos `context_*_bytes` en `RequestMetric`) —
 usada para medir el efecto de `--tools` en
-[`docs/context-tax.md`](docs/context-tax.md) §5.
+[`docs/context-tax.md`](docs/context-tax.md) §5, y el **eje de cuota de
+suscripción** (`codex_quota` en `/requests` + panel `u` del monitor) para el
+tráfico de Codex/ChatGPT por OAuth.
 
 **Descartado** ⛔ (con evidencia, para tráfico conversacional)
 - **Palanca B — dedup por `prompt_hash`.** Medido contra tráfico real de
@@ -398,6 +401,12 @@ usada para medir el efecto de `--tools` en
 - **Precios reales por modelo** — deuda archivada: los ratios de caché ya son
   correctos; los precios-base son placeholders y, para el objetivo (ahorrar
   tokens y latencia), la aproximación alcanza.
+- **Eje de cuota — siguientes cortes:** coste nocional (qué costaría ese
+  tráfico por API pública, con precios GPT-5 en `pricing.rs`, siempre
+  etiquetado como estimación) y atribución marginal por petición (cuidando que
+  `used_percent` es entero y el delta de una sola petición redondea a 0).
+  Sin verificar aún: si las cabeceras `x-codex-*` aparecen en respuestas `429`
+  (permitiría avisar antes de agotar la cuota).
 
 > Hallazgo central que guía las prioridades: el overhead del harness domina el
 > coste. Claude Code inyecta ~7.368 tokens de contexto por llamada; un "Responde
