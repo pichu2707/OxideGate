@@ -1208,17 +1208,23 @@ fn quota_bar(percent: u64) -> String {
 /// prioridad de fuente documentada en el diseño: `primary_reset_at`
 /// (absoluto) primero; si falta, `source_timestamp` (RFC 3339 de la fila
 /// fuente) más `primary_reset_after_seconds` reconstruido a instante
-/// absoluto. `None` si ninguna de las dos fuentes está disponible, o si
-/// `source_timestamp` no parsea. `now` se inyecta (no se lee
-/// `chrono::Utc::now()` acá) para que la función sea PURA y testeable con un
-/// reloj fijo.
+/// absoluto. `None` si ninguna de las dos fuentes está disponible, si
+/// `source_timestamp` no parsea, o si la aritmética se desborda. `now` se
+/// inyecta (no se lee `chrono::Utc::now()` acá) para que la función sea PURA
+/// y testeable con un reloj fijo.
+///
+/// Toda la aritmética usa `checked_*`: las cabeceras `x-codex-*` son datos NO
+/// confiables, y un `reset_at` cercano a `i64::MIN`/`MAX` desbordaría una
+/// resta directa (panic en debug, wrap silencioso en release). Ante un
+/// desbordamiento preferimos `None` —que se renderiza como `"—"`— a un
+/// countdown inventado: mismo principio de honestidad que el resto del módulo.
 fn quota_reset_remaining(quota: &CodexQuotaRow, source_timestamp: &str, now: i64) -> Option<i64> {
     if let Some(reset_at) = quota.primary_reset_at {
-        return Some(reset_at - now);
+        return reset_at.checked_sub(now);
     }
     let after = quota.primary_reset_after_seconds?;
     let base = chrono::DateTime::parse_from_rfc3339(source_timestamp).ok()?.timestamp();
-    Some(base + after as i64 - now)
+    base.checked_add(after as i64)?.checked_sub(now)
 }
 
 /// Formatea segundos restantes como texto humano de las dos unidades más
@@ -3883,6 +3889,19 @@ mod tests {
         quota.primary_reset_at = None;
         quota.primary_reset_after_seconds = None;
         assert_eq!(quota_reset_remaining(&quota, "2024-01-01T00:00:00Z", 0), None);
+    }
+
+    /// Regresión: un `reset_at` cercano a `i64::MIN` (cabecera `x-codex-*`
+    /// adversaria o corrupta) NO debe desbordar la resta —panic en debug, wrap
+    /// silencioso en release—, sino degradar a `None` (que se renderiza `"—"`).
+    #[test]
+    fn quota_reset_remaining_no_desborda_con_reset_at_extremo() {
+        let mut quota = full_quota();
+        quota.primary_reset_at = Some(i64::MIN);
+        assert_eq!(quota_reset_remaining(&quota, "2024-01-01T00:00:00Z", 1_750_000_000), None);
+
+        quota.primary_reset_at = Some(i64::MAX);
+        assert_eq!(quota_reset_remaining(&quota, "2024-01-01T00:00:00Z", -1), None);
     }
 
     #[test]
