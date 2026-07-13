@@ -24,7 +24,10 @@ pub enum CacheAccounting {
     },
     /// `cache_read` es SUBCONJUNTO del input (OpenAI, Gemini): la porción no
     /// cacheada se factura a tarifa plena y la cacheada al multiplicador dado.
-    /// Estas rutas no reportan cache-write.
+    /// La Responses API de OpenAI SÍ reporta `cache_write_tokens`
+    /// (`input_tokens_details.cache_write_tokens`), pero este arm lo ignora a
+    /// propósito: no lo factura aparte (en la práctica llega en `0`). Si algún
+    /// día OpenAI cobra la escritura de caché, se cablea aquí.
     Subset { read_multiplier: f64 },
 }
 

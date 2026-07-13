@@ -217,10 +217,13 @@ export OPENAI_BASE_URL=http://127.0.0.1:8899/v1
 
 - `/v1/responses` (Responses API, la de los clientes modernos): **validado en
   vivo** con API key real.
-- **Codex con login de ChatGPT no se puede medir.** Autenticado con cuenta (sin
-  API key) pega al backend interno de ChatGPT, no a `api.openai.com`, e **ignora
-  `OPENAI_BASE_URL`**. Redirigirlo exigiría un MITM con CA propio: fuera de
-  alcance. Para medir OpenAI, API pública con API key.
+- **La suscripción de ChatGPT (Codex, OAuth) SÍ se mide** — sin API key. La
+  variable `OPENAI_BASE_URL` no sirve (Codex y OpenCode con login de ChatGPT la
+  ignoran), pero el token OAuth es válido contra el backend de Codex, y OxideGate
+  puede ponerse en medio apuntando ahí. Medido en vivo `gpt-5.5`: `200`, 19.381
+  tokens de entrada, 61 de salida, 5.504 de caché. La receta completa y el bug de
+  extracción que destapó están en
+  [`docs/telemetry-level-1.md`](docs/telemetry-level-1.md) §5.3.
 
 ### Y el TUI, en todos los casos
 

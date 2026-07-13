@@ -325,13 +325,44 @@ fn inject_include_usage(raw: Vec<u8>, parsed: Option<Value>) -> Vec<u8> {
 
 /// Extractor compartido por ambas variantes de OpenAI: `usage` en la raíz
 /// (Chat Completions) o anidado bajo `response` (Responses API, evento
-/// `response.completed`). Campos: `prompt_tokens`/`completion_tokens`.
+/// `response.completed`).
+///
+/// **Los dos dialectos usan nombres de campo DISTINTOS para los conteos
+/// principales**, y esta función tiene que reconocer ambos porque la
+/// comparte `OpenAiChat` y `OpenAiResponses` (ver el trait [`Provider`] en
+/// `super`):
+/// - Chat Completions: `prompt_tokens` / `completion_tokens`.
+/// - Responses API: `input_tokens` / `output_tokens` (confirmado contra una
+///   captura real de tráfico, evento `response.completed` de
+///   `chatgpt.com/backend-api/codex`, modelo gpt-5.5 — ver
+///   `docs/telemetry-level-1.md` §5).
+///
+/// PRECEDENCIA: se prueba primero el nombre de Chat Completions y se cae al
+/// de Responses con `.or_else` si el primero está ausente. En la práctica
+/// ambos nunca coexisten en el mismo payload (cada API manda su propio
+/// dialecto, nunca los dos a la vez), así que el orden es arbitrario en
+/// cuanto a corrección; se eligió Chat-primero solo por ser el campo
+/// históricamente soportado acá, para minimizar el diff. Mismo patrón que ya
+/// usa la extracción de caché de abajo.
 ///
 /// Los tokens de caché son SUBCONJUNTO del prompt/input (no se restan acá,
 /// `input_tokens` se queda crudo). El nombre del campo anidado difiere por
 /// variante: Chat Completions manda `prompt_tokens_details.cached_tokens`,
 /// Responses manda `input_tokens_details.cached_tokens`; probamos ambos ya
-/// que esta función es compartida. No hay cache-write en ninguna variante.
+/// que esta función es compartida.
+///
+/// Cache-write: Chat Completions no tiene este concepto. Responses SÍ lo
+/// expone (`input_tokens_details.cache_write_tokens`, visible en la misma
+/// captura real citada arriba) y `Usage::cache_write_tokens` ya existe como
+/// campo (lo llena Anthropic), así que se popula acá cuando está presente.
+///
+/// GAP CONOCIDO, NO RESUELTO ACÁ: `output_tokens_details.reasoning_tokens`
+/// (modelos de razonamiento, GPT-5.x) no se extrae. Los tokens de
+/// razonamiento son habitualmente un SUBCONJUNTO de `output_tokens` (ya
+/// contados), y `Usage` no tiene hoy un campo dedicado para desglosarlos sin
+/// arriesgar doble conteo en `telemetry::pricing`. Se deja sin tocar a
+/// propósito hasta confirmar la semántica exacta y decidir dónde vive ese
+/// desglose.
 fn extract_openai_usage(value: &Value, usage: &mut Usage) {
     let Some(u) = value
         .get("usage")
@@ -340,19 +371,32 @@ fn extract_openai_usage(value: &Value, usage: &mut Usage) {
         return;
     };
 
-    if let Some(v) = u.get("prompt_tokens").and_then(Value::as_u64) {
-        usage.input_tokens = Some(v);
-    }
-    if let Some(v) = u.get("completion_tokens").and_then(Value::as_u64) {
-        usage.output_tokens = Some(v);
-    }
     if let Some(v) = u
-        .get("prompt_tokens_details")
-        .or_else(|| u.get("input_tokens_details"))
-        .and_then(|d| d.get("cached_tokens"))
+        .get("prompt_tokens")
+        .or_else(|| u.get("input_tokens"))
         .and_then(Value::as_u64)
     {
+        usage.input_tokens = Some(v);
+    }
+    if let Some(v) = u
+        .get("completion_tokens")
+        .or_else(|| u.get("output_tokens"))
+        .and_then(Value::as_u64)
+    {
+        usage.output_tokens = Some(v);
+    }
+
+    let details = u
+        .get("prompt_tokens_details")
+        .or_else(|| u.get("input_tokens_details"));
+    if let Some(v) = details.and_then(|d| d.get("cached_tokens")).and_then(Value::as_u64) {
         usage.cache_read_tokens = Some(v);
+    }
+    if let Some(v) = details
+        .and_then(|d| d.get("cache_write_tokens"))
+        .and_then(Value::as_u64)
+    {
+        usage.cache_write_tokens = Some(v);
     }
 }
 
@@ -391,6 +435,41 @@ mod tests {
 
         assert_eq!(usage.input_tokens, Some(4));
         assert_eq!(usage.output_tokens, Some(6));
+    }
+
+    /// REGRESIÓN (bug real, no hipotético): captura real de tráfico, evento
+    /// `response.completed` de la Responses API (`chatgpt.com/backend-api/codex`,
+    /// modelo gpt-5.5). El `usage` real usa `input_tokens`/`output_tokens`,
+    /// NO `prompt_tokens`/`completion_tokens` — antes del fix, el extractor
+    /// solo reconocía el nombre de Chat Completions y este payload real
+    /// devolvía `input_tokens`/`output_tokens` en `None` pese a un 200 OK.
+    /// Este test FALLA contra el código pre-fix y pasa con el `.or_else`
+    /// agregado a `extract_openai_usage`.
+    #[test]
+    fn extracts_usage_from_real_responses_completed_event_input_output_tokens() {
+        let mut usage = Usage::default();
+        let value: Value = serde_json::from_str(
+            r#"{
+                "type": "response.completed",
+                "response": {
+                    "usage": {
+                        "input_tokens": 13,
+                        "input_tokens_details": {"cache_write_tokens": 0, "cached_tokens": 0},
+                        "output_tokens": 6,
+                        "output_tokens_details": {"reasoning_tokens": 0},
+                        "total_tokens": 19
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        OPENAI_RESPONSES.extract_usage(&value, &mut usage);
+
+        assert_eq!(usage.input_tokens, Some(13));
+        assert_eq!(usage.output_tokens, Some(6));
+        assert_eq!(usage.cache_read_tokens, Some(0));
+        assert_eq!(usage.cache_write_tokens, Some(0));
     }
 
     /// Chat Completions reporta la caché como subconjunto de `prompt_tokens`

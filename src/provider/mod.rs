@@ -137,8 +137,9 @@ pub struct Usage {
     /// Tokens servidos desde caché (lectura, tarifa reducida). Crudo: cada
     /// familia decide si es subconjunto de `input_tokens` o va aparte.
     pub cache_read_tokens: Option<u64>,
-    /// Tokens escritos a caché (creación, sobreprecio). Solo lo reportan
-    /// algunos proveedores (p. ej. Anthropic); el resto lo deja en `None`.
+    /// Tokens escritos a caché (creación). Lo reportan Anthropic (a sobreprecio,
+    /// y se factura como tal) y la Responses API de OpenAI (que hoy lo manda en
+    /// `0` y no se factura aparte, ver `pricing.rs`); el resto lo deja en `None`.
     pub cache_write_tokens: Option<u64>,
     /// Velocidad con la que el proveedor SIRVIÓ REALMENTE la respuesta
     /// (`usage.speed`, string), leída con la misma semántica "último gana"

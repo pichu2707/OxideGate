@@ -161,6 +161,17 @@ consecuencia de diseño es directa:
     reporta `usage` **por defecto**, anidado bajo `response` en el evento
     `response.completed`. Modelo y `stream` van en el body; no se inyecta nada.
     **Validado en vivo** con API key real (`api.openai.com`).
+    **Corrección (captura real de hoy):** una captura de tráfico en vivo
+    (gpt-5.5 vía el backend de ChatGPT/Codex, `chatgpt.com/backend-api/codex`)
+    mostró que el extractor compartido (`extract_openai_usage`,
+    `src/provider/openai.rs`) leía únicamente los nombres de campo de Chat
+    Completions (`prompt_tokens`/`completion_tokens`), no los de Responses
+    (`input_tokens`/`output_tokens`): el request devolvía `200 OK` pero
+    `input_tokens`/`output_tokens` quedaban en `null` en `/requests`. La caché
+    (`input_tokens_details.cached_tokens`) sí se leía bien. Ya está corregido:
+    el extractor ahora reconoce ambos nombres (`.or_else`, mismo patrón que ya
+    usaba la extracción de caché). Sigue pendiente el desglose de
+    `output_tokens_details.reasoning_tokens` (§6).
   - **Chat Completions** (`/v1/chat/completions`): **no** manda `usage` en
     streaming salvo que el request traiga `stream_options.include_usage = true`;
     como el cliente no lo pone, **OxideGate lo inyecta** (única mutación).
@@ -168,12 +179,18 @@ consecuencia de diseño es directa:
     OpenAI-compatible (Ollama), cliente real (OpenCode) — ver §5.1. **Falta**
     repetirlo contra `api.openai.com` con API key: el mecanismo está probado,
     el proveedor concreto no.
-- **Codex (login ChatGPT) — callejón cerrado.** Codex autenticado con cuenta
-  ChatGPT (`auth_mode: "chatgpt"`, sin API key) pega al **backend interno de
-  ChatGPT** (`chatgpt.com/backend-api/...`), NO a `api.openai.com`, e **ignora
-  `OPENAI_BASE_URL`**: no se puede redirigir por OxideGate (haría falta un MITM
-  con CA propio, fuera de alcance). Para medir OpenAI se usa la **API pública con
-  API key**, no el Codex con login de cuenta.
+- **Codex / suscripción de ChatGPT — SÍ se puede medir (medido en vivo, §5.3).**
+  Codex autenticado con cuenta ChatGPT (`auth_mode: "chatgpt"`, sin API key) pega
+  al **backend de Codex** (`chatgpt.com/backend-api/codex`), NO a
+  `api.openai.com`. La variable de entorno `OPENAI_BASE_URL` **no** lo redirige
+  (se comprobó: Codex y OpenCode con login de ChatGPT la ignoran). Pero el token
+  OAuth SÍ es válido contra ese backend, y OxideGate puede ponerse en medio como
+  proxy explícito apuntando su `OPENAI_API_BASE` a `chatgpt.com/backend-api/codex`
+  y haciendo que el cliente enrute por él. Ver §5.3 para la medición completa de
+  `gpt-5.5` con tokens reales. **Lo que sigue sin poder medirse** es
+  `api.openai.com` con este token: el OAuth de plan ChatGPT tiene scopes
+  limitados (`GET /models` responde `403 insufficient permissions`), así que la
+  API pública sigue necesitando su propia API key.
 - **Gemini** rompe varios supuestos y por eso necesitó ruta y parser propios:
   - **El modelo va en la URL**, no en el body:
     `/v1beta/models/{model}:{método}`. `streamGenerateContent` ⇒ streaming;
@@ -249,6 +266,62 @@ Es el escenario para el que existe el marcador `TRUNC` del monitor, y la medida
 sirvió para descubrir que su umbral estaba mal calibrado: ver
 [`docs/monitor-tui.md`](monitor-tui.md) §7.4.
 
+### 5.3. Medir la suscripción de ChatGPT (OAuth) — sin API key
+
+El supuesto de partida era que el tráfico con login de cuenta ChatGPT no se
+podía medir. Es falso. Sí se puede, y no hace falta API key ni MITM: basta con
+usar OxideGate como el proxy explícito que ya es.
+
+**Qué NO funciona (comprobado):** la variable `OPENAI_BASE_URL`. Ni Codex ni el
+provider `openai` de OpenCode la respetan cuando el auth es de cuenta ChatGPT —
+tienen el endpoint del backend clavado. Apuntar la variable al proxy hace que la
+petición conteste bien pero **sin pasar por OxideGate**: no queda fila.
+
+**Qué SÍ funciona.** El backend de Codex (`chatgpt.com/backend-api/codex`) acepta
+el token OAuth de la cuenta. Y Codex permite declarar un *provider* propio que
+reutiliza ese login (`requires_openai_auth`) contra un `base_url` cualquiera. Se
+apunta ese `base_url` a OxideGate, y OxideGate reenvía al backend de Codex:
+
+```sh
+# 1. Proxy con el backend de Codex como upstream de la superficie OpenAI
+OXIDEGATE_PORT=8899 \
+  OPENAI_API_BASE=https://chatgpt.com/backend-api/codex \
+  oxidegate
+
+# 2. Codex enrutado por el proxy, reutilizando su propio login de ChatGPT
+codex exec \
+  -c 'model_provider="oxi"' \
+  -c 'model_providers.oxi.name="oxi"' \
+  -c 'model_providers.oxi.base_url="http://127.0.0.1:8899/v1"' \
+  -c 'model_providers.oxi.wire_api="responses"' \
+  -c 'model_providers.oxi.requires_openai_auth=true' \
+  --model gpt-5.5 "..."
+```
+
+Codex adjunta al request todas sus cabeceras reales (`authorization`,
+`chatgpt-account-id`, `originator`, `session-id`, `x-codex-*`), que viajan
+intactas por el proxy hasta el backend. Medido en vivo, una petición de
+`gpt-5.5`:
+
+| Campo | Valor |
+|---|---|
+| `status` | `200` |
+| `input_tokens` | 19.381 |
+| `output_tokens` | 61 |
+| `cache_read_tokens` | 5.504 |
+| `ttft_ms` | 738 |
+| `total_ms` | 3.470 |
+
+Esta medición destapó un bug real de extracción (§6): el extractor de OpenAI
+compartido leía los nombres de campo de Chat Completions (`prompt_tokens` /
+`completion_tokens`), que la Responses API **no** usa —manda `input_tokens` /
+`output_tokens`—, así que los conteos salían `null` pese al `200`. Corregido: el
+extractor prueba ambos dialectos.
+
+> **El único hueco que queda.** `cost_estimate_usd` sale `null` porque `gpt-5.5`
+> aún no está en `pricing.rs` (deuda conocida: los precios son placeholders). Los
+> tokens, que son lo que de verdad se factura, son exactos.
+
 ---
 
 ## 6. Simplificaciones y deuda conocida (fase 1)
@@ -270,13 +343,23 @@ sirvió para descubrir que su umbral estaba mal calibrado: ver
     (APARTE del input).
   - Gemini: `cachedContentTokenCount` (SUBCONJUNTO del input).
   - OpenAI: `prompt_tokens_details.cached_tokens` /
-    `input_tokens_details.cached_tokens` (SUBCONJUNTO del input).
+    `input_tokens_details.cached_tokens` (SUBCONJUNTO del input). La
+    Responses API además expone `input_tokens_details.cache_write_tokens`,
+    que se extrae hacia `Usage.cache_write_tokens`; Chat Completions no tiene
+    equivalente de cache-write.
 
   `telemetry::pricing::estimate_cost_usd` es el único que conoce si la caché
   de una familia es subconjunto del input o va aparte, y precia cada porción
   a su tarifa reducida sin doble contar.
 - **Tokens de "thinking" de Gemini sin sumar.** `thoughtsTokenCount` se factura
   (a tarifa de output) y hoy no se contempla. Mismo bucket de deuda de coste.
+- **`output_tokens_details.reasoning_tokens` de OpenAI Responses sin
+  extraer.** Los modelos de razonamiento (familia GPT-5.x) facturan estos
+  tokens a tarifa de output. No se extraen todavía: son habitualmente un
+  SUBCONJUNTO de `output_tokens` (ya contado), y `Usage` no tiene hoy un
+  campo dedicado para desglosarlos sin arriesgar doble conteo en
+  `telemetry::pricing`. Mismo bucket de deuda que el "thinking" de Gemini,
+  arriba.
 - **Precio de Gemini flash-lite genérico.** `gemini-*-flash-lite` cae en el
   precio de la familia `flash` (más caro que el *lite* real): coste levemente
   sobreestimado hasta afinar la tabla.
