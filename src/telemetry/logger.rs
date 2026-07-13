@@ -8,7 +8,7 @@
 //! agregación y el detalle reciente en vivo sin tocar el JSONL. Así el I/O de
 //! log NUNCA se suma a la latencia que le devolvemos a gentle-ai.
 use crate::provider::{ContextBreakdown, ToolServerBytes};
-use crate::telemetry::{RecentRequests, StatsRegistry};
+use crate::telemetry::{CodexQuota, RecentRequests, StatsRegistry};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -157,17 +157,17 @@ pub struct RequestMetric {
     /// identificado individualmente, y `(others)` si se agotó el cupo de
     /// servidores trackeados —ver `provider::MAX_TOOL_SERVERS`—).
     ///
-    /// **ESTE ES EL ÚNICO CAMPO NO-PLANO DE TODA LA FILA.** El resto de
-    /// `RequestMetric` son escalares (número, string, booleano) porque el
-    /// esquema de columnas de un JSONL de telemetría se fija de antemano.
-    /// Acá no puede serlo: la cardinalidad es DEPENDIENTE DEL DATO (una fila
-    /// por cada servidor MCP distinto que el cliente declare en ESTE request
-    /// puntual, de cero a `provider::MAX_TOOL_SERVERS + 1`), así que no
-    /// existe un conjunto fijo de columnas (`tool_server_1_bytes`,
-    /// `tool_server_2_bytes`…) que lo cubra sin desperdiciar espacio en la
-    /// mayoría de las filas o sin truncar arbitrariamente en las que
-    /// declaran más servidores. Un array JSON anidado es la única
-    /// representación honesta de este dato.
+    /// Uno de los DOS campos no-planos de la fila (el otro es `codex_quota`,
+    /// más abajo). El resto de `RequestMetric` son escalares (número, string,
+    /// booleano) porque el esquema de columnas de un JSONL de telemetría se
+    /// fija de antemano. Acá no puede serlo: la cardinalidad es DEPENDIENTE
+    /// DEL DATO (una fila por cada servidor MCP distinto que el cliente
+    /// declare en ESTE request puntual, de cero a
+    /// `provider::MAX_TOOL_SERVERS + 1`), así que no existe un conjunto fijo
+    /// de columnas (`tool_server_1_bytes`, `tool_server_2_bytes`…) que lo
+    /// cubra sin desperdiciar espacio en la mayoría de las filas o sin
+    /// truncar arbitrariamente en las que declaran más servidores. Un array
+    /// JSON anidado es la única representación honesta de este dato.
     ///
     /// `None` y `Some(vec![])` son estados DISTINTOS, mismo criterio que ya
     /// aplica `Provider::tool_entries` entre "ausente" y "vacío": `None`
@@ -212,6 +212,26 @@ pub struct RequestMetric {
     /// en la misma proporción en requests con muchas herramientas; no se
     /// optimiza acá a propósito (ver informe del cambio).
     pub prepare_us: u64,
+
+    // --- Cuota de suscripción de Codex (ver `telemetry::codex_quota`) ---
+    /// Estado de la cuota de suscripción de Codex, parseado de las doce
+    /// cabeceras `x-codex-*` que manda el backend de Codex cuando el
+    /// request se enrutó vía OAuth (plan de suscripción, no API key). El
+    /// SEGUNDO campo no-plano de la fila (ver `tools_by_server` arriba).
+    ///
+    /// `None` si el tráfico no llevaba ninguna cabecera `x-codex-*`
+    /// (Anthropic, Gemini, o OpenAI vía API key en `api.openai.com`) — la
+    /// PRESENCIA de cabeceras es la única señal discriminadora, nunca el
+    /// `upstream` ni el slug del modelo (ver `telemetry::codex_quota` para
+    /// el contrato completo). También `None` en la rama de error de
+    /// upstream (`middleware::proxy`), donde no llegó a existir respuesta
+    /// que inspeccionar.
+    ///
+    /// SEPARADO A PROPÓSITO de `cost_estimate_usd`: la cuota es un
+    /// porcentaje de ventana en un plan de precio fijo, nunca un importe en
+    /// dólares. Ninguna función de este proyecto mezcla ambas entradas —
+    /// ver la garantía estructural documentada en `telemetry::codex_quota`.
+    pub codex_quota: Option<CodexQuota>,
 }
 
 /// Tupla de los 8 campos `context_*` en el mismo orden en que aparecen en

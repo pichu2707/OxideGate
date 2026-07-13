@@ -43,28 +43,28 @@ Chain strategy: pending
 
 ## Phase 3: Wiring through the metric chain
 
-- [ ] 3.1 `src/telemetry/metered.rs`: add `pub codex_quota: Option<CodexQuota>` to `MetricBase`.
-- [ ] 3.2 `src/telemetry/metered.rs` (`MeteredBody::emit`, ~250): add `codex_quota: self.base.codex_quota.clone()` to the `RequestMetric` literal.
-- [ ] 3.3 `src/telemetry/logger.rs`: add `pub codex_quota: Option<CodexQuota>` to `RequestMetric`.
-- [ ] 3.4 `src/telemetry/logger.rs`: fix `tools_by_server` doc — remove "ÚNICO CAMPO NO-PLANO" claim, no longer true once `codex_quota` lands.
-- [ ] 3.5 `src/telemetry/recent.rs`: add `pub codex_quota: Option<CodexQuota>` to `RecentRequest`.
-- [ ] 3.6 `src/telemetry/recent.rs` (`RecentRequest::from`): add `codex_quota: m.codex_quota.clone()`.
-- [ ] 3.7 `src/middleware/proxy.rs` (`base` literal, ~209): add `codex_quota: CodexQuota::from_headers(resp.headers())`.
-- [ ] 3.8 `src/middleware/proxy.rs` (upstream error branch, ~161): add `codex_quota: None`.
-- [ ] 3.9 `src/middleware/proxy.rs`: import `CodexQuota` from `crate::telemetry`.
+- [x] 3.1 `src/telemetry/metered.rs`: add `pub codex_quota: Option<CodexQuota>` to `MetricBase`.
+- [x] 3.2 `src/telemetry/metered.rs` (`MeteredBody::emit`, ~250): add `codex_quota: self.base.codex_quota.clone()` to the `RequestMetric` literal.
+- [x] 3.3 `src/telemetry/logger.rs`: add `pub codex_quota: Option<CodexQuota>` to `RequestMetric`.
+- [x] 3.4 `src/telemetry/logger.rs`: fix `tools_by_server` doc — remove "ÚNICO CAMPO NO-PLANO" claim, no longer true once `codex_quota` lands.
+- [x] 3.5 `src/telemetry/recent.rs`: add `pub codex_quota: Option<CodexQuota>` to `RecentRequest`.
+- [x] 3.6 `src/telemetry/recent.rs` (`RecentRequest::from`): add `codex_quota: m.codex_quota.clone()`.
+- [x] 3.7 `src/middleware/proxy.rs` (`base` literal, ~209): add `codex_quota: CodexQuota::from_headers(resp.headers())`.
+- [x] 3.8 `src/middleware/proxy.rs` (upstream error branch, ~161): add `codex_quota: None`.
+- [x] 3.9 `src/middleware/proxy.rs`: import `CodexQuota` from `crate::telemetry`. Also added `pub use codex_quota::CodexQuota;` to `mod.rs` (deferred from task 1.5 — see Apply Progress note) and, as a mechanical necessity not called out in this task list, `codex_quota: None` in `stats.rs`'s test-only `base_metric()` helper (a third `RequestMetric` literal site the design/tasks didn't enumerate).
 
 ## Phase 4: Wiring tests (`recent.rs`)
 
-- [ ] 4.1 Update `base_metric()` test helper: add `codex_quota: None`.
-- [ ] 4.2 Extend `proyeccion_copia_campos_fielmente_incluyendo_none`: assert `row.codex_quota` is `None`.
-- [ ] 4.3 New test: projection copies `codex_quota` faithfully when `Some` (fixture `CodexQuota`, assert equality).
-- [ ] 4.4 New test: round-trip serde of `RecentRequest` with `codex_quota: Some(..)` preserves all nested fields (pattern of `round_trip_serde_con_tools_by_server_presente`).
-- [ ] 4.5 New test: round-trip serde with `codex_quota: None` serializes to `null` (pattern of `round_trip_serde_con_client_none`).
+- [x] 4.1 Update `base_metric()` test helper: add `codex_quota: None`.
+- [x] 4.2 Extend `proyeccion_copia_campos_fielmente_incluyendo_none`: assert `row.codex_quota` is `None`.
+- [x] 4.3 New test: projection copies `codex_quota` faithfully when `Some` (fixture `CodexQuota`, assert equality).
+- [x] 4.4 New test: round-trip serde of `RecentRequest` with `codex_quota: Some(..)` preserves all nested fields (pattern of `round_trip_serde_con_tools_by_server_presente`).
+- [x] 4.5 New test: round-trip serde with `codex_quota: None` serializes to `null` (pattern of `round_trip_serde_con_client_none`).
 
 ## Phase 5: Verification and docs
 
-- [ ] 5.1 Run `cargo test` and `cargo clippy --all-targets` — all green, no warnings.
-- [ ] 5.2 Live verify: route a real `gpt-5.5` request via Codex backend (`OPENAI_API_BASE=https://chatgpt.com/backend-api/codex`, Codex CLI custom provider with `requires_openai_auth`); confirm the `/requests` row carries parsed quota fields, and Anthropic/Gemini/API-key rows carry `codex_quota: null` (recipe: `docs/telemetry-level-1.md` §5.3).
-- [ ] 5.3 Fix `proposal.md` "~11 campos" typo to "12 campos" (artifact-only, no code impact).
+- [x] 5.1 Run `cargo test` and `cargo clippy --all-targets` — all green, no warnings. (Done per commit: see Apply Progress artifact for exact result lines per commit.)
+- [ ] 5.2 Live verify: route a real `gpt-5.5` request via Codex backend (`OPENAI_API_BASE=https://chatgpt.com/backend-api/codex`, Codex CLI custom provider with `requires_openai_auth`); confirm the `/requests` row carries parsed quota fields, and Anthropic/Gemini/API-key rows carry `codex_quota: null` (recipe: `docs/telemetry-level-1.md` §5.3). **Explicitly left to the orchestrator per launch instructions — not run in this apply pass.**
+- [x] 5.3 Fix `proposal.md` "~11 campos" typo to "12 campos" (artifact-only, no code impact).
 
 **Out of scope (not tasked here):** `/stats` aggregation, TUI gauge, notional API cost, marginal delta — slices 2-5 per `proposal.md` chain order.

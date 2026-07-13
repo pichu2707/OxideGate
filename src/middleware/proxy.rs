@@ -11,7 +11,7 @@
 use crate::provider::{self, Incoming, Outgoing, Provider};
 use crate::state::AppState;
 use crate::telemetry::logger::{flatten_context_breakdown, tools_fields};
-use crate::telemetry::{MeteredBody, MetricBase, RequestMetric};
+use crate::telemetry::{CodexQuota, MeteredBody, MetricBase, RequestMetric};
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -195,6 +195,10 @@ async fn send_and_meter(
                 requested_effort: out.requested_effort,
                 requested_speed: out.requested_speed,
                 served_speed: None,
+                // No hubo respuesta del upstream que inspeccionar: sin
+                // `resp`, no hay cabeceras `x-codex-*` que leer. `None`
+                // honesto, no un dato inventado.
+                codex_quota: None,
             });
             return plain_error(
                 StatusCode::BAD_GATEWAY,
@@ -224,6 +228,12 @@ async fn send_and_meter(
         requested_effort: out.requested_effort,
         requested_speed: out.requested_speed,
         provider: prov,
+        // `resp` está vivo acá: `resp.status()` ya se leyó arriba (préstamo
+        // inmutable) y el bucle de copia de cabeceras a la respuesta
+        // saliente todavía no corrió. `from_headers` hace lookups puntuales
+        // `get("x-codex-…")` — no recorre ni bufferiza — así que esto no es
+        // un segundo pase costoso ni toca el stream SSE.
+        codex_quota: CodexQuota::from_headers(resp.headers()),
     };
 
     // Copiamos las cabeceras ANTES de consumir `resp`: `bytes_stream` toma

@@ -41,6 +41,7 @@
 //! localhost.
 use crate::provider::ToolServerBytes;
 use crate::telemetry::logger::RequestMetric;
+use crate::telemetry::CodexQuota;
 use serde::Serialize;
 use std::collections::VecDeque;
 
@@ -156,6 +157,14 @@ pub struct RecentRequest {
     /// (parseo, `decompose` y mutación opcional del body). No incluye la
     /// lectura del body del socket ni el round-trip upstream.
     pub prepare_us: u64,
+    /// Estado de la cuota de suscripción de Codex (ver
+    /// `telemetry::logger::RequestMetric::codex_quota` para el contrato
+    /// completo). `None` para tráfico sin cabeceras `x-codex-*` (Anthropic,
+    /// Gemini, OpenAI vía API key) o cuando el upstream falló antes de
+    /// responder. No compromete la invariante de privacidad del módulo: no
+    /// hay contenido de prompt en ningún campo de `CodexQuota`, solo estado
+    /// de cuota (porcentajes, ventanas, timestamps de reseteo).
+    pub codex_quota: Option<CodexQuota>,
 }
 
 impl From<&RequestMetric> for RecentRequest {
@@ -193,6 +202,7 @@ impl From<&RequestMetric> for RecentRequest {
             tools_by_server: m.tools_by_server.clone(),
             tools_overhead_bytes: m.tools_overhead_bytes,
             prepare_us: m.prepare_us,
+            codex_quota: m.codex_quota.clone(),
         }
     }
 }
@@ -277,6 +287,26 @@ mod tests {
             }]),
             tools_overhead_bytes: Some(4),
             prepare_us: 42,
+            codex_quota: None,
+        }
+    }
+
+    /// `CodexQuota` de prueba con los doce campos en `Some`, usada por los
+    /// tests de proyección y round-trip serde de `codex_quota`.
+    fn fixture_codex_quota() -> CodexQuota {
+        CodexQuota {
+            plan_type: Some("pro".to_string()),
+            active_limit: Some("primary".to_string()),
+            credits_balance: Some("12.50".to_string()),
+            primary_used_percent: Some(4),
+            secondary_used_percent: Some(12),
+            primary_window_minutes: Some(300),
+            secondary_window_minutes: Some(10080),
+            primary_reset_after_seconds: Some(1800),
+            primary_reset_at: Some(1_732_000_000),
+            secondary_reset_at: Some(1_732_600_000),
+            credits_has_credits: Some(false),
+            credits_unlimited: Some(false),
         }
     }
 
@@ -376,6 +406,65 @@ mod tests {
         assert_eq!(row.tools_by_server, None);
         assert_eq!(row.tools_overhead_bytes, None);
         assert_eq!(row.prepare_us, 42);
+        assert_eq!(row.codex_quota, None);
+    }
+
+    /// La proyección copia `codex_quota` fielmente cuando SÍ hay cuota
+    /// (`Some`), campo a campo, igual que ya se verifica para
+    /// `tools_by_server` en `proyeccion_copia_campos_de_contexto_cuando_hay_desglose`.
+    #[test]
+    fn proyeccion_copia_codex_quota_fielmente_cuando_esta_presente() {
+        let mut m = base_metric("t1");
+        m.codex_quota = Some(fixture_codex_quota());
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+
+        let row = &recent.snapshot()[0];
+        assert_eq!(row.codex_quota, Some(fixture_codex_quota()));
+    }
+
+    /// Round-trip serde de `RecentRequest` con `codex_quota: Some(..)`
+    /// preserva todos los campos anidados, mismo patrón que
+    /// `round_trip_serde_con_tools_by_server_presente`.
+    #[test]
+    fn round_trip_serde_con_codex_quota_presente() {
+        let mut m = base_metric("t1");
+        m.codex_quota = Some(fixture_codex_quota());
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+        let row = &recent.snapshot()[0];
+        let json = serde_json::to_string(row).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["codex_quota"]["plan_type"], "pro");
+        assert_eq!(parsed["codex_quota"]["active_limit"], "primary");
+        assert_eq!(parsed["codex_quota"]["credits_balance"], "12.50");
+        assert_eq!(parsed["codex_quota"]["primary_used_percent"], 4);
+        assert_eq!(parsed["codex_quota"]["secondary_used_percent"], 12);
+        assert_eq!(parsed["codex_quota"]["primary_window_minutes"], 300);
+        assert_eq!(parsed["codex_quota"]["secondary_window_minutes"], 10080);
+        assert_eq!(parsed["codex_quota"]["primary_reset_after_seconds"], 1800);
+        assert_eq!(parsed["codex_quota"]["primary_reset_at"], 1_732_000_000i64);
+        assert_eq!(parsed["codex_quota"]["secondary_reset_at"], 1_732_600_000i64);
+        assert_eq!(parsed["codex_quota"]["credits_has_credits"], false);
+        assert_eq!(parsed["codex_quota"]["credits_unlimited"], false);
+    }
+
+    /// Round-trip serde con `codex_quota: None` serializa a `null`, mismo
+    /// patrón que `round_trip_serde_con_client_none`.
+    #[test]
+    fn round_trip_serde_con_codex_quota_none() {
+        let m = base_metric("t1"); // codex_quota ya es None por defecto
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+        let row = &recent.snapshot()[0];
+        let json = serde_json::to_string(row).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert!(parsed["codex_quota"].is_null());
     }
 
     /// Cuando SÍ hay desglose calculado, la proyección debe copiarlo fiel

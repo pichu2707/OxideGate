@@ -39,18 +39,6 @@
 //! - Campos booleanos: solo `"True"`/`"False"` (capitalizados, tal como los
 //!   manda Codex) parsean a `bool`; cualquier otro valor, incluido vacío o
 //!   minúsculas, mapea a `None`.
-//!
-//! # Nota de scaffolding (temporal, este commit)
-//!
-//! `OxideGate` es un crate SOLO-binario (sin `src/lib.rs`): sin un blanco de
-//! biblioteca, `#[warn(dead_code)]` trata `pub` como "reachable" únicamente
-//! si algo en el grafo alcanzable desde `main` lo usa de verdad, no por ser
-//! `pub`. Este commit introduce el módulo en aislamiento (unidad de trabajo
-//! 1 de 2, ver `tasks.md`); el cableado que lo vuelve alcanzable llega en el
-//! commit siguiente. El `allow` de abajo es ESTRICTAMENTE transitorio: se
-//! retira en cuanto `MetricBase`/`RequestMetric`/`RecentRequest` empiecen a
-//! construir `CodexQuota` de verdad.
-#![allow(dead_code)]
 use reqwest::header::HeaderMap;
 
 /// Nombres de las doce cabeceras `x-codex-*`, en el mismo orden que los

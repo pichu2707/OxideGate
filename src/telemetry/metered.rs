@@ -21,7 +21,7 @@
 use crate::provider::{ContextBreakdown, Provider, ToolServerBytes, Usage};
 use crate::telemetry::logger::{flatten_context_breakdown, tools_fields};
 use crate::telemetry::pricing;
-use crate::telemetry::{RequestMetric, TelemetrySink};
+use crate::telemetry::{CodexQuota, RequestMetric, TelemetrySink};
 use bytes::Bytes;
 use futures_util::Stream;
 use serde_json::Value;
@@ -84,6 +84,13 @@ pub struct MetricBase {
     /// `usage` se delega íntegramente en él, así este módulo no necesita
     /// saber nada de ningún proveedor concreto.
     pub provider: &'static dyn Provider,
+    /// Cuota de suscripción de Codex, parseada de las cabeceras `x-codex-*`
+    /// de la respuesta del upstream (`CodexQuota::from_headers`, ver
+    /// `middleware::proxy::send_and_meter`). `None` si la petición no fue a
+    /// Codex vía OAuth (Anthropic, Gemini, OpenAI vía API key) o si el
+    /// upstream falló antes de que hubiera respuesta que inspeccionar. Viaja
+    /// intacto hasta `RequestMetric::codex_quota`.
+    pub codex_quota: Option<CodexQuota>,
 }
 
 /// Acumulador incremental que extrae `input/output_tokens` del cuerpo de la
@@ -280,6 +287,7 @@ impl MeteredBody {
             requested_effort: self.base.requested_effort.clone(),
             requested_speed: self.base.requested_speed.clone(),
             served_speed: self.scanner.usage.speed.clone(),
+            codex_quota: self.base.codex_quota.clone(),
         });
     }
 }
