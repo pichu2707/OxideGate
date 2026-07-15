@@ -8,7 +8,7 @@
 //! agregación y el detalle reciente en vivo sin tocar el JSONL. Así el I/O de
 //! log NUNCA se suma a la latencia que le devolvemos a gentle-ai.
 use crate::provider::{ContextBreakdown, ToolServerBytes};
-use crate::telemetry::{CodexQuota, RecentRequests, StatsRegistry};
+use crate::telemetry::{CodexQuota, RecentRequests, SessionAttribution, StatsRegistry};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -157,8 +157,9 @@ pub struct RequestMetric {
     /// identificado individualmente, y `(others)` si se agotó el cupo de
     /// servidores trackeados —ver `provider::MAX_TOOL_SERVERS`—).
     ///
-    /// Uno de los DOS campos no-planos de la fila (el otro es `codex_quota`,
-    /// más abajo). El resto de `RequestMetric` son escalares (número, string,
+    /// Uno de los TRES campos no-planos de la fila (los otros son
+    /// `codex_quota` y `session`, más abajo). El resto de `RequestMetric` son
+    /// escalares (número, string,
     /// booleano) porque el esquema de columnas de un JSONL de telemetría se
     /// fija de antemano. Acá no puede serlo: la cardinalidad es DEPENDIENTE
     /// DEL DATO (una fila por cada servidor MCP distinto que el cliente
@@ -217,7 +218,8 @@ pub struct RequestMetric {
     /// Estado de la cuota de suscripción de Codex, parseado de las doce
     /// cabeceras `x-codex-*` que manda el backend de Codex cuando el
     /// request se enrutó vía OAuth (plan de suscripción, no API key). El
-    /// SEGUNDO campo no-plano de la fila (ver `tools_by_server` arriba).
+    /// SEGUNDO campo no-plano de la fila (ver `tools_by_server` arriba);
+    /// `session`, más abajo, es el TERCERO.
     ///
     /// `None` si el tráfico no llevaba ninguna cabecera `x-codex-*`
     /// (Anthropic, Gemini, o OpenAI vía API key en `api.openai.com`) — la
@@ -232,6 +234,23 @@ pub struct RequestMetric {
     /// dólares. Ninguna función de este proyecto mezcla ambas entradas —
     /// ver la garantía estructural documentada en `telemetry::codex_quota`.
     pub codex_quota: Option<CodexQuota>,
+
+    // --- Atribución de sesión (ver `telemetry::session`) ---
+    /// Sesión resuelta por precedencia de cabeceras del REQUEST entrante
+    /// (`middleware::proxy::session_of`): `X-OxideGate-Session` explícito,
+    /// `x-claude-code-session-id` nativo, o el bucket de fallback
+    /// `Unattributed` con el `User-Agent` como valor. El TERCER campo
+    /// no-plano de la fila (ver `tools_by_server` y `codex_quota` arriba).
+    ///
+    /// Nunca `Option`: la precedencia siempre resuelve a algo — la peor rama
+    /// es un fallback honesto, no una ausencia (ver `telemetry::session`
+    /// para el contrato completo de honestidad `source`+`key`). A
+    /// diferencia de `codex_quota`, que depende de la RESPUESTA del
+    /// upstream y por eso puede quedar en `None` si el upstream falla,
+    /// `session` se resuelve de las cabeceras del REQUEST y por eso está
+    /// disponible idéntico tanto en el camino de éxito como en el de error
+    /// de `middleware::proxy::send_and_meter`.
+    pub session: SessionAttribution,
 }
 
 /// Tupla de los 8 campos `context_*` en el mismo orden en que aparecen en
@@ -397,5 +416,104 @@ impl TelemetrySink {
     /// disco.
     pub fn recent(&self) -> Arc<RwLock<RecentRequests>> {
         Arc::clone(&self.recent)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::SessionSource;
+
+    /// Construye un `RequestMetric` mínimo (resto de campos en su valor más
+    /// neutro) con la `session` dada, para ejercitar el round-trip serde de
+    /// ese único campo sin depender de una fixture compartida con
+    /// `recent.rs` (fuera de alcance de este PR).
+    fn minimal_metric(session: SessionAttribution) -> RequestMetric {
+        RequestMetric {
+            timestamp: "2026-07-15T00:00:00Z".to_string(),
+            route: "/v1/messages".to_string(),
+            upstream: "anthropic".to_string(),
+            model: None,
+            prompt_hash: "hash".to_string(),
+            stream: false,
+            client: None,
+            prompt_bytes: 0,
+            input_tokens: None,
+            output_tokens: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_estimate_usd: None,
+            cache_control_forced: false,
+            requested_effort: None,
+            requested_speed: None,
+            served_speed: None,
+            status: 200,
+            ttft_ms: None,
+            total_ms: 0.0,
+            tokens_per_sec: None,
+            context_system_bytes: None,
+            context_tools_bytes: None,
+            context_history_bytes: None,
+            context_last_turn_bytes: None,
+            context_other_bytes: None,
+            context_measured_bytes: None,
+            context_messages_count: None,
+            context_tax_ratio: None,
+            tools_by_server: None,
+            tools_overhead_bytes: None,
+            prepare_us: 0,
+            codex_quota: None,
+            session,
+        }
+    }
+
+    /// Round-trip serde con `session.source = Explicit`: el JSON serializa
+    /// `"source": "explicit"` y la `key` correspondiente (mismo patrón que
+    /// `round_trip_serde_con_codex_quota_presente` de `recent.rs`).
+    #[test]
+    fn round_trip_serde_con_session_explicit() {
+        let metric = minimal_metric(SessionAttribution {
+            source: SessionSource::Explicit,
+            key: "claude-1".to_string(),
+        });
+
+        let json = serde_json::to_value(&metric).expect("RequestMetric serializa a JSON");
+        assert_eq!(json["session"]["source"], "explicit");
+        assert_eq!(json["session"]["key"], "claude-1");
+    }
+
+    /// Round-trip serde con `session.source = Native`.
+    #[test]
+    fn round_trip_serde_con_session_native() {
+        let metric = minimal_metric(SessionAttribution {
+            source: SessionSource::Native,
+            key: "native-session-9".to_string(),
+        });
+
+        let json = serde_json::to_value(&metric).expect("RequestMetric serializa a JSON");
+        assert_eq!(json["session"]["source"], "native");
+        assert_eq!(json["session"]["key"], "native-session-9");
+    }
+
+    /// Round-trip serde con `session.source = Unattributed`: afirma la
+    /// forma con el `User-Agent` como valor y, por separado, la constante
+    /// de fallback cuando no hay `User-Agent`.
+    #[test]
+    fn round_trip_serde_con_session_unattributed() {
+        let con_user_agent = minimal_metric(SessionAttribution {
+            source: SessionSource::Unattributed,
+            key: "claude-cli/1.2.3 (external, cli)".to_string(),
+        });
+        let json = serde_json::to_value(&con_user_agent).expect("RequestMetric serializa a JSON");
+        assert_eq!(json["session"]["source"], "unattributed");
+        assert_eq!(json["session"]["key"], "claude-cli/1.2.3 (external, cli)");
+
+        let sin_user_agent = minimal_metric(SessionAttribution {
+            source: SessionSource::Unattributed,
+            key: "unattributed".to_string(),
+        });
+        let json = serde_json::to_value(&sin_user_agent).expect("RequestMetric serializa a JSON");
+        assert_eq!(json["session"]["source"], "unattributed");
+        assert_eq!(json["session"]["key"], "unattributed");
     }
 }

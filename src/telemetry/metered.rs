@@ -21,7 +21,7 @@
 use crate::provider::{ContextBreakdown, Provider, ToolServerBytes, Usage};
 use crate::telemetry::logger::{flatten_context_breakdown, tools_fields};
 use crate::telemetry::pricing;
-use crate::telemetry::{CodexQuota, RequestMetric, TelemetrySink};
+use crate::telemetry::{CodexQuota, RequestMetric, SessionAttribution, TelemetrySink};
 use bytes::Bytes;
 use futures_util::Stream;
 use serde_json::Value;
@@ -46,6 +46,13 @@ pub struct MetricBase {
     /// ANTES de que exista ningún `Outgoing` (`middleware::proxy::client_of`).
     /// Viaja intacto hasta `RequestMetric::client`.
     pub client: Option<String>,
+    /// Atribución de sesión resuelta por precedencia de cabeceras
+    /// (`middleware::proxy::session_of`), ANTES de que exista ningún
+    /// `Outgoing`, igual que `client`. Nunca `Option`: la peor rama es
+    /// `SessionSource::Unattributed`, un bucket honesto, no una ausencia
+    /// (ver `telemetry::session` para el contrato completo). Viaja intacto
+    /// hasta `RequestMetric::session`.
+    pub session: SessionAttribution,
     /// `true` si `provider.prepare` inyectó un breakpoint de `cache_control`
     /// en el body saliente (palanca A del optimizador). Nace en `Outgoing` y
     /// viaja intacto hasta la métrica final.
@@ -262,6 +269,7 @@ impl MeteredBody {
             prompt_hash: self.base.prompt_hash.clone(),
             stream: self.base.stream,
             client: self.base.client.clone(),
+            session: self.base.session.clone(),
             prompt_bytes: self.base.prompt_bytes,
             input_tokens: self.scanner.usage.input_tokens,
             output_tokens: self.scanner.usage.output_tokens,

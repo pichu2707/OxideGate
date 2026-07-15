@@ -309,6 +309,11 @@ impl StatsRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `session` es un campo REQUERIDO de `RequestMetric` desde este slice
+    // (nunca `Option`, ver `telemetry::session`): esta fixture necesita un
+    // valor aunque `StatsRegistry` no agregue por sesión (fuera de alcance
+    // de esta rebanada, ver `spec.md`).
+    use crate::telemetry::{SessionAttribution, SessionSource};
 
     /// Construye una métrica mínima con los campos por defecto, para no
     /// repetir el struct literal completo en cada test.
@@ -347,6 +352,10 @@ mod tests {
             tools_overhead_bytes: None,
             prepare_us: 0,
             codex_quota: None,
+            session: SessionAttribution {
+                source: SessionSource::Unattributed,
+                key: "unattributed".to_string(),
+            },
         }
     }
 
