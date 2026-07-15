@@ -58,7 +58,8 @@ curl localhost:8899/requests
     "cost_estimate_usd": 0.0891,
     "cache_control_forced": false,
     "ttft_ms": 780.4,
-    "total_ms": 3210.9
+    "total_ms": 3210.9,
+    "session": { "source": "native", "key": "sess-abc123" }
   },
   {
     "timestamp": "2026-07-09T14:02:14.117Z",
@@ -140,6 +141,7 @@ reenviado crudo. Ver §4.3 antes de exponer este endpoint fuera de
 | `prepare_us` | Microsegundos que el proxy pasó dentro de `Provider::prepare` (parseo del body + `decompose` + mutación opcional, p. ej. inyectar `cache_control`) | Ver la nota sobre qué NO incluye, más abajo |
 | `tools_by_server` | Desglose de `context_tools_bytes` por servidor MCP declarante: `[{server, kind, tools, bytes, deferred_tools}, …]`, ordenado por `bytes` descendente | `null` si el body no parseó como objeto (o build anterior a este campo); `[]` si SÍ parseó pero no declaraba `tools` — son estados DISTINTOS, ver §4.2. `deferred_tools` (por elemento) es la fuente de verdad POR SERVIDOR de cuánto está diferido, ver §4.2 |
 | `tools_overhead_bytes` | Bytes de `tools` no atribuidos a ningún servidor (brackets/comas del array, wrapper de Gemini, herramientas huérfanas) | `null` en los mismos casos que `tools_by_server` es `null`; `sum(tools_by_server[].bytes) + tools_overhead_bytes == context_tools_bytes` siempre que ambos sean no-nulos |
+| `session` | Sesión resuelta por precedencia de cabeceras del request: `{source, key}`. Nunca `null` — la peor rama es un fallback honesto (`source: "unattributed"`), no una ausencia | Ver §4.4 para la tabla de precedencia completa y cómo estampar el header desde cada harness |
 
 Ninguno de los campos de latencia/coste/identidad es nuevo: todos ya existían
 en `RequestMetric` (Nivel 1). Los campos `context_*`, `prepare_us`,
@@ -282,6 +284,71 @@ sensibles, y el tope de 200 caracteres limita el radio de un log-injection
 grosero), pero es un riesgo de una clase distinta al resto de la tabla, y
 quien decida exponer `GET /requests` o compartir `telemetry.jsonl` fuera del
 host donde corre el proxy debería saberlo antes de hacerlo, no después.
+
+---
+
+### 4.4. `session`: la clave de atribución por sesión
+
+`GET /stats` agrega por `(proveedor, modelo)`; ninguna vista, hasta ahora,
+sabía a qué SESIÓN pertenecía cada petición — solo a qué TIPO de harness
+(`client`, el `User-Agent`). `session` cierra esa brecha: es la clave de
+sesión resuelta por el proxy para cada request, la base de datos real que
+necesitan las rebanadas futuras de este eje (agregación por sesión en
+`/stats`, panel de sesión en el monitor TUI).
+
+**Forma:**
+
+```json
+"session": { "source": "explicit", "key": "mi-sesion-1" }
+```
+
+| Campo | Qué es |
+|---|---|
+| `source` | `"explicit"` \| `"native"` \| `"unattributed"` — qué señal de precedencia ganó la resolución. Fija cómo interpretar `key` |
+| `key` | Valor opaco resuelto: el header de atribución crudo (`explicit`/`native`) o el `User-Agent`/constante de fallback (`unattributed`) |
+
+**`source` y `key` viajan siempre juntos, nunca por separado:** una `key` de
+`claude-cli/1.2.3` significa cosas opuestas según su `source` — con
+`"native"` es una sesión real atribuida por Claude Code; con
+`"unattributed"` es solo el `User-Agent` del fallback, NO una identidad.
+Por eso `session` nunca es `null`: la precedencia siempre resuelve a algo, y
+el peor caso es el bucket `"unattributed"`, un fallback honesto, no una
+ausencia.
+
+**Precedencia (de mayor a menor):**
+
+| Orden | Cabecera del request | `source` resultante |
+|---|---|---|
+| 1 | `X-OxideGate-Session` | `"explicit"` |
+| 2 | `x-claude-code-session-id` | `"native"` |
+| 3 | (ninguna de las anteriores) | `"unattributed"`, `key` = `User-Agent` crudo, o la constante `"unattributed"` si no hay `User-Agent` legible |
+
+Una cabecera de atribución presente pero vacía se trata como ausente y la
+resolución cae al siguiente nivel: `key` nunca es un string vacío en ninguna
+rama.
+
+**Invariante de privacidad.** El resolver (`middleware::proxy::session_of`)
+lee EXCLUSIVAMENTE esas tres cabeceras. Jamás `Authorization`, `x-api-key` ni
+`x-goog-api-key`: `key` es siempre una etiqueta o identificador opaco, nunca
+una credencial cruda. Un request con `Authorization: Bearer …` y
+`X-OxideGate-Session: mi-sesion-1` simultáneos resuelve `key: "mi-sesion-1"`
+— la credencial nunca aparece en ningún campo de la respuesta.
+
+**Cómo estampar el header desde cada harness.** `X-OxideGate-Session` es un
+header custom: ningún harness lo manda por defecto, hay que configurarlo
+explícitamente por proceso. `x-claude-code-session-id` sí lo manda Claude
+Code nativamente, sin configuración adicional.
+
+| Harness | Cómo estampar `X-OxideGate-Session` |
+|---|---|
+| Claude Code | Variable de entorno `ANTHROPIC_CUSTOM_HEADERS` (formato `Header: valor`, headers múltiples separados por `,`) |
+| Gemini CLI | Variable de entorno `GEMINI_CLI_CUSTOM_HEADERS` |
+| OpenCode | `options.headers` en la config del proveedor, con interpolación `{env:VAR}` para tomar el valor de una variable de entorno en vez de hardcodearlo |
+
+Sin ninguna de estas configuraciones, el tráfico de esos harnesses cae en
+`source: "native"` (Claude Code, vía `x-claude-code-session-id`) o
+`source: "unattributed"` (Gemini CLI y OpenCode, que hoy no mandan ningún
+header de sesión nativo — caen al `User-Agent`).
 
 ---
 

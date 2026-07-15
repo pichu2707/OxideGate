@@ -28,6 +28,7 @@ impacto **en vivo**, comparando el antes y el después.
 | **Detalle por request** | `GET /requests` + panel `p` del monitor: las últimas 200 peticiones individuales en vivo, con detección de outliers (error, cache-miss, TTFT lento, generación lenta). | ✅ |
 | **Perillas de velocidad** | Captura `requested_effort`, `requested_speed` y `served_speed` (`output_config.effort` y `speed` de Anthropic) por petición, expuestas en `GET /requests` y en el monitor. | ✅ |
 | **Cuota de suscripción (Codex/ChatGPT)** | Mide el tráfico de suscripción por OAuth de ChatGPT —que no se factura por token sino por cuota— parseando las cabeceras `x-codex-*` en un objeto `codex_quota` por petición (`GET /requests`), y lo muestra en el panel `u` del monitor: plan, % de ventana usado y cuenta atrás del reset. Ver [`docs/telemetry-level-1.md`](docs/telemetry-level-1.md) §5.3. | ✅ |
+| **Atribución de sesiones (rebanada 1)** | Resuelve una clave de sesión por precedencia de cabeceras (`X-OxideGate-Session` explícito → `x-claude-code-session-id` nativo de Claude Code → fallback honesto por `User-Agent`), capturada por petición y expuesta en `GET /requests` + `telemetry.jsonl` (`session.source`/`session.key`). Ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.4. Agregación por sesión en `/stats` y panel en el monitor TUI son rebanadas futuras, todavía sin construir. | 🚧 |
 
 ---
 
@@ -381,9 +382,12 @@ Palanca A (forzado de caché), agregación por modelo (`/stats`), monitor TUI,
 **decomposición de `prompt_bytes` por componente** (`system` / `tools` /
 historial / turno actual, campos `context_*_bytes` en `RequestMetric`) —
 usada para medir el efecto de `--tools` en
-[`docs/context-tax.md`](docs/context-tax.md) §5, y el **eje de cuota de
+[`docs/context-tax.md`](docs/context-tax.md) §5, el **eje de cuota de
 suscripción** (`codex_quota` en `/requests` + panel `u` del monitor) para el
-tráfico de Codex/ChatGPT por OAuth.
+tráfico de Codex/ChatGPT por OAuth, y la **rebanada 1 del eje de atribución
+de sesiones** (clave de sesión resuelta por precedencia de cabeceras,
+capturada en `session` en `/requests` + `telemetry.jsonl` — ver
+[`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.4).
 
 **Descartado** ⛔ (con evidencia, para tráfico conversacional)
 - **Palanca B — dedup por `prompt_hash`.** Medido contra tráfico real de
@@ -407,6 +411,10 @@ tráfico de Codex/ChatGPT por OAuth.
   `used_percent` es entero y el delta de una sola petición redondea a 0).
   Sin verificar aún: si las cabeceras `x-codex-*` aparecen en respuestas `429`
   (permitiría avisar antes de agotar la cuota).
+- **Eje de atribución de sesiones — siguientes rebanadas:** agregación por
+  sesión en `GET /stats` (rebanada 2) y columna/panel de sesión en
+  `oxidegate-monitor` (rebanada 3). La rebanada 1 (captura y exposición cruda
+  en `/requests` + `telemetry.jsonl`) ya está hecha — ver tabla de arriba.
 
 > Hallazgo central que guía las prioridades: el overhead del harness domina el
 > coste. Claude Code inyecta ~7.368 tokens de contexto por llamada; un "Responde
