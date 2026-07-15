@@ -197,6 +197,11 @@ async fn send_and_meter(
     // solo viaja hasta la métrica.
     let client = client_of(req_headers);
 
+    // Resuelto ANTES de reenviar, igual que `client`: `session_of` solo lee
+    // cabeceras del request entrante, así que resuelve idéntico tanto si el
+    // upstream responde como si falla (ver doc de `session_of`).
+    let session = session_of(req_headers);
+
     // Reconstruimos la petición copiando las cabeceras originales (auth,
     // content-type, anthropic-version, x-goog-api-key…).
     let mut outbound = state.http.post(&out.url).body(out.body);
@@ -248,6 +253,11 @@ async fn send_and_meter(
                 // que ambos usos son mutuamente excluyentes en tiempo de
                 // ejecución y el análisis de flujo del compilador lo permite.
                 client,
+                // Mismo patrón de `move` que `client`: `session` ya se
+                // resolvió arriba a partir de `req_headers`, así que el
+                // fallback honesto de `session_of` se aplica de forma
+                // natural acá, sin caso especial para el fallo de upstream.
+                session,
                 prompt_bytes: out.prompt_bytes,
                 input_tokens: None,
                 output_tokens: None,
@@ -296,6 +306,7 @@ async fn send_and_meter(
         prompt_hash: out.prompt_hash,
         stream: out.stream,
         client,
+        session,
         prompt_bytes: out.prompt_bytes,
         status: status.as_u16(),
         cache_control_forced: out.cache_control_forced,

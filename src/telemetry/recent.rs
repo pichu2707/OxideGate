@@ -244,6 +244,11 @@ impl RecentRequests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // `session` es un campo REQUERIDO de `RequestMetric` desde este slice
+    // (nunca `Option`, ver `telemetry::session`): esta fixture necesita un
+    // valor, aunque `RecentRequest` todavía no lo proyecte (eso es alcance
+    // de la rebanada 2 de atribución de sesiones, no de este cambio).
+    use crate::telemetry::{SessionAttribution, SessionSource};
 
     /// Construye una métrica mínima, variando el `timestamp` para poder
     /// distinguir requests entre sí en los asserts de orden.
@@ -288,6 +293,10 @@ mod tests {
             tools_overhead_bytes: Some(4),
             prepare_us: 42,
             codex_quota: None,
+            session: SessionAttribution {
+                source: SessionSource::Unattributed,
+                key: "unattributed".to_string(),
+            },
         }
     }
 
