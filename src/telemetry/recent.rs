@@ -41,7 +41,7 @@
 //! localhost.
 use crate::provider::ToolServerBytes;
 use crate::telemetry::logger::RequestMetric;
-use crate::telemetry::CodexQuota;
+use crate::telemetry::{CodexQuota, SessionAttribution};
 use serde::Serialize;
 use std::collections::VecDeque;
 
@@ -165,6 +165,18 @@ pub struct RecentRequest {
     /// hay contenido de prompt en ningún campo de `CodexQuota`, solo estado
     /// de cuota (porcentajes, ventanas, timestamps de reseteo).
     pub codex_quota: Option<CodexQuota>,
+    /// Sesión resuelta por precedencia de cabeceras del request (ver
+    /// `telemetry::logger::RequestMetric::session` para el contrato completo
+    /// de honestidad `source`+`key`). Nunca `Option`: la peor rama es el
+    /// bucket `Unattributed`, un fallback honesto, no una ausencia.
+    ///
+    /// No compromete la invariante de privacidad del módulo: `key` es
+    /// siempre una etiqueta opaca (el header de atribución crudo o el
+    /// `User-Agent` de fallback), jamás contenido de prompt ni una
+    /// credencial — el resolver (`middleware::proxy::session_of`) lee
+    /// exclusivamente `X-OxideGate-Session`, `x-claude-code-session-id` y
+    /// `User-Agent`.
+    pub session: SessionAttribution,
 }
 
 impl From<&RequestMetric> for RecentRequest {
@@ -203,6 +215,7 @@ impl From<&RequestMetric> for RecentRequest {
             tools_overhead_bytes: m.tools_overhead_bytes,
             prepare_us: m.prepare_us,
             codex_quota: m.codex_quota.clone(),
+            session: m.session.clone(),
         }
     }
 }
@@ -244,11 +257,10 @@ impl RecentRequests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // `session` es un campo REQUERIDO de `RequestMetric` desde este slice
-    // (nunca `Option`, ver `telemetry::session`): esta fixture necesita un
-    // valor, aunque `RecentRequest` todavía no lo proyecte (eso es alcance
-    // de la rebanada 2 de atribución de sesiones, no de este cambio).
-    use crate::telemetry::{SessionAttribution, SessionSource};
+    // `session` es un campo REQUERIDO de `RequestMetric` (nunca `Option`, ver
+    // `telemetry::session`) y ahora también se proyecta a `RecentRequest`
+    // (ver tests de proyección/round-trip más abajo).
+    use crate::telemetry::SessionSource;
 
     /// Construye una métrica mínima, variando el `timestamp` para poder
     /// distinguir requests entre sí en los asserts de orden.
@@ -416,6 +428,7 @@ mod tests {
         assert_eq!(row.tools_overhead_bytes, None);
         assert_eq!(row.prepare_us, 42);
         assert_eq!(row.codex_quota, None);
+        assert_eq!(row.session, base_metric("t1").session);
     }
 
     /// La proyección copia `codex_quota` fielmente cuando SÍ hay cuota
@@ -431,6 +444,84 @@ mod tests {
 
         let row = &recent.snapshot()[0];
         assert_eq!(row.codex_quota, Some(fixture_codex_quota()));
+    }
+
+    /// La proyección copia `session` fielmente cuando `source =
+    /// SessionSource::Explicit` (clave asignada explícitamente por quien
+    /// invoca vía `X-OxideGate-Session`).
+    #[test]
+    fn proyeccion_copia_session_fielmente_cuando_es_explicit() {
+        let mut m = base_metric("t1");
+        m.session = SessionAttribution {
+            source: SessionSource::Explicit,
+            key: "claude-1".to_string(),
+        };
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+
+        let row = &recent.snapshot()[0];
+        assert_eq!(row.session.source, SessionSource::Explicit);
+        assert_eq!(row.session.key, "claude-1");
+    }
+
+    /// La proyección copia `session` fielmente cuando `source =
+    /// SessionSource::Native` (id de sesión nativo de Claude Code, sin
+    /// header explícito de OxideGate).
+    #[test]
+    fn proyeccion_copia_session_fielmente_cuando_es_native() {
+        let mut m = base_metric("t1");
+        m.session = SessionAttribution {
+            source: SessionSource::Native,
+            key: "native-session-9".to_string(),
+        };
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+
+        let row = &recent.snapshot()[0];
+        assert_eq!(row.session.source, SessionSource::Native);
+        assert_eq!(row.session.key, "native-session-9");
+    }
+
+    /// La proyección copia `session` fielmente cuando `source =
+    /// SessionSource::Unattributed` (ningún header de atribución presente,
+    /// fallback al `User-Agent` crudo).
+    #[test]
+    fn proyeccion_copia_session_fielmente_cuando_es_unattributed() {
+        let mut m = base_metric("t1");
+        m.session = SessionAttribution {
+            source: SessionSource::Unattributed,
+            key: "claude-cli/1.2.3 (external, cli)".to_string(),
+        };
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+
+        let row = &recent.snapshot()[0];
+        assert_eq!(row.session.source, SessionSource::Unattributed);
+        assert_eq!(row.session.key, "claude-cli/1.2.3 (external, cli)");
+    }
+
+    /// Round-trip serde de `RecentRequest` con `session.source = Explicit`
+    /// preserva `source` y `key` en el JSON, mismo patrón que
+    /// `round_trip_serde_con_codex_quota_presente`.
+    #[test]
+    fn round_trip_serde_con_session_presente() {
+        let mut m = base_metric("t1");
+        m.session = SessionAttribution {
+            source: SessionSource::Explicit,
+            key: "claude-1".to_string(),
+        };
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+        let row = &recent.snapshot()[0];
+        let json = serde_json::to_string(row).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["session"]["source"], "explicit");
+        assert_eq!(parsed["session"]["key"], "claude-1");
     }
 
     /// Round-trip serde de `RecentRequest` con `codex_quota: Some(..)`
