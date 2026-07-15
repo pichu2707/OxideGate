@@ -11,7 +11,9 @@
 use crate::provider::{self, Incoming, Outgoing, Provider};
 use crate::state::AppState;
 use crate::telemetry::logger::{flatten_context_breakdown, tools_fields};
-use crate::telemetry::{CodexQuota, MeteredBody, MetricBase, RequestMetric};
+use crate::telemetry::{
+    CodexQuota, MeteredBody, MetricBase, RequestMetric, SessionAttribution, SessionSource,
+};
 use axum::{
     body::Body,
     extract::{Request, State},
@@ -39,6 +41,82 @@ fn client_of(headers: &HeaderMap) -> Option<String> {
         Some(value.chars().take(MAX_CLIENT_LEN).collect())
     } else {
         Some(value.to_string())
+    }
+}
+
+/// Nombre del header explícito de OxideGate: máxima precedencia en
+/// [`session_of`]. Quien invoca lo manda a propósito para etiquetar su
+/// propia sesión, por encima de cualquier señal nativa del harness.
+const SESSION_HEADER_EXPLICIT: &str = "x-oxidegate-session";
+
+/// Nombre del header nativo de sesión que manda Claude Code. Segunda
+/// precedencia en [`session_of`]: se consume como string OPACA, jamás se
+/// interpreta semántica propia de Claude (mantiene el transporte agnóstico
+/// del proveedor).
+const SESSION_HEADER_NATIVE: &str = "x-claude-code-session-id";
+
+/// Clave de fallback cuando ni el header explícito ni el nativo resolvieron
+/// y tampoco hay un `User-Agent` legible (ausente o no UTF-8 válido).
+/// Bucket nombrado y honesto, nunca un string vacío ni una identidad
+/// inventada.
+const UNATTRIBUTED_KEY: &str = "unattributed";
+
+/// Lee un header de atribución de sesión (`X-OxideGate-Session` o
+/// `x-claude-code-session-id`) por nombre. Un header presente pero vacío
+/// (tras `trim`) se trata como ausente — nunca produce `Some("")` — para que
+/// [`session_of`] pueda caer limpiamente al siguiente nivel de precedencia.
+fn attribution_header(headers: &HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get(name)?.to_str().ok()?;
+    if raw.trim().is_empty() {
+        None
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+/// Resuelve la [`SessionAttribution`] de un request por precedencia de tres
+/// niveles, leyendo EXCLUSIVAMENTE cabeceras de request (nunca la respuesta
+/// del upstream, a diferencia de [`CodexQuota::from_headers`]):
+///
+/// 1. `X-OxideGate-Session` presente y no vacío → [`SessionSource::Explicit`].
+/// 2. `x-claude-code-session-id` presente y no vacío → [`SessionSource::Native`].
+/// 3. Fallback → [`SessionSource::Unattributed`], con `key` = `User-Agent`
+///    (reusando [`client_of`]: mismo tope de longitud y criterio de UTF-8
+///    válido) o la constante [`UNATTRIBUTED_KEY`] si no hay `User-Agent`
+///    legible.
+///
+/// Hermana de [`client_of`] (misma categoría: transporte agnóstico de
+/// proveedor, ambas leen el mismo `&HeaderMap` del request entrante). Es
+/// pura y síncrona: no depende de la respuesta del upstream, así que resuelve
+/// idéntico tanto en el camino de éxito como en el de error de
+/// `send_and_meter`.
+///
+/// **Invariante de privacidad**: lee SOLO las tres cabeceras de arriba,
+/// jamás `Authorization`, `x-api-key` ni `x-goog-api-key`. La `key` resuelta
+/// es siempre una etiqueta opaca, nunca una credencial.
+fn session_of(headers: &HeaderMap) -> SessionAttribution {
+    if let Some(key) = attribution_header(headers, SESSION_HEADER_EXPLICIT) {
+        return SessionAttribution {
+            source: SessionSource::Explicit,
+            key,
+        };
+    }
+    if let Some(key) = attribution_header(headers, SESSION_HEADER_NATIVE) {
+        return SessionAttribution {
+            source: SessionSource::Native,
+            key,
+        };
+    }
+    // Reusamos `client_of` para el fallback (mismo tope de longitud y
+    // criterio de UTF-8 válido). Filtramos también un `User-Agent` vacío:
+    // `client_of` no sanea esa forma por su cuenta, pero la invariante
+    // "jamás Some(\"\")" de este eje sí lo exige.
+    let key = client_of(headers)
+        .filter(|ua| !ua.is_empty())
+        .unwrap_or_else(|| UNATTRIBUTED_KEY.to_string());
+    SessionAttribution {
+        source: SessionSource::Unattributed,
+        key,
     }
 }
 
@@ -261,4 +339,148 @@ fn plain_error(status: StatusCode, msg: String) -> Response {
         .status(status)
         .body(Body::from(msg))
         .expect("respuesta de error siempre construible")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::{HeaderName, HeaderValue};
+
+    /// Inserta un header sintético en un `HeaderMap` de prueba.
+    fn insert(headers: &mut HeaderMap, name: &'static str, value: &str) {
+        headers.insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_str(value).expect("valor de cabecera de prueba válido"),
+        );
+    }
+
+    /// Scenario (spec §"X-OxideGate-Session presente y no vacío"): gana
+    /// sobre `x-claude-code-session-id` aunque ambos estén presentes.
+    #[test]
+    fn explicit_gana_sobre_native_cuando_ambos_presentes() {
+        let mut headers = HeaderMap::new();
+        insert(&mut headers, "x-oxidegate-session", "claude-1");
+        insert(&mut headers, "x-claude-code-session-id", "native-session-9");
+
+        let session = session_of(&headers);
+
+        assert_eq!(session.source, SessionSource::Explicit);
+        assert_eq!(session.key, "claude-1");
+    }
+
+    /// Scenario (spec §"X-OxideGate-Session ausente, x-claude-code-session-id
+    /// presente"): sin el header explícito, gana el nativo.
+    #[test]
+    fn native_gana_cuando_explicit_esta_ausente() {
+        let mut headers = HeaderMap::new();
+        insert(&mut headers, "x-claude-code-session-id", "native-session-9");
+
+        let session = session_of(&headers);
+
+        assert_eq!(session.source, SessionSource::Native);
+        assert_eq!(session.key, "native-session-9");
+    }
+
+    /// Scenario (spec §"Ambos headers ausentes"): sin ningún header de
+    /// atribución, cae al fallback con el `User-Agent` como valor.
+    #[test]
+    fn fallback_con_user_agent_cuando_ningun_header_de_atribucion_presente() {
+        let mut headers = HeaderMap::new();
+        insert(
+            &mut headers,
+            "user-agent",
+            "claude-cli/1.2.3 (external, cli)",
+        );
+
+        let session = session_of(&headers);
+
+        assert_eq!(session.source, SessionSource::Unattributed);
+        assert_eq!(session.key, "claude-cli/1.2.3 (external, cli)");
+    }
+
+    /// Scenario (spec §"X-OxideGate-Session presente pero vacío,
+    /// x-claude-code-session-id presente"): un header vacío se trata como
+    /// ausente y la resolución cae al siguiente nivel, nunca al string vacío.
+    #[test]
+    fn explicit_vacio_cae_a_native_nunca_string_vacio() {
+        let mut headers = HeaderMap::new();
+        insert(&mut headers, "x-oxidegate-session", "");
+        insert(&mut headers, "x-claude-code-session-id", "native-session-9");
+
+        let session = session_of(&headers);
+
+        assert_eq!(session.source, SessionSource::Native);
+        assert_eq!(session.key, "native-session-9");
+        assert_ne!(session.key, "");
+    }
+
+    /// Scenario (spec §"Ambos headers de atribución presentes pero
+    /// vacíos"): ambos caen al fallback con el `User-Agent`, nunca un
+    /// string vacío.
+    #[test]
+    fn ambos_headers_de_atribucion_vacios_caen_al_fallback_nunca_string_vacio() {
+        let mut headers = HeaderMap::new();
+        insert(&mut headers, "x-oxidegate-session", "");
+        insert(&mut headers, "x-claude-code-session-id", "");
+        insert(&mut headers, "user-agent", "gemini-cli/0.9");
+
+        let session = session_of(&headers);
+
+        assert_eq!(session.source, SessionSource::Unattributed);
+        assert_eq!(session.key, "gemini-cli/0.9");
+        assert_ne!(session.key, "");
+    }
+
+    /// Scenario (spec §"Ambos headers ausentes", caso sin `User-Agent`): el
+    /// fallback sin ningún `User-Agent` presente resuelve a la constante
+    /// `"unattributed"`, nunca el string vacío ni `None`.
+    #[test]
+    fn fallback_sin_user_agent_usa_constante_unattributed() {
+        let headers = HeaderMap::new();
+
+        let session = session_of(&headers);
+
+        assert_eq!(session.source, SessionSource::Unattributed);
+        assert_eq!(session.key, UNATTRIBUTED_KEY);
+    }
+
+    /// Prueba de invariante de privacidad: una credencial (`Authorization`)
+    /// presente junto al header explícito de sesión nunca contamina la
+    /// `key` resuelta — `session_of` lee EXCLUSIVAMENTE las tres cabeceras
+    /// de transporte, jamás cabeceras de auth.
+    #[test]
+    fn credencial_presente_no_contamina_la_key_resuelta() {
+        let mut headers = HeaderMap::new();
+        insert(&mut headers, "authorization", "Bearer super-secreto-123");
+        insert(&mut headers, "x-oxidegate-session", "claude-1");
+
+        let session = session_of(&headers);
+
+        assert_eq!(session.key, "claude-1");
+        assert!(!session.key.contains("super-secreto-123"));
+    }
+
+    /// Invariante explícita "nunca `Some(\"\")`": recorre los casos de saneo
+    /// (headers vacíos) y afirma además que `key` nunca es `String::new()`
+    /// en ninguna rama, sea cual sea la fuente que terminó resolviendo.
+    #[test]
+    fn key_nunca_es_string_vacio_en_ninguna_rama_de_saneo() {
+        let mut solo_native_vacio_con_native_valido = HeaderMap::new();
+        insert(
+            &mut solo_native_vacio_con_native_valido,
+            "x-oxidegate-session",
+            "",
+        );
+        insert(
+            &mut solo_native_vacio_con_native_valido,
+            "x-claude-code-session-id",
+            "native-session-9",
+        );
+        assert_ne!(session_of(&solo_native_vacio_con_native_valido).key, "");
+
+        let mut ambos_vacios = HeaderMap::new();
+        insert(&mut ambos_vacios, "x-oxidegate-session", "");
+        insert(&mut ambos_vacios, "x-claude-code-session-id", "");
+        assert_ne!(session_of(&ambos_vacios).key, "");
+    }
 }

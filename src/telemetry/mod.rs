@@ -4,10 +4,12 @@ pub mod logger;
 pub mod metered;
 pub mod pricing;
 pub mod recent;
+pub mod session;
 pub mod stats;
 
 pub use codex_quota::CodexQuota;
 pub use logger::{RequestMetric, TelemetrySink};
 pub use metered::{MeteredBody, MetricBase};
 pub use recent::{RecentRequest, RecentRequests};
+pub use session::{SessionAttribution, SessionSource};
 pub use stats::{StatsRegistry, StatsSnapshot};
