@@ -14,9 +14,9 @@
 //! (`output_config.effort` y `speed` a nivel raíz), así que acá quedan
 //! siempre en `None` a propósito (ver la nota en cada `prepare`).
 use super::{
-    array_field, fingerprint, measure_key, measure_other, measure_value, model_and_stream_from_value,
-    parse_body, split_history_and_last_turn, tools_overhead_bytes, ContextBreakdown, Incoming,
-    Outgoing, Provider, Usage,
+    array_field, fingerprint, maybe_decompress, measure_key, measure_other, measure_value,
+    model_and_stream_from_value, parse_body, split_history_and_last_turn, tools_overhead_bytes,
+    ContextBreakdown, Incoming, Outgoing, Provider, ToolServerBytes, Usage,
 };
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -27,8 +27,25 @@ pub struct OpenAiChat;
 /// Adaptador de OpenAI Responses API (`/v1/responses`).
 pub struct OpenAiResponses;
 
+/// Adaptador de la Responses API de Codex (`/v1/codex/responses`, la ruta
+/// que usa el cliente `pi`), reenviada a `chatgpt.com/backend-api/codex` en
+/// vez de `api.openai.com`. Mismo dialecto JSON exacto que [`OpenAiResponses`]
+/// (`instructions`/`input`/`tools`, `usage` bajo `response`): solo cambian
+/// `url` y `route`. `decompose`/`extract_usage`/`tool_entries` DELEGAN en
+/// [`OPENAI_RESPONSES`] en vez de duplicar el parseo del dialecto — ver la
+/// nota de cada método.
+///
+/// Diferencia real con `OpenAiResponses`: el cliente `pi` manda el body
+/// comprimido (`content-encoding: zstd`, a veces `gzip`). `prepare` mide la
+/// telemetría (`prompt_hash`, `prompt_bytes`, `context`, `tools_by_server`)
+/// sobre el JSON LÓGICO descomprimido (ver [`maybe_decompress`]), pero
+/// reenvía `incoming.body` CRUDO intacto — igual que `OpenAiResponses`, el
+/// forward nunca muta ni recomprime nada.
+pub struct OpenAiCodexResponses;
+
 pub static OPENAI_CHAT: OpenAiChat = OpenAiChat;
 pub static OPENAI_RESPONSES: OpenAiResponses = OpenAiResponses;
+pub static OPENAI_CODEX_RESPONSES: OpenAiCodexResponses = OpenAiCodexResponses;
 
 impl Provider for OpenAiChat {
     fn name(&self) -> &'static str {
@@ -200,10 +217,21 @@ impl Provider for OpenAiResponses {
     /// `context` y `tools_by_server`/`tools_overhead_bytes` (mismo contrato
     /// que `OpenAiChat::prepare`); el body reenviado es siempre
     /// `incoming.body` intacto (no hay mutación en esta variante).
+    ///
+    /// `prompt_hash`/`prompt_bytes`/`parsed` se calculan sobre el JSON LÓGICO
+    /// (ver [`maybe_decompress`]), no sobre `incoming.body` crudo: si el
+    /// cliente mandó `content-encoding: zstd`/`gzip` (hoy nadie lo hace en
+    /// esta variante, pero el mismo dialecto lo comparte
+    /// [`super::OpenAiCodexResponses`], que SÍ recibe tráfico comprimido de
+    /// `pi`), medir sobre el wire comprimido daría un `prompt_hash`/`context`
+    /// sin sentido (bytes de un frame zstd, no del JSON real). Sin
+    /// `content-encoding` (el caso de hoy), `maybe_decompress` es una copia
+    /// transparente: este cambio no altera ningún número ya medido.
     fn prepare(&self, incoming: Incoming, cfg: &AppConfig) -> Outgoing {
-        let prompt_hash = fingerprint(&incoming.body);
-        let prompt_bytes = incoming.body.len();
-        let parsed = parse_body(&incoming.body);
+        let logical = maybe_decompress(&incoming.body, incoming.content_encoding.as_deref());
+        let prompt_hash = fingerprint(&logical);
+        let prompt_bytes = logical.len();
+        let parsed = parse_body(&logical);
 
         let (model, stream) = parsed
             .as_ref()
@@ -301,6 +329,103 @@ impl Provider for OpenAiResponses {
                 })
                 .collect(),
         )
+    }
+}
+
+impl Provider for OpenAiCodexResponses {
+    /// Mismo nombre corto que el resto de la familia OpenAI en la métrica de
+    /// upstream, pero DISTINTO: `"codex"`, no `"openai"`. Decisión deliberada,
+    /// no descuido — este proveedor pega a un backend enteramente distinto
+    /// (`chatgpt.com/backend-api/codex`, autenticado con sesión de ChatGPT,
+    /// con su propio sistema de cuota — ver `telemetry::CodexQuota`), así que
+    /// agregarlo bajo `"openai"` mezclaría dos backends con límites y
+    /// facturación propios en la misma fila de `/stats`.
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    /// Arma el request hacia `{codex}/responses`
+    /// (`chatgpt.com/backend-api/codex/responses`, NO `api.openai.com`).
+    /// Mismo dialecto exacto que [`OpenAiResponses::prepare`] — de hecho el
+    /// cuerpo de esta función es una copia deliberada de esa, con `url`/
+    /// `route` cambiados; no se factoriza en una función compartida porque
+    /// eso movería la construcción de `Outgoing` (con sus 13 campos) a una
+    /// firma genérica que ganaría más complejidad de la que ahorra para dos
+    /// llamadores.
+    ///
+    /// La diferencia real de este proveedor es la de arriba, en el tipo: el
+    /// cliente `pi` manda el body comprimido (`content-encoding: zstd`, a
+    /// veces `gzip`). `prompt_hash`/`prompt_bytes`/`context`/`tools_by_server`
+    /// se miden sobre el JSON LÓGICO descomprimido ([`maybe_decompress`]);
+    /// `Outgoing::body` sigue siendo `incoming.body` CRUDO, byte-idéntico al
+    /// que mandó el cliente — el forward nunca pasa por `maybe_decompress`.
+    fn prepare(&self, incoming: Incoming, cfg: &AppConfig) -> Outgoing {
+        let logical = maybe_decompress(&incoming.body, incoming.content_encoding.as_deref());
+        let prompt_hash = fingerprint(&logical);
+        let prompt_bytes = logical.len();
+        let parsed = parse_body(&logical);
+
+        let (model, stream) = parsed
+            .as_ref()
+            .map(model_and_stream_from_value)
+            .unwrap_or((None, false));
+        let context = parsed.as_ref().and_then(|v| self.decompose(v));
+        let by_server = parsed
+            .as_ref()
+            .map(|v| self.tools_by_server(v))
+            .unwrap_or_default();
+        let overhead = context
+            .as_ref()
+            .map(|c| tools_overhead_bytes(c.tools_bytes, &by_server))
+            .unwrap_or(0);
+
+        Outgoing {
+            url: format!("{}/responses", cfg.target_codex_url),
+            route: "/v1/codex/responses".to_string(),
+            upstream: self.name(),
+            model,
+            stream,
+            prompt_hash,
+            prompt_bytes,
+            body: incoming.body,
+            // Codex gestiona su propia caché del lado del backend; no aplica
+            // la palanca de Anthropic.
+            cache_control_forced: false,
+            context,
+            tools_by_server: by_server,
+            tools_overhead_bytes: overhead,
+            // `effort`/`speed` son dialecto exclusivo de Anthropic.
+            requested_effort: None,
+            requested_speed: None,
+        }
+    }
+
+    /// DELEGA en [`OPENAI_RESPONSES`]: es exactamente el mismo evento
+    /// `response.completed` con `usage` bajo `response`, mismo `input_tokens`/
+    /// `output_tokens`. Nunca se duplica el parseo del dialecto.
+    fn extract_usage(&self, value: &Value, usage: &mut Usage) {
+        OPENAI_RESPONSES.extract_usage(value, usage);
+    }
+
+    /// DELEGA en [`OPENAI_RESPONSES::decompose`]: mismo dialecto exacto
+    /// (`instructions`/`tools`/`input`), sin reescribir el mapeo acá.
+    fn decompose(&self, body: &Value) -> Option<ContextBreakdown> {
+        OPENAI_RESPONSES.decompose(body)
+    }
+
+    /// DELEGA en [`OPENAI_RESPONSES::tool_entries`]: mismo dialecto exacto
+    /// (`tools[].name` plano), sin reescribir el parseo acá.
+    fn tool_entries<'a>(&self, body: &'a Value) -> Option<Vec<(&'a str, &'a Value)>> {
+        OPENAI_RESPONSES.tool_entries(body)
+    }
+
+    /// DELEGA en [`OPENAI_RESPONSES::tools_by_server`] en vez del default del
+    /// trait: ambos comparten el mismo `tool_entries`, así que el resultado
+    /// sería idéntico de todas formas, pero llamar directamente evita
+    /// depender de que el default del trait no cambie de comportamiento por
+    /// accidente en el futuro.
+    fn tools_by_server(&self, body: &Value) -> Vec<ToolServerBytes> {
+        OPENAI_RESPONSES.tools_by_server(body)
     }
 }
 
@@ -709,6 +834,7 @@ mod tests {
             target_openai_url: "https://api.openai.com/v1".to_string(),
             target_anthropic_url: "https://api.anthropic.com/v1".to_string(),
             target_gemini_url: "https://generativelanguage.googleapis.com".to_string(),
+            target_codex_url: "https://chatgpt.com/backend-api/codex".to_string(),
             storage_dir: std::path::PathBuf::from("/tmp/oxidegate-test"),
             force_prompt_cache: false,
         }
@@ -719,6 +845,19 @@ mod tests {
             path: "/v1/chat/completions".to_string(),
             query: None,
             body: body.as_bytes().to_vec(),
+            content_encoding: None,
+        }
+    }
+
+    /// Variante de `incoming_with_body` para fixtures con `content-encoding`
+    /// explícito (los tests de Codex/zstd la usan; el resto sigue con
+    /// `content_encoding: None` vía `incoming_with_body`).
+    fn incoming_with_encoded_body(body: Vec<u8>, content_encoding: &str) -> Incoming {
+        Incoming {
+            path: "/v1/codex/responses".to_string(),
+            query: None,
+            body,
+            content_encoding: Some(content_encoding.to_string()),
         }
     }
 
@@ -988,5 +1127,80 @@ mod tests {
         let entries = OPENAI_CHAT.tool_entries(&body).expect("tools presente");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "Write");
+    }
+
+    // -----------------------------------------------------------------
+    // OPENAI_CODEX_RESPONSES — Responses API de Codex (`/v1/codex/responses`,
+    // reenviada a `{codex}/responses`). `pi` manda el body comprimido en
+    // zstd (`content-encoding: zstd`): estos tests verifican el contrato
+    // completo de esa ruta.
+    // -----------------------------------------------------------------
+
+    /// `prepare` con un body zstd debe: (a) medir telemetría (`context` y
+    /// `tools_by_server` NO deben quedar en `None`/vacíos: el body SÍ
+    /// parseó, solo que había que descomprimirlo primero) sobre el JSON
+    /// LÓGICO descomprimido, y (b) reenviar el body CRUDO comprimido,
+    /// byte-idéntico al original — el forward nunca pasa por
+    /// `maybe_decompress` (ver `Outgoing::body`).
+    #[test]
+    fn codex_prepare_mide_sobre_zstd_pero_reenvia_crudo() {
+        let cfg = test_config();
+        let logical = r#"{
+            "model": "gpt-5.5",
+            "instructions": "eres un asistente util",
+            "input": "hola",
+            "tools": [{"type": "function", "name": "mcp__claude_ai_Gmail__search_threads", "parameters": {}}]
+        }"#
+        .as_bytes();
+        let comprimido = zstd::encode_all(logical, 0).expect("zstd comprime el fixture");
+        let incoming = incoming_with_encoded_body(comprimido.clone(), "zstd");
+
+        let out = OPENAI_CODEX_RESPONSES.prepare(incoming, &cfg);
+
+        assert!(out.context.is_some(), "el body zstd debe medirse, no quedar en None");
+        assert!(
+            !out.tools_by_server.is_empty(),
+            "las tools del body zstd deben desglosarse por servidor"
+        );
+        assert_eq!(
+            out.body, comprimido,
+            "el body reenviado debe ser byte-idéntico al comprimido original (forward intacto)"
+        );
+        assert_eq!(out.url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(out.route, "/v1/codex/responses");
+    }
+
+    /// Mismo contrato con un body SIN comprimir (`content_encoding: None`):
+    /// `maybe_decompress` debe ser transparente y el resultado debe coincidir
+    /// exactamente con el de `OPENAI_RESPONSES` sobre el mismo body, salvo
+    /// `url`/`route` (que son los de Codex).
+    #[test]
+    fn codex_prepare_sin_compresion_delega_en_la_misma_logica_que_responses() {
+        let cfg = test_config();
+        let incoming = incoming_with_body(
+            r#"{"model":"gpt-5.5","instructions":"be helpful","input":"explain the builder pattern"}"#,
+        );
+
+        let out = OPENAI_CODEX_RESPONSES.prepare(incoming, &cfg);
+        let bd = out.context.expect("body válido debe producir contexto");
+
+        assert_eq!(bd.system_bytes, 12);
+        assert_eq!(bd.last_turn_bytes, 29);
+        assert_eq!(out.url, "https://chatgpt.com/backend-api/codex/responses");
+        assert_eq!(out.route, "/v1/codex/responses");
+    }
+
+    /// Body no-JSON en Codex: `prepare` no debe romper, reenvía intacto y
+    /// deja `context` en `None` (mismo contrato que el resto de proveedores).
+    #[test]
+    fn codex_prepare_body_no_json_no_panica() {
+        let cfg = test_config();
+        let incoming = incoming_with_body("esto no es JSON");
+        let original_body = incoming.body.clone();
+
+        let out = OPENAI_CODEX_RESPONSES.prepare(incoming, &cfg);
+
+        assert_eq!(out.body, original_body);
+        assert_eq!(out.context, None);
     }
 }

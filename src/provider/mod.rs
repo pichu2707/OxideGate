@@ -20,7 +20,7 @@ use std::hash::{Hash, Hasher};
 
 pub use anthropic::ANTHROPIC;
 pub use gemini::GEMINI;
-pub use openai::{OPENAI_CHAT, OPENAI_RESPONSES};
+pub use openai::{OPENAI_CHAT, OPENAI_CODEX_RESPONSES, OPENAI_RESPONSES};
 
 /// Lo que el proxy sabe del request entrante, antes de saber a qué proveedor
 /// pertenece.
@@ -38,6 +38,14 @@ pub struct Incoming {
     pub query: Option<String>,
     /// Body crudo, tal cual llegó del cliente, sin parsear todavía.
     pub body: Vec<u8>,
+    /// Valor crudo del header `Content-Encoding` del request entrante
+    /// (p. ej. `"zstd"`, `"gzip"`), o `None` si el cliente no lo mandó.
+    /// Nunca se usa para decidir qué se reenvía (`Outgoing::body` siempre
+    /// viaja con `body` tal cual, comprimido o no): solo alimenta
+    /// [`maybe_decompress`], que un `Provider::prepare` puede usar para medir
+    /// telemetría (`prompt_hash`, `prompt_bytes`, `context`,
+    /// `tools_by_server`) sobre el JSON LÓGICO en vez del wire comprimido.
+    pub content_encoding: Option<String>,
 }
 
 /// Petición ya resuelta y lista para reenviar al proveedor, con todo lo que
@@ -722,6 +730,43 @@ pub(crate) fn parse_body(raw: &[u8]) -> Option<Value> {
     serde_json::from_slice::<Value>(raw).ok()
 }
 
+/// Descomprime `body` para medición LÓGICA (telemetría), nunca para lo que
+/// se reenvía al proveedor: `Outgoing::body` siempre viaja con el body
+/// crudo tal cual llegó del cliente, comprimido o no (ver el contrato en
+/// [`Incoming::content_encoding`]).
+///
+/// Reconoce dos codificaciones, comparando `encoding` insensible a
+/// mayúsculas (`"zstd"`/`"ZSTD"`/`"Zstd"` son equivalentes):
+/// - `"zstd"` (RFC 8878): la que manda la Responses API de Codex.
+/// - `"gzip"`: la otra codificación de contenido habitual en HTTP.
+///
+/// Cualquier otro valor de `encoding` (`"br"`, `"identity"`, un dialecto que
+/// este proxy todavía no sabe medir) o `None` (el cliente no mandó
+/// `Content-Encoding`) devuelve una COPIA de `body` sin tocar.
+///
+/// **FALLBACK SEGURO, nunca panic**: si la descompresión falla — el body
+/// está corrupto, truncado, o declarado zstd/gzip pero en realidad no lo
+/// es — esta función NO propaga el error: devuelve una copia de `body` tal
+/// cual. Preferimos medir sobre bytes crudos (mal etiquetados como
+/// "descomprimidos" pero al menos presentes) a abortar la medición de todo
+/// el request por un body mal formado. Mismo espíritu que [`parse_body`]
+/// (`Option`, nunca `Result` propagado) y que el resto de este módulo:
+/// preferimos un hueco honesto (medir sobre lo que hay) a un panic.
+pub fn maybe_decompress(body: &[u8], encoding: Option<&str>) -> Vec<u8> {
+    match encoding.map(str::to_ascii_lowercase).as_deref() {
+        Some("zstd") => zstd::decode_all(body).unwrap_or_else(|_| body.to_vec()),
+        Some("gzip") => {
+            let mut out = Vec::new();
+            let mut decoder = flate2::read::GzDecoder::new(body);
+            match std::io::Read::read_to_end(&mut decoder, &mut out) {
+                Ok(_) => out,
+                Err(_) => body.to_vec(),
+            }
+        }
+        _ => body.to_vec(),
+    }
+}
+
 /// Lee `model` y `stream` de un `Value` YA PARSEADO (formato Anthropic
 /// messages, OpenAI chat/completions y OpenAI Responses comparten esta
 /// forma). Si `value` no trae esas claves (o no es un objeto), cada campo
@@ -1229,5 +1274,82 @@ mod tests {
         let sum: usize = by_server.iter().map(|s| s.bytes).sum();
         assert!(overhead > 0);
         assert_eq!(overhead, bd.tools_bytes - sum);
+    }
+
+    // -----------------------------------------------------------------
+    // maybe_decompress — descompresión LÓGICA (solo para medición) del
+    // body de la Responses API de Codex, que llega con `content-encoding:
+    // zstd` (a veces gzip). El body que se REENVÍA (`Outgoing::body`) nunca
+    // pasa por acá: sigue siendo `incoming.body` crudo, ver
+    // `openai::tests::codex_prepare_mide_sobre_zstd_pero_reenvia_crudo`.
+    // -----------------------------------------------------------------
+
+    /// `zstd`: comprime un JSON fixture con `zstd::encode_all` y verifica que
+    /// `maybe_decompress` recupera exactamente los bytes originales.
+    #[test]
+    fn maybe_decompress_zstd_recupera_bytes_originales() {
+        let original = br#"{"model":"gpt-5","input":"hola"}"#;
+        let comprimido = zstd::encode_all(&original[..], 0).expect("zstd comprime el fixture");
+
+        let recuperado = maybe_decompress(&comprimido, Some("zstd"));
+
+        assert_eq!(recuperado, original);
+    }
+
+    /// `gzip`: mismo contrato, con `flate2::write::GzEncoder` como fixture.
+    #[test]
+    fn maybe_decompress_gzip_recupera_bytes_originales() {
+        use std::io::Write;
+        let original = br#"{"model":"gpt-5","input":"hola"}"#;
+        let mut encoder =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(original).expect("gzip comprime el fixture");
+        let comprimido = encoder.finish().expect("gzip cierra el stream");
+
+        let recuperado = maybe_decompress(&comprimido, Some("gzip"));
+
+        assert_eq!(recuperado, original);
+    }
+
+    /// Sin `content-encoding` (`None`), el body se devuelve tal cual, sin
+    /// intentar ninguna descompresión.
+    #[test]
+    fn maybe_decompress_sin_encoding_devuelve_body_intacto() {
+        let body = br#"{"model":"gpt-5"}"#;
+        assert_eq!(maybe_decompress(body, None), body.to_vec());
+    }
+
+    /// Un `content-encoding` desconocido (ni zstd ni gzip) también devuelve
+    /// el body intacto: no es un error, es simplemente una codificación que
+    /// este proxy no sabe medir todavía.
+    #[test]
+    fn maybe_decompress_encoding_desconocido_devuelve_body_intacto() {
+        let body = br#"{"model":"gpt-5"}"#;
+        assert_eq!(maybe_decompress(body, Some("br")), body.to_vec());
+    }
+
+    /// Un body declarado `zstd` pero en realidad corrupto (no es zstd
+    /// válido) NUNCA debe hacer panic: `maybe_decompress` cae al fallback
+    /// seguro y devuelve el body crudo tal cual llegó.
+    #[test]
+    fn maybe_decompress_zstd_corrupto_no_panica_y_cae_a_fallback() {
+        let corrupto = b"esto no es un frame zstd valido";
+        assert_eq!(maybe_decompress(corrupto, Some("zstd")), corrupto.to_vec());
+    }
+
+    /// Mismo fallback para `gzip` corrupto.
+    #[test]
+    fn maybe_decompress_gzip_corrupto_no_panica_y_cae_a_fallback() {
+        let corrupto = b"esto tampoco es un stream gzip valido";
+        assert_eq!(maybe_decompress(corrupto, Some("gzip")), corrupto.to_vec());
+    }
+
+    /// `Content-Encoding` insensible a mayúsculas (`"ZSTD"`, como podría
+    /// mandar un cliente): debe reconocerlo igual que en minúsculas.
+    #[test]
+    fn maybe_decompress_encoding_insensible_a_mayusculas() {
+        let original = br#"{"a":1}"#;
+        let comprimido = zstd::encode_all(&original[..], 0).expect("zstd comprime el fixture");
+        assert_eq!(maybe_decompress(&comprimido, Some("ZSTD")), original);
     }
 }

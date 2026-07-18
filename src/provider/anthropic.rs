@@ -332,6 +332,7 @@ mod tests {
             target_openai_url: "https://api.openai.com/v1".to_string(),
             target_anthropic_url: "https://api.anthropic.com/v1".to_string(),
             target_gemini_url: "https://generativelanguage.googleapis.com".to_string(),
+            target_codex_url: "https://chatgpt.com/backend-api/codex".to_string(),
             storage_dir: std::path::PathBuf::from("/tmp/oxidegate-test"),
             force_prompt_cache,
         }
@@ -342,6 +343,7 @@ mod tests {
             path: "/v1/messages".to_string(),
             query: None,
             body: body.as_bytes().to_vec(),
+            content_encoding: None,
         }
     }
 
