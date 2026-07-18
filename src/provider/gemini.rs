@@ -8,8 +8,9 @@
 //! son dialecto exclusivo de Anthropic (`output_config.effort` y `speed` a
 //! nivel raíz) sin equivalente hoy en Gemini.
 use super::{
-    array_field, fingerprint, measure_key, measure_other, parse_body, split_history_and_last_turn,
-    tools_overhead_bytes, ContextBreakdown, Incoming, Outgoing, Provider, Usage,
+    array_field, fingerprint, maybe_decompress, measure_key, measure_other, parse_body,
+    split_history_and_last_turn, tools_overhead_bytes, ContextBreakdown, Incoming, Outgoing,
+    Provider, Usage,
 };
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -43,7 +44,11 @@ impl Provider for Gemini {
     /// mismo contrato `None`/vacío que en el resto de proveedores.
     fn prepare(&self, incoming: Incoming, cfg: &AppConfig) -> Outgoing {
         let (model, stream) = parse_gemini_path(&incoming.path);
-        let parsed = parse_body(&incoming.body);
+        // Medición sobre el JSON LÓGICO (ver `maybe_decompress`): sin
+        // `content-encoding` (el caso de hoy en Gemini), es una copia
+        // transparente y no altera ningún número ya medido.
+        let logical = maybe_decompress(&incoming.body, incoming.content_encoding.as_deref());
+        let parsed = parse_body(&logical);
         let context = parsed.as_ref().and_then(|v| self.decompose(v));
         let by_server = parsed
             .as_ref()
@@ -66,8 +71,8 @@ impl Provider for Gemini {
             upstream: self.name(),
             model,
             stream,
-            prompt_hash: fingerprint(&incoming.body),
-            prompt_bytes: incoming.body.len(),
+            prompt_hash: fingerprint(&logical),
+            prompt_bytes: logical.len(),
             body: incoming.body,
             // La caché de Gemini se gestiona aparte (implícita o explícita
             // vía `cachedContent`), no con esta palanca: no aplica acá.
@@ -327,6 +332,7 @@ mod tests {
             target_openai_url: "https://api.openai.com/v1".to_string(),
             target_anthropic_url: "https://api.anthropic.com/v1".to_string(),
             target_gemini_url: "https://generativelanguage.googleapis.com".to_string(),
+            target_codex_url: "https://chatgpt.com/backend-api/codex".to_string(),
             storage_dir: std::path::PathBuf::from("/tmp/oxidegate-test"),
             force_prompt_cache: false,
         }
@@ -337,6 +343,7 @@ mod tests {
             path: path.to_string(),
             query: None,
             body: body.as_bytes().to_vec(),
+            content_encoding: None,
         }
     }
 

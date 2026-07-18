@@ -9,6 +9,11 @@ pub struct AppConfig {
     /// Host raíz de Gemini (sin path). El path `/v1beta/models/...` lo preserva
     /// el proxy tal cual llega del cliente, así que aquí va solo el origen.
     pub target_gemini_url: String,
+    /// Base de la Responses API de Codex (`chatgpt.com/backend-api/codex`,
+    /// NO `api.openai.com`): es el backend que usa el cliente `pi` de Codex,
+    /// autenticado con la sesión de ChatGPT en vez de una API key de OpenAI.
+    /// Ruta local `/v1/codex/responses` la reenvía a `{target_codex_url}/responses`.
+    pub target_codex_url: String,
     pub storage_dir: PathBuf,
     /// Palanca A del optimizador: fuerza un breakpoint de `cache_control` en
     /// las peticiones a Anthropic que no gestionan su propio prompt caching.
@@ -42,6 +47,8 @@ impl AppConfig {
             // y ese path se reenvía sin tocar.
             target_gemini_url: env::var("GEMINI_API_BASE")
                 .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string()),
+            target_codex_url: env::var("OXIDEGATE_CODEX_API_BASE")
+                .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex".to_string()),
             storage_dir,
             force_prompt_cache: env::var("OXIDEGATE_FORCE_CACHE")
                 .map(|v| v == "true" || v == "1")

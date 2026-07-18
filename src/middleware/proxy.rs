@@ -136,6 +136,15 @@ pub async fn handle_openai_responses(state: State<Arc<AppState>>, req: Request) 
     run(&provider::OPENAI_RESPONSES, state, req).await
 }
 
+/// `POST /v1/codex/responses` → Responses API de Codex (`pi`), reenviada al
+/// backend `chatgpt.com/backend-api/codex` en vez de `api.openai.com`. El
+/// body puede llegar comprimido (`content-encoding: zstd`, a veces gzip):
+/// [`provider::OPENAI_CODEX_RESPONSES`] mide la telemetría de contexto sobre
+/// el JSON lógico descomprimido, pero reenvía el body crudo tal cual.
+pub async fn handle_openai_codex_responses(state: State<Arc<AppState>>, req: Request) -> Response {
+    run(&provider::OPENAI_CODEX_RESPONSES, state, req).await
+}
+
 /// `POST /v1beta/models/{model}:{método}` → proveedor Google Gemini.
 pub async fn handle_gemini_route(state: State<Arc<AppState>>, req: Request) -> Response {
     run(&provider::GEMINI, state, req).await
@@ -164,10 +173,21 @@ async fn run(prov: &'static dyn Provider, State(state): State<Arc<AppState>>, re
         Err(e) => return plain_error(StatusCode::BAD_REQUEST, format!("body inválido: {e}")),
     };
 
+    // `Content-Encoding` del request entrante (p. ej. `zstd` de la Responses
+    // API de Codex): se guarda tal cual, sin normalizar mayúsculas acá (eso
+    // lo hace `provider::maybe_decompress` en el punto de uso). NUNCA se
+    // usa para decidir qué se reenvía: el body sigue viajando crudo abajo.
+    let content_encoding = parts
+        .headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+
     let incoming = Incoming {
         path,
         query,
         body: raw,
+        content_encoding,
     };
 
     // `prepare_us` mide EXCLUSIVAMENTE el trabajo propio del proxy dentro de

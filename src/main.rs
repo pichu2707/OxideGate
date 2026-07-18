@@ -63,6 +63,13 @@ async fn main() {
             "/v1/responses",
             post(middleware::proxy::handle_openai_responses),
         )
+        // Responses API de Codex (`pi`): mismo dialecto que la de arriba,
+        // pero reenviada a chatgpt.com/backend-api/codex en vez de
+        // api.openai.com. Body a veces comprimido en zstd.
+        .route(
+            "/v1/codex/responses",
+            post(middleware::proxy::handle_openai_codex_responses),
+        )
         // Ruta comodín de Gemini: captura `/v1beta/models/{model}:{método}`.
         .route(
             "/v1beta/*rest",
