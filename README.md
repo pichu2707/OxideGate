@@ -89,6 +89,7 @@ propio reporte, en vez de presentar un ahorro que no existe.
 | `POST /v1/chat/completions` | OpenAI (Chat Completions) |
 | `POST /v1/responses` | OpenAI (Responses API) |
 | `POST /v1beta/*` | Google Gemini |
+| `GET  /health` | Liveness (JSON). No toca la telemetría: responde mientras el proceso sirva |
 | `GET  /stats` | Agregación por modelo (JSON) |
 | `GET  /requests` | Últimas 200 peticiones individuales, en vivo (JSON) |
 
