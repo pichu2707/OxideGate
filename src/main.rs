@@ -75,6 +75,10 @@ async fn main() {
             "/v1beta/*rest",
             post(middleware::proxy::handle_gemini_route),
         )
+        // Liveness barata: no depende de AppState ni toma locks de
+        // telemetría. La usa el plugin de OpenCode para decidir si redirige
+        // tráfico de Codex hacia acá antes de tocar nada más pesado.
+        .route("/health", get(middleware::health::handle_health))
         // Agregación en vivo por (proveedor, modelo): qué optimizar ahora.
         .route("/stats", get(middleware::stats::handle_stats))
         // Detalle en vivo de los últimos requests individuales: qué request
@@ -86,6 +90,7 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
 
     println!("🛰️  Escuchando en http://{addr}");
+    println!("💚 Liveness en http://{addr}/health");
     println!("📊 Estadísticas en vivo por modelo en http://{addr}/stats");
     println!("🧾 Últimos requests en vivo en http://{addr}/requests");
     axum::serve(listener, app).await.unwrap();
