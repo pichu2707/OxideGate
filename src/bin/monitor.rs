@@ -396,6 +396,14 @@ struct RequestRow {
     /// del array, wrapper de Gemini, herramientas huérfanas sin `name`
     /// válido). Mismo contrato `None`/`Some` que `tools_by_server`.
     tools_overhead_bytes: Option<usize>,
+    /// Señal de carga diferida de herramientas (`tool_search`) del dialecto
+    /// OpenAI/Codex Responses (ver [`ToolSearchRow`] y, del lado del proxy,
+    /// `provider::ToolSearchSignal`). El diferenciador eager-vs-lazy por
+    /// cliente. `None` en Anthropic/Gemini/OpenAI-Chat (no aplica), si el body
+    /// no parseó, o si el proxy es de una build anterior a este campo y ni
+    /// manda la clave — mismo criterio que el resto de los campos opcionales.
+    /// Se renderiza con [`tsearch_cell`] en la vista Context.
+    tool_search: Option<ToolSearchRow>,
     /// Estado de cuota de suscripción Codex de esta petición puntual (ver
     /// [`CodexQuotaRow`]). `Some` únicamente si la petición se enrutó al
     /// backend de Codex vía OAuth y el upstream mandó al menos una cabecera
@@ -440,6 +448,25 @@ struct ToolServerRow {
     /// lo informó", `Some(0)` es "lo midió y dio cero" — nunca se colapsan
     /// entre sí. Ver `deferred_cell` para cómo se renderiza el tercer estado.
     deferred_tools: Option<usize>,
+}
+
+/// Señal de carga diferida de herramientas: espejo local y liviano de
+/// `provider::ToolSearchSignal` (ver ese tipo en el proxy para el contrato
+/// completo). Solo se MUESTRA (vía [`tsearch_cell`]), nunca se decide nada en
+/// base a sus valores. A diferencia de `deferred_tools` (que mide
+/// `defer_loading` en `tools[]`, siempre eager en este dialecto), esta señal
+/// mide los items `tool_search_*` de `input[]`: el único sitio donde el
+/// dialecto Responses/Codex expone qué se difirió de verdad.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct ToolSearchRow {
+    /// `true` si el body traía algún item `tool_search_call`/`tool_search_output`
+    /// en `input[]`: comportamiento LAZY confirmado en esta petición. `false`
+    /// en un request Responses/Codex sin esos items: EAGER confirmado.
+    used: bool,
+    /// Cuántas herramientas con `defer_loading: true` se cargaron vía
+    /// `tool_search_output`. `0` cuando `used == false`, y también posible con
+    /// `used == true` si solo hubo un `tool_search_call` sin output.
+    deferred_loaded: usize,
 }
 
 /// Espejo local de [`CodexQuota`](../../src/telemetry/codex_quota.rs) (12
@@ -1326,7 +1353,9 @@ enum RequestsView {
     Latency,
     /// Columnas del desglose de bytes de contexto (`tools`, `history`,
     /// `system`, `last_turn`, `other`, `total`, `tax%`, `B/tok`, `prep_us`,
-    /// `msgs`), más `cliente` (`RequestRow::client`). `B/tok` es
+    /// `msgs`), más `cliente` (`RequestRow::client`) y `tsearch`
+    /// (`RequestRow::tool_search`, el diferenciador eager-vs-lazy — ver
+    /// [`tsearch_cell`]). `B/tok` es
     /// [`bytes_per_token`]: bytes medidos por token de prompt, el
     /// denominador correcto según dialecto de `upstream`. `cliente` va ACÁ y
     /// no en `Latency` porque el caso que motiva es correlacionar un salto
@@ -2085,7 +2114,7 @@ fn requests_table_header<'a>(view: RequestsView) -> Row<'a> {
         RequestsView::Context => {
             vec![
                 "hora", "modelo", "msgs", "tools", "history", "system", "last_turn", "other", "total", "tax%", "B/tok", "prep_us",
-                "cliente", "outlier",
+                "cliente", "tsearch", "outlier",
             ]
         }
     };
@@ -2130,6 +2159,7 @@ fn requests_table_widths(view: RequestsView) -> Vec<Constraint> {
             Constraint::Length(7),
             Constraint::Length(8),
             Constraint::Length(18),
+            Constraint::Length(7),
             Constraint::Length(14),
         ],
     }
@@ -2172,7 +2202,27 @@ fn requests_row_cells(view: RequestsView, r: &RequestRow) -> Vec<String> {
             opt_fixed(bytes_per_token(r), 1),
             opt_u64(r.prepare_us),
             truncate_client(r.client.as_deref()),
+            tsearch_cell(r),
         ],
+    }
+}
+
+/// Celda `tsearch` (vista Context): el diferenciador eager-vs-lazy del
+/// dialecto Responses/Codex, leído de `RequestRow::tool_search`.
+///
+/// - `None` → `"-"`: el proxy no lo informó (dialecto donde no aplica —
+///   Anthropic/Gemini/OpenAI-Chat—, body que no parseó, o build anterior al
+///   campo). Mismo criterio de `"-"` que el resto de las celdas opcionales.
+/// - `Some { used: false, .. }` → `"eager"`: petición Responses/Codex medida
+///   sin carga diferida este turno.
+/// - `Some { used: true, deferred_loaded }` → `"lazy:N"`: el cliente ejercitó
+///   la búsqueda diferida; `N` es cuántas tools cargó (`0` si solo hubo un
+///   `tool_search_call` sin output).
+fn tsearch_cell(r: &RequestRow) -> String {
+    match &r.tool_search {
+        None => "-".to_string(),
+        Some(ts) if ts.used => format!("lazy:{}", ts.deferred_loaded),
+        Some(_) => "eager".to_string(),
     }
 }
 
@@ -2406,14 +2456,14 @@ fn print_context_table(rows: &[RequestRow]) {
     let outliers = classify_outliers(rows);
 
     println!(
-        "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<18} {:<14}",
+        "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<18} {:<7} {:<14}",
         "HORA", "MODELO", "msgs", "tools", "history", "system", "last_turn", "other", "total", "tax%", "B/tok", "prep_us", "cliente",
-        "outlier"
+        "tsearch", "outlier"
     );
     for (i, r) in rows.iter().enumerate().rev() {
         let cells = requests_row_cells(RequestsView::Context, r);
         println!(
-            "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<18} {:<14}",
+            "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<18} {:<7} {:<14}",
             cells[0],
             cells[1],
             cells[2],
@@ -2427,6 +2477,7 @@ fn print_context_table(rows: &[RequestRow]) {
             cells[10],
             cells[11],
             cells[12],
+            cells[13],
             marker_text(&outliers[i]),
         );
     }
@@ -2441,6 +2492,9 @@ fn print_context_table(rows: &[RequestRow]) {
     );
     println!(
         "nota: cliente = User-Agent crudo (truncado, ver docs/telemetry-per-request.md)"
+    );
+    println!(
+        "nota: tsearch = carga diferida de tools (dialecto Responses/Codex): eager = sin diferido este turno; lazy:N = cargó N tools vía tool_search; - = no aplica (ver docs/telemetry-per-request.md §4.3)"
     );
 }
 
@@ -2730,6 +2784,7 @@ mod tests {
             prepare_us: Some(850),
             tools_by_server: None,
             tools_overhead_bytes: None,
+            tool_search: None,
             codex_quota: None,
         }
     }
@@ -3145,6 +3200,108 @@ mod tests {
     #[test]
     fn truncate_client_no_trunca_si_entra() {
         assert_eq!(truncate_client(Some("curl/8.0")), "curl/8.0");
+    }
+
+    /// La columna `tsearch` (índice 13) de la vista Context surfacea la señal
+    /// eager-vs-lazy: `used: true` con `deferred_loaded: 3` ⇒ `"lazy:3"`.
+    #[test]
+    fn requests_row_cells_context_tsearch_lazy() {
+        let mut r = req("codex", "gpt-5.5", 200, Some(10.0), 100.0, Some(50), Some(10));
+        r.tool_search = Some(ToolSearchRow {
+            used: true,
+            deferred_loaded: 3,
+        });
+
+        let cells = requests_row_cells(RequestsView::Context, &r);
+
+        assert_eq!(cells[13], "lazy:3");
+    }
+
+    /// `used: false` (petición Responses/Codex medida sin diferido este turno)
+    /// ⇒ `"eager"` — EAGER confirmado, no ausencia de dato.
+    #[test]
+    fn tsearch_cell_eager_cuando_used_false() {
+        let mut r = req("codex", "gpt-5.5", 200, Some(10.0), 100.0, Some(50), Some(10));
+        r.tool_search = Some(ToolSearchRow {
+            used: false,
+            deferred_loaded: 0,
+        });
+
+        assert_eq!(tsearch_cell(&r), "eager");
+    }
+
+    /// `lazy:0` es un estado válido y distinto de `eager`: hubo un
+    /// `tool_search_call` (mecanismo lazy ejercitado) que no llegó a cargar
+    /// ninguna tool.
+    #[test]
+    fn tsearch_cell_lazy_cero_no_es_eager() {
+        let mut r = req("codex", "gpt-5.5", 200, Some(10.0), 100.0, Some(50), Some(10));
+        r.tool_search = Some(ToolSearchRow {
+            used: true,
+            deferred_loaded: 0,
+        });
+
+        assert_eq!(tsearch_cell(&r), "lazy:0");
+    }
+
+    /// `tool_search: None` (dialecto donde no aplica, o proxy viejo) ⇒ `"-"`,
+    /// nunca string vacío ni un valor inventado.
+    #[test]
+    fn tsearch_cell_none_es_guion() {
+        let mut r = req("anthropic", "claude-opus-4", 200, Some(10.0), 100.0, Some(50), Some(10));
+        r.tool_search = None;
+
+        assert_eq!(tsearch_cell(&r), "-");
+    }
+
+    /// Un proxy de build anterior a este campo manda el JSON de `/requests`
+    /// SIN la clave `tool_search`: debe deserializar a `None` (serde trata un
+    /// `Option` ausente como `None`), no romper el parseo de la fila entera.
+    #[test]
+    fn request_row_deserializa_tool_search_ausente_como_none() {
+        let json = r#"{
+            "timestamp": "2026-07-24T00:00:00Z",
+            "route": "/v1/codex/responses",
+            "upstream": "codex",
+            "model": "gpt-5.5",
+            "stream": true,
+            "status": 200,
+            "cache_control_forced": false,
+            "total_ms": 100.0
+        }"#;
+
+        let row: RequestRow = serde_json::from_str(json).unwrap();
+
+        assert_eq!(row.tool_search, None);
+        assert_eq!(tsearch_cell(&row), "-");
+    }
+
+    /// Con la clave presente (proxy actual, dialecto Responses/Codex lazy), se
+    /// deserializa a `Some` con `used`/`deferred_loaded` exactos.
+    #[test]
+    fn request_row_deserializa_tool_search_presente() {
+        let json = r#"{
+            "timestamp": "2026-07-24T00:00:00Z",
+            "route": "/v1/codex/responses",
+            "upstream": "codex",
+            "model": "gpt-5.5",
+            "stream": true,
+            "status": 200,
+            "cache_control_forced": false,
+            "total_ms": 100.0,
+            "tool_search": {"used": true, "deferred_loaded": 7}
+        }"#;
+
+        let row: RequestRow = serde_json::from_str(json).unwrap();
+
+        assert_eq!(
+            row.tool_search,
+            Some(ToolSearchRow {
+                used: true,
+                deferred_loaded: 7
+            })
+        );
+        assert_eq!(tsearch_cell(&row), "lazy:7");
     }
 
     #[test]
