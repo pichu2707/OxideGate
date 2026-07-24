@@ -211,6 +211,21 @@ pub struct RequestMetric {
     /// vuelve a sumar bytes ni toca `tools_by_server`.
     pub tool_search: Option<ToolSearchSignal>,
 
+    /// Señal de honestidad sobre la ATRIBUCIÓN de `tools_by_server` en el
+    /// dialecto Responses/Codex (ver `provider::Provider::tools_flattened`).
+    /// Complementa a `tools_by_server`: avisa de cuándo su cubo `(native)` NO
+    /// es verificable porque el cliente (`pi`/`opencode`) no usa el
+    /// namespacing `mcp__`.
+    ///
+    /// - `None`: dialecto donde no aplica (Anthropic/Gemini/OpenAI-Chat, cuyo
+    ///   `mcp__` es fiable) o body sin herramientas.
+    /// - `Some(false)`: hay tools Y al menos una usa `mcp__` — el `(native)`
+    ///   de esta fila es de fiar.
+    /// - `Some(true)`: hay tools pero NINGUNA usa `mcp__` — el `(native)`
+    ///   puede ocultar MCP aplanado (medido en `pi`/`opencode`). Observación
+    ///   estructural, NUNCA una atribución inventada: no nombra servidores.
+    pub tools_flattened: Option<bool>,
+
     /// Microsegundos que `middleware::proxy::run` pasó DENTRO de
     /// `Provider::prepare` (parseo del body + `decompose` + mutación
     /// opcional del body). `u64` en MICROsegundos, no `f64` en milisegundos:
@@ -467,6 +482,7 @@ mod tests {
             requested_speed: None,
             served_speed: None,
             tool_search: None,
+            tools_flattened: None,
             status: 200,
             ttft_ms: None,
             total_ms: 0.0,

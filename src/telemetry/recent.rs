@@ -160,6 +160,12 @@ pub struct RecentRequest {
     /// invariante de privacidad del módulo: solo lleva un booleano y un conteo,
     /// jamás nombres de herramienta ni fragmentos de su esquema.
     pub tool_search: Option<ToolSearchSignal>,
+    /// Señal de honestidad sobre la atribución de `tools_by_server` (ver
+    /// `telemetry::logger::RequestMetric::tools_flattened`). `Some(true)` avisa
+    /// de que el cubo `(native)` de esta fila puede ocultar MCP aplanado
+    /// (`pi`/`opencode`). No compromete la invariante de privacidad: es solo un
+    /// booleano estructural, jamás nombres de herramienta ni de servidor.
+    pub tools_flattened: Option<bool>,
     /// Microsegundos que el proxy pasó dentro de `Provider::prepare`
     /// (parseo, `decompose` y mutación opcional del body). No incluye la
     /// lectura del body del socket ni el round-trip upstream.
@@ -221,6 +227,7 @@ impl From<&RequestMetric> for RecentRequest {
             tools_by_server: m.tools_by_server.clone(),
             tools_overhead_bytes: m.tools_overhead_bytes,
             tool_search: m.tool_search.clone(),
+            tools_flattened: m.tools_flattened,
             prepare_us: m.prepare_us,
             codex_quota: m.codex_quota.clone(),
             session: m.session.clone(),
@@ -312,6 +319,7 @@ mod tests {
             }]),
             tools_overhead_bytes: Some(4),
             tool_search: None,
+            tools_flattened: None,
             prepare_us: 42,
             codex_quota: None,
             session: SessionAttribution {
@@ -712,6 +720,40 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["tool_search"]["used"], true);
         assert_eq!(parsed["tool_search"]["deferred_loaded"], 3);
+    }
+
+    /// La señal `tools_flattened` (`Some(true)` = `(native)` no verificable en
+    /// pi/opencode) debe proyectarse a `RecentRequest` y sobrevivir el
+    /// round-trip serde — el dato que `oxidegate-lens` lee para no confundir el
+    /// cubo `(native)` aplanado con tools genuinamente nativas.
+    #[test]
+    fn round_trip_serde_con_tools_flattened_true() {
+        let mut m = base_metric("t1");
+        m.tools_flattened = Some(true);
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+        let row = &recent.snapshot()[0];
+        assert_eq!(row.tools_flattened, Some(true), "la proyección copia el campo");
+
+        let json = serde_json::to_string(row).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["tools_flattened"], true);
+    }
+
+    /// Con `tools_flattened` ausente (`None`) debe serializar a `null`, nunca
+    /// desaparecer del JSON ni fallar.
+    #[test]
+    fn round_trip_serde_con_tools_flattened_none() {
+        let mut m = base_metric("t1");
+        m.tools_flattened = None;
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+        let row = &recent.snapshot()[0];
+        let json = serde_json::to_string(row).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["tools_flattened"].is_null());
     }
 
     /// Con `tool_search` ausente (`None`: el caso de Anthropic/Gemini/Chat, o

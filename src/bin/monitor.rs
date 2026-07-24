@@ -404,6 +404,13 @@ struct RequestRow {
     /// manda la clave — mismo criterio que el resto de los campos opcionales.
     /// Se renderiza con [`tsearch_cell`] en la vista Context.
     tool_search: Option<ToolSearchRow>,
+    /// Señal de honestidad sobre la atribución de `tools_by_server` (espejo de
+    /// `telemetry::logger::RequestMetric::tools_flattened`). `Some(true)` avisa
+    /// de que el cubo `(native)` de esta fila puede ocultar MCP aplanado
+    /// (`pi`/`opencode`, que no usan `mcp__`); `Some(false)` = `(native)`
+    /// verificado; `None` = no aplica o proxy viejo. Se renderiza con
+    /// [`flattened_cell`] en la vista Context.
+    tools_flattened: Option<bool>,
     /// Estado de cuota de suscripción Codex de esta petición puntual (ver
     /// [`CodexQuotaRow`]). `Some` únicamente si la petición se enrutó al
     /// backend de Codex vía OAuth y el upstream mandó al menos una cabecera
@@ -1353,9 +1360,10 @@ enum RequestsView {
     Latency,
     /// Columnas del desglose de bytes de contexto (`tools`, `history`,
     /// `system`, `last_turn`, `other`, `total`, `tax%`, `B/tok`, `prep_us`,
-    /// `msgs`), más `cliente` (`RequestRow::client`) y `tsearch`
+    /// `msgs`), más `cliente` (`RequestRow::client`), `tsearch`
     /// (`RequestRow::tool_search`, el diferenciador eager-vs-lazy — ver
-    /// [`tsearch_cell`]). `B/tok` es
+    /// [`tsearch_cell`]) y `flat` (`RequestRow::tools_flattened`, honestidad
+    /// del cubo `(native)` — ver [`flattened_cell`]). `B/tok` es
     /// [`bytes_per_token`]: bytes medidos por token de prompt, el
     /// denominador correcto según dialecto de `upstream`. `cliente` va ACÁ y
     /// no en `Latency` porque el caso que motiva es correlacionar un salto
@@ -2114,7 +2122,7 @@ fn requests_table_header<'a>(view: RequestsView) -> Row<'a> {
         RequestsView::Context => {
             vec![
                 "hora", "modelo", "msgs", "tools", "history", "system", "last_turn", "other", "total", "tax%", "B/tok", "prep_us",
-                "cliente", "tsearch", "outlier",
+                "cliente", "tsearch", "flat", "outlier",
             ]
         }
     };
@@ -2160,6 +2168,7 @@ fn requests_table_widths(view: RequestsView) -> Vec<Constraint> {
             Constraint::Length(8),
             Constraint::Length(18),
             Constraint::Length(7),
+            Constraint::Length(5),
             Constraint::Length(14),
         ],
     }
@@ -2203,6 +2212,7 @@ fn requests_row_cells(view: RequestsView, r: &RequestRow) -> Vec<String> {
             opt_u64(r.prepare_us),
             truncate_client(r.client.as_deref()),
             tsearch_cell(r),
+            flattened_cell(r),
         ],
     }
 }
@@ -2223,6 +2233,23 @@ fn tsearch_cell(r: &RequestRow) -> String {
         None => "-".to_string(),
         Some(ts) if ts.used => format!("lazy:{}", ts.deferred_loaded),
         Some(_) => "eager".to_string(),
+    }
+}
+
+/// Celda `flat` (vista Context): honestidad de la atribución de tools, leída de
+/// `RequestRow::tools_flattened`.
+///
+/// - `None` → `"-"`: no aplica (Anthropic/Gemini/Chat usan `mcp__` fiable) o
+///   proxy anterior al campo.
+/// - `Some(true)` → `"yes"`: el `(native)` de esta fila puede ocultar MCP
+///   aplanado — `pi`/`opencode` no usan `mcp__` (medido).
+/// - `Some(false)` → `"no"`: hay tools `mcp__` namespaceadas, el `(native)` es
+///   de fiar.
+fn flattened_cell(r: &RequestRow) -> String {
+    match r.tools_flattened {
+        None => "-".to_string(),
+        Some(true) => "yes".to_string(),
+        Some(false) => "no".to_string(),
     }
 }
 
@@ -2456,14 +2483,14 @@ fn print_context_table(rows: &[RequestRow]) {
     let outliers = classify_outliers(rows);
 
     println!(
-        "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<18} {:<7} {:<14}",
+        "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<18} {:<7} {:<5} {:<14}",
         "HORA", "MODELO", "msgs", "tools", "history", "system", "last_turn", "other", "total", "tax%", "B/tok", "prep_us", "cliente",
-        "tsearch", "outlier"
+        "tsearch", "flat", "outlier"
     );
     for (i, r) in rows.iter().enumerate().rev() {
         let cells = requests_row_cells(RequestsView::Context, r);
         println!(
-            "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<18} {:<7} {:<14}",
+            "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<18} {:<7} {:<5} {:<14}",
             cells[0],
             cells[1],
             cells[2],
@@ -2478,6 +2505,7 @@ fn print_context_table(rows: &[RequestRow]) {
             cells[11],
             cells[12],
             cells[13],
+            cells[14],
             marker_text(&outliers[i]),
         );
     }
@@ -2495,6 +2523,9 @@ fn print_context_table(rows: &[RequestRow]) {
     );
     println!(
         "nota: tsearch = carga diferida de tools (dialecto Responses/Codex): eager = sin diferido este turno; lazy:N = cargó N tools vía tool_search; - = no aplica (ver docs/telemetry-per-request.md §4.3)"
+    );
+    println!(
+        "nota: flat = honestidad del cubo (native): yes = el cliente NO usa mcp__ (pi/opencode), el (native) puede ocultar MCP aplanado; no = (native) verificado; - = no aplica (ver docs/telemetry-per-request.md §4.4)"
     );
 }
 
@@ -2785,6 +2816,7 @@ mod tests {
             tools_by_server: None,
             tools_overhead_bytes: None,
             tool_search: None,
+            tools_flattened: None,
             codex_quota: None,
         }
     }
@@ -3252,6 +3284,74 @@ mod tests {
         r.tool_search = None;
 
         assert_eq!(tsearch_cell(&r), "-");
+    }
+
+    /// La columna `flat` (índice 14) de la vista Context surfacea
+    /// `tools_flattened`: `Some(true)` (pi/opencode, `(native)` no verificable)
+    /// ⇒ `"yes"`.
+    #[test]
+    fn requests_row_cells_context_flat_yes() {
+        let mut r = req("codex", "gpt-5.5", 200, Some(10.0), 100.0, Some(50), Some(10));
+        r.tools_flattened = Some(true);
+
+        let cells = requests_row_cells(RequestsView::Context, &r);
+
+        assert_eq!(cells[14], "yes");
+    }
+
+    /// `Some(false)` (hay tools `mcp__`, `(native)` de fiar) ⇒ `"no"`; `None`
+    /// (no aplica / proxy viejo) ⇒ `"-"`. Nunca string vacío.
+    #[test]
+    fn flattened_cell_no_y_guion() {
+        let mut r = req("codex", "gpt-5.5", 200, Some(10.0), 100.0, Some(50), Some(10));
+        r.tools_flattened = Some(false);
+        assert_eq!(flattened_cell(&r), "no");
+        r.tools_flattened = None;
+        assert_eq!(flattened_cell(&r), "-");
+    }
+
+    /// Un proxy anterior al campo manda el JSON de `/requests` SIN la clave
+    /// `tools_flattened`: debe deserializar a `None` (Option ausente en serde),
+    /// no romper el parseo de la fila.
+    #[test]
+    fn request_row_deserializa_tools_flattened_ausente_como_none() {
+        let json = r#"{
+            "timestamp": "2026-07-24T00:00:00Z",
+            "route": "/v1/codex/responses",
+            "upstream": "codex",
+            "model": "gpt-5.5",
+            "stream": true,
+            "status": 200,
+            "cache_control_forced": false,
+            "total_ms": 100.0
+        }"#;
+
+        let row: RequestRow = serde_json::from_str(json).unwrap();
+
+        assert_eq!(row.tools_flattened, None);
+        assert_eq!(flattened_cell(&row), "-");
+    }
+
+    /// Con la clave presente (proxy actual, opencode aplanado) se deserializa a
+    /// `Some(true)` y se renderiza `"yes"`.
+    #[test]
+    fn request_row_deserializa_tools_flattened_presente() {
+        let json = r#"{
+            "timestamp": "2026-07-24T00:00:00Z",
+            "route": "/v1/codex/responses",
+            "upstream": "codex",
+            "model": "gpt-5.5",
+            "stream": true,
+            "status": 200,
+            "cache_control_forced": false,
+            "total_ms": 100.0,
+            "tools_flattened": true
+        }"#;
+
+        let row: RequestRow = serde_json::from_str(json).unwrap();
+
+        assert_eq!(row.tools_flattened, Some(true));
+        assert_eq!(flattened_cell(&row), "yes");
     }
 
     /// Un proxy de build anterior a este campo manda el JSON de `/requests`

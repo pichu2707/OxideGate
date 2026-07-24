@@ -106,9 +106,9 @@ Esto mirroriza la misma invariante que ya documenta
 haya o no autenticación de por medio.
 
 **Esta invariante cubre huellas de prompt, no el campo `client`.** El campo
-`client` (§4, §4.4) es un caso aparte: no es una huella de prompt, pero
+`client` (§4, §4.5) es un caso aparte: no es una huella de prompt, pero
 tampoco es un dato que el proxy calcule — es el `User-Agent` del cliente,
-reenviado crudo. Ver §4.4 antes de exponer este endpoint fuera de
+reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 `127.0.0.1` o de compartir `telemetry.jsonl`.
 
 ---
@@ -122,7 +122,7 @@ reenviado crudo. Ver §4.4 antes de exponer este endpoint fuera de
 | `upstream` | Proveedor destino (`anthropic`, `openai`, …) | Junto con `model`, la clave de agrupación para comparar contra pares |
 | `model` | Modelo solicitado, o `null` si no venía en el body | Un `null` sostenido en el tiempo suele indicar clientes mal configurados |
 | `stream` | `true` si el cliente pidió SSE | Sin streaming, `ttft_ms` no aplica — ver `total_ms` en su lugar |
-| `client` | `User-Agent` del request entrante, CRUDO (sin normalizar), topeado a 200 caracteres. `null` si el header no vino o no era UTF-8 válido | Distingue un harness que YA difiere tools MCP por su cuenta (Claude Code sin caer al fallback de carga upfront) de uno genuinamente eager — ver `docs/optimizer-tool-search.md` §3. **Léase §4.4 antes de exponer este campo**: a diferencia del resto de esta tabla, es contenido controlado por el cliente, no una propiedad que el proxy calcula |
+| `client` | `User-Agent` del request entrante, CRUDO (sin normalizar), topeado a 200 caracteres. `null` si el header no vino o no era UTF-8 válido | Distingue un harness que YA difiere tools MCP por su cuenta (Claude Code sin caer al fallback de carga upfront) de uno genuinamente eager — ver `docs/optimizer-tool-search.md` §3. **Léase §4.5 antes de exponer este campo**: a diferencia del resto de esta tabla, es contenido controlado por el cliente, no una propiedad que el proxy calcula |
 | `status` | Código HTTP devuelto al cliente | `>= 400` es la señal de error más barata de todas: no necesita comparación con nada |
 | `input_tokens` / `output_tokens` | Tokens exactos reportados por el proveedor | `null` si el proveedor no los reportó (p. ej. request fallido antes de leer `usage`) |
 | `cache_read_tokens` / `cache_write_tokens` | Tokens servidos o escritos a caché | Una fila con `cache_read_tokens` en `0`/`null` en medio de una conversación larga que sí cachea es un miss caro y aislado |
@@ -142,7 +142,8 @@ reenviado crudo. Ver §4.4 antes de exponer este endpoint fuera de
 | `tools_by_server` | Desglose de `context_tools_bytes` por servidor MCP declarante: `[{server, kind, tools, bytes, deferred_tools}, …]`, ordenado por `bytes` descendente | `null` si el body no parseó como objeto (o build anterior a este campo); `[]` si SÍ parseó pero no declaraba `tools` — son estados DISTINTOS, ver §4.2. `deferred_tools` (por elemento) es la fuente de verdad POR SERVIDOR de cuánto está diferido, ver §4.2 |
 | `tools_overhead_bytes` | Bytes de `tools` no atribuidos a ningún servidor (brackets/comas del array, wrapper de Gemini, herramientas huérfanas) | `null` en los mismos casos que `tools_by_server` es `null`; `sum(tools_by_server[].bytes) + tools_overhead_bytes == context_tools_bytes` siempre que ambos sean no-nulos |
 | `tool_search` | Señal de carga diferida de herramientas del dialecto Responses/Codex: `{used, deferred_loaded}`, o `null`. `used: false` ⇒ EAGER confirmado este turno; `used: true` ⇒ LAZY (el cliente cargó tools a mitad de sesión) | `null` en Anthropic/Gemini/OpenAI-Chat (no aplica) o si el body no parseó. Es el diferenciador eager-vs-lazy por cliente que `tools_by_server` NO puede dar — ver §4.3 |
-| `session` | Sesión resuelta por precedencia de cabeceras del request: `{source, key}`. Nunca `null` — la peor rama es un fallback honesto (`source: "unattributed"`), no una ausencia | Ver §4.5 para la tabla de precedencia completa y cómo estampar el header desde cada harness |
+| `tools_flattened` | Honestidad de la atribución de `tools_by_server`: `true` ⇒ el cliente NO usa el namespacing `mcp__`, así que su cubo `(native)` puede ocultar MCP aplanado; `false` ⇒ hay tools `mcp__`, el `(native)` es de fiar; `null` ⇒ no aplica (Anthropic/Gemini/Chat) o sin tools | Solo dialecto Responses/Codex. `pi` manda nombres crudos y `opencode` usa `<server>_<tool>` (ambiguo) — ninguno con `mcp__`. Es una advertencia estructural, NUNCA una atribución inventada: no nombra servidores. Ver §4.4 |
+| `session` | Sesión resuelta por precedencia de cabeceras del request: `{source, key}`. Nunca `null` — la peor rama es un fallback honesto (`source: "unattributed"`), no una ausencia | Ver §4.6 para la tabla de precedencia completa y cómo estampar el header desde cada harness |
 
 Ninguno de los campos de latencia/coste/identidad es nuevo: todos ya existían
 en `RequestMetric` (Nivel 1). Los campos `context_*`, `prepare_us`,
@@ -293,7 +294,48 @@ de "una medición, un dueño" que el resto de la fila.
 
 ---
 
-### 4.4. `client`: el único campo de esta fila que NO es una medición del proxy
+### 4.4. `tools_flattened`: cuándo NO fiarse del cubo `(native)`
+
+`tools_by_server` (§4.2) atribuye cada herramienta a su servidor partiendo el
+namespacing `mcp__<server>__<tool>` (separador `__`, **inequívoco**). Claude
+Code lo usa, así que su cubo `(native)` es de fiar: una tool sin `mcp__` es
+genuinamente nativa.
+
+Pero **los clientes del dialecto Responses/Codex no usan `mcp__`** — medido en
+tráfico real:
+
+- **`opencode`** prefija sus tools MCP como `<server>_<tool>`:
+  `context7_query-docs`, `engram_mem_search`. El separador es UN solo `_`,
+  **ambiguo**: colisiona con nombres nativos (`apply_patch`, `delegation_list`,
+  `read_mcp_resource`). No hay forma fiable de partirlo, y OxideGate —como
+  proxy— no conoce la lista de servidores MCP del cliente para desambiguar.
+- **`pi`** manda los nombres **crudos**, sin prefijo alguno (`read`, `bash`, …).
+
+Resultado: TODAS sus tools caen en `(native)`, ocultando el peso MCP real (en
+una petición medida de `opencode`, 20 de 36 tools eran de `context7`/`engram`
+pero el desglose las daba como nativas).
+
+`tools_flattened` **avisa de esa opacidad sin fabricar una atribución que no se
+puede probar**:
+
+| Valor | Significado |
+|---|---|
+| `null` | No aplica: Anthropic/Gemini/OpenAI-Chat (su `mcp__` es fiable), o la petición no declaró `tools` |
+| `false` | Hay tools Y al menos una usa `mcp__` — el `(native)` de esta fila es de fiar |
+| `true` | Hay tools pero NINGUNA usa `mcp__` — el `(native)` **no es verificable**: puede ocultar MCP aplanado |
+
+**Es una observación estructural, no una acusación.** `true` afirma exactamente
+el hecho comprobable —"ninguna tool usa el separador `mcp__`"— y NADA más: no
+nombra `context7` ni `engram`, no inventa cubos, no adivina. Un consumidor
+(`oxidegate-lens`) que lea `tools_flattened: true` debe tratar el `(native)` de
+esa fila como "peso de herramientas sin atribuir", no como "herramientas
+nativas". El porqué de no intentar la atribución por heurística de nombres está
+en el issue #5: para una herramienta de honestidad, misatribuir (`delegation`
+como si fuera un servidor MCP) es peor que un `(native)` opaco pero honesto.
+
+---
+
+### 4.5. `client`: el único campo de esta fila que NO es una medición del proxy
 
 Todo lo demás en esta tabla es algo que OxideGate **calculó** a partir del
 body (bytes, tokens, latencia) o **decidió** (`cache_control_forced`).
@@ -329,7 +371,7 @@ host donde corre el proxy debería saberlo antes de hacerlo, no después.
 
 ---
 
-### 4.5. `session`: la clave de atribución por sesión
+### 4.6. `session`: la clave de atribución por sesión
 
 `GET /stats` agrega por `(proveedor, modelo)`; ninguna vista, hasta ahora,
 sabía a qué SESIÓN pertenecía cada petición — solo a qué TIPO de harness

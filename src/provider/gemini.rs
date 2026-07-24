@@ -89,6 +89,8 @@ impl Provider for Gemini {
             // El mecanismo `tool_search` (carga diferida vía `input[]`) es
             // exclusivo del dialecto Responses/Codex: Gemini no lo tiene.
             tool_search: None,
+            // Gemini no aplana el namespacing MCP como pi/opencode: `None`.
+            tools_flattened: None,
         }
     }
 

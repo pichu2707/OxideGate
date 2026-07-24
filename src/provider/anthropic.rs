@@ -105,6 +105,9 @@ impl Provider for Anthropic {
             // El mecanismo `tool_search` (carga diferida vía `input[]`) es
             // exclusivo del dialecto Responses/Codex: Anthropic no lo tiene.
             tool_search: None,
+            // Anthropic usa el namespacing `mcp__` fiable (Claude Code): su
+            // `(native)` no necesita la advertencia de aplanado.
+            tools_flattened: None,
         }
     }
 

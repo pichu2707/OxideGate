@@ -14,9 +14,10 @@
 //! (`output_config.effort` y `speed` a nivel raíz), así que acá quedan
 //! siempre en `None` a propósito (ver la nota en cada `prepare`).
 use super::{
-    array_field, fingerprint, maybe_decompress, measure_key, measure_other, measure_value,
-    model_and_stream_from_value, parse_body, split_history_and_last_turn, tools_overhead_bytes,
-    ContextBreakdown, Incoming, Outgoing, Provider, ToolSearchSignal, ToolServerBytes, Usage,
+    array_field, classify, fingerprint, maybe_decompress, measure_key, measure_other,
+    measure_value, model_and_stream_from_value, parse_body, split_history_and_last_turn,
+    tools_overhead_bytes, ContextBreakdown, Incoming, Outgoing, Provider, ToolSearchSignal,
+    ToolServerBytes, ToolServerKind, Usage,
 };
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -115,6 +116,9 @@ impl Provider for OpenAiChat {
             // exclusivo del dialecto Responses/Codex: Chat Completions no lo
             // tiene. Mismo criterio de `None` explícito que arriba.
             tool_search: None,
+            // El aplanado del namespacing MCP se mide en el dialecto Responses/
+            // Codex (pi/opencode), no en Chat Completions: `None`.
+            tools_flattened: None,
         }
     }
 
@@ -254,6 +258,7 @@ impl Provider for OpenAiResponses {
         // `None` solo si el body no parseó (`parsed` es `None`), coherente con
         // el contrato de `Outgoing::tool_search`.
         let tool_search = parsed.as_ref().and_then(|v| self.tool_search(v));
+        let tools_flattened = parsed.as_ref().and_then(|v| self.tools_flattened(v));
 
         Outgoing {
             url: format!("{}/responses", cfg.target_openai_url),
@@ -275,6 +280,7 @@ impl Provider for OpenAiResponses {
             requested_effort: None,
             requested_speed: None,
             tool_search,
+            tools_flattened,
         }
     }
 
@@ -395,6 +401,27 @@ impl Provider for OpenAiResponses {
             deferred_loaded,
         })
     }
+
+    /// Mide si el `(native)` de esta petición es verificable (ver
+    /// [`Outgoing::tools_flattened`] y el default del trait para el contrato).
+    ///
+    /// Reutiliza [`Self::tool_entries`] (mismo `tools[]` que alimenta
+    /// `tools_by_server`) y [`super::classify`]: `None` si no hay tools;
+    /// `Some(false)` si alguna clasifica como [`super::ToolServerKind::Mcp`]
+    /// (namespacing `mcp__` presente y fiable); `Some(true)` si hay tools pero
+    /// ninguna — el caso medido de `pi`/`opencode`, cuyo `(native)` puede
+    /// ocultar MCP aplanado. NO inspecciona nombres crudos ni intenta adivinar
+    /// servidores: solo comprueba la PRESENCIA del separador inequívoco `mcp__`.
+    fn tools_flattened(&self, body: &Value) -> Option<bool> {
+        let entries = self.tool_entries(body)?;
+        if entries.is_empty() {
+            return None;
+        }
+        let any_mcp = entries
+            .iter()
+            .any(|(name, _)| matches!(classify(name).0, ToolServerKind::Mcp));
+        Some(!any_mcp)
+    }
 }
 
 impl Provider for OpenAiCodexResponses {
@@ -446,6 +473,7 @@ impl Provider for OpenAiCodexResponses {
         // Mismo contrato que `OpenAiResponses::prepare`: medido sobre el JSON
         // LÓGICO descomprimido, `None` solo si el body no parseó.
         let tool_search = parsed.as_ref().and_then(|v| self.tool_search(v));
+        let tools_flattened = parsed.as_ref().and_then(|v| self.tools_flattened(v));
 
         Outgoing {
             url: format!("{}/responses", cfg.target_codex_url),
@@ -466,6 +494,7 @@ impl Provider for OpenAiCodexResponses {
             requested_effort: None,
             requested_speed: None,
             tool_search,
+            tools_flattened,
         }
     }
 
@@ -495,6 +524,13 @@ impl Provider for OpenAiCodexResponses {
     /// y quedaría ciego a la carga diferida justo del cliente que más la usa.
     fn tool_search(&self, body: &Value) -> Option<ToolSearchSignal> {
         OPENAI_RESPONSES.tool_search(body)
+    }
+
+    /// DELEGA en [`OPENAI_RESPONSES::tools_flattened`]: `pi` es el cliente que
+    /// motiva esta señal (nombres de tool crudos, sin `mcp__`), así que la
+    /// medición es idéntica a la del dialecto Responses base.
+    fn tools_flattened(&self, body: &Value) -> Option<bool> {
+        OPENAI_RESPONSES.tools_flattened(body)
     }
 
     /// DELEGA en [`OPENAI_RESPONSES::tools_by_server`] en vez del default del
@@ -1352,6 +1388,119 @@ mod tests {
         let out = OPENAI_RESPONSES.prepare(incoming, &cfg);
 
         assert_eq!(out.tool_search, None);
+    }
+
+    // -----------------------------------------------------------------
+    // tools_flattened — honestidad de la atribución de tools_by_server.
+    // Medido en tráfico real: pi manda nombres crudos (read, bash…) y opencode
+    // usa `<server>_<tool>` (context7_query-docs, engram_mem_search) con `_`
+    // AMBIGUO — ninguno usa el `mcp__` inequívoco. Ver ToolSearchSignal doc.
+    // -----------------------------------------------------------------
+
+    /// Reproduce el set REAL medido de opencode: nombres nativos (`read`,
+    /// `apply_patch`) y MCP aplanados con `_` (`context7_query-docs`,
+    /// `engram_mem_search`), NINGUNO con `mcp__`. `(native)` no verificable ⇒
+    /// `Some(true)`.
+    #[test]
+    fn responses_tools_flattened_true_cuando_ninguna_usa_mcp() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "gpt-5.5",
+                "tools": [
+                    {"type": "function", "name": "read", "parameters": {}},
+                    {"type": "function", "name": "apply_patch", "parameters": {}},
+                    {"type": "function", "name": "context7_query-docs", "parameters": {}},
+                    {"type": "function", "name": "engram_mem_search", "parameters": {}}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(OPENAI_RESPONSES.tools_flattened(&body), Some(true));
+    }
+
+    /// Si AL MENOS una tool usa el namespacing inequívoco `mcp__server__tool`,
+    /// el `(native)` es de fiar ⇒ `Some(false)`. (Poco común en este dialecto,
+    /// pero el contrato debe ser honesto si aparece.)
+    #[test]
+    fn responses_tools_flattened_false_cuando_alguna_usa_mcp() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "gpt-5.5",
+                "tools": [
+                    {"type": "function", "name": "read", "parameters": {}},
+                    {"type": "function", "name": "mcp__claude_ai_Gmail__search", "parameters": {}}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(OPENAI_RESPONSES.tools_flattened(&body), Some(false));
+    }
+
+    /// Sin `tools` (clave ausente) ⇒ `None`: no hay nada que juzgar, no una
+    /// afirmación de "verificable" ni de "aplanado".
+    #[test]
+    fn responses_tools_flattened_none_sin_tools() {
+        let body: Value =
+            serde_json::from_str(r#"{"model": "gpt-5.5", "input": "hola"}"#).unwrap();
+
+        assert_eq!(OPENAI_RESPONSES.tools_flattened(&body), None);
+    }
+
+    /// `tools: []` (declaró herramientas, son cero) ⇒ `None`: sin elementos no
+    /// se puede decir si el `(native)` estaría o no verificado.
+    #[test]
+    fn responses_tools_flattened_none_tools_vacio() {
+        let body: Value =
+            serde_json::from_str(r#"{"model": "gpt-5.5", "tools": []}"#).unwrap();
+
+        assert_eq!(OPENAI_RESPONSES.tools_flattened(&body), None);
+    }
+
+    /// El nombre nativo con `_` interno NO se confunde con `mcp__`: `apply_patch`
+    /// o `read_mcp_resource` (que contiene `mcp` pero NO el patrón `mcp__x__y`)
+    /// no cuentan como namespaced. Guarda contra un `contains("mcp")` ingenuo.
+    #[test]
+    fn responses_tools_flattened_native_con_mcp_en_el_nombre_no_cuenta() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "gpt-5.5",
+                "tools": [
+                    {"type": "function", "name": "read_mcp_resource", "parameters": {}},
+                    {"type": "function", "name": "list_mcp_resources", "parameters": {}}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(OPENAI_RESPONSES.tools_flattened(&body), Some(true));
+    }
+
+    /// El dialecto Chat Completions NO aplana (o al menos no se mide acá):
+    /// hereda el default `None` del trait.
+    #[test]
+    fn chat_tools_flattened_es_none() {
+        let body: Value = serde_json::from_str(
+            r#"{"model": "gpt-4o", "tools": [{"type": "function", "function": {"name": "read"}}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(OPENAI_CHAT.tools_flattened(&body), None);
+    }
+
+    /// `prepare` de Codex cablea `tools_flattened` (delegando en Responses):
+    /// un body con tools aplanadas debe reportar `Some(true)`.
+    #[test]
+    fn codex_prepare_cablea_tools_flattened() {
+        let cfg = test_config();
+        let incoming = incoming_with_body(
+            r#"{"model":"gpt-5.5","tools":[{"type":"function","name":"engram_mem_search","parameters":{}}]}"#,
+        );
+
+        let out = OPENAI_CODEX_RESPONSES.prepare(incoming, &cfg);
+
+        assert_eq!(out.tools_flattened, Some(true));
     }
 
     /// Sin `tools`, se tolera el array legado `functions[]` (nombre PLANO,
