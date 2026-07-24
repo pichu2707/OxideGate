@@ -39,7 +39,7 @@
 //! tanto por `GET /requests` como al `telemetry.jsonl` en texto plano. Léase
 //! `docs/telemetry-per-request.md` §4.3 antes de exponer este endpoint fuera de
 //! localhost.
-use crate::provider::ToolServerBytes;
+use crate::provider::{ToolSearchSignal, ToolServerBytes};
 use crate::telemetry::logger::RequestMetric;
 use crate::telemetry::{CodexQuota, SessionAttribution};
 use serde::Serialize;
@@ -153,6 +153,13 @@ pub struct RecentRequest {
     /// Bytes de `tools` no atribuidos a ningún servidor. Mismo contrato
     /// `None`/`Some` que `tools_by_server`.
     pub tools_overhead_bytes: Option<usize>,
+    /// Señal de carga diferida de herramientas (`tool_search`) del dialecto
+    /// OpenAI/Codex Responses (ver
+    /// `telemetry::logger::RequestMetric::tool_search` para el contrato
+    /// completo). El diferenciador eager-vs-lazy por cliente. No compromete la
+    /// invariante de privacidad del módulo: solo lleva un booleano y un conteo,
+    /// jamás nombres de herramienta ni fragmentos de su esquema.
+    pub tool_search: Option<ToolSearchSignal>,
     /// Microsegundos que el proxy pasó dentro de `Provider::prepare`
     /// (parseo, `decompose` y mutación opcional del body). No incluye la
     /// lectura del body del socket ni el round-trip upstream.
@@ -213,6 +220,7 @@ impl From<&RequestMetric> for RecentRequest {
             context_tax_ratio: m.context_tax_ratio,
             tools_by_server: m.tools_by_server.clone(),
             tools_overhead_bytes: m.tools_overhead_bytes,
+            tool_search: m.tool_search.clone(),
             prepare_us: m.prepare_us,
             codex_quota: m.codex_quota.clone(),
             session: m.session.clone(),
@@ -303,6 +311,7 @@ mod tests {
                 deferred_tools: 0,
             }]),
             tools_overhead_bytes: Some(4),
+            tool_search: None,
             prepare_us: 42,
             codex_quota: None,
             session: SessionAttribution {
@@ -679,6 +688,46 @@ mod tests {
         assert!(parsed["requested_effort"].is_null());
         assert!(parsed["requested_speed"].is_null());
         assert!(parsed["served_speed"].is_null());
+    }
+
+    /// La señal `tool_search` LAZY (`Some { used: true, deferred_loaded }`)
+    /// debe proyectarse desde `RequestMetric` a `RecentRequest` y sobrevivir
+    /// el round-trip serde con `used` y `deferred_loaded` exactos — el dato
+    /// que `oxidegate-lens` lee para decir "este cliente es lazy". Mismo
+    /// patrón que `round_trip_serde_con_effort_y_speed_presentes`.
+    #[test]
+    fn round_trip_serde_con_tool_search_lazy() {
+        let mut m = base_metric("t1");
+        m.tool_search = Some(ToolSearchSignal {
+            used: true,
+            deferred_loaded: 3,
+        });
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+        let row = &recent.snapshot()[0];
+        assert_eq!(row.tool_search, m.tool_search, "la proyección copia el campo");
+
+        let json = serde_json::to_string(row).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["tool_search"]["used"], true);
+        assert_eq!(parsed["tool_search"]["deferred_loaded"], 3);
+    }
+
+    /// Con `tool_search` ausente (`None`: el caso de Anthropic/Gemini/Chat, o
+    /// un body que no parseó) debe serializar a `null`, nunca desaparecer del
+    /// JSON ni fallar.
+    #[test]
+    fn round_trip_serde_con_tool_search_none() {
+        let mut m = base_metric("t1");
+        m.tool_search = None;
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+        let row = &recent.snapshot()[0];
+        let json = serde_json::to_string(row).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed["tool_search"].is_null());
     }
 
     /// Mismo round-trip, con el campo en `None`: debe serializar a `null`,

@@ -16,7 +16,7 @@
 use super::{
     array_field, fingerprint, maybe_decompress, measure_key, measure_other, measure_value,
     model_and_stream_from_value, parse_body, split_history_and_last_turn, tools_overhead_bytes,
-    ContextBreakdown, Incoming, Outgoing, Provider, ToolServerBytes, Usage,
+    ContextBreakdown, Incoming, Outgoing, Provider, ToolSearchSignal, ToolServerBytes, Usage,
 };
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -111,6 +111,10 @@ impl Provider for OpenAiChat {
             // decida conscientemente acá y no se cuele por accidente.
             requested_effort: None,
             requested_speed: None,
+            // El mecanismo `tool_search` (carga diferida vía `input[]`) es
+            // exclusivo del dialecto Responses/Codex: Chat Completions no lo
+            // tiene. Mismo criterio de `None` explícito que arriba.
+            tool_search: None,
         }
     }
 
@@ -246,6 +250,10 @@ impl Provider for OpenAiResponses {
             .as_ref()
             .map(|c| tools_overhead_bytes(c.tools_bytes, &by_server))
             .unwrap_or(0);
+        // Medido sobre el MISMO `Value` ya parseado (nunca un segundo parseo):
+        // `None` solo si el body no parseó (`parsed` es `None`), coherente con
+        // el contrato de `Outgoing::tool_search`.
+        let tool_search = parsed.as_ref().and_then(|v| self.tool_search(v));
 
         Outgoing {
             url: format!("{}/responses", cfg.target_openai_url),
@@ -266,6 +274,7 @@ impl Provider for OpenAiResponses {
             // completo).
             requested_effort: None,
             requested_speed: None,
+            tool_search,
         }
     }
 
@@ -330,6 +339,62 @@ impl Provider for OpenAiResponses {
                 .collect(),
         )
     }
+
+    /// Mide la carga diferida de herramientas (`tool_search`) recorriendo
+    /// `input[]`. Ver [`ToolSearchSignal`] para el porqué de mirar acá y no en
+    /// `tools[]`.
+    ///
+    /// Recorre los items de `input[]` buscando `type == "tool_search_call"` o
+    /// `"tool_search_output"`: cualquiera de los dos marca `used = true` (el
+    /// mecanismo LAZY se ejercitó). Solo `tool_search_output` aporta a
+    /// `deferred_loaded`, contando dentro de su `tools[]` las que traen
+    /// `defer_loading: true` — la marca real de una herramienta diferida
+    /// (leída con la misma clave que [`group_tools_by_server`]).
+    ///
+    /// Nunca es `None` cuando el body parseó: un request Responses/Codex SIN
+    /// items `tool_search_*` devuelve `Some { used: false, deferred_loaded: 0 }`
+    /// — EAGER confirmado, no ausencia de dato. `input` ausente, string, o
+    /// no-array cae en ese mismo caso (no hay items que puedan diferir).
+    fn tool_search(&self, body: &Value) -> Option<ToolSearchSignal> {
+        let items = body
+            .as_object()
+            .and_then(|o| o.get("input"))
+            .and_then(Value::as_array);
+
+        let Some(items) = items else {
+            return Some(ToolSearchSignal {
+                used: false,
+                deferred_loaded: 0,
+            });
+        };
+
+        let mut used = false;
+        let mut deferred_loaded = 0;
+        for item in items {
+            match item.get("type").and_then(Value::as_str) {
+                Some("tool_search_call") => used = true,
+                Some("tool_search_output") => {
+                    used = true;
+                    if let Some(tools) = item.get("tools").and_then(Value::as_array) {
+                        deferred_loaded += tools
+                            .iter()
+                            .filter(|t| {
+                                t.get("defer_loading")
+                                    .and_then(Value::as_bool)
+                                    .unwrap_or(false)
+                            })
+                            .count();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Some(ToolSearchSignal {
+            used,
+            deferred_loaded,
+        })
+    }
 }
 
 impl Provider for OpenAiCodexResponses {
@@ -378,6 +443,9 @@ impl Provider for OpenAiCodexResponses {
             .as_ref()
             .map(|c| tools_overhead_bytes(c.tools_bytes, &by_server))
             .unwrap_or(0);
+        // Mismo contrato que `OpenAiResponses::prepare`: medido sobre el JSON
+        // LÓGICO descomprimido, `None` solo si el body no parseó.
+        let tool_search = parsed.as_ref().and_then(|v| self.tool_search(v));
 
         Outgoing {
             url: format!("{}/responses", cfg.target_codex_url),
@@ -397,6 +465,7 @@ impl Provider for OpenAiCodexResponses {
             // `effort`/`speed` son dialecto exclusivo de Anthropic.
             requested_effort: None,
             requested_speed: None,
+            tool_search,
         }
     }
 
@@ -417,6 +486,15 @@ impl Provider for OpenAiCodexResponses {
     /// (`tools[].name` plano), sin reescribir el parseo acá.
     fn tool_entries<'a>(&self, body: &'a Value) -> Option<Vec<(&'a str, &'a Value)>> {
         OPENAI_RESPONSES.tool_entries(body)
+    }
+
+    /// DELEGA en [`OPENAI_RESPONSES::tool_search`]: `pi` habla exactamente este
+    /// dialecto (de hecho es su cliente principal, con `input[]` que SÍ trae
+    /// items `tool_search_*`), así que la medición es idéntica. Sin esta
+    /// delegación, `OpenAiCodexResponses` heredaría el default `None` del trait
+    /// y quedaría ciego a la carga diferida justo del cliente que más la usa.
+    fn tool_search(&self, body: &Value) -> Option<ToolSearchSignal> {
+        OPENAI_RESPONSES.tool_search(body)
     }
 
     /// DELEGA en [`OPENAI_RESPONSES::tools_by_server`] en vez del default del
@@ -1091,6 +1169,189 @@ mod tests {
         // Mismo motivo que en Chat Completions: `defer_loading` no existe en
         // el dialecto de OpenAI Responses.
         assert!(by_server.iter().all(|s| s.deferred_tools == 0));
+    }
+
+    // -----------------------------------------------------------------
+    // tool_search — carga diferida de herramientas del dialecto Responses.
+    // Verdad del terreno (verificada contra @earendil-works/pi-ai): las tools
+    // diferidas NO viven en `tools[]` (siempre eager) sino en items
+    // `tool_search_output` dentro de `input[]`. Ver `ToolSearchSignal`.
+    // -----------------------------------------------------------------
+
+    /// Un request Responses con `input[]` de mensajes normales (sin ningún
+    /// item `tool_search_*`) es EAGER CONFIRMADO: `Some { used: false }`, no
+    /// `None`. `None` está reservado a "no pude ni mirar" (body sin parsear).
+    #[test]
+    fn responses_tool_search_eager_sin_items() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "gpt-5.5",
+                "tools": [{"type": "function", "name": "Read", "parameters": {}}],
+                "input": [
+                    {"type": "message", "role": "user", "content": "hola"},
+                    {"type": "message", "role": "assistant", "content": "buenas"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            OPENAI_RESPONSES.tool_search(&body),
+            Some(ToolSearchSignal {
+                used: false,
+                deferred_loaded: 0
+            })
+        );
+    }
+
+    /// El caso LAZY completo: `tool_search_call` + `tool_search_output` con dos
+    /// tools `defer_loading: true`. `used == true` y `deferred_loaded == 2`.
+    #[test]
+    fn responses_tool_search_lazy_cuenta_tools_diferidas() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "model": "gpt-5.5",
+                "input": [
+                    {"type": "message", "role": "user", "content": "usa las tools nuevas"},
+                    {"type": "tool_search_call", "call_id": "pi_tool_load_x", "execution": "client", "status": "completed"},
+                    {"type": "tool_search_output", "call_id": "pi_tool_load_x", "execution": "client", "status": "completed",
+                     "tools": [
+                        {"type": "function", "name": "mcp__srv__a", "parameters": {}, "defer_loading": true},
+                        {"type": "function", "name": "mcp__srv__b", "parameters": {}, "defer_loading": true}
+                     ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            OPENAI_RESPONSES.tool_search(&body),
+            Some(ToolSearchSignal {
+                used: true,
+                deferred_loaded: 2
+            })
+        );
+    }
+
+    /// Un `tool_search_call` SIN su `tool_search_output` (búsqueda que no
+    /// cargó nada) sigue marcando `used == true` — el mecanismo LAZY se
+    /// ejercitó — pero `deferred_loaded == 0`.
+    #[test]
+    fn responses_tool_search_call_sin_output_es_lazy_sin_carga() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "input": [
+                    {"type": "tool_search_call", "call_id": "x", "execution": "client", "status": "completed"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            OPENAI_RESPONSES.tool_search(&body),
+            Some(ToolSearchSignal {
+                used: true,
+                deferred_loaded: 0
+            })
+        );
+    }
+
+    /// Dentro de un `tool_search_output`, solo cuentan las tools con
+    /// `defer_loading: true`: una tool sin la marca NO suma a `deferred_loaded`
+    /// (misma lectura por-tool que `group_tools_by_server`).
+    #[test]
+    fn responses_tool_search_output_ignora_tools_sin_marca() {
+        let body: Value = serde_json::from_str(
+            r#"{
+                "input": [
+                    {"type": "tool_search_output", "call_id": "x", "execution": "client", "status": "completed",
+                     "tools": [
+                        {"type": "function", "name": "mcp__srv__a", "parameters": {}, "defer_loading": true},
+                        {"type": "function", "name": "mcp__srv__b", "parameters": {}}
+                     ]}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            OPENAI_RESPONSES.tool_search(&body),
+            Some(ToolSearchSignal {
+                used: true,
+                deferred_loaded: 1
+            })
+        );
+    }
+
+    /// `input` como STRING plano (un solo turno de texto) no puede contener
+    /// items diferidos: EAGER confirmado, mismo caso que `input` ausente o
+    /// no-array. Nunca `None` mientras el body haya parseado.
+    #[test]
+    fn responses_tool_search_input_string_es_eager() {
+        let body: Value =
+            serde_json::from_str(r#"{"model": "gpt-5.5", "input": "explica el patron builder"}"#)
+                .unwrap();
+
+        assert_eq!(
+            OPENAI_RESPONSES.tool_search(&body),
+            Some(ToolSearchSignal {
+                used: false,
+                deferred_loaded: 0
+            })
+        );
+    }
+
+    /// El dialecto Chat Completions NO tiene `tool_search`: hereda el default
+    /// `None` del trait (contrato de "no aplica"), aun con `input` presente.
+    #[test]
+    fn chat_tool_search_es_none() {
+        let body: Value = serde_json::from_str(
+            r#"{"model": "gpt-4o", "input": [{"type": "tool_search_call"}]}"#,
+        )
+        .unwrap();
+
+        assert_eq!(OPENAI_CHAT.tool_search(&body), None);
+    }
+
+    /// `prepare` de Codex cablea `tool_search` (delegando en Responses): un
+    /// body zstd LAZY debe medirse sobre el JSON descomprimido y reportar la
+    /// carga diferida, no quedar ciego.
+    #[test]
+    fn codex_prepare_cablea_tool_search_lazy_desde_zstd() {
+        let cfg = test_config();
+        let logical = r#"{
+            "model": "gpt-5.5",
+            "input": [
+                {"type": "tool_search_call", "call_id": "x", "execution": "client", "status": "completed"},
+                {"type": "tool_search_output", "call_id": "x", "execution": "client", "status": "completed",
+                 "tools": [{"type": "function", "name": "mcp__srv__a", "parameters": {}, "defer_loading": true}]}
+            ]
+        }"#
+        .as_bytes();
+        let comprimido = zstd::encode_all(logical, 0).expect("zstd comprime el fixture");
+        let incoming = incoming_with_encoded_body(comprimido, "zstd");
+
+        let out = OPENAI_CODEX_RESPONSES.prepare(incoming, &cfg);
+
+        assert_eq!(
+            out.tool_search,
+            Some(ToolSearchSignal {
+                used: true,
+                deferred_loaded: 1
+            })
+        );
+    }
+
+    /// Body no-JSON: `tool_search` queda en `None` ("no pude ni mirar"),
+    /// mismo contrato que `context`.
+    #[test]
+    fn responses_prepare_body_no_json_tool_search_none() {
+        let cfg = test_config();
+        let incoming = incoming_with_body("esto no es JSON");
+
+        let out = OPENAI_RESPONSES.prepare(incoming, &cfg);
+
+        assert_eq!(out.tool_search, None);
     }
 
     /// Sin `tools`, se tolera el array legado `functions[]` (nombre PLANO,

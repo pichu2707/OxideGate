@@ -86,6 +86,9 @@ impl Provider for Gemini {
             // `Outgoing::requested_effort`/`requested_speed`).
             requested_effort: None,
             requested_speed: None,
+            // El mecanismo `tool_search` (carga diferida vía `input[]`) es
+            // exclusivo del dialecto Responses/Codex: Gemini no lo tiene.
+            tool_search: None,
         }
     }
 
@@ -382,6 +385,22 @@ mod tests {
         assert_eq!(out.body, original_body);
         assert_eq!(out.context, None);
         assert_eq!(out.model.as_deref(), Some("gemini-1.5-flash"));
+    }
+
+    /// El dialecto de Gemini NO tiene `tool_search` (mecanismo exclusivo de
+    /// Responses/Codex): `prepare` debe dejar el campo en `None` de punta a
+    /// punta, no solo el método del trait.
+    #[test]
+    fn prepare_deja_tool_search_en_none() {
+        let cfg = test_config();
+        let incoming = incoming_with_body(
+            "/v1beta/models/gemini-1.5-flash:generateContent",
+            r#"{"systemInstruction":{"parts":[{"text":"be helpful"}]},"contents":[]}"#,
+        );
+
+        let out = GEMINI.prepare(incoming, &cfg);
+
+        assert_eq!(out.tool_search, None);
     }
 
     /// `prepare` con un body Gemini válido produce un `context` `Some` con

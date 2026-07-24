@@ -122,6 +122,13 @@ pub struct Outgoing {
     /// de la respuesta (qué velocidad sirvió REALMENTE el proveedor, que
     /// puede diferir de esta si el modo `fast` está rate-limiteado).
     pub requested_speed: Option<String>,
+    /// Señal de carga diferida de herramientas medida sobre `input[]` (ver
+    /// [`ToolSearchSignal`] para el contrato completo del `Option`). Solo la
+    /// llenan los proveedores del dialecto Responses/Codex
+    /// ([`super::openai::OpenAiResponses`] y [`super::openai::OpenAiCodexResponses`]);
+    /// Anthropic, Gemini y OpenAI Chat devuelven siempre `None` acá porque el
+    /// mecanismo `tool_search` no existe en sus dialectos.
+    pub tool_search: Option<ToolSearchSignal>,
 }
 
 /// Acumulador de tokens medidos desde la respuesta del proveedor.
@@ -429,6 +436,45 @@ pub struct ToolServerBytes {
     pub deferred_tools: usize,
 }
 
+/// Señal de carga diferida de herramientas (`tool_search`) del dialecto
+/// OpenAI/Codex Responses, medida sobre el array `input[]` del body ENTRANTE.
+///
+/// **Por qué existe y no un `defer_loading` en `tools_by_server`.** En este
+/// dialecto las herramientas diferidas NO viajan en `tools[]` (ese set es
+/// siempre EAGER: `pi` arma `params.tools = convertResponsesTools(immediate)`
+/// SIN la marca `deferLoading`). Se difieren a mitad de sesión y reaparecen
+/// dentro de `input[]` como items `tool_search_output` (precedidos de un
+/// `tool_search_call`, ambos `execution: "client"`), donde cada tool ahí sí
+/// trae `defer_loading: true`. Verificado contra `@earendil-works/pi-ai`
+/// (`dist/api/openai-responses.js` + `openai-responses-shared.js`).
+///
+/// **Dominio y no-doble-conteo.** Es una OBSERVACIÓN PURA de `input[]`, no
+/// una decisión del proxy. Los bytes de esos items YA los mide
+/// [`ContextBreakdown`] (viven en `input`, van a `history`/`last_turn`): esta
+/// señal NO los vuelve a sumar ni toca `tools_by_server`. Solo cuenta cuántas
+/// herramientas diferidas se cargaron y si el mecanismo se usó — el
+/// diferenciador eager-vs-lazy por cliente que `tools_by_server` no puede dar.
+///
+/// **Contrato del `Option` que la envuelve en [`Outgoing::tool_search`].**
+/// `None` = dialecto donde el concepto no aplica (Anthropic, Gemini, OpenAI
+/// Chat) o body que no parseó: "no pude ni mirar". `Some { used: false }` =
+/// dialecto Responses/Codex medido, sin `tool_search_*` este turno: EAGER
+/// confirmado (no ausencia de dato). `Some { used: true }` = LAZY: el cliente
+/// usó la búsqueda diferida en ESTA petición.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ToolSearchSignal {
+    /// `true` si el body traía al menos un item `tool_search_call` o
+    /// `tool_search_output` en `input[]`: el mecanismo de carga diferida se
+    /// EJERCITÓ en esta petición (comportamiento LAZY confirmado). `false` en
+    /// un request Responses/Codex sin esos items (EAGER confirmado).
+    pub used: bool,
+    /// Cuántas herramientas con `defer_loading: true` aparecieron dentro de
+    /// items `tool_search_output` de `input[]` — las que el cliente cargó
+    /// dinámicamente a mitad de sesión. `0` cuando `used == false`, y también
+    /// posible con `used == true` si solo hubo `tool_search_call` sin output.
+    pub deferred_loaded: usize,
+}
+
 /// Clasifica `tool_name` en `(ToolServerKind, servidor_o_sentinel)`. Pura: no
 /// mide bytes, solo parsea el nombre. Fuente única de verdad del parseo:
 /// [`server_of`] delega acá y descarta el `ToolServerKind`.
@@ -693,6 +739,19 @@ pub trait Provider: Send + Sync {
     /// misma operación para los cuatro dialectos
     /// ([`group_tools_by_server`]) — no hay conocimiento de dialecto que
     /// decidir acá.
+    /// Señal de carga diferida de herramientas (`tool_search`) del dialecto
+    /// OpenAI/Codex Responses. Ver [`ToolSearchSignal`] para el contrato.
+    ///
+    /// Implementación por defecto `None` (a diferencia de `decompose` y
+    /// `tool_entries`, que la exigen explícita): el mecanismo `tool_search`
+    /// solo existe en el dialecto Responses/Codex, así que un default `None`
+    /// es la respuesta CORRECTA para Anthropic, Gemini y OpenAI Chat — no un
+    /// silencio peligroso. Únicamente [`super::openai::OpenAiResponses`]
+    /// (y su delegado [`super::openai::OpenAiCodexResponses`]) lo sobreescriben.
+    fn tool_search(&self, _body: &Value) -> Option<ToolSearchSignal> {
+        None
+    }
+
     fn tools_by_server(&self, body: &Value) -> Vec<ToolServerBytes> {
         match self.tool_entries(body) {
             Some(entries) => group_tools_by_server(entries.into_iter()),

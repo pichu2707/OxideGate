@@ -7,7 +7,7 @@
 //! para que `/stats` y `/requests` puedan leer, respectivamente, la
 //! agregación y el detalle reciente en vivo sin tocar el JSONL. Así el I/O de
 //! log NUNCA se suma a la latencia que le devolvemos a gentle-ai.
-use crate::provider::{ContextBreakdown, ToolServerBytes};
+use crate::provider::{ContextBreakdown, ToolSearchSignal, ToolServerBytes};
 use crate::telemetry::{CodexQuota, RecentRequests, SessionAttribution, StatsRegistry};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -193,6 +193,24 @@ pub struct RequestMetric {
     /// se puede tener uno `Some` y el otro `None`.
     pub tools_overhead_bytes: Option<usize>,
 
+    /// Señal de carga diferida de herramientas (`tool_search`) del dialecto
+    /// OpenAI/Codex Responses (ver `provider::ToolSearchSignal`). El SEGUNDO
+    /// campo no-plano de la fila (`tools_by_server` es el primero; `codex_quota`
+    /// y `session`, más abajo, son el tercero y cuarto).
+    ///
+    /// Es el diferenciador eager-vs-lazy por cliente que `tools_by_server` no
+    /// puede dar: en este dialecto las tools diferidas NO viajan en `tools[]`
+    /// (siempre eager) sino como items `tool_search_output` dentro de
+    /// `input[]`. `Some { used: false }` = request Responses/Codex medido, sin
+    /// carga diferida este turno (EAGER confirmado); `Some { used: true }` =
+    /// LAZY; `None` = dialecto donde no aplica (Anthropic, Gemini, OpenAI Chat)
+    /// o body que no parseó.
+    ///
+    /// **No dobla bytes.** Los bytes de esos items ya los miden los campos
+    /// `context_*` (viven en `input`): esta señal solo cuenta y clasifica, no
+    /// vuelve a sumar bytes ni toca `tools_by_server`.
+    pub tool_search: Option<ToolSearchSignal>,
+
     /// Microsegundos que `middleware::proxy::run` pasó DENTRO de
     /// `Provider::prepare` (parseo del body + `decompose` + mutación
     /// opcional del body). `u64` en MICROsegundos, no `f64` en milisegundos:
@@ -218,8 +236,8 @@ pub struct RequestMetric {
     /// Estado de la cuota de suscripción de Codex, parseado de las doce
     /// cabeceras `x-codex-*` que manda el backend de Codex cuando el
     /// request se enrutó vía OAuth (plan de suscripción, no API key). El
-    /// SEGUNDO campo no-plano de la fila (ver `tools_by_server` arriba);
-    /// `session`, más abajo, es el TERCERO.
+    /// TERCER campo no-plano de la fila (ver `tools_by_server` y `tool_search`
+    /// arriba); `session`, más abajo, es el CUARTO.
     ///
     /// `None` si el tráfico no llevaba ninguna cabecera `x-codex-*`
     /// (Anthropic, Gemini, o OpenAI vía API key en `api.openai.com`) — la
@@ -239,8 +257,9 @@ pub struct RequestMetric {
     /// Sesión resuelta por precedencia de cabeceras del REQUEST entrante
     /// (`middleware::proxy::session_of`): `X-OxideGate-Session` explícito,
     /// `x-claude-code-session-id` nativo, o el bucket de fallback
-    /// `Unattributed` con el `User-Agent` como valor. El TERCER campo
-    /// no-plano de la fila (ver `tools_by_server` y `codex_quota` arriba).
+    /// `Unattributed` con el `User-Agent` como valor. El CUARTO campo
+    /// no-plano de la fila (ver `tools_by_server`, `tool_search` y
+    /// `codex_quota` arriba).
     ///
     /// Nunca `Option`: la precedencia siempre resuelve a algo — la peor rama
     /// es un fallback honesto, no una ausencia (ver `telemetry::session`
@@ -447,6 +466,7 @@ mod tests {
             requested_effort: None,
             requested_speed: None,
             served_speed: None,
+            tool_search: None,
             status: 200,
             ttft_ms: None,
             total_ms: 0.0,

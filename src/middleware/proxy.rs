@@ -303,6 +303,10 @@ async fn send_and_meter(
                 requested_effort: out.requested_effort,
                 requested_speed: out.requested_speed,
                 served_speed: None,
+                // Señal de carga diferida medida en `prepare` (solo dialecto
+                // Responses/Codex); viaja intacta desde `Outgoing`, igual que
+                // en el camino con respuesta.
+                tool_search: out.tool_search,
                 // No hubo respuesta del upstream que inspeccionar: sin
                 // `resp`, no hay cabeceras `x-codex-*` que leer. `None`
                 // honesto, no un dato inventado.
@@ -336,6 +340,7 @@ async fn send_and_meter(
         prepare_us,
         requested_effort: out.requested_effort,
         requested_speed: out.requested_speed,
+        tool_search: out.tool_search,
         provider: prov,
         // `resp` está vivo acá: `resp.status()` ya se leyó arriba (préstamo
         // inmutable) y el bucle de copia de cabeceras a la respuesta
