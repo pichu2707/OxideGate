@@ -129,6 +129,24 @@ pub struct Outgoing {
     /// Anthropic, Gemini y OpenAI Chat devuelven siempre `None` acá porque el
     /// mecanismo `tool_search` no existe en sus dialectos.
     pub tool_search: Option<ToolSearchSignal>,
+    /// Señal de honestidad sobre la ATRIBUCIÓN de `tools_by_server` en el
+    /// dialecto Responses/Codex, medida sobre el array `tools[]` del body
+    /// ENTRANTE. Ver la doc del método [`Provider::tools_flattened`] para el
+    /// contrato completo.
+    ///
+    /// **Por qué existe.** `pi` y `opencode` NO usan el namespacing
+    /// `mcp__<server>__<tool>` (separador `__`, inequívoco) del que depende
+    /// [`classify`]: `pi` manda nombres crudos sin prefijo, y `opencode` usa
+    /// `<server>_<tool>` (separador `_` simple, AMBIGUO — colisiona con
+    /// nombres nativos como `apply_patch`/`delegation_list`). Medido en tráfico
+    /// real. Sin `mcp__`, TODAS sus tools caen en `(native)`, ocultando el peso
+    /// MCP real. Este flag AVISA de esa opacidad SIN fabricar una atribución
+    /// que no se puede probar: dice "el `(native)` de esta fila no es
+    /// verificable", nunca inventa `context7`/`engram`.
+    ///
+    /// Solo lo llenan los proveedores del dialecto Responses/Codex; el resto
+    /// devuelve `None` (su `mcp__` sí es fiable, no hay nada que advertir).
+    pub tools_flattened: Option<bool>,
 }
 
 /// Acumulador de tokens medidos desde la respuesta del proveedor.
@@ -749,6 +767,27 @@ pub trait Provider: Send + Sync {
     /// silencio peligroso. Únicamente [`super::openai::OpenAiResponses`]
     /// (y su delegado [`super::openai::OpenAiCodexResponses`]) lo sobreescriben.
     fn tool_search(&self, _body: &Value) -> Option<ToolSearchSignal> {
+        None
+    }
+
+    /// Señal de honestidad sobre la atribución de `tools_by_server` (ver
+    /// [`Outgoing::tools_flattened`] para el porqué).
+    ///
+    /// Contrato del `Option`:
+    /// - `None`: el proveedor no aplana (Anthropic, Gemini, OpenAI Chat — su
+    ///   `mcp__` es fiable) o el body no declara herramientas (`tool_entries`
+    ///   devuelve `None`/vacío): no hay nada que advertir.
+    /// - `Some(false)`: hay herramientas Y al menos una usa el namespacing
+    ///   `mcp__<server>__<tool>` que [`classify`] sabe atribuir — el cubo
+    ///   `(native)` de esta fila es de fiar.
+    /// - `Some(true)`: hay herramientas pero NINGUNA usa `mcp__` — el cubo
+    ///   `(native)` NO es verificable: puede ocultar tools MCP aplanadas
+    ///   (`context7_*`/`engram_*` de opencode, nombres crudos de pi). Es una
+    ///   OBSERVACIÓN ESTRUCTURAL PURA, nunca una atribución inventada.
+    ///
+    /// Implementación por defecto `None`: solo el dialecto Responses/Codex
+    /// ([`super::openai::OpenAiResponses`] y su delegado) lo sobreescribe.
+    fn tools_flattened(&self, _body: &Value) -> Option<bool> {
         None
     }
 

@@ -351,6 +351,7 @@ mod tests {
             tools_by_server: None,
             tools_overhead_bytes: None,
             tool_search: None,
+            tools_flattened: None,
             prepare_us: 0,
             codex_quota: None,
             session: SessionAttribution {

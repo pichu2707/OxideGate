@@ -91,6 +91,10 @@ pub struct MetricBase {
     /// (`Outgoing::tool_search`, solo dialecto Responses/Codex). Viaja intacta
     /// hasta `RequestMetric::tool_search`. `None` en el resto de dialectos.
     pub tool_search: Option<ToolSearchSignal>,
+    /// Señal de honestidad sobre la atribución de `tools_by_server`
+    /// (`Outgoing::tools_flattened`, solo dialecto Responses/Codex). Viaja
+    /// intacta hasta `RequestMetric::tools_flattened`. `None` en el resto.
+    pub tools_flattened: Option<bool>,
     /// Proveedor dueño del dialecto de esta respuesta: la extracción del
     /// `usage` se delega íntegramente en él, así este módulo no necesita
     /// saber nada de ningún proveedor concreto.
@@ -300,6 +304,7 @@ impl MeteredBody {
             requested_speed: self.base.requested_speed.clone(),
             served_speed: self.scanner.usage.speed.clone(),
             tool_search: self.base.tool_search.clone(),
+            tools_flattened: self.base.tools_flattened,
             codex_quota: self.base.codex_quota.clone(),
         });
     }
