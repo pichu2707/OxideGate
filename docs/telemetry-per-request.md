@@ -106,9 +106,9 @@ Esto mirroriza la misma invariante que ya documenta
 haya o no autenticación de por medio.
 
 **Esta invariante cubre huellas de prompt, no el campo `client`.** El campo
-`client` (§4, §4.3) es un caso aparte: no es una huella de prompt, pero
+`client` (§4, §4.4) es un caso aparte: no es una huella de prompt, pero
 tampoco es un dato que el proxy calcule — es el `User-Agent` del cliente,
-reenviado crudo. Ver §4.3 antes de exponer este endpoint fuera de
+reenviado crudo. Ver §4.4 antes de exponer este endpoint fuera de
 `127.0.0.1` o de compartir `telemetry.jsonl`.
 
 ---
@@ -122,7 +122,7 @@ reenviado crudo. Ver §4.3 antes de exponer este endpoint fuera de
 | `upstream` | Proveedor destino (`anthropic`, `openai`, …) | Junto con `model`, la clave de agrupación para comparar contra pares |
 | `model` | Modelo solicitado, o `null` si no venía en el body | Un `null` sostenido en el tiempo suele indicar clientes mal configurados |
 | `stream` | `true` si el cliente pidió SSE | Sin streaming, `ttft_ms` no aplica — ver `total_ms` en su lugar |
-| `client` | `User-Agent` del request entrante, CRUDO (sin normalizar), topeado a 200 caracteres. `null` si el header no vino o no era UTF-8 válido | Distingue un harness que YA difiere tools MCP por su cuenta (Claude Code sin caer al fallback de carga upfront) de uno genuinamente eager — ver `docs/optimizer-tool-search.md` §3. **Léase §4.3 antes de exponer este campo**: a diferencia del resto de esta tabla, es contenido controlado por el cliente, no una propiedad que el proxy calcula |
+| `client` | `User-Agent` del request entrante, CRUDO (sin normalizar), topeado a 200 caracteres. `null` si el header no vino o no era UTF-8 válido | Distingue un harness que YA difiere tools MCP por su cuenta (Claude Code sin caer al fallback de carga upfront) de uno genuinamente eager — ver `docs/optimizer-tool-search.md` §3. **Léase §4.4 antes de exponer este campo**: a diferencia del resto de esta tabla, es contenido controlado por el cliente, no una propiedad que el proxy calcula |
 | `status` | Código HTTP devuelto al cliente | `>= 400` es la señal de error más barata de todas: no necesita comparación con nada |
 | `input_tokens` / `output_tokens` | Tokens exactos reportados por el proveedor | `null` si el proveedor no los reportó (p. ej. request fallido antes de leer `usage`) |
 | `cache_read_tokens` / `cache_write_tokens` | Tokens servidos o escritos a caché | Una fila con `cache_read_tokens` en `0`/`null` en medio de una conversación larga que sí cachea es un miss caro y aislado |
@@ -141,7 +141,8 @@ reenviado crudo. Ver §4.3 antes de exponer este endpoint fuera de
 | `prepare_us` | Microsegundos que el proxy pasó dentro de `Provider::prepare` (parseo del body + `decompose` + mutación opcional, p. ej. inyectar `cache_control`) | Ver la nota sobre qué NO incluye, más abajo |
 | `tools_by_server` | Desglose de `context_tools_bytes` por servidor MCP declarante: `[{server, kind, tools, bytes, deferred_tools}, …]`, ordenado por `bytes` descendente | `null` si el body no parseó como objeto (o build anterior a este campo); `[]` si SÍ parseó pero no declaraba `tools` — son estados DISTINTOS, ver §4.2. `deferred_tools` (por elemento) es la fuente de verdad POR SERVIDOR de cuánto está diferido, ver §4.2 |
 | `tools_overhead_bytes` | Bytes de `tools` no atribuidos a ningún servidor (brackets/comas del array, wrapper de Gemini, herramientas huérfanas) | `null` en los mismos casos que `tools_by_server` es `null`; `sum(tools_by_server[].bytes) + tools_overhead_bytes == context_tools_bytes` siempre que ambos sean no-nulos |
-| `session` | Sesión resuelta por precedencia de cabeceras del request: `{source, key}`. Nunca `null` — la peor rama es un fallback honesto (`source: "unattributed"`), no una ausencia | Ver §4.4 para la tabla de precedencia completa y cómo estampar el header desde cada harness |
+| `tool_search` | Señal de carga diferida de herramientas del dialecto Responses/Codex: `{used, deferred_loaded}`, o `null`. `used: false` ⇒ EAGER confirmado este turno; `used: true` ⇒ LAZY (el cliente cargó tools a mitad de sesión) | `null` en Anthropic/Gemini/OpenAI-Chat (no aplica) o si el body no parseó. Es el diferenciador eager-vs-lazy por cliente que `tools_by_server` NO puede dar — ver §4.3 |
+| `session` | Sesión resuelta por precedencia de cabeceras del request: `{source, key}`. Nunca `null` — la peor rama es un fallback honesto (`source: "unattributed"`), no una ausencia | Ver §4.5 para la tabla de precedencia completa y cómo estampar el header desde cada harness |
 
 Ninguno de los campos de latencia/coste/identidad es nuevo: todos ya existían
 en `RequestMetric` (Nivel 1). Los campos `context_*`, `prepare_us`,
@@ -196,7 +197,7 @@ Cada elemento trae:
 | `kind` | `"native"` / `"mcp"` / `"others"` — el tipo de cubo, en minúsculas |
 | `tools` | Cantidad de herramientas atribuidas a este servidor |
 | `bytes` | Suma de bytes de las herramientas de este servidor |
-| `deferred_tools` | Cuántas de `tools` traían `defer_loading: true` en su propia definición dentro del body ENTRANTE. `0` en `openai`/`gemini` (el campo no existe en esos dialectos) |
+| `deferred_tools` | Cuántas de `tools` traían `defer_loading: true` en su propia definición dentro del array `tools[]` del body ENTRANTE. `0` en `openai`/`gemini`: NO porque el diferido no exista en esos dialectos, sino porque en el dialecto Responses/Codex las tools diferidas NO viajan en `tools[]` (siempre eager) sino en items `tool_search_output` dentro de `input[]` — para esa señal, ver el campo `tool_search` (§4.3), no este |
 
 **`tools` y `bytes` son conteos y BYTES, nunca tokens** — mismo contrato de
 medición que `context_tools_bytes` (§4.1): se miden re-serializando el
@@ -251,7 +252,48 @@ tres contribuyentes.
 
 ---
 
-### 4.3. `client`: el único campo de esta fila que NO es una medición del proxy
+### 4.3. `tool_search`: eager vs. lazy en el dialecto Responses/Codex
+
+`tools_by_server[].deferred_tools` (§4.2) mide `defer_loading` **dentro de
+`tools[]`**. Para Anthropic eso alcanza: ese cliente marca las tools diferidas
+en el propio array `tools[]`. Pero el dialecto **OpenAI/Codex Responses**
+(clientes `pi` y `opencode`) funciona distinto, y por eso hace falta un campo
+aparte.
+
+**La verdad del terreno** (verificada contra el código de `@earendil-works/pi-ai`,
+`dist/api/openai-responses.js` + `openai-responses-shared.js`): el `tools[]` de
+nivel superior de una petición Responses es **siempre EAGER** — el cliente arma
+`params.tools = convertResponsesTools(immediate)` SIN la marca `deferLoading`.
+Las tools que sí se difieren NO aparecen en `tools[]`: se cargan a mitad de
+sesión y reaparecen dentro de `input[]` como items `tool_search_output`
+(precedidos de un `tool_search_call`, ambos `execution: "client"`), y ahí cada
+tool sí trae `defer_loading: true`.
+
+Consecuencia: medir `defer_loading` sobre `tools[]` da `deferred_tools == 0`
+para estos clientes — y ese `0` es **correcto** (el set base ES eager), no un
+bug. El señalador real de comportamiento lazy es la **presencia de items
+`tool_search_*` en `input[]`**, que es exactamente lo que mide `tool_search`.
+
+| Valor | Significado |
+|---|---|
+| `null` | Dialecto donde el concepto no aplica (Anthropic, Gemini, OpenAI Chat), o body que no parseó — "no se pudo ni mirar" |
+| `{used: false, deferred_loaded: 0}` | Petición Responses/Codex medida, sin items `tool_search_*` este turno: **EAGER confirmado** (no ausencia de dato) |
+| `{used: true, deferred_loaded: N}` | **LAZY**: el cliente ejercitó la búsqueda diferida; `N` tools con `defer_loading: true` se cargaron vía `tool_search_output` |
+
+`tool_search` es un objeto de forma FIJA (dos campos), a diferencia del array
+de longitud variable de `tools_by_server`. `used` puede ser `true` con
+`deferred_loaded: 0` cuando hubo un `tool_search_call` que no llegó a cargar
+ninguna tool.
+
+**No dobla bytes.** Los bytes de esos items `tool_search_output` ya los miden
+los campos `context_*` (viven en `input`, cuentan como `context_history_bytes`
+/ `context_last_turn_bytes`). `tool_search` solo **cuenta y clasifica**; nunca
+vuelve a sumar esos bytes ni los mezcla en `tools_by_server` — misma disciplina
+de "una medición, un dueño" que el resto de la fila.
+
+---
+
+### 4.4. `client`: el único campo de esta fila que NO es una medición del proxy
 
 Todo lo demás en esta tabla es algo que OxideGate **calculó** a partir del
 body (bytes, tokens, latencia) o **decidió** (`cache_control_forced`).
@@ -287,7 +329,7 @@ host donde corre el proxy debería saberlo antes de hacerlo, no después.
 
 ---
 
-### 4.4. `session`: la clave de atribución por sesión
+### 4.5. `session`: la clave de atribución por sesión
 
 `GET /stats` agrega por `(proveedor, modelo)`; ninguna vista, hasta ahora,
 sabía a qué SESIÓN pertenecía cada petición — solo a qué TIPO de harness
