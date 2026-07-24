@@ -18,7 +18,7 @@
 //! conocen ANTES de la respuesta); `served_speed` sale de `Usage::speed`, que
 //! el escáner de `usage` recién conoce al leer la respuesta — por eso viaja
 //! en `self.scanner.usage.speed`, no en `MetricBase`.
-use crate::provider::{ContextBreakdown, Provider, ToolServerBytes, Usage};
+use crate::provider::{ContextBreakdown, Provider, ToolSearchSignal, ToolServerBytes, Usage};
 use crate::telemetry::logger::{flatten_context_breakdown, tools_fields};
 use crate::telemetry::pricing;
 use crate::telemetry::{CodexQuota, RequestMetric, SessionAttribution, TelemetrySink};
@@ -87,6 +87,10 @@ pub struct MetricBase {
     /// que sale de `self.scanner.usage.speed` recién en [`MeteredBody::emit`],
     /// no acá: solo se conoce después de leer la respuesta).
     pub requested_speed: Option<String>,
+    /// Señal de carga diferida de herramientas medida en `prepare`
+    /// (`Outgoing::tool_search`, solo dialecto Responses/Codex). Viaja intacta
+    /// hasta `RequestMetric::tool_search`. `None` en el resto de dialectos.
+    pub tool_search: Option<ToolSearchSignal>,
     /// Proveedor dueño del dialecto de esta respuesta: la extracción del
     /// `usage` se delega íntegramente en él, así este módulo no necesita
     /// saber nada de ningún proveedor concreto.
@@ -295,6 +299,7 @@ impl MeteredBody {
             requested_effort: self.base.requested_effort.clone(),
             requested_speed: self.base.requested_speed.clone(),
             served_speed: self.scanner.usage.speed.clone(),
+            tool_search: self.base.tool_search.clone(),
             codex_quota: self.base.codex_quota.clone(),
         });
     }

@@ -102,6 +102,9 @@ impl Provider for Anthropic {
             tools_overhead_bytes: overhead,
             requested_effort,
             requested_speed,
+            // El mecanismo `tool_search` (carga diferida vía `input[]`) es
+            // exclusivo del dialecto Responses/Codex: Anthropic no lo tiene.
+            tool_search: None,
         }
     }
 
@@ -398,6 +401,22 @@ mod tests {
 
         assert!(!out.cache_control_forced);
         assert_eq!(out.body, original_body);
+    }
+
+    /// El dialecto de Anthropic NO tiene `tool_search` (mecanismo exclusivo de
+    /// Responses/Codex): `prepare` debe dejar el campo en `None` de punta a
+    /// punta, no solo el método del trait. Complementa la cobertura del método
+    /// que ya hace `chat_tool_search_es_none` en `provider::openai`.
+    #[test]
+    fn prepare_deja_tool_search_en_none() {
+        let cfg = test_config(false);
+        let incoming = incoming_with_body(
+            r#"{"model":"claude-3-5-sonnet","system":"hola","messages":[]}"#,
+        );
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert_eq!(out.tool_search, None);
     }
 
     /// Body no-JSON: `prepare` no debe romper, solo reenviar intacto, marcar
