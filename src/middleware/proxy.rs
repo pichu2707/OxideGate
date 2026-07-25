@@ -309,6 +309,9 @@ async fn send_and_meter(
                 tool_search: out.tool_search,
                 tools_flattened: out.tools_flattened,
                 skills: out.skills,
+                // No hubo respuesta que recorrer: `None` honesto, no un `0`
+                // que se leería como "el proveedor devolvió un cuerpo vacío".
+                response_bytes: None,
                 // No hubo respuesta del upstream que inspeccionar: sin
                 // `resp`, no hay cabeceras `x-codex-*` que leer. `None`
                 // honesto, no un dato inventado.

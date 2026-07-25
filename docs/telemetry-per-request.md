@@ -145,6 +145,7 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `tools_flattened` | Honestidad de la atribución de `tools_by_server`: `true` ⇒ el cliente NO usa el namespacing `mcp__`, así que su cubo `(native)` puede ocultar MCP aplanado; `false` ⇒ hay tools `mcp__`, el `(native)` es de fiar; `null` ⇒ no aplica (Anthropic/Gemini/Chat) o sin tools | Solo dialecto Responses/Codex. `pi` manda nombres crudos y `opencode` usa `<server>_<tool>` (ambiguo) — ninguno con `mcp__`. Es una advertencia estructural, NUNCA una atribución inventada: no nombra servidores. Ver §4.4 |
 | `session` | Sesión resuelta por precedencia de cabeceras del request: `{source, key}`. Nunca `null` — la peor rama es un fallback honesto (`source: "unattributed"`), no una ausencia | Ver §4.6 para la tabla de precedencia completa y cómo estampar el header desde cada harness |
 | `skills` | Listado de skills declarado en el body: `{declared, listing_bytes, format}`, o `null`. Se paga en CADA petición, se invoque una skill o no | `null` = no se reconoció ningún listado, **nunca "cero skills"**. `format` dice qué forma se encontró y, de paso, de qué herramienta viene el tráfico sin fiarse del `User-Agent` — ver §4.8 |
+| `response_bytes` | Bytes del CUERPO DE LA RESPUESTA que cruzaron el proxy. `null` si no llegó a haber respuesta | **Sin comprimir**, y por eso no es ancho de banda: el proxy descarta `Accept-Encoding` para poder leer el SSE. Ver §4.9 antes de compararlo con `prompt_bytes` |
 | `codex_quota` | Estado de la cuota de suscripción de Codex (OAuth de `chatgpt.com`), parseado de las doce cabeceras `x-codex-*` de la RESPUESTA del upstream: doce campos, todos opcionales. `null` si la petición no fue a Codex vía OAuth, o si el upstream falló antes de responder | Es el ÚNICO campo de esta fila que se lee de la respuesta y no del request ni del body. Cuota NUNCA son dólares: no alimenta ni puede alimentar `cost_estimate_usd` — ver §4.7 |
 
 Ninguno de los campos de latencia/coste/identidad es nuevo: todos ya existían
@@ -583,6 +584,44 @@ fila.
 **No dobla bytes.** Esos bytes ya los cuentan los campos `context_*` — viven
 dentro de uno de sus buckets. `skills` sólo **atribuye**; nunca vuelve a
 sumarlos.
+
+---
+
+### 4.9. `response_bytes`: la otra dirección, con una advertencia
+
+Hasta ahora toda la contabilidad en bytes era de SUBIDA. `response_bytes`
+cierra la otra mitad: cuántos bytes de cuerpo bajaron del proveedor al cliente.
+
+Se acumula en el mismo recorrido que ya hace `MeteredBody` para sacar el TTFT y
+el `usage` — ni un segundo pase ni bufferizar la respuesta entera.
+
+**La advertencia, y hay que leerla antes de usar el campo.**
+
+> **Son bytes SIN COMPRIMIR.** El proxy descarta `Accept-Encoding` a propósito
+> (ver `middleware::proxy`): si dejara que el proveedor comprimiera la
+> respuesta, el escáner SSE leería bytes comprimidos y no podría extraer el
+> `usage`. **Sin el medidor en el camino, el cliente habría recibido esta misma
+> respuesta comprimida.**
+
+Así que `response_bytes` mide el **tamaño del contenido que bajó**, no los
+bytes que se habrían pagado en la red sin proxy. Para texto SSE la diferencia
+no es menor: la compresión sobre texto repetitivo es agresiva.
+
+Es el mismo tipo de contaminación que ya documenta
+[`docs/optimizer-tool-search.md`](optimizer-tool-search.md) §3 con los
+esquemas MCP —*parte de lo que se ve existe porque el medidor está en el
+camino*— solo que en la dirección contraria: aquí el medidor **quita** una
+optimización que sin él estaría, y la bajada se ve más grande de lo que sería.
+
+**No lo dividas por `prompt_bytes` sin decirlo en voz alta.** Un cociente
+subida/bajada mezcla wire de subida con contenido de bajada. Es una ratio útil
+si se declara qué son sus dos términos, y engañosa si no.
+
+**`null` significa "no hubo respuesta que recorrer"**, nunca "el proveedor
+devolvió un cuerpo vacío". Un `0` fabricado ahí confundiría un fallo de
+conexión con una respuesta vacía legítima. Si el stream se cortó a mitad,
+`response_bytes` lleva lo que SÍ cruzó —una medición real de un cuerpo
+parcial— y es el `status` de la fila quien dice que hubo error.
 
 ---
 

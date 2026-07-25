@@ -230,6 +230,18 @@ pub struct RequestMetric {
     /// skill o no. `null` significa "no se reconoció ningún listado" — nunca
     /// "cero skills": ver `provider::skills` y `docs/skills-across-tools.md`.
     pub skills: Option<SkillsBlock>,
+    /// Bytes del CUERPO DE LA RESPUESTA que cruzaron el proxy. `None` si no
+    /// llegó a haber respuesta del upstream.
+    ///
+    /// **Sin comprimir, y no es lo mismo que ancho de banda.** El proxy
+    /// descarta `Accept-Encoding` para poder leer el SSE en texto plano y
+    /// sacar el `usage`; sin el medidor delante, el cliente habría recibido
+    /// esta respuesta comprimida. Mide el TAMAÑO DEL CONTENIDO que bajó, no
+    /// los bytes que se habrían pagado en la red sin proxy.
+    ///
+    /// No se combina con `prompt_bytes` en un mismo ratio sin decir en voz
+    /// alta que uno es wire de subida y el otro contenido de bajada.
+    pub response_bytes: Option<usize>,
 
     /// Microsegundos que `middleware::proxy::run` pasó DENTRO de
     /// `Provider::prepare` (parseo del body + `decompose` + mutación
@@ -543,6 +555,7 @@ mod tests {
             tool_search: None,
             tools_flattened: None,
             skills: None,
+            response_bytes: None,
             status: 200,
             ttft_ms: None,
             total_ms: 0.0,

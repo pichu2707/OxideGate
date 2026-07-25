@@ -195,6 +195,18 @@ pub struct MeteredBody {
     start: Instant,
     ttft_ms: Option<f64>,
     scanner: UsageScanner,
+    /// Bytes del cuerpo de la respuesta que han cruzado el proxy.
+    ///
+    /// Se acumula en el MISMO recorrido que ya hace `poll_next`: ni un segundo
+    /// pase ni bufferizar la respuesta entera.
+    ///
+    /// **Son bytes SIN COMPRIMIR, y eso importa.** El proxy descarta
+    /// `Accept-Encoding` a propósito (ver `middleware::proxy`) para poder leer
+    /// el SSE en texto plano y extraer el `usage`. Sin el proxy en medio, el
+    /// cliente habría recibido esta misma respuesta comprimida. Es una medida
+    /// honesta del TAMAÑO DEL CONTENIDO, no del ancho de banda que se habría
+    /// consumido sin el medidor delante.
+    response_bytes: usize,
     /// Guarda para no emitir la métrica dos veces (fin de stream + Drop).
     emitted: bool,
 }
@@ -219,6 +231,7 @@ impl MeteredBody {
             start,
             ttft_ms: None,
             scanner: UsageScanner::new(is_stream, provider),
+            response_bytes: 0,
             emitted: false,
         }
     }
@@ -309,6 +322,7 @@ impl MeteredBody {
             tool_search: self.base.tool_search.clone(),
             tools_flattened: self.base.tools_flattened,
             skills: self.base.skills,
+            response_bytes: Some(self.response_bytes),
             codex_quota: self.base.codex_quota.clone(),
         });
     }
@@ -326,6 +340,7 @@ impl Stream for MeteredBody {
                 if this.ttft_ms.is_none() {
                     this.ttft_ms = Some(this.start.elapsed().as_secs_f64() * 1000.0);
                 }
+                this.response_bytes += bytes.len();
                 this.scanner.feed(&bytes);
                 Poll::Ready(Some(Ok(bytes)))
             }
@@ -352,8 +367,82 @@ impl Drop for MeteredBody {
 
 #[cfg(test)]
 mod tests {
-    use super::UsageScanner;
+    use super::{MeteredBody, MetricBase, UsageScanner};
     use crate::provider::ANTHROPIC;
+    use crate::telemetry::{SessionAttribution, SessionSource, TelemetrySink};
+    use bytes::Bytes;
+    use futures_util::StreamExt;
+    use std::time::Instant;
+
+    /// `MetricBase` mínima para ejercitar el recorrido del stream.
+    fn base_de_prueba(stream: bool) -> MetricBase {
+        MetricBase {
+            timestamp: "2026-07-25T00:00:00Z".to_string(),
+            route: "/v1/messages".to_string(),
+            upstream: "anthropic".to_string(),
+            model: None,
+            prompt_hash: "h".to_string(),
+            stream,
+            client: None,
+            session: SessionAttribution {
+                source: SessionSource::Unattributed,
+                key: "k".to_string(),
+            },
+            prompt_bytes: 0,
+            status: 200,
+            cache_control_forced: false,
+            context: None,
+            tools_by_server: Vec::new(),
+            tools_overhead_bytes: 0,
+            prepare_us: 0,
+            requested_effort: None,
+            requested_speed: None,
+            tool_search: None,
+            tools_flattened: None,
+            skills: None,
+            provider: &ANTHROPIC,
+            codex_quota: None,
+        }
+    }
+
+    /// Los bytes de bajada se acumulan a lo largo de TODOS los chunks, no solo
+    /// del primero ni del último. Un contador que se reasigne en vez de sumar
+    /// daría el tamaño del último chunk y parecería plausible.
+    #[tokio::test]
+    async fn response_bytes_suma_todos_los_chunks() {
+        let dir = std::env::temp_dir().join(format!("oxi-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir de prueba");
+        let sink = TelemetrySink::spawn(dir.clone());
+        let recent = sink.recent();
+
+        let chunks = vec![
+            Ok(Bytes::from_static(b"12345")),
+            Ok(Bytes::from_static(b"678")),
+            Ok(Bytes::from_static(b"90")),
+        ];
+        let mut body = MeteredBody::new(
+            futures_util::stream::iter(chunks),
+            sink,
+            base_de_prueba(true),
+            Instant::now(),
+        );
+        while body.next().await.is_some() {}
+        drop(body);
+
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let filas = recent
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .snapshot();
+        let fila = filas.last().expect("debe haber una fila");
+
+        assert_eq!(
+            fila.response_bytes,
+            Some(10),
+            "5 + 3 + 2 = 10 bytes bajados"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// El caso feo: un evento SSE partido entre dos chunks. El buffer de
     /// línea debe recomponerlo antes de parsear, delegando en el proveedor
