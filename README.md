@@ -103,6 +103,9 @@ Y dos creencias extendidas, refutadas con grupo de control:
 
 Esta tabla existe para que nadie confunda una intención con un resultado. Es la
 misma disciplina que el resto del proyecto: un dato ausente se declara ausente.
+Cada hueco tiene su issue, y todas viven en el
+[project](https://github.com/users/pichu2707/projects/13): declarar la deuda y
+seguirla son lo mismo.
 
 | Superficie | Estado |
 |---|---|
@@ -112,14 +115,14 @@ misma disciplina que el resto del proyecto: un dato ausente se declara ausente.
 | Declarar una skill (el listado) | ✅ **138 B por skill**, en cada petición — ver [§3](docs/optimizer-skills.md) |
 | Invocar una skill (el cuerpo) | ✅ **`SKILL.md` − frontmatter + ~300 B**, y el historial lo reenvía cada turno — ver [§7](docs/optimizer-skills.md) |
 | `AGENTS.md` | ✅ Medido: **Claude Code no lo manda**, 0 B — ver [§4](docs/optimizer-skills.md) |
-| **Skills de plugin** | ❌ Sin medir: solo se midieron las de usuario |
-| **`AGENTS.md` en Codex, `pi` y OpenCode** | ❌ Sin medir; esos sí lo usan |
+| **Skills de plugin** | ❌ Sin medir: solo se midieron las de usuario — [#26](https://github.com/pichu2707/OxideGate/issues/26) |
+| **`AGENTS.md` en Codex, `pi` y OpenCode** | ❌ Sin medir; esos sí lo usan — [#27](https://github.com/pichu2707/OxideGate/issues/27) |
 | **Skills atribuidas POR PETICIÓN** en `/requests` | ✅ Campo `skills` con `declared`, `listing_bytes` y `format` — ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.8 |
 | Comparar el coste de skills entre herramientas | ✅ Medido en 4 clientes: **138 B/skill en Claude Code, 390 B en Codex** — ver [`docs/skills-across-tools.md`](docs/skills-across-tools.md) |
-| **Invocar una skill en Gemini, opencode y Codex** | ❌ Sin medir; solo está medido en Claude Code |
+| **Invocar una skill en Gemini, opencode y Codex** | ❌ Sin medir; solo está medido en Claude Code — [#28](https://github.com/pichu2707/OxideGate/issues/28) |
 | Bytes de bajada | ✅ Campo `response_bytes` — **sin comprimir**, ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.9 |
-| **Comparar herramientas sobre la misma TAREA** (no solo config) | ❌ Sin medir |
-| Agregación por sesión y panel de sesión en el TUI | 🚧 La captura existe; la vista, no |
+| **Comparar herramientas sobre la misma TAREA** (no solo config) | ❌ Sin medir — [#29](https://github.com/pichu2707/OxideGate/issues/29) |
+| Agregación por sesión y panel de sesión en el TUI | 🚧 La captura existe; la vista, no — [#30](https://github.com/pichu2707/OxideGate/issues/30) |
 
 ---
 
