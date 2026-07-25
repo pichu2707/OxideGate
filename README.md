@@ -85,10 +85,16 @@ es su lista de mensajes completa, repetida en cada request.
 | `CLAUDE.md` lean | **−29.509 B** por petición | El 85,1% del archivo era flujo, no regla |
 | `--effort low` | **−20,0%** tokens de salida, **−22,0%** de reloj | Cero en exactitud: 45/45 sobre respuesta cerrada |
 
-Y una creencia extendida, refutada con grupo de control:
+Y dos creencias extendidas, refutadas con grupo de control:
 
 > **Marcar una tool con `defer_loading` cuesta 21 bytes y no quita ninguno.**
 > El esquema viaja completo. La carga diferida ahorra **contexto**, no **cable**.
+
+> **Las skills sí son perezosas: 200.601 B en disco → ~1,5 kB al cable.** Solo
+> viaja el listado, a **138 B por skill**. La palanca no es instalar menos
+> skills, es escribir descripciones cortas — esa línea se paga en cada
+> petición, se invoque o no. Detalle en
+> [`docs/optimizer-skills.md`](docs/optimizer-skills.md).
 
 ---
 
@@ -102,8 +108,11 @@ misma disciplina que el resto del proyecto: un dato ausente se declara ausente.
 | Esquemas MCP, `CLAUDE.md`, historial, `system`, último turno | ✅ Medido en bytes, por petición |
 | Tokens, coste, TTFT y latencia por proveedor y modelo | ✅ Medido, del `usage` real |
 | Cuota de suscripción (Codex/ChatGPT) | ✅ Medida, de las cabeceras `x-codex-*` |
-| **Skills como coste en bytes** | ❌ Solo se ha observado *si* el agente las carga, nunca *cuánto pesan* |
-| **`AGENTS.md`** | ❌ Sin medir |
+| Skills como coste en bytes | ✅ **138 B por skill**, en `context_last_turn_bytes` — ver [§3](docs/optimizer-skills.md) |
+| `AGENTS.md` | ✅ Medido: **Claude Code no lo manda**, 0 B — ver [§4](docs/optimizer-skills.md) |
+| **Coste de INVOCAR una skill** (el cuerpo del `SKILL.md`) | ❌ Sin medir; aquí solo está el listado |
+| **Skills de plugin** | ❌ Sin medir: solo se midieron las de usuario |
+| **`AGENTS.md` en Codex, `pi` y OpenCode** | ❌ Sin medir; esos sí lo usan |
 | **Comparar herramientas distintas sobre la misma tarea** | ❌ Sin medir |
 | Agregación por sesión y panel de sesión en el TUI | 🚧 La captura existe; la vista, no |
 
@@ -514,6 +523,7 @@ por función con su contrato) y **responsabilidad única estricta** por módulo.
 | [`docs/optimizer-prompt-cache.md`](docs/optimizer-prompt-cache.md) | Palanca A: forzado de prompt caching de Anthropic |
 | [`docs/optimizer-dedup.md`](docs/optimizer-dedup.md) | Palanca B: dedup de respuestas por `prompt_hash` (descartada para tráfico conversacional, con evidencia) |
 | [`docs/optimizer-claude-md.md`](docs/optimizer-claude-md.md) | El `CLAUDE.md` lean: −29.509 B/petición medidos en el cable, y un A/B de comportamiento (la delegación sobrevive al lean; el guardado proactivo no es medible en modo `-p`) |
+| [`docs/optimizer-skills.md`](docs/optimizer-skills.md) | Skills y `AGENTS.md`: 138 B por skill en el último turno (200.601 B en disco → ~1,5 kB al cable), y por qué Claude Code no manda `AGENTS.md`. Incluye una retractación y el control que la forzó |
 | [`docs/context-tax.md`](docs/context-tax.md) | El impuesto de contexto: descomposición medida de costo y latencia de una sesión real de agente, y el piso del harness |
 | [`docs/telemetry-by-model.md`](docs/telemetry-by-model.md) | El endpoint `GET /stats` y qué señala cada métrica |
 | [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) | El endpoint `GET /requests`: detalle en vivo por petición, la invariante de privacidad y el límite de 200 filas |
