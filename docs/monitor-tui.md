@@ -516,6 +516,10 @@ momento de ESA petición puntual, presente únicamente cuando la petición se
 enrutó al backend de Codex vía OAuth (suscripción, no API key). Responde:
 *"¿cuánto me queda de cuota, y cuándo resetea?"*
 
+El contrato campo a campo de `codex_quota` (los doce campos, su saneo y por
+qué la cuota nunca se mezcla con `cost_estimate_usd`) está en
+[`telemetry-per-request.md`](telemetry-per-request.md) §4.7.
+
 Se alterna con la tecla `u`, **INDEPENDIENTE** de `p`/`c`/`s`: las cuatro
 teclas controlan estados ortogonales, cualquier combinación de visibilidad es
 válida.
