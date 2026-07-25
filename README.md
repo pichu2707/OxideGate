@@ -74,9 +74,14 @@ presentación y nunca dos mediciones que compiten — la trampa en la que cayó
 sobre `127.0.0.1`. **Cualquiera puede escribir su propia lente**: no hace
 falta permiso, ni un plugin, ni tocar este repo. Basta con leer esas rutas.
 
+Y `GET /version` dice qué versión del contrato sirve el proxy que tienes
+delante y qué campos publica, para que una lente pueda distinguir *«este
+proxy no lo soporta»* de *«aquí no había dato»* sin sondear por ausencia.
+
 El contrato campo a campo está en
-[`docs/telemetry-per-request.md`](docs/telemetry-per-request.md), y lo que
-debe hacer un consumidor ante un campo que no conoce (ignorarlo) también.
+[`docs/telemetry-per-request.md`](docs/telemetry-per-request.md); las reglas
+de qué es aditivo y qué es ruptura, en su
+[§8](docs/telemetry-per-request.md).
 
 ---
 
@@ -201,6 +206,7 @@ seguirla son lo mismo.
 | **Nombres de tools por fila** | Cada entrada de `tools_by_server` lleva los `tool_names` que viajaron. OxideGate **no atribuye** las aplanadas —no puede— pero publica el hecho para que lo cruce quien tenga la lista autoritativa. Acotado a 64 nombres por fila; si `tool_names.len() < tools`, está recortada. Ver §4.2. | ✅ |
 | **Skills por petición** | Detecta el listado de skills en el body sea cual sea la herramienta —tres formatos medidos en Claude Code, Gemini CLI, opencode y Codex— y lo expone en `GET /requests` como `{declared, listing_bytes, format}`. Un bloque sin entradas no cuenta: la marca aparece también en el texto del usuario. Ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.8. | ✅ |
 | **Atribución por sesión** | Resuelve una clave de sesión por precedencia de cabeceras (`X-OxideGate-Session` explícito → `x-claude-code-session-id` nativo de Claude Code → fallback honesto por `User-Agent`), capturada por petición y expuesta en `GET /requests` + `telemetry.jsonl` (`session.source`/`session.key`). Ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.6. **Agregada** en `GET /sessions` —endpoint aparte, no un campo en `/stats`, para no romper la forma que ya consumen sus clientes— y con **panel propio en el monitor** (tecla `e`). Ver [`docs/telemetry-by-session.md`](docs/telemetry-by-session.md) y [`docs/monitor-tui.md`](docs/monitor-tui.md) §12. | ✅ |
+| **Contrato versionado y descubrible** | `GET /version` publica versión, versión del contrato, endpoints y los campos que marcan una capacidad — para que un consumidor distinga «este proxy no lo soporta» de «aquí no había dato» en vez de sondear por ausencia. Reglas de aditivo-vs-ruptura y tres tests de snapshot que congelan las claves de `/requests`, `/stats` y `/sessions`. Ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §8. | ✅ |
 
 ---
 
@@ -332,6 +338,7 @@ propio reporte, en vez de presentar un ahorro que no existe.
 | `POST /v1/responses` | OpenAI (Responses API) |
 | `POST /v1beta/*` | Google Gemini |
 | `GET  /health` | Liveness (JSON). No toca la telemetría: responde mientras el proceso sirva |
+| `GET  /version` | Capacidades: versión, versión del contrato, endpoints y campos publicados. Un 404 aquí significa build anterior al contrato — ver [§8](docs/telemetry-per-request.md) |
 | `GET  /stats` | Agregación por modelo (JSON) |
 | `GET  /sessions` | Agregación por sesión: qué costó cada sesión de trabajo (JSON) |
 | `GET  /requests` | Últimas 200 peticiones individuales, en vivo (JSON) |
