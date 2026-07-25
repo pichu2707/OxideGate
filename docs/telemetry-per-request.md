@@ -144,6 +144,7 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `tool_search` | Señal de carga diferida de herramientas del dialecto Responses/Codex: `{used, deferred_loaded}`, o `null`. `used: false` ⇒ EAGER confirmado este turno; `used: true` ⇒ LAZY (el cliente cargó tools a mitad de sesión) | `null` en Anthropic/Gemini/OpenAI-Chat (no aplica) o si el body no parseó. Es el diferenciador eager-vs-lazy por cliente que `tools_by_server` NO puede dar — ver §4.3 |
 | `tools_flattened` | Honestidad de la atribución de `tools_by_server`: `true` ⇒ el cliente NO usa el namespacing `mcp__`, así que su cubo `(native)` puede ocultar MCP aplanado; `false` ⇒ hay tools `mcp__`, el `(native)` es de fiar; `null` ⇒ no aplica (Anthropic/Gemini/Chat) o sin tools | Solo dialecto Responses/Codex. `pi` manda nombres crudos y `opencode` usa `<server>_<tool>` (ambiguo) — ninguno con `mcp__`. Es una advertencia estructural, NUNCA una atribución inventada: no nombra servidores. Ver §4.4 |
 | `session` | Sesión resuelta por precedencia de cabeceras del request: `{source, key}`. Nunca `null` — la peor rama es un fallback honesto (`source: "unattributed"`), no una ausencia | Ver §4.6 para la tabla de precedencia completa y cómo estampar el header desde cada harness |
+| `codex_quota` | Estado de la cuota de suscripción de Codex (OAuth de `chatgpt.com`), parseado de las doce cabeceras `x-codex-*` de la RESPUESTA del upstream: doce campos, todos opcionales. `null` si la petición no fue a Codex vía OAuth, o si el upstream falló antes de responder | Es el ÚNICO campo de esta fila que se lee de la respuesta y no del request ni del body. Cuota NUNCA son dólares: no alimenta ni puede alimentar `cost_estimate_usd` — ver §4.7 |
 
 Ninguno de los campos de latencia/coste/identidad es nuevo: todos ya existían
 en `RequestMetric` (Nivel 1). Los campos `context_*`, `prepare_us`,
@@ -436,6 +437,106 @@ header de sesión nativo — caen al `User-Agent`).
 
 ---
 
+### 4.7. `codex_quota`: cuánta cuota queda, y por qué nunca son dólares
+
+Todos los demás campos de esta fila salen del **request**: de su body
+(`context_*`, `tools_by_server`, `tool_search`) o de sus cabeceras
+(`session`, `client`). `codex_quota` es la excepción: se parsea de las
+cabeceras de la **respuesta del upstream**
+(`middleware::proxy::send_and_meter`, vía `CodexQuota::from_headers`). Es la
+única asimetría de dirección de toda la tabla y conviene tenerla presente al
+razonar sobre el resto del contrato.
+
+Cuando una petición se enruta al backend de Codex por **OAuth** (plan de
+suscripción de ChatGPT, no API key), la respuesta trae doce cabeceras
+`x-codex-*` que describen el estado de la cuota. Este campo las transporta
+crudas, **sin derivar nada**: ni agregación, ni delta entre filas, ni coste
+nocional.
+
+**Forma:**
+
+```json
+"codex_quota": {
+  "plan_type": "pro",
+  "active_limit": "primary",
+  "credits_balance": "12.50",
+  "primary_used_percent": 4,
+  "secondary_used_percent": 12,
+  "primary_window_minutes": 300,
+  "secondary_window_minutes": 10080,
+  "primary_reset_after_seconds": 1800,
+  "primary_reset_at": 1732000000,
+  "secondary_reset_at": 1732600000,
+  "credits_has_credits": false,
+  "credits_unlimited": false
+}
+```
+
+| Campo | Tipo | Cabecera de origen |
+|---|---|---|
+| `plan_type` | string cruda | `x-codex-plan-type` |
+| `active_limit` | string cruda — cuál de las dos ventanas limita hoy | `x-codex-active-limit` |
+| `credits_balance` | **string cruda, sin parseo numérico** | `x-codex-credits-balance` |
+| `primary_used_percent` | entero | `x-codex-primary-used-percent` |
+| `secondary_used_percent` | entero | `x-codex-secondary-used-percent` |
+| `primary_window_minutes` | entero | `x-codex-primary-window-minutes` |
+| `secondary_window_minutes` | entero | `x-codex-secondary-window-minutes` |
+| `primary_reset_after_seconds` | entero | `x-codex-primary-reset-after-seconds` |
+| `primary_reset_at` | timestamp unix | `x-codex-primary-reset-at` |
+| `secondary_reset_at` | timestamp unix | `x-codex-secondary-reset-at` |
+| `credits_has_credits` | booleano | `x-codex-credits-has-credits` |
+| `credits_unlimited` | booleano | `x-codex-credits-unlimited` |
+
+`credits_balance` viaja como **string a propósito**: el upstream no garantiza
+el formato exacto del saldo (unidades, notación), así que parsearlo a número
+sería inventar una precisión que nadie prometió.
+
+**Cuota y dólares no se mezclan — y la separación es estructural.**
+`CodexQuota` es un tipo aparte, en un módulo aparte, sin ningún campo en USD.
+Es *incapaz por construcción* de alimentar `cost_estimate_usd`. La razón no
+es de estilo: la cuota es un **porcentaje de ventana consumida en un plan de
+precio fijo**, no un importe. Sumar ambas monedas en un mismo número no sería
+una simplificación, sería un error. Un test
+(`codex_quota_no_tiene_campo_en_dolares_ni_ruta_a_cost_estimate_usd`) fija
+que el JSON serializado jamás contenga `usd` ni `cost`, para que la garantía
+no dependa de que nadie se despiste.
+
+**La presencia es la única señal discriminadora.** `from_headers` se dispara
+por la presencia de cabeceras `x-codex-*` en la respuesta — **nunca** por la
+identidad del upstream ni por el slug del modelo. `api.openai.com` vía API
+key comparte el proveedor `openai` pero jamás manda estas cabeceras;
+Anthropic y Gemini tampoco. Por eso este campo distingue algo que `upstream`
+no puede: **OAuth de suscripción frente a API key de pago por uso**, dentro
+del mismo proveedor.
+
+**Dos formas de "no hay dato", y significan cosas distintas:**
+
+| Valor | Significado |
+|---|---|
+| `codex_quota: null` | Ninguna de las doce cabeceras vino: no es tráfico de Codex por OAuth, o el upstream falló antes de responder |
+| `codex_quota: { …, "secondary_reset_at": null, … }` | SÍ es tráfico de Codex con cuota, pero ese campo puntual faltó, llegó vacío o no parseó |
+
+Nunca se devuelve un `CodexQuota` con los doce campos en `null`: esa forma
+está reservada para el segundo caso, no para el primero.
+
+**Contrato de saneo, compartido por los doce campos** (mismo criterio que el
+resto del proyecto: un dato ausente y un cero real son cosas distintas):
+
+- Cabecera ausente → `null`.
+- Cabecera presente pero **vacía** → `null`, nunca `""` ni un `0` fabricado.
+  No es hipotético: `x-codex-secondary-reset-at` llega vacía en captura real.
+- Valor numérico no parseable → `null`. El parseo **nunca hace `panic`**: un
+  dialecto de cabecera malformado no puede tumbar el proxy.
+- Booleanos: solo los literales exactos `"True"`/`"False"` (capitalizados,
+  tal como los manda Codex) parsean. `"true"`, `"1"` o vacío → `null`.
+
+**Invariante de privacidad.** `codex_quota` no compromete §3: no hay
+contenido de prompt en ninguno de los doce campos — solo porcentajes,
+duraciones de ventana, timestamps de reseteo y saldo de plan. Tampoco lleva
+credenciales: las cabeceras `x-codex-*` describen la cuota, no autentican.
+
+---
+
 ## 5. Límite de memoria: 200 filas, y se pierden al reiniciar
 
 `RECENT_CAPACITY = 200` (`src/telemetry/recent.rs`): el buffer es un
@@ -488,6 +589,7 @@ el historial completo, o algo más viejo que las últimas 200 peticiones, la
 | Archivo | Responsabilidad |
 |---|---|
 | `src/telemetry/recent.rs` | `RecentRequests`, `RecentRequest` — buffer FIFO acotado y proyección, sin axum |
+| `src/telemetry/codex_quota.rs` | `CodexQuota`, `CodexQuota::from_headers` — parseo y saneo de las doce cabeceras `x-codex-*`, sin ningún campo en USD (§4.7) |
 | `src/telemetry/logger.rs` | `TelemetrySink::spawn` alimenta el buffer en la misma task que escribe el JSONL; `TelemetrySink::recent()` expone el `Arc<RwLock<RecentRequests>>` |
 | `src/middleware/requests.rs` | `handle_requests` — el handler HTTP de `GET /requests` |
 | `src/main.rs` | Registra la ruta `/requests` en el `Router` |
