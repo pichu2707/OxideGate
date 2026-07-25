@@ -117,6 +117,7 @@ misma disciplina que el resto del proyecto: un dato ausente se declara ausente.
 | **Skills atribuidas POR PETICIÓN** en `/requests` | ✅ Campo `skills` con `declared`, `listing_bytes` y `format` — ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.8 |
 | Comparar el coste de skills entre herramientas | ✅ Medido en 4 clientes: **138 B/skill en Claude Code, 390 B en Codex** — ver [`docs/skills-across-tools.md`](docs/skills-across-tools.md) |
 | **Invocar una skill en Gemini, opencode y Codex** | ❌ Sin medir; solo está medido en Claude Code |
+| **Bytes de BAJADA** (todo el conteo en bytes es de subida) | ❌ Sin medir — [#22](https://github.com/pichu2707/OxideGate/issues/22) |
 | **Comparar herramientas sobre la misma TAREA** (no solo config) | ❌ Sin medir |
 | Agregación por sesión y panel de sesión en el TUI | 🚧 La captura existe; la vista, no |
 
@@ -560,6 +561,13 @@ tráfico de Codex/ChatGPT por OAuth, y la **rebanada 1 del eje de atribución
 de sesiones** (clave de sesión resuelta por precedencia de cabeceras,
 capturada en `session` en `/requests` + `telemetry.jsonl` — ver
 [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.6).
+
+**Siguiente** 🔜
+- **Bytes de bajada** ([#22](https://github.com/pichu2707/OxideGate/issues/22)).
+  Hoy toda la contabilidad en bytes mide la petición; de la respuesta solo hay
+  tokens. Sin la bajada no se puede ver el perfil real de un cliente que manda
+  poco y recibe mucho, ni cuánto del SSE es framing y cuánto contenido. La
+  instrumentación ya pasa por `MeteredBody`, que consume el stream entero.
 
 **Descartado** ⛔ (con evidencia, para tráfico conversacional)
 - **Palanca B — dedup por `prompt_hash`.** Medido contra tráfico real de
