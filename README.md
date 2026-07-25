@@ -15,6 +15,100 @@ impacto **en vivo**, comparando el antes y el después.
 
 ---
 
+## En 30 segundos
+
+```mermaid
+flowchart LR
+    CC["Claude Code"] --> OG
+    OC["OpenCode"] --> OG
+    GC["Gemini CLI"] --> OG
+    CX["Codex · pi"] --> OG
+    OG["OxideGate<br/>proxy local<br/>mide cada petición"]
+    OG --> AN["Anthropic"]
+    OG --> OA["OpenAI"]
+    OG --> GE["Gemini"]
+```
+
+Apuntas tus clientes al proxy en vez de al proveedor. La petición viaja
+**intacta** —tu autenticación incluida— y de paso queda medida. Un solo sitio
+donde ver el gasto de todos los modelos y todas las herramientas a la vez.
+
+---
+
+## El hallazgo: tu pregunta es el 0,03% de lo que pagas
+
+Petición real de un agente, **225.798 bytes**. Esto es lo que iba dentro:
+
+```mermaid
+pie showData
+    title Dónde van los bytes de una petición típica
+    "Esquemas de herramientas" : 159874
+    "CLAUDE.md global" : 35140
+    "Volcado del hook de memoria" : 19668
+    "system del harness" : 8928
+    "Tu mensaje" : 75
+```
+
+| Bloque | Bytes | % del body |
+|---|---:|---:|
+| Esquemas de herramientas (`tools`) | 159.874 | **70,8%** |
+| `CLAUDE.md` global, inyectado como `<system-reminder>` | 35.140 | 15,6% |
+| Volcado del hook `SessionStart` de memoria | 19.668 | 8,7% |
+| `system` del harness | 8.928 | 4,0% |
+| **El mensaje del usuario** | **75** | **0,03%** |
+
+Del coste total, el **78,2%** es maquinaria de contexto —releer y reescribir el
+prefijo— y solo el **3,0%** es input genuinamente nuevo.
+
+---
+
+## Y empeora en cada turno
+
+> **El coste de una conversación crece N², no N.**
+> Cada turno relee el prefijo entero, y el prefijo crece con cada turno.
+
+La caché no lo arregla: **cambia el precio, no la cantidad**. Un token cacheado
+sube igual por el cable, ocupa la misma ventana de contexto y pasa por prefill
+igual. Cuesta el 10% de la tarifa de input, en cada turno, para siempre. No
+existe "cachear al abrir el proyecto": la API es sin estado y una conversación
+es su lista de mensajes completa, repetida en cada request.
+
+---
+
+## Las palancas que funcionan (medidas, no supuestas)
+
+| Palanca | Efecto medido | Lo que cuesta |
+|---|---|---|
+| `mcp-lean.json` + `--strict-mcp-config` | **−55.098 B** por petición | Nada, si esos servidores no se usaban |
+| `--tools <lista>` | **−94,9%** del array de esquemas | Ese agente ya no edita, ni busca por patrón, ni delega |
+| Las dos apiladas | 224.653 B → **51.540 B** (**−77,1%**) | Las dos renuncias a la vez |
+| `CLAUDE.md` lean | **−29.509 B** por petición | El 85,1% del archivo era flujo, no regla |
+| `--effort low` | **−20,0%** tokens de salida, **−22,0%** de reloj | Cero en exactitud: 45/45 sobre respuesta cerrada |
+
+Y una creencia extendida, refutada con grupo de control:
+
+> **Marcar una tool con `defer_loading` cuesta 21 bytes y no quita ninguno.**
+> El esquema viaja completo. La carga diferida ahorra **contexto**, no **cable**.
+
+---
+
+## Lo que todavía NO está medido
+
+Esta tabla existe para que nadie confunda una intención con un resultado. Es la
+misma disciplina que el resto del proyecto: un dato ausente se declara ausente.
+
+| Superficie | Estado |
+|---|---|
+| Esquemas MCP, `CLAUDE.md`, historial, `system`, último turno | ✅ Medido en bytes, por petición |
+| Tokens, coste, TTFT y latencia por proveedor y modelo | ✅ Medido, del `usage` real |
+| Cuota de suscripción (Codex/ChatGPT) | ✅ Medida, de las cabeceras `x-codex-*` |
+| **Skills como coste en bytes** | ❌ Solo se ha observado *si* el agente las carga, nunca *cuánto pesan* |
+| **`AGENTS.md`** | ❌ Sin medir |
+| **Comparar herramientas distintas sobre la misma tarea** | ❌ Sin medir |
+| Agregación por sesión y panel de sesión en el TUI | 🚧 La captura existe; la vista, no |
+
+---
+
 ## Estado actual
 
 | Capa | Qué hace | Estado |
