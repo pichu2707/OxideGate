@@ -90,6 +90,10 @@ Y dos creencias extendidas, refutadas con grupo de control:
 > **Marcar una tool con `defer_loading` cuesta 21 bytes y no quita ninguno.**
 > El esquema viaja completo. La carga diferida ahorra **contexto**, no **cable**.
 
+> **Gemini CLI cobra 288 B por skill y no declara la herramienta para
+> canjearlos.** Su prompt manda llamar `activate_skill`; esa herramienta no
+> está entre las once que envía. Medido en `gemini -p`, dos capturas idénticas.
+
 > **`disable-model-invocation: true` hace que una skill cueste CERO bytes.** No
 > se lista, así que no se paga en ninguna petición. En esta máquina son 11 de
 > 22 skills. Es la única palanca del eje que no recorta nada: elimina el coste
@@ -125,7 +129,8 @@ seguirla son lo mismo.
 | `AGENTS.md` en Codex, `pi` y OpenCode | ✅ Los tres lo mandan: **+159 B / +200 B / +160 B** sobre un fichero de 74 B. Claude Code, 0 B. Ver [§6](docs/skills-across-tools.md) |
 | **Skills atribuidas POR PETICIÓN** en `/requests` | ✅ Campo `skills` con `declared`, `listing_bytes` y `format` — ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.8 |
 | Comparar el coste de skills entre herramientas | ✅ Medido en 4 clientes: **138 B/skill en Claude Code, 390 B en Codex** — ver [`docs/skills-across-tools.md`](docs/skills-across-tools.md) |
-| **Invocar una skill en Gemini, opencode y Codex** | ❌ Sin medir; solo está medido en Claude Code — [#28](https://github.com/pichu2707/OxideGate/issues/28) |
+| Invocar una skill en Gemini, opencode y Codex | ✅ Medido: opencode **3.335 B**; Codex **no tiene mecanismo** (lee el fichero); Gemini anuncia `activate_skill` y **no la declara** — ver [§7](docs/skills-across-tools.md) |
+| **`activate_skill` en el modo interactivo de Gemini** | ❌ Sin medir: aquí se probó `gemini -p` |
 | Bytes de bajada | ✅ Campo `response_bytes` — **sin comprimir**, ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.9 |
 | **Comparar herramientas sobre la misma TAREA** (no solo config) | ❌ Sin medir — [#29](https://github.com/pichu2707/OxideGate/issues/29) |
 | Agregación por sesión | ✅ `GET /sessions` — ver [`docs/telemetry-by-session.md`](docs/telemetry-by-session.md) |
