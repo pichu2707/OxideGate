@@ -64,6 +64,19 @@ curl 127.0.0.1:8899/stats     # agregado por modelo
 oxidegate-monitor             # o el dashboard en vivo (misma OXIDEGATE_PORT)
 ```
 
+**No hace falta ir a comprobar si funcionó.** La primera vez que OxideGate mide
+algo lo dice él, sin que se lo pidan:
+
+```
+✅ Primera petición medida — el cableado funciona.
+   claude-cli/2.0.1 → anthropic /v1/messages 200
+   Dashboard en vivo: oxidegate-monitor
+```
+
+Sale una sola vez por arranque. Si tras lanzar el agente esa línea **no**
+aparece, el tráfico no está pasando por el proxy — y la causa casi siempre es
+el `/v1` de la nota de abajo.
+
 > **`ANTHROPIC_BASE_URL` va SIN `/v1`.** El cliente le agrega la ruta él mismo
 > (`/v1/messages`). Si se agrega el `/v1`, la petición sale a `/v1/v1/messages` y
 > el proxy devuelve **404**. Es el error más fácil de cometer y el más difícil de
