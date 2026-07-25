@@ -1,5 +1,7 @@
 # OxideGate
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/pichu2707/OxideGate)
+
 > Proxy local en Rust que se sienta entre los clientes de IA (gentle-ai,
 > agentes, SDKs, Claude Code) y los proveedores (Anthropic, OpenAI, Gemini).
 > **Mide** cada petición —coste, tokens, latencia— por proveedor **y por
