@@ -128,7 +128,8 @@ seguirla son lo mismo.
 | **Invocar una skill en Gemini, opencode y Codex** | ❌ Sin medir; solo está medido en Claude Code — [#28](https://github.com/pichu2707/OxideGate/issues/28) |
 | Bytes de bajada | ✅ Campo `response_bytes` — **sin comprimir**, ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.9 |
 | **Comparar herramientas sobre la misma TAREA** (no solo config) | ❌ Sin medir — [#29](https://github.com/pichu2707/OxideGate/issues/29) |
-| Agregación por sesión y panel de sesión en el TUI | 🚧 La captura existe; la vista, no — [#30](https://github.com/pichu2707/OxideGate/issues/30) |
+| Agregación por sesión | ✅ `GET /sessions` — ver [`docs/telemetry-by-session.md`](docs/telemetry-by-session.md) |
+| **Panel de sesión en el monitor TUI** | 🚧 Los datos están; la vista no — [#30](https://github.com/pichu2707/OxideGate/issues/30) |
 
 ---
 
@@ -271,6 +272,7 @@ propio reporte, en vez de presentar un ahorro que no existe.
 | `POST /v1beta/*` | Google Gemini |
 | `GET  /health` | Liveness (JSON). No toca la telemetría: responde mientras el proceso sirva |
 | `GET  /stats` | Agregación por modelo (JSON) |
+| `GET  /sessions` | Agregación por sesión: qué costó cada sesión de trabajo (JSON) |
 | `GET  /requests` | Últimas 200 peticiones individuales, en vivo (JSON) |
 
 ### Variables de entorno
@@ -550,6 +552,7 @@ por función con su contrato) y **responsabilidad única estricta** por módulo.
 | [`docs/skills-across-tools.md`](docs/skills-across-tools.md) | La misma convención `SKILL.md` en cuatro herramientas y cuatro precios: dónde manda cada una el listado y por qué Claude Code cuesta menos de la mitad que Codex |
 | [`docs/optimizer-skills.md`](docs/optimizer-skills.md) | Skills y `AGENTS.md`: declarar una skill cuesta 138 B en cada petición; invocarla, el cuerpo entero del `SKILL.md` dentro del historial. Y por qué Claude Code no manda `AGENTS.md`. Incluye una retractación y el control que la forzó |
 | [`docs/context-tax.md`](docs/context-tax.md) | El impuesto de contexto: descomposición medida de costo y latencia de una sesión real de agente, y el piso del harness |
+| [`docs/telemetry-by-session.md`](docs/telemetry-by-session.md) | El endpoint `GET /sessions`: qué costó cada sesión, por qué se agrega por `(source, key)` y no por la clave sola, y qué significa `is_session: false` |
 | [`docs/telemetry-by-model.md`](docs/telemetry-by-model.md) | El endpoint `GET /stats` y qué señala cada métrica |
 | [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) | El endpoint `GET /requests`: detalle en vivo por petición, la invariante de privacidad y el límite de 200 filas |
 | [`docs/speed.md`](docs/speed.md) | Tokens y tiempo son monedas distintas: por qué el TTFT no correlaciona con nada medido, y las dos palancas que sí mueven el tok/s |

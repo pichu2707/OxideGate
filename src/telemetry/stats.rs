@@ -306,6 +306,103 @@ impl StatsRegistry {
     }
 }
 
+
+/// Tope de sesiones distintas que [`SessionRegistry`] trackea.
+///
+/// `X-OxideGate-Session` es una cabecera **controlada por quien llama**: un
+/// mapa sin cota keyeado por ella es un vector de crecimiento de memoria en el
+/// camino crítico. Mismo espíritu que [`MAX_DISTINCT_PROMPTS_PER_MODEL`], y
+/// mismo comportamiento: **satura**. Al llegar al tope se dejan de admitir
+/// claves NUEVAS —las conocidas siguen sumando— y el snapshot lo declara.
+const MAX_DISTINCT_SESSIONS: usize = 10_000;
+
+/// Acumulador de una sesión.
+#[derive(Debug, Default)]
+struct SessionAccumulator {
+    requests: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_read_tokens: u64,
+    cost_usd: f64,
+}
+
+impl SessionAccumulator {
+    fn ingest(&mut self, m: &RequestMetric) {
+        self.requests += 1;
+        self.input_tokens += m.input_tokens.unwrap_or(0);
+        self.output_tokens += m.output_tokens.unwrap_or(0);
+        self.cache_read_tokens += m.cache_read_tokens.unwrap_or(0);
+        self.cost_usd += m.cost_estimate_usd.unwrap_or(0.0);
+    }
+}
+
+/// Una fila de la agregación por sesión.
+#[derive(Debug, serde::Serialize, PartialEq)]
+pub struct SessionStatsRow {
+    /// `explicit` | `native` | `unattributed`. **Viaja siempre con `key`**:
+    /// la misma clave bajo distinto origen significa cosas distintas.
+    pub source: String,
+    /// Clave resuelta. Con `unattributed` es el `User-Agent`, NO una identidad.
+    pub key: String,
+    /// `false` cuando la fila es el cubo de fallback `unattributed`, que
+    /// agrupa a TODAS las sesiones no atribuidas de ese `User-Agent`. Tratarla
+    /// como una sesión más daría un número que parece una y son muchas.
+    pub is_session: bool,
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cost_usd: f64,
+}
+
+/// Vista serializable de la agregación por sesión: filas y si se saturó.
+#[derive(Debug, serde::Serialize)]
+pub struct SessionSnapshot(pub Vec<SessionStatsRow>, pub bool);
+
+/// Registro en memoria de la agregación por `(source, key)`.
+///
+/// **Se keyea por el par, no solo por la clave.** Ver `SessionStatsRow::source`.
+#[derive(Debug, Default)]
+pub struct SessionRegistry {
+    accumulators: HashMap<(String, String), SessionAccumulator>,
+    saturated: bool,
+}
+
+impl SessionRegistry {
+    /// Incorpora una métrica al acumulador de su sesión.
+    pub fn ingest(&mut self, m: &RequestMetric) {
+        let source = m.session.source.as_str().to_string();
+        let key = (source, m.session.key.clone());
+
+        if !self.accumulators.contains_key(&key) && self.accumulators.len() >= MAX_DISTINCT_SESSIONS
+        {
+            self.saturated = true;
+            return;
+        }
+        self.accumulators.entry(key).or_default().ingest(m);
+    }
+
+    /// Vista serializable, ordenada por tráfico descendente.
+    pub fn snapshot(&self) -> SessionSnapshot {
+        let mut rows: Vec<SessionStatsRow> = self
+            .accumulators
+            .iter()
+            .map(|((source, key), acc)| SessionStatsRow {
+                is_session: source != "unattributed",
+                source: source.clone(),
+                key: key.clone(),
+                requests: acc.requests,
+                input_tokens: acc.input_tokens,
+                output_tokens: acc.output_tokens,
+                cache_read_tokens: acc.cache_read_tokens,
+                cost_usd: acc.cost_usd,
+            })
+            .collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.requests));
+        SessionSnapshot(rows, self.saturated)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,6 +411,96 @@ mod tests {
     // valor aunque `StatsRegistry` no agregue por sesión (fuera de alcance
     // de esta rebanada, ver `spec.md`).
     use crate::telemetry::{SessionAttribution, SessionSource};
+
+    // --- Agregación por sesión ---
+
+    fn metric_de_sesion(source: SessionSource, key: &str, inp: u64, cost: f64) -> RequestMetric {
+        let mut m = base_metric("anthropic", "claude-opus-4-1");
+        m.session = SessionAttribution {
+            source,
+            key: key.to_string(),
+        };
+        m.input_tokens = Some(inp);
+        m.cost_estimate_usd = Some(cost);
+        m
+    }
+
+    /// **La trampa que este agregado tiene que evitar.** La misma `key` bajo
+    /// distinto `source` significa cosas distintas: con `native` es una sesión
+    /// real; con `unattributed` es el `User-Agent` del fallback, que agrupa a
+    /// TODAS las sesiones no atribuidas de ese harness. Fusionarlas daría un
+    /// número que parece una sesión y son muchas.
+    #[test]
+    fn la_misma_key_con_distinto_source_no_se_fusiona() {
+        let mut reg = SessionRegistry::default();
+        reg.ingest(&metric_de_sesion(SessionSource::Native, "claude-cli/1.0", 10, 0.1));
+        reg.ingest(&metric_de_sesion(
+            SessionSource::Unattributed,
+            "claude-cli/1.0",
+            20,
+            0.2,
+        ));
+
+        let filas = reg.snapshot().0;
+
+        assert_eq!(filas.len(), 2, "son dos cubos distintos: {filas:?}");
+        assert!(filas.iter().any(|f| f.source == "native" && f.input_tokens == 10));
+        assert!(filas.iter().any(|f| f.source == "unattributed" && f.input_tokens == 20));
+    }
+
+    /// Lo básico: varias peticiones de la misma sesión suman.
+    #[test]
+    fn agrega_las_peticiones_de_una_misma_sesion() {
+        let mut reg = SessionRegistry::default();
+        for _ in 0..3 {
+            reg.ingest(&metric_de_sesion(SessionSource::Explicit, "s1", 100, 0.5));
+        }
+
+        let filas = reg.snapshot().0;
+
+        assert_eq!(filas.len(), 1);
+        assert_eq!(filas[0].requests, 3);
+        assert_eq!(filas[0].input_tokens, 300);
+        assert!((filas[0].cost_usd - 1.5).abs() < 1e-9);
+    }
+
+    /// La fila `unattributed` se marca como lo que es: un cubo de fallback,
+    /// no una sesión. Sin esa marca, un consumidor la trata como una más.
+    #[test]
+    fn la_fila_no_atribuida_se_declara_como_cubo_no_como_sesion() {
+        let mut reg = SessionRegistry::default();
+        reg.ingest(&metric_de_sesion(SessionSource::Unattributed, "curl/8", 5, 0.0));
+
+        let f = &reg.snapshot().0[0];
+
+        assert!(!f.is_session, "un fallback no es una sesión identificada");
+    }
+
+    /// `X-OxideGate-Session` es una cabecera controlada por quien llama: un
+    /// mapa sin cota keyeado por ella es un vector de crecimiento de memoria
+    /// en el camino crítico. Al saturar se deja de admitir claves NUEVAS y se
+    /// declara la saturación; las ya conocidas siguen sumando.
+    #[test]
+    fn el_numero_de_sesiones_esta_acotado_y_la_saturacion_se_declara() {
+        let mut reg = SessionRegistry::default();
+        for i in 0..MAX_DISTINCT_SESSIONS + 10 {
+            reg.ingest(&metric_de_sesion(
+                SessionSource::Explicit,
+                &format!("s{i}"),
+                1,
+                0.0,
+            ));
+        }
+        // Una clave YA conocida sigue acumulando pese a la saturación.
+        reg.ingest(&metric_de_sesion(SessionSource::Explicit, "s0", 7, 0.0));
+
+        let snap = reg.snapshot();
+
+        assert_eq!(snap.0.len(), MAX_DISTINCT_SESSIONS, "no crece sin límite");
+        assert!(snap.1, "la saturación se declara, no se esconde");
+        let s0 = snap.0.iter().find(|f| f.key == "s0").expect("s0 sigue ahí");
+        assert_eq!(s0.input_tokens, 8, "las conocidas siguen sumando");
+    }
 
     /// Construye una métrica mínima con los campos por defecto, para no
     /// repetir el struct literal completo en cada test.
