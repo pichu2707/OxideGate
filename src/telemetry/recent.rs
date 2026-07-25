@@ -7,7 +7,11 @@
 //! un consumidor (el monitor TUI, hoy; cualquier vista futura) pueda detectar
 //! requests ATÍPICOS (outliers de latencia, coste o tokens) sin tocar disco.
 //!
-//! INVARIANTE CRÍTICA: `prompt_hash` NUNCA se expone acá. Igual que
+//! INVARIANTE CRÍTICA: `prompt_hash` NUNCA se expone acá — y la invariante
+//! es sobre la HUELLA, no sobre todo lo que empiece por `prompt_`.
+//! `prompt_bytes` SÍ se publica desde este slice: es un entero, no
+//! identifica ningún prompt concreto, y era la mitad de subida que le
+//! faltaba a `response_bytes` (ver §4.10). Igual que
 //! documenta [`middleware::stats`](crate::middleware::stats) para los
 //! agregados, esta vista tampoco filtra huellas individuales de prompt: solo
 //! expone los campos de coste/latencia/identidad de ruta que ya son
@@ -55,10 +59,15 @@ pub const RECENT_CAPACITY: usize = 200;
 /// Proyección compacta de un [`RequestMetric`] para exposición en vivo.
 ///
 /// Copia fielmente los campos de identidad, coste y latencia de la métrica
-/// original, PERO deliberadamente omite `prompt_hash` y `prompt_bytes`: el
-/// primero por la invariante de privacidad (ninguna huella individual sale
-/// de este módulo), el segundo porque es un detalle de implementación del
-/// tamaño del body que no aporta a detectar outliers.
+/// original, PERO deliberadamente omite `prompt_hash`: ninguna huella
+/// individual sale de este módulo.
+///
+/// `prompt_bytes` estuvo omitido junto a él, con otro motivo —«un detalle de
+/// implementación que no aporta a detectar outliers»— escrito cuando esta
+/// vista servía solo para cazar filas atípicas. Desde que `/requests` es el
+/// contrato público del ecosistema y publica `response_bytes`, esa asimetría
+/// dejaba a un consumidor pudiendo responder cuántos bytes BAJARON y no
+/// cuántos subieron. Ahora se publica (§4.10).
 ///
 /// No calcula nada derivado (sin `gen_ms`, sin tokens/s, sin lógica de
 /// outlier): eso es responsabilidad de la vista que consuma el snapshot.
@@ -170,6 +179,27 @@ pub struct RecentRequest {
     /// format}`, o `null`. Se paga en CADA petición, se invoque una skill o
     /// no. `null` = no se reconoció ningún listado, NUNCA "cero skills".
     pub skills: Option<SkillsBlock>,
+    /// Bytes del body que MANDÓ EL CLIENTE, en su forma lógica. La mitad de
+    /// subida que le faltaba a [`Self::response_bytes`].
+    ///
+    /// **Tres cosas que NO es**, y las tres importan (contrato completo en
+    /// `docs/telemetry-per-request.md` §4.10):
+    ///
+    /// 1. **No es el tamaño de wire.** En `/v1/codex/responses` y `/v1beta/*`
+    ///    se mide sobre el body ya DESCOMPRIMIDO (ver
+    ///    `provider::maybe_decompress`): si el cliente comprimió —`pi` manda
+    ///    zstd— por el cable subieron menos bytes que los que dice este campo.
+    /// 2. **No es lo que subió al proveedor.** Se calcula sobre el body
+    ///    ORIGINAL, antes de cualquier mutación. Con
+    ///    [`Self::cache_control_forced`] en `true` el body reenviado es MAYOR
+    ///    que este número — ese booleano es lo que delata la intervención.
+    /// 3. **No es la suma del desglose.** `context_measured_bytes` es JSON
+    ///    canónico re-serializado, medido en otro punto del pipeline. Los dos
+    ///    NUNCA deben combinarse en un mismo cociente (§4.1).
+    ///
+    /// No compromete la invariante de privacidad del módulo: es un entero, no
+    /// una huella. `prompt_hash` sigue sin salir de acá.
+    pub prompt_bytes: usize,
     /// Bytes del cuerpo de la respuesta, SIN COMPRIMIR (el proxy descarta
     /// `Accept-Encoding`). `None` si no hubo respuesta. Ver §4.9.
     pub response_bytes: Option<usize>,
@@ -236,6 +266,7 @@ impl From<&RequestMetric> for RecentRequest {
             tool_search: m.tool_search.clone(),
             tools_flattened: m.tools_flattened,
             skills: m.skills,
+            prompt_bytes: m.prompt_bytes,
             response_bytes: m.response_bytes,
             prepare_us: m.prepare_us,
             codex_quota: m.codex_quota.clone(),
@@ -628,13 +659,18 @@ mod tests {
         assert_eq!(row.prepare_us, 42);
     }
 
-    /// `RecentRequest` NUNCA debe exponer `prompt_hash` ni `prompt_bytes`
-    /// (invariante de privacidad documentada en el header del módulo): lo
-    /// verificamos a nivel de JSON serializado, no solo por inspección del
-    /// tipo, para que un futuro `#[serde(flatten)]` accidental no cuele estas
-    /// claves sin que ningún test lo note.
+    /// `RecentRequest` NUNCA debe exponer `prompt_hash` (invariante de
+    /// privacidad documentada en el header del módulo): lo verificamos a
+    /// nivel de JSON serializado, no solo por inspección del tipo, para que
+    /// un futuro `#[serde(flatten)]` accidental no cuele esa clave sin que
+    /// ningún test lo note.
+    ///
+    /// La invariante es sobre la HUELLA, no sobre todo prefijo `prompt_`:
+    /// `prompt_bytes` es un entero que no identifica ningún prompt concreto
+    /// y desde este slice se publica a propósito (§4.10). Este test lo
+    /// afirma en positivo para que quitarlo vuelva a fallar acá.
     #[test]
-    fn recent_request_no_expone_prompt_hash_ni_prompt_bytes() {
+    fn recent_request_expone_los_bytes_pero_nunca_la_huella() {
         let mut recent = RecentRequests::default();
         recent.ingest(&base_metric("t1"));
 
@@ -642,7 +678,7 @@ mod tests {
         let json = serde_json::to_string(row).unwrap();
 
         assert!(!json.contains("prompt_hash"), "no debe exponer prompt_hash");
-        assert!(!json.contains("prompt_bytes"), "no debe exponer prompt_bytes");
+        assert!(json.contains("prompt_bytes"), "debe exponer prompt_bytes");
     }
 
     /// `RequestMetric` (con el desglose de herramientas presente) y
@@ -906,6 +942,7 @@ mod tests {
             "model",
             "output_tokens",
             "prepare_us",
+            "prompt_bytes",
             "requested_effort",
             "requested_speed",
             "response_bytes",
@@ -946,12 +983,58 @@ mod tests {
         let mut claves = std::collections::BTreeSet::new();
         claves_recursivas(&fila, &mut claves);
 
-        for prohibida in ["prompt_hash", "prompt_bytes"] {
-            assert!(
-                !claves.contains(prohibida),
-                "`{prohibida}` se filtró a /requests: {claves:?}"
-            );
-        }
+        // `prompt_bytes` YA NO está en esta lista: es un entero, no una huella,
+        // y desde este slice se publica a propósito (ver el test de abajo). Lo
+        // que la invariante protege es la HUELLA individual del prompt, y esa
+        // sigue sin salir de acá.
+        assert!(
+            !claves.contains("prompt_hash"),
+            "`prompt_hash` se filtró a /requests: {claves:?}"
+        );
+    }
+
+    /// `prompt_bytes` se publica, y lleva el tamaño real — no un cero ni un
+    /// derivado del desglose.
+    ///
+    /// Es la mitad de subida que le faltaba a `response_bytes`: hasta ahora
+    /// una lente podía responder cuántos bytes BAJARON y no cuántos subieron,
+    /// aunque el número llevara meses escribiéndose al `telemetry.jsonl`.
+    #[test]
+    fn requests_publica_los_bytes_de_subida() {
+        let mut m = base_metric("t1");
+        m.prompt_bytes = 4242;
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+        let fila = serde_json::to_value(&recent.snapshot()[0]).unwrap();
+
+        assert_eq!(
+            fila["prompt_bytes"], 4242,
+            "no publica los bytes de subida: {fila}"
+        );
+    }
+
+    /// El desglose y el tamaño del body son mediciones DISTINTAS, tomadas en
+    /// puntos distintos del pipeline, y publicarlas juntas hace muy fácil
+    /// olvidarlo. Este test fija que no se exige que coincidan: si alguien
+    /// "arreglara" la diferencia igualándolas, estaría falseando una de las
+    /// dos. Ver §4.1 y §4.10 de `docs/telemetry-per-request.md`.
+    #[test]
+    fn los_bytes_de_subida_no_son_la_suma_del_desglose() {
+        let mut m = base_metric("t1");
+        m.prompt_bytes = 100;
+        m.context_measured_bytes = Some(52);
+
+        let mut recent = RecentRequests::default();
+        recent.ingest(&m);
+        let fila = serde_json::to_value(&recent.snapshot()[0]).unwrap();
+
+        assert_eq!(fila["prompt_bytes"], 100);
+        assert_eq!(fila["context_measured_bytes"], 52);
+        assert_ne!(
+            fila["prompt_bytes"], fila["context_measured_bytes"],
+            "se publicaron como si fueran la misma medición"
+        );
     }
 
     /// Toda capacidad que `/version` anuncia existe de verdad en el JSON.

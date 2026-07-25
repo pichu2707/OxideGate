@@ -224,8 +224,10 @@ pub struct Usage {
 ///    CANÓNICO que produce `serde_json`, NO los bytes exactos que trajo el
 ///    cliente en el body original: no se preserva el espaciado ni el orden
 ///    de claves original. Por lo tanto `measured_bytes` en general va a
-///    diferir levemente de `Outgoing::prompt_bytes` (que sí es el tamaño
-///    exacto sobre el cable). Las razones (`ratio`) calculadas DENTRO de este
+///    diferir levemente de `Outgoing::prompt_bytes` (que mide el body tal
+///    como lo mandó el cliente, sin re-serializar — y que tampoco es el
+///    tamaño de wire: ver `RequestMetric::prompt_bytes`).
+///    Las razones (`ratio`) calculadas DENTRO de este
 ///    tipo son consistentes entre sí porque todos los componentes se miden
 ///    de la misma manera; nunca hay que mezclar `measured_bytes` con
 ///    `prompt_bytes` en un mismo cociente.

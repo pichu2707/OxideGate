@@ -184,6 +184,8 @@ seguirla son lo mismo.
 | Invocar una skill en Gemini, opencode y Codex | ✅ Medido: opencode **3.335 B**; Codex **no tiene mecanismo** (lee el fichero); Gemini anuncia `activate_skill` y **no la declara** — ver [§7](docs/skills-across-tools.md) |
 | **`activate_skill` en el modo interactivo de Gemini** | ❌ Sin medir: aquí se probó `gemini -p` |
 | Bytes de bajada | ✅ Campo `response_bytes` — **sin comprimir**, ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.9 |
+| Bytes de subida, en `GET /requests` | ✅ Campo `prompt_bytes` — **no es wire**: en Codex y Gemini se mide descomprimido, y con la Palanca A el body reenviado es mayor. Ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.10 |
+| **Gasto por sección** (euros por cubo, no bytes) | ❌ Sin hacer: el proveedor reporta `input_tokens` TOTAL, sin desglose, y repartir por bytes está sesgado contra `tools` — [#50](https://github.com/pichu2707/OxideGate/issues/50) |
 | El **peaje fijo** de cada herramienta (misma tarea trivial) | ✅ Medido en las cuatro — ver [`docs/floor-across-tools.md`](docs/floor-across-tools.md) |
 | **Comparar herramientas sobre una tarea REAL** (con n>1 y tarea verificable) | ❌ Sin medir: gasta cuota y no es determinista — [#29](https://github.com/pichu2707/OxideGate/issues/29) |
 | Agregación por sesión | ✅ `GET /sessions` — ver [`docs/telemetry-by-session.md`](docs/telemetry-by-session.md) |
