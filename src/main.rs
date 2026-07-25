@@ -7,8 +7,8 @@ mod state;
 mod telemetry;
 
 use axum::{
-    routing::{get, post},
     Router,
+    routing::{get, post},
 };
 use config::AppConfig;
 use state::AppState;
@@ -16,8 +16,62 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use telemetry::TelemetrySink;
 
+/// Busca un flag saltándose SIEMPRE `argv[0]`: un binario invocado por un
+/// path que contenga `-h` no es una petición de ayuda.
+fn wants_flag(args: &[String], long: &str, short: &str) -> bool {
+    args.iter().skip(1).any(|a| a == long || a == short)
+}
+
+fn usage_text() -> String {
+    format!(
+        "oxidegate {version} — proxy local que mide el coste real de contexto
+
+USO:
+    oxidegate                Levanta el proxy y se queda escuchando
+    oxidegate --help         Muestra esta ayuda
+    oxidegate --version      Muestra la versión
+
+VARIABLES DE ENTORNO:
+    OXIDEGATE_PORT   Puerto de escucha (por defecto 8080). Conviene cambiarlo:
+                     Apache, Tomcat y compañía suelen tener el 8080 ocupado, y
+                     un cliente apuntando a su servidor no da ningún error
+                     evidente.
+
+RUTAS QUE SIRVE:
+    GET  /health     Liveness barata. Los clientes la sondean para decidir si
+                     enrutan por aquí; si devuelve 404 caen al proveedor
+                     directo en silencio, sin error y sin log.
+    GET  /stats      Agregado en vivo por (proveedor, modelo).
+    GET  /requests   Detalle de los últimos requests individuales.
+
+VER TAMBIÉN:
+    oxidegate-monitor        Panel en vivo sobre este proxy (--once para
+                             un volcado de texto plano sin TUI).
+",
+        version = env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn version_text() -> String {
+    format!("oxidegate {}", env!("CARGO_PKG_VERSION"))
+}
+
 #[tokio::main]
 async fn main() {
+    // Ayuda y versión se responden ANTES de tocar nada: ni configuración, ni
+    // carpeta de datos, ni bind. `oxidegate --help` con una instancia ya
+    // corriendo panicaba con AddrInUse — justo el momento en el que más falta
+    // hace poder leer la ayuda.
+    let args: Vec<String> = std::env::args().collect();
+    if wants_flag(&args, "--help", "-h") {
+        print!("{}", usage_text());
+        return;
+    }
+    if wants_flag(&args, "--version", "-V") {
+        println!("{}", version_text());
+        return;
+    }
+
     // Inicializamos la telemetría interna por consola
     tracing_subscriber::fmt::init();
 
@@ -94,4 +148,51 @@ async fn main() {
     println!("📊 Estadísticas en vivo por modelo en http://{addr}/stats");
     println!("🧾 Últimos requests en vivo en http://{addr}/requests");
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn argv(rest: &[&str]) -> Vec<String> {
+        std::iter::once("oxidegate".to_string())
+            .chain(rest.iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn asks_for_help_with_either_spelling() {
+        assert!(wants_flag(&argv(&["--help"]), "--help", "-h"));
+        assert!(wants_flag(&argv(&["-h"]), "--help", "-h"));
+        assert!(!wants_flag(&argv(&[]), "--help", "-h"));
+    }
+
+    #[test]
+    fn argv_zero_is_never_a_flag() {
+        // Un binario invocado por un path que contenga "-h" no debe
+        // confundirse con una petición de ayuda. Se salta argv[0] siempre.
+        let disguised = vec!["-h".to_string()];
+        assert!(!wants_flag(&disguised, "--help", "-h"));
+    }
+
+    #[test]
+    fn usage_names_the_port_knob_and_every_route_it_serves() {
+        let text = usage_text();
+        // El puerto es lo primero que un usuario necesita cambiar: el default
+        // 8080 lo suelen ocupar Apache y compañía.
+        assert!(
+            text.contains("OXIDEGATE_PORT"),
+            "falta OXIDEGATE_PORT: {text}"
+        );
+        // /health es lo que sondean los clientes antes de enrutar. Si no se
+        // documenta, un 404 ahí es indistinguible de "el proxy no arranca".
+        for route in ["/health", "/stats", "/requests"] {
+            assert!(text.contains(route), "falta la ruta {route}: {text}");
+        }
+    }
+
+    #[test]
+    fn version_text_carries_the_crate_version() {
+        assert!(version_text().contains(env!("CARGO_PKG_VERSION")));
+    }
 }
