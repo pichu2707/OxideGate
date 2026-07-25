@@ -266,6 +266,8 @@ fn run_once(url: &str, requests_url: &str) {
             print_tools_table(&rows);
             println!();
             print_quota_table(&rows);
+            println!();
+            print_sessions_table(url);
         }
         Err(e) => {
             println!("/requests no disponible en {requests_url} ({e}) — puede ser una build del proxy anterior a este endpoint");
@@ -471,6 +473,110 @@ struct RequestRow {
     /// OpenAI vía API key) y para un proxy anterior a esta captura. Fuente
     /// del panel de cuota (tecla `u`, ver [`find_quota_source_row`]).
     codex_quota: Option<CodexQuotaRow>,
+}
+
+
+/// Fila de `GET /sessions`: espejo local y liviano de `SessionStatsRow`.
+///
+/// `source` e `is_session` viajan juntos a propósito: una `key` bajo
+/// `unattributed` es el `User-Agent`, **no una identidad**, y agrupa a TODAS
+/// las sesiones no atribuidas de ese harness. Ver `docs/telemetry-by-session.md`.
+#[derive(Debug, Clone, Deserialize)]
+struct SessionRow {
+    source: String,
+    key: String,
+    /// `false` en el cubo de fallback. El panel lo marca para que nadie lo
+    /// lea como una sesión más.
+    #[serde(default)]
+    is_session: bool,
+    #[serde(default)]
+    requests: u64,
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cost_usd: f64,
+}
+
+/// Respuesta completa de `GET /sessions`.
+#[derive(Debug, Clone, Deserialize, Default)]
+struct SessionsPayload {
+    #[serde(default)]
+    sessions: Vec<SessionRow>,
+    /// `true` si el proxy dejó de admitir claves nuevas: las filas son una
+    /// COTA INFERIOR, no el total.
+    #[serde(default)]
+    saturated: bool,
+}
+
+/// URL de `/sessions`, derivada del `/stats` configurado.
+fn resolve_sessions_url(stats_url: &str) -> String {
+    resolve_sessions_url_inner(
+        stats_url,
+        std::env::var("OXIDEGATE_SESSIONS_URL").ok(),
+        std::env::var("OXIDEGATE_PORT").ok(),
+    )
+}
+
+/// Núcleo puro de [`resolve_sessions_url`], con el entorno ya leído: misma
+/// razón que en `resolve_requests_url_inner` (testear sin mutar `std::env`).
+fn resolve_sessions_url_inner(
+    stats_url: &str,
+    sessions_url_env: Option<String>,
+    port_env: Option<String>,
+) -> String {
+    if let Some(url) = sessions_url_env {
+        return url;
+    }
+    if let Some(prefix) = stats_url.strip_suffix("/stats") {
+        return format!("{prefix}/sessions");
+    }
+    let port = port_env.unwrap_or_else(|| "8080".to_string());
+    format!("http://127.0.0.1:{port}/sessions")
+}
+
+/// Líneas del panel de sesión.
+///
+/// Función pura para poder fijar por test lo que de verdad importa: que un
+/// cubo de fallback NO se lea como una sesión, y que la saturación se declare.
+fn session_lines(rows: &[SessionRow], saturated: bool) -> Vec<String> {
+    let mut out = Vec::new();
+
+    if saturated {
+        out.push(
+            "⚠ saturado: se dejaron de admitir sesiones nuevas — estas cifras son una cota inferior"
+                .to_string(),
+        );
+    }
+
+    if rows.is_empty() {
+        out.push("sin sesiones medidas todavía".to_string());
+        return out;
+    }
+
+    for r in rows.iter().take(6) {
+        let marca = if r.is_session {
+            String::new()
+        } else {
+            "  [sin atribuir]".to_string()
+        };
+        out.push(format!(
+            "{:<22} {:<13} {:>4} req  {:>7} in  {:>6} out  ${:.4}{}",
+            truncate_client(Some(r.key.as_str())),
+            r.source,
+            r.requests,
+            r.input_tokens,
+            r.output_tokens,
+            r.cost_usd,
+            marca
+        ));
+    }
+
+    if rows.len() > 6 {
+        out.push(format!("… y {} sesiones más", rows.len() - 6));
+    }
+    out
 }
 
 /// Fila del desglose de `tools` por servidor: espejo local y liviano de
@@ -1519,10 +1625,15 @@ struct App {
     /// `u`. INDEPENDIENTE de `p`/`c`/`s`: las cuatro teclas controlan
     /// estados ortogonales entre sí.
     show_quota_panel: bool,
+    /// Panel de sesión: INDEPENDIENTE del resto, igual que el de cuota.
+    show_sessions_panel: bool,
+    sessions: SessionsPayload,
+    sessions_url: String,
 }
 
 impl App {
     fn new(url: String) -> Self {
+        let sessions_url = resolve_sessions_url(&url);
         Self {
             url,
             latest: Vec::new(),
@@ -1537,6 +1648,9 @@ impl App {
             requests_view: RequestsView::Latency,
             show_tools_panel: true,
             show_quota_panel: true,
+            show_sessions_panel: true,
+            sessions: SessionsPayload::default(),
+            sessions_url,
         }
     }
 
@@ -1546,6 +1660,7 @@ impl App {
     fn poll(&mut self, client: &reqwest::blocking::Client, url: &str, requests_url: &str) {
         self.poll_stats(client, url);
         self.poll_requests(client, requests_url);
+        self.poll_sessions(client);
     }
 
     /// Hace un fetch de `/stats` y actualiza todo el estado derivado
@@ -1610,6 +1725,17 @@ impl App {
         }
     }
 
+    /// Sondea `/sessions`. Degrada con gracia igual que `/requests`: un
+    /// proxy anterior a este endpoint responde 404 y el panel lo dice, en vez
+    /// de dejar cifras viejas que parecerían actuales.
+    fn poll_sessions(&mut self, client: &reqwest::blocking::Client) {
+        let url = self.sessions_url.clone();
+        match client.get(&url).send().and_then(|r| r.json::<SessionsPayload>()) {
+            Ok(p) => self.sessions = p,
+            Err(_) => self.sessions = SessionsPayload::default(),
+        }
+    }
+
     /// Alterna la visibilidad del panel de requests recientes (tecla `p`).
     fn toggle_requests_panel(&mut self) {
         self.show_requests_panel = !self.show_requests_panel;
@@ -1639,6 +1765,11 @@ impl App {
     /// el estado de los otros.
     fn toggle_quota_panel(&mut self) {
         self.show_quota_panel = !self.show_quota_panel;
+    }
+
+    /// Alterna el panel de sesión sin tocar los demás.
+    fn toggle_sessions_panel(&mut self) {
+        self.show_sessions_panel = !self.show_sessions_panel;
     }
 
     /// Marca el baseline en el instante actual con los contadores crudos de
@@ -1736,6 +1867,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, url: &str, request
                     KeyCode::Char('c') => app.cycle_requests_view(),
                     KeyCode::Char('s') => app.toggle_tools_panel(),
                     KeyCode::Char('u') => app.toggle_quota_panel(),
+                    // `e` de sEsión: `s` ya es tools.
+                    KeyCode::Char('e') => app.toggle_sessions_panel(),
                     _ => {}
                 }
             }
@@ -1789,6 +1922,9 @@ fn ui(f: &mut Frame, app: &App) {
     if app.show_quota_panel {
         constraints.push(Constraint::Length(7)); // cuota codex
     }
+    if app.show_sessions_panel {
+        constraints.push(Constraint::Length(9)); // gasto por sesión
+    }
     constraints.push(Constraint::Length(1)); // footer
 
     let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
@@ -1809,6 +1945,10 @@ fn ui(f: &mut Frame, app: &App) {
     }
     if app.show_quota_panel {
         draw_quota_panel(f, chunks[idx], app);
+        idx += 1;
+    }
+    if app.show_sessions_panel {
+        draw_sessions_panel(f, chunks[idx], app);
         idx += 1;
     }
     draw_footer(f, chunks[idx]);
@@ -2664,9 +2804,41 @@ fn print_quota_table(rows: &[RequestRow]) {
     }
 }
 
+/// Vuelca el gasto por sesión en modo `--once` (sin TUI).
+///
+/// Sondea `/sessions` por su cuenta porque `run_once` no construye un `App`.
+/// Degrada con gracia: un proxy anterior a este endpoint da 404 y se dice,
+/// en vez de callar y parecer que no hay sesiones.
+fn print_sessions_table(stats_url: &str) {
+    println!("--- vista: gasto por sesión ---");
+    let url = resolve_sessions_url(stats_url);
+    let client = reqwest::blocking::Client::new();
+    match client.get(&url).send().and_then(|r| r.json::<SessionsPayload>()) {
+        Ok(p) => {
+            for line in session_lines(&p.sessions, p.saturated) {
+                println!("{line}");
+            }
+            println!(
+                "nota: [sin atribuir] = cubo de fallback por User-Agent, NO una sesión — agrupa todas las no atribuidas de ese harness (ver docs/telemetry-by-session.md)"
+            );
+        }
+        Err(e) => println!("(/sessions no disponible en {url} ({e}) — puede ser una build del proxy anterior a este endpoint)"),
+    }
+}
+
+/// Panel de gasto por sesión: responde "quién gastó", no "qué modelo".
+fn draw_sessions_panel(f: &mut Frame, area: Rect, app: &App) {
+    let lineas = session_lines(&app.sessions.sessions, app.sessions.saturated);
+    let text: Vec<Line> = lineas.into_iter().map(Line::from).collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" gasto por sesión (e) ");
+    f.render_widget(Paragraph::new(text).block(block), area);
+}
+
 fn draw_footer(f: &mut Frame, area: Rect) {
     let text = Line::from(
-        "q salir · b marcar baseline · r reset · ↑/↓ elegir modelo · p requests · c vista latency/context · s tools por servidor · u cuota codex",
+        "q salir · b baseline · r reset · ↑/↓ modelo · p requests · c latency/context · s tools · u cuota · e sesión",
     );
     f.render_widget(Paragraph::new(text), area);
 }
@@ -4073,6 +4245,93 @@ mod tests {
         assert!(!app.show_tools_panel);
         // Apagar `s` no debe afectar `p`.
         assert!(app.show_requests_panel);
+    }
+
+    // --- Panel de sesión ---
+
+    fn fila(source: &str, key: &str, is_session: bool, req: u64, cost: f64) -> SessionRow {
+        SessionRow {
+            source: source.to_string(),
+            key: key.to_string(),
+            is_session,
+            requests: req,
+            input_tokens: 10,
+            output_tokens: 2,
+            cost_usd: cost,
+        }
+    }
+
+    /// El panel marca las filas de fallback. Sin la marca, quien lo mira suma
+    /// una sesión concreta con el cubo que agrupa a todas las no atribuidas
+    /// de ese harness — y el número parece una sesión siendo muchas.
+    #[test]
+    fn el_panel_distingue_una_sesion_de_un_cubo_no_atribuido() {
+        let lineas = session_lines(&[fila("explicit", "s-A", true, 3, 0.5)], false);
+        let no_atrib = session_lines(&[fila("unattributed", "curl/8", false, 1, 0.1)], false);
+
+        assert!(lineas.iter().any(|l| l.contains("s-A")));
+        assert!(
+            no_atrib.iter().any(|l| l.contains("sin atribuir")),
+            "no marca el cubo de fallback: {no_atrib:?}"
+        );
+        assert!(
+            !lineas.iter().any(|l| l.contains("sin atribuir")),
+            "marca como fallback una sesión real: {lineas:?}"
+        );
+    }
+
+    /// Saturado: las filas son una cota inferior y el panel lo dice. Callarlo
+    /// haría leer un total como si fuera completo.
+    #[test]
+    fn el_panel_declara_la_saturacion() {
+        let con = session_lines(&[fila("explicit", "s", true, 1, 0.0)], true);
+        let sin = session_lines(&[fila("explicit", "s", true, 1, 0.0)], false);
+
+        assert!(
+            con.iter().any(|l| l.to_lowercase().contains("satur")),
+            "no declara la saturación: {con:?}"
+        );
+        assert!(!sin.iter().any(|l| l.to_lowercase().contains("satur")));
+    }
+
+    /// Sin datos no se pinta un cero: se dice que no hay nada medido todavía.
+    #[test]
+    fn el_panel_vacio_lo_dice_en_vez_de_pintar_ceros() {
+        let lineas = session_lines(&[], false);
+
+        assert!(!lineas.is_empty());
+        assert!(
+            lineas.iter().any(|l| l.contains("sin sesiones")),
+            "no explica el vacío: {lineas:?}"
+        );
+    }
+
+    /// El panel de sesión es INDEPENDIENTE de los demás, igual que el de
+    /// cuota: cualquier combinación de visibilidad es válida.
+    #[test]
+    fn show_sessions_panel_arranca_visible_y_es_independiente() {
+        let mut app = App::new("http://x/stats".to_string());
+        assert!(app.show_sessions_panel);
+
+        app.toggle_sessions_panel();
+        assert!(!app.show_sessions_panel);
+        assert!(app.show_quota_panel, "no debe tocar el de cuota");
+        assert!(app.show_requests_panel, "no debe tocar el de requests");
+    }
+
+    /// La URL de `/sessions` se deriva del `/stats` configurado, igual que la
+    /// de `/requests`: un solo puerto que configurar, no tres.
+    #[test]
+    fn la_url_de_sessions_se_deriva_de_la_de_stats() {
+        assert_eq!(
+            resolve_sessions_url_inner("http://127.0.0.1:8899/stats", None, None),
+            "http://127.0.0.1:8899/sessions"
+        );
+        assert_eq!(
+            resolve_sessions_url_inner("http://x/stats", Some("http://otro/s".to_string()), None),
+            "http://otro/s",
+            "el override explícito manda"
+        );
     }
 
     #[test]

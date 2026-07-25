@@ -129,7 +129,8 @@ seguirla son lo mismo.
 | Bytes de bajada | ✅ Campo `response_bytes` — **sin comprimir**, ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.9 |
 | **Comparar herramientas sobre la misma TAREA** (no solo config) | ❌ Sin medir — [#29](https://github.com/pichu2707/OxideGate/issues/29) |
 | Agregación por sesión | ✅ `GET /sessions` — ver [`docs/telemetry-by-session.md`](docs/telemetry-by-session.md) |
-| **Panel de sesión en el monitor TUI** | 🚧 Los datos están; la vista no — [#30](https://github.com/pichu2707/OxideGate/issues/30) |
+| Panel de sesión en el monitor TUI | ✅ Tecla `e` — ver [`docs/monitor-tui.md`](docs/monitor-tui.md) §10 |
+| **Ventana temporal y persistencia del agregado por sesión** | ❌ Sin hacer: es desde que arrancó el proceso, igual que `/stats` |
 
 ---
 
