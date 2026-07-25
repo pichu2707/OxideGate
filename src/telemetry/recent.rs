@@ -324,6 +324,7 @@ mod tests {
                 kind: crate::provider::ToolServerKind::Mcp,
                 tools: 2,
                 bytes: 30,
+                tool_names: Vec::new(),
                 deferred_tools: 0,
             }]),
             tools_overhead_bytes: Some(4),
@@ -619,6 +620,7 @@ mod tests {
                 kind: crate::provider::ToolServerKind::Mcp,
                 tools: 2,
                 bytes: 30,
+                tool_names: Vec::new(),
                 deferred_tools: 0,
             }])
         );

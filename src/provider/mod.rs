@@ -385,6 +385,19 @@ const OTHERS_LABEL: &str = "(others)";
 /// ni una herramienta.
 const MAX_TOOL_SERVERS: usize = 32;
 
+/// Tope de NOMBRES de herramienta publicados por fila de servidor.
+///
+/// Mismo motivo que [`MAX_TOOL_SERVERS`]: el body es entrada controlada por
+/// quien llama, y estas filas viven además en el buffer de 200 de
+/// `/requests`, así que el coste se multiplica. Al truncar, el conteo `tools`
+/// SIGUE siendo el real: comparar `tool_names.len()` con `tools` delata el
+/// recorte sin necesidad de un campo extra que pudiera desincronizarse.
+const MAX_TOOL_NAMES: usize = 64;
+
+/// Tope de longitud de cada nombre publicado. Un nombre de herramienta real
+/// no se acerca; uno de 1 MB sería una entrada hostil, no un caso de uso.
+const MAX_TOOL_NAME_LEN: usize = 128;
+
 /// Naturaleza del cubo al que se atribuye una herramienta. Distingue por
 /// TIPO, no por una cadena mágica: un servidor MCP llamado literalmente
 /// `(native)` (o `(others)`) es un servidor MCP, no una herramienta nativa
@@ -435,6 +448,17 @@ pub struct ToolServerBytes {
     pub tools: usize,
     /// Suma de los bytes de cada herramienta de este servidor.
     pub bytes: usize,
+    /// Nombres CRUDOS de las herramientas de esta fila, tal como viajaron.
+    ///
+    /// OxideGate **no deduce** a qué servidor pertenece cada uno cuando el
+    /// cliente aplana: publica el hecho de que estos nombres cruzaron, y el
+    /// cruce contra la lista autoritativa lo hace quien la tiene (ver
+    /// `tools_flattened` y `docs/telemetry-per-request.md` §4.2).
+    ///
+    /// Acotada a [`MAX_TOOL_NAMES`] entradas de [`MAX_TOOL_NAME_LEN`] bytes.
+    /// Si `tool_names.len() < tools`, la lista está truncada y el conteo
+    /// `tools` es el bueno.
+    pub tool_names: Vec<String>,
     /// Cuántas de las `tools` de ESTE servidor traían `defer_loading: true`
     /// en su propia definición dentro del body ENTRANTE. OBSERVACIÓN PURA,
     /// leída tool por tool en [`group_tools_by_server`] — nunca una
@@ -611,7 +635,17 @@ pub fn server_of(tool_name: &str) -> &str {
 pub fn group_tools_by_server<'a>(
     entries: impl Iterator<Item = (&'a str, &'a Value)>,
 ) -> Vec<ToolServerBytes> {
-    let mut totals: HashMap<(ToolServerKind, &'a str), (usize, usize, usize)> = HashMap::new();
+    /// Acumulador por servidor. Con nombre en vez de una tupla de cuatro:
+    /// `.0`/`.3` no dicen si son bytes, conteos o diferidas.
+    #[derive(Default)]
+    struct Acc {
+        tools: usize,
+        bytes: usize,
+        deferred: usize,
+        names: Vec<String>,
+    }
+
+    let mut totals: HashMap<(ToolServerKind, &'a str), Acc> = HashMap::new();
 
     for (name, value) in entries {
         let bytes = measure_value(value);
@@ -627,22 +661,29 @@ pub fn group_tools_by_server<'a>(
             (ToolServerKind::Others, OTHERS_LABEL)
         };
 
-        let entry = totals.entry(key).or_insert((0, 0, 0));
-        entry.0 += 1;
-        entry.1 += bytes;
+        let entry = totals.entry(key).or_default();
+        entry.tools += 1;
+        entry.bytes += bytes;
         if deferred {
-            entry.2 += 1;
+            entry.deferred += 1;
+        }
+        // El conteo de arriba NO se acota; la lista de nombres sí. Así el
+        // recorte queda a la vista comparando `tool_names.len()` con `tools`.
+        if entry.names.len() < MAX_TOOL_NAMES {
+            let recortado: String = name.chars().take(MAX_TOOL_NAME_LEN).collect();
+            entry.names.push(recortado);
         }
     }
 
     let mut rows: Vec<ToolServerBytes> = totals
         .into_iter()
-        .map(|((kind, server), (tools, bytes, deferred_tools))| ToolServerBytes {
+        .map(|((kind, server), acc)| ToolServerBytes {
             server: server.to_string(),
             kind,
-            tools,
-            bytes,
-            deferred_tools,
+            tools: acc.tools,
+            bytes: acc.bytes,
+            tool_names: acc.names,
+            deferred_tools: acc.deferred,
         })
         .collect();
 
@@ -1254,6 +1295,83 @@ mod tests {
     /// `len(",\"defer_loading\":true") == 21`. El servidor primitivo ANEXA la
     /// marca a una definición que sigue viajando completa; no la retiene.
     ///
+    /// Los NOMBRES viajan junto al conteo. OxideGate no deduce a qué servidor
+    /// pertenece cada uno —no tiene datos para saberlo cuando el cliente
+    /// aplana— pero sí puede publicar el hecho de que estos nombres cruzaron.
+    /// El cruce contra la lista autoritativa lo hace quien la tiene.
+    #[test]
+    fn publica_los_nombres_de_las_tools_observadas() {
+        let a = serde_json::json!({"name": "engram_mem_search"});
+        let b = serde_json::json!({"name": "delegation_list"});
+        let entries = vec![("engram_mem_search", &a), ("delegation_list", &b)];
+
+        let rows = group_tools_by_server(entries.into_iter());
+        let nativa = rows.iter().find(|r| r.tools == 2).expect("ambas son nativas al aplanarse");
+
+        assert!(
+            nativa.tool_names.contains(&"engram_mem_search".to_string()),
+            "falta el nombre aplanado: {:?}",
+            nativa.tool_names
+        );
+        assert!(
+            nativa.tool_names.contains(&"delegation_list".to_string()),
+            "falta la nativa genuina: {:?}",
+            nativa.tool_names
+        );
+    }
+
+    /// Los nombres van con SU servidor cuando el cliente sí usa `mcp__`: la
+    /// lista no es un cajón global, es por fila.
+    #[test]
+    fn los_nombres_van_con_su_servidor() {
+        let a = serde_json::json!({"name": "mcp__engram__mem_search"});
+        let b = serde_json::json!({"name": "apply_patch"});
+        let entries = vec![("mcp__engram__mem_search", &a), ("apply_patch", &b)];
+
+        let rows = group_tools_by_server(entries.into_iter());
+        let engram = rows.iter().find(|r| r.server == "engram").expect("fila de engram");
+        let nativa = rows.iter().find(|r| r.kind == ToolServerKind::Native).expect("fila nativa");
+
+        assert_eq!(engram.tool_names, vec!["mcp__engram__mem_search".to_string()]);
+        assert_eq!(nativa.tool_names, vec!["apply_patch".to_string()]);
+    }
+
+    /// El body es entrada controlada por quien llama: publicar nombres sin
+    /// cota es el mismo vector de memoria que ya acota `MAX_TOOL_SERVERS`,
+    /// agravado porque estas filas viven en un buffer de 200. Al truncar, el
+    /// conteo `tools` sigue siendo el real: comparar `tool_names.len()` con
+    /// `tools` delata el recorte sin necesidad de un campo extra.
+    #[test]
+    fn los_nombres_estan_acotados_y_el_recorte_es_visible() {
+        let v = serde_json::json!({"name": "x"});
+        let nombres: Vec<String> = (0..MAX_TOOL_NAMES + 25).map(|i| format!("t{i}")).collect();
+        let entries: Vec<(&str, &serde_json::Value)> =
+            nombres.iter().map(|n| (n.as_str(), &v)).collect();
+
+        let rows = group_tools_by_server(entries.into_iter());
+        let fila = &rows[0];
+
+        assert_eq!(fila.tools, MAX_TOOL_NAMES + 25, "el conteo NO se trunca");
+        assert_eq!(fila.tool_names.len(), MAX_TOOL_NAMES, "la lista sí");
+        assert!(
+            fila.tool_names.len() < fila.tools,
+            "el recorte debe ser visible comparando len con tools"
+        );
+    }
+
+    /// Un nombre absurdamente largo tampoco entra entero: misma entrada
+    /// controlada, misma cota.
+    #[test]
+    fn un_nombre_gigante_se_recorta() {
+        let largo = "z".repeat(MAX_TOOL_NAME_LEN * 4);
+        let v = serde_json::json!({"name": "x"});
+        let entries = vec![(largo.as_str(), &v)];
+
+        let rows = group_tools_by_server(entries.into_iter());
+
+        assert_eq!(rows[0].tool_names[0].len(), MAX_TOOL_NAME_LEN);
+    }
+
     /// Este test compara la MISMA tool servida por `group_tools_by_server`
     /// con y sin la clave, sobre el campo `bytes` (no `n_bytes` de telemetría,
     /// pero el mismo camino de medición: `measure_value` vía

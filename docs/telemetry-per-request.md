@@ -139,7 +139,7 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `context_messages_count` | Cantidad de mensajes del historial completo (incluyendo el último) | Sube con la conversación; útil para correlacionar contra `context_history_bytes` |
 | `context_tax_ratio` | `(context_system_bytes + context_tools_bytes + context_history_bytes) / context_measured_bytes` | Cercano a `1.0` (100%) ⇒ casi todo el body de esta petición es contexto YA enviado antes, no turno nuevo — la "tasa" que se paga por repetir contexto en cada request |
 | `prepare_us` | Microsegundos que el proxy pasó dentro de `Provider::prepare` (parseo del body + `decompose` + mutación opcional, p. ej. inyectar `cache_control`) | Ver la nota sobre qué NO incluye, más abajo |
-| `tools_by_server` | Desglose de `context_tools_bytes` por servidor MCP declarante: `[{server, kind, tools, bytes, deferred_tools}, …]`, ordenado por `bytes` descendente | `null` si el body no parseó como objeto (o build anterior a este campo); `[]` si SÍ parseó pero no declaraba `tools` — son estados DISTINTOS, ver §4.2. `deferred_tools` (por elemento) es la fuente de verdad POR SERVIDOR de cuánto está diferido, ver §4.2 |
+| `tools_by_server` | Desglose de `context_tools_bytes` por servidor MCP declarante: `[{server, kind, tools, bytes, deferred_tools, tool_names}, …]`, ordenado por `bytes` descendente | `null` si el body no parseó como objeto (o build anterior a este campo); `[]` si SÍ parseó pero no declaraba `tools` — son estados DISTINTOS, ver §4.2. `deferred_tools` (por elemento) es la fuente de verdad POR SERVIDOR de cuánto está diferido, ver §4.2 |
 | `tools_overhead_bytes` | Bytes de `tools` no atribuidos a ningún servidor (brackets/comas del array, wrapper de Gemini, herramientas huérfanas) | `null` en los mismos casos que `tools_by_server` es `null`; `sum(tools_by_server[].bytes) + tools_overhead_bytes == context_tools_bytes` siempre que ambos sean no-nulos |
 | `tool_search` | Señal de carga diferida de herramientas del dialecto Responses/Codex: `{used, deferred_loaded}`, o `null`. `used: false` ⇒ EAGER confirmado este turno; `used: true` ⇒ LAZY (el cliente cargó tools a mitad de sesión) | `null` en Anthropic/Gemini/OpenAI-Chat (no aplica) o si el body no parseó. Es el diferenciador eager-vs-lazy por cliente que `tools_by_server` NO puede dar — ver §4.3 |
 | `tools_flattened` | Honestidad de la atribución de `tools_by_server`: `true` ⇒ el cliente NO usa el namespacing `mcp__`, así que su cubo `(native)` puede ocultar MCP aplanado; `false` ⇒ hay tools `mcp__`, el `(native)` es de fiar; `null` ⇒ no aplica (Anthropic/Gemini/Chat) o sin tools | Solo dialecto Responses/Codex. `pi` manda nombres crudos y `opencode` usa `<server>_<tool>` (ambiguo) — ninguno con `mcp__`. Es una advertencia estructural, NUNCA una atribución inventada: no nombra servidores. Ver §4.4 |
@@ -253,6 +253,46 @@ Anthropic/OpenAI, donde cada herramienta ES el elemento del array, sin
 wrapper), y herramientas huérfanas sin `name` válido. Ver
 `provider::tools_overhead_bytes` en el proxy para el detalle completo de los
 tres contribuyentes.
+
+---
+
+#### `tool_names`: el hecho crudo, para que atribuya quien puede
+
+Cada fila lleva los **nombres** de las herramientas que la componen, tal como
+viajaron. OxideGate **no deduce** a qué servidor pertenece cada uno cuando el
+cliente aplana — no tiene con qué — pero sí puede publicar que **estos nombres
+cruzaron**.
+
+```json
+{ "server": "(native)", "kind": "native", "tools": 2,
+  "tool_names": ["engram_mem_search", "delegation_list"] }
+```
+
+Ahí está la asimetría que hace útil el campo: `engram_mem_search` es MCP
+aplanado y `delegation_list` es nativa de verdad, y **OxideGate no puede
+distinguirlas**. Partir por `_` atribuiría `delegation` como si fuera un
+servidor — el error que `tools_flattened` (§4.4) existe para no cometer.
+
+Pero un consumidor que tenga la **lista autoritativa** de tools por servidor sí
+puede: cruza cada nombre contra ella. `engram_mem_search` casa con
+`engram → mem_search`; `delegation_list` no casa con ninguna lista MCP y sigue
+siendo nativa. Un nombre que case con dos servidores se reporta como ambiguo,
+no se adivina.
+
+> **El reparto:** OxideGate ve el cable pero no sabe de quién es cada tool.
+> Quien tiene el inventario no ve el cable. Ninguno de los dos puede solo — por
+> eso el proxy publica el hecho en vez de una conclusión.
+
+**La lista está acotada, y el recorte se ve.** Máximo 64 nombres por fila, de
+128 bytes cada uno. El body es entrada controlada por quien llama y estas filas
+viven en el buffer de 200, así que sin cota sería un vector de crecimiento de
+memoria — el mismo que ya acota el tope de servidores. **El conteo `tools` NO
+se trunca**: si `tool_names.len() < tools`, la lista está recortada y el bueno
+es `tools`. No hace falta un campo extra que pudiera desincronizarse.
+
+**Privacidad**: son nombres de herramienta, no argumentos ni contenido de
+prompt. Mismo nivel de exposición que el conteo y los bytes que la fila ya
+publicaba (§3).
 
 ---
 
