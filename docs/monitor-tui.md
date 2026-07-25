@@ -115,6 +115,7 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
 | `p` | Mostrar/ocultar el panel de requests recientes (ver §7) |
 | `c` | Ciclar la vista de columnas del panel de requests recientes — `Latency` ⇄ `Context` (ver §7.1). **No-op si el panel está oculto**: no cambia nada mientras `p` lo tenga escondido |
 | `s` | Mostrar/ocultar el panel de tools por servidor (ver §8). **INDEPENDIENTE** de `p`/`c`: ninguna de las tres teclas afecta el estado de las otras |
+| `e` | Mostrar/ocultar el panel de **gasto por sesión** — `e` de s**e**sión, porque `s` ya es tools (ver §10). **INDEPENDIENTE** de `p`/`c`/`s`/`u` |
 | `u` | Mostrar/ocultar el panel de cuota de suscripción Codex — "uso de cuota" (ver §9). **INDEPENDIENTE** de `p`/`c`/`s` |
 
 ## 5. Layout de la pantalla
@@ -606,3 +607,46 @@ hay nada que ocultar.
 - El panel de requests recientes muestra como máximo las últimas 200
   peticiones (`RECENT_CAPACITY` en `src/telemetry/recent.rs`) y se pierde al
   reiniciar el proxy — ver `docs/telemetry-per-request.md` §5.
+
+---
+
+## 10. Panel de gasto por sesión (`e`)
+
+Consume `GET /sessions` (ver [`telemetry-by-session.md`](telemetry-by-session.md)),
+no `/requests`. Responde una pregunta que ningún otro panel responde:
+*"¿quién gastó esto?"* — el gasto por modelo no dice de qué sesión salió.
+
+```
+--- vista: gasto por sesión ---
+refactor-auth          explicit         4 req       48 in      12 out  $0.0016
+curl/8.21              unattributed     1 req       12 in       3 out  $0.0004  [sin atribuir]
+```
+
+Se alterna con `e`, **INDEPENDIENTE** de `p`/`c`/`s`/`u`: los cinco estados son
+ortogonales y cualquier combinación es válida.
+
+### 10.1. `[sin atribuir]` no es una sesión
+
+La marca es el detalle que hace legible el panel. Una fila `unattributed` **no
+es una sesión**: es el cubo de fallback por `User-Agent`, y agrupa a **todas**
+las sesiones no atribuidas de ese harness.
+
+> Si la fila de mayor gasto lleva `[sin atribuir]`, no has encontrado una
+> sesión cara: has encontrado tráfico sin atribuir. Lo accionable no es el
+> número, es estampar el header — ver `telemetry-per-request.md` §4.6.
+
+Sin la marca, quien mira el panel suma una sesión concreta con un cubo de
+muchas, y el total parece una sesión siendo varias.
+
+### 10.2. Saturación y vacío, dichos en voz alta
+
+- **Saturado**: si el proxy dejó de admitir claves nuevas (tope de 10.000), la
+  primera línea lo avisa y las cifras son una **cota inferior**, no el total.
+- **Vacío**: se imprime *"sin sesiones medidas todavía"* en vez de una tabla de
+  ceros. Un cero medido y un "aún no hay nada" son cosas distintas.
+- **Proxy sin el endpoint**: un `/sessions` que da 404 se declara como tal —
+  puede ser una build anterior— en vez de dejar cifras viejas que parecerían
+  actuales.
+
+El panel muestra las **6 sesiones de mayor tráfico** y, si hay más, lo dice con
+un `… y N sesiones más`. Nunca trunca en silencio.
