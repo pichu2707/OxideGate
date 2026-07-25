@@ -90,6 +90,11 @@ Y dos creencias extendidas, refutadas con grupo de control:
 > **Marcar una tool con `defer_loading` cuesta 21 bytes y no quita ninguno.**
 > El esquema viaja completo. La carga diferida ahorra **contexto**, no **cable**.
 
+> **`disable-model-invocation: true` hace que una skill cueste CERO bytes.** No
+> se lista, así que no se paga en ninguna petición. En esta máquina son 11 de
+> 22 skills. Es la única palanca del eje que no recorta nada: elimina el coste
+> entero de lo que el modelo no debería elegir solo.
+
 > **Las skills sí son perezosas: 200.601 B en disco → ~1,5 kB al cable.** Solo
 > viaja el listado, a **138 B por skill**. Pero **invocar** una cuesta el
 > cuerpo entero del `SKILL.md` — y entra en el historial, que se reenvía en
@@ -115,7 +120,8 @@ seguirla son lo mismo.
 | Declarar una skill (el listado) | ✅ **138 B por skill**, en cada petición — ver [§3](docs/optimizer-skills.md) |
 | Invocar una skill (el cuerpo) | ✅ **`SKILL.md` − frontmatter + ~300 B**, y el historial lo reenvía cada turno — ver [§7](docs/optimizer-skills.md) |
 | `AGENTS.md` | ✅ Medido: **Claude Code no lo manda**, 0 B — ver [§4](docs/optimizer-skills.md) |
-| **Skills de plugin** | ❌ Sin medir: solo se midieron las de usuario — [#26](https://github.com/pichu2707/OxideGate/issues/26) |
+| Skills de plugin | ✅ **182 B**, igual que una propia — el origen no exime. Ver [§6](docs/optimizer-skills.md) |
+| **Cuántos bytes del listado son comandos** y cuántos skills | ❌ Sin medir: se estableció que conviven, no la proporción |
 | **`AGENTS.md` en Codex, `pi` y OpenCode** | ❌ Sin medir; esos sí lo usan — [#27](https://github.com/pichu2707/OxideGate/issues/27) |
 | **Skills atribuidas POR PETICIÓN** en `/requests` | ✅ Campo `skills` con `declared`, `listing_bytes` y `format` — ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.8 |
 | Comparar el coste de skills entre herramientas | ✅ Medido en 4 clientes: **138 B/skill en Claude Code, 390 B en Codex** — ver [`docs/skills-across-tools.md`](docs/skills-across-tools.md) |

@@ -13,6 +13,8 @@
 | **Una skill declarada** (listado) | **138 B**, en CADA petición | `context_last_turn_bytes` |
 | 11 skills de usuario | 1.520 B por petición | idem |
 | Skills integradas del harness (8) | 3.411 B por petición | idem — se pagan siempre |
+| **Una skill de plugin** | **182 B**, igual que una propia (§6) | idem |
+| **Skill con `disable-model-invocation`** | **0 B — no se lista** (§6) | en ninguna parte |
 | **Invocar una skill** (§7) | **el cuerpo del `SKILL.md` menos el frontmatter, +~300 B** | historial, y ahí se queda |
 | **`AGENTS.md`** | **0 B — no se manda** | en ninguna parte |
 
@@ -145,14 +147,59 @@ La captura del body lo cerró: cero ocurrencias.
 
 ---
 
-## 6. Lo que queda sin medir
+## 6. Skills de plugin, y una palanca que cuesta cero
 
-- **Las skills de plugin.** Las 10 `sdd-*` de la instalación real no llegaron
-  al cable en este experimento porque vienen de un plugin y el sandbox no copió
-  `plugins/`. Que las de usuario cuesten 138 B no prueba que las de plugin
-  cuesten lo mismo.
-- **`AGENTS.md` en otros clientes.** Aquí se midió Claude Code. Codex, `pi` y
-  OpenCode sí lo usan; cuánto cuesta ahí está sin medir.
+Medido sobre la instalación real (30 entradas, 5.955 B de listado), atribuyendo
+cada entrada **por su descripción** y no por su nombre — el nombre no basta,
+como se ve más abajo:
+
+| Origen | Entradas | Bytes |
+|---|---:|---:|
+| Skills de usuario | 11 | 1.520 |
+| **Skill de plugin** (`engram:memory`) | **1** | **182** |
+| Comandos e integradas del harness | 18 | 4.253 |
+
+**Las skills de plugin sí llegan al cable, y cuestan lo mismo.** 182 B frente a
+los 138 B de media de las de usuario: la diferencia es el largo de su
+descripción, no su origen. Un plugin instalado se paga en cada petición igual
+que una skill propia.
+
+> Solo hay **un** plugin con skills en esta instalación, así que el número es
+> de una sola muestra. Lo que sí queda establecido es que **el origen no
+> exime**: no existe un canal barato por ser plugin.
+
+### La palanca: `disable-model-invocation: true` cuesta CERO
+
+De las 22 skills de usuario en disco, **11 llevan `disable-model-invocation:
+true`** — y **ninguna aparece en el listado**. No cuestan un byte por petición.
+
+Es la palanca más limpia de todo este eje: una skill que solo debe invocar el
+usuario o un orquestador no necesita estar en el menú del modelo, y quitarla
+del menú la hace gratis. Frente a las otras dos —descripciones cortas para el
+listado, cuerpos concisos para la invocación—, esta no recorta nada: **elimina
+el coste entero** de las skills que el modelo no debería elegir por su cuenta.
+
+### Retractación
+
+Una versión anterior de este documento decía que las 10 `sdd-*` no llegaron al
+cable *"porque vienen de un plugin y el sandbox no copió `plugins/`"`*.
+**Falso, y por partida doble**: son skills de **usuario** (`~/.claude/skills/`),
+sí estaban en el sandbox, y las de plugin sí llegan. Lo que las excluye es su
+`disable-model-invocation: true`.
+
+El error salió de explicar una ausencia con la primera causa plausible en vez
+de comprobarla. La comprobación era barata —leer el frontmatter— y no se hizo.
+
+### Y una trampa de atribución, para quien repita la medida
+
+El nombre de una entrada **no identifica su origen**. En esta instalación
+`sdd-apply` existe a la vez como skill deshabilitada (`~/.claude/skills/`) y
+como **slash command** (`~/.claude/commands/`), y lo que viaja en el listado es
+la descripción del comando, no la de la skill. Atribuir por nombre habría dado
+"una skill deshabilitada aparece en el listado" — conclusión falsa que se cae
+en cuanto se compara la descripción.
+
+**El bloque no contiene solo skills**: los comandos comparten sitio con ellas.
 
 ---
 
@@ -224,6 +271,16 @@ Dos obstáculos que costaron un rato y conviene no reaprender:
    streaming y **reintenta la petición entera** — lo que hacía parecer que el
    `tool_use` se ignoraba, cuando lo que pasaba es que nunca llegó a leerse.
    Hay que hablar el protocolo de eventos.
+
+---
+
+## 8. Lo que queda sin medir
+
+- **`AGENTS.md` en otros clientes.** Aquí se midió Claude Code. Codex, `pi` y
+  OpenCode sí lo usan; cuánto cuesta ahí está sin medir ([#27](https://github.com/pichu2707/OxideGate/issues/27)).
+- **El coste de invocar** en Gemini, opencode y Codex ([#28](https://github.com/pichu2707/OxideGate/issues/28)).
+- **Cuántos bytes son comandos** y cuántos skills en el listado. Aquí se
+  estableció que conviven, no la proporción exacta de cada uno.
 
 ---
 
