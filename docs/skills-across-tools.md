@@ -134,12 +134,74 @@ buena, la conclusión habría sido exactamente la contraria a la medida.
 
 ---
 
-## 7. Lo que queda sin medir
+## 7. Invocar una skill: cuatro mecanismos, y dos que no existen
 
-- **El coste de invocar** en Gemini, opencode y Codex. En Claude Code está
-  medido (`docs/optimizer-skills.md` §7): el cuerpo del `SKILL.md` menos el
-  frontmatter. Las otras tres usan una herramienta de activación propia
-  (`activate_skill` en Gemini) y el mecanismo puede diferir.
+Declarar una skill cuesta entre 138 B y 390 B por petición (§1). **Invocarla es
+otra cosa — y en dos de las cuatro herramientas ni siquiera es posible por la
+vía que ellas mismas anuncian.**
+
+| Herramienta | Mecanismo de invocación | Coste medido |
+|---|---|---|
+| **Claude Code** | Herramienta `Skill` dedicada | **2.998 B** |
+| **opencode** | Herramienta `skill` dedicada | **3.335 B** |
+| **Codex** | **Ninguna**: da un `file:` locator y el modelo lee el fichero | sin mecanismo propio |
+| **Gemini CLI** | Anuncia `activate_skill`… **que no declara** | **no invocable** |
+
+Misma skill en las dos que sí funcionan (`judgment-day`, 2.846 B en disco):
+
+| | Claude Code | opencode |
+|---|---:|---:|
+| Texto inyectado | 2.703 B | 3.073 B |
+| Delta total del body | **2.998 B** | **3.335 B** |
+| ¿Reenvía el frontmatter? | no | no |
+
+**Ninguna reenvía el frontmatter** — ya se pagó en el listado. La diferencia
+está en el envoltorio: opencode envuelve con `<skill_content name="…">` y
+repite el nombre como cabecera, ~470 B frente a los ~100 B de ruta de Claude
+Code. Un 11% más cara por la misma capacidad.
+
+### Gemini CLI: se paga el listado y no hay puerta
+
+El `systemInstruction` de Gemini dice, literalmente:
+
+> *"To activate a skill and receive its detailed instructions, call the
+> `activate_skill` tool with the skill's name."*
+
+**`activate_skill` no está entre las herramientas declaradas.** Las once que
+llegan son `update_topic`, `list_directory`, `read_file`, `grep_search`,
+`glob`, `replace`, `write_file`, `web_fetch`, `google_web_search`,
+`enter_plan_mode` e `invoke_agent`. Verificado en dos capturas idénticas: la
+cadena `activate_skill` aparece **solo** dentro de `systemInstruction`, nunca
+en `tools`.
+
+Consecuencia medida: en este modo se pagan **288 B por skill en cada petición**
+y el modelo no tiene forma de canjearlos.
+
+> **Alcance de la afirmación.** Medido con `gemini -p` (no interactivo, un solo
+> turno). Si el modo interactivo declara la herramienta, está **sin medir** —
+> esta conclusión vale para el modo probado, no para todos.
+
+### Codex: no invoca, lee
+
+Codex no tiene herramienta de skill. Su bloque entrega un **locator** por
+entrada —`(file: /ruta/SKILL.md)`— y explica que los `file` locators están en
+el sistema de ficheros del host. El modelo abre el fichero con sus herramientas
+normales.
+
+Eso significa que **en Codex no hay un "coste de invocar" propio**: hay el
+coste de una lectura de fichero, que depende de cómo la haga el modelo (entero,
+por rangos) y no de un mecanismo de skills. Compararlo con los 2.998 B de
+Claude Code sería comparar dos cosas distintas.
+
+---
+
+## 8. Lo que queda sin medir
+
+- **`activate_skill` en el modo interactivo de Gemini.** Aquí se midió
+  `gemini -p`. Si el modo interactivo sí la declara, el veredicto de §7 cambia
+  para ese modo.
+- **El coste real de leer un `SKILL.md` en Codex**, que depende de cómo lo lea
+  el modelo y no de un mecanismo de skills.
 - **Todas las cifras son de UNA instalación**: la de este equipo, con este
   conjunto de skills. El coste POR SKILL es comparable entre herramientas; el
   total depende de cuántas tenga cada una instaladas.
