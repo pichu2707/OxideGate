@@ -105,7 +105,8 @@ son el suelo de esta superficie.
 
 ## 4. `AGENTS.md`: no llega al cable
 
-**Claude Code 2.1.220 no manda `AGENTS.md`.** Con un `AGENTS.md` de 61 B en el
+**Claude Code 2.1.220 no manda `AGENTS.md`.** (Codex, opencode y `pi` sí — con
+precios distintos, medidos en `docs/skills-across-tools.md` §6.) Con un `AGENTS.md` de 61 B en el
 directorio del proyecto, el body capturado no contiene **ni su contenido ni la
 cadena `AGENTS`**: cero ocurrencias. Y el body con y sin el fichero tiene el
 mismo tamaño exacto.
@@ -276,8 +277,8 @@ Dos obstáculos que costaron un rato y conviene no reaprender:
 
 ## 8. Lo que queda sin medir
 
-- **`AGENTS.md` en otros clientes.** Aquí se midió Claude Code. Codex, `pi` y
-  OpenCode sí lo usan; cuánto cuesta ahí está sin medir ([#27](https://github.com/pichu2707/OxideGate/issues/27)).
+- ~~**`AGENTS.md` en otros clientes**~~ — medido: los tres lo mandan, entre
+  +159 B y +200 B sobre un fichero de 74 B. Ver `docs/skills-across-tools.md` §6.
 - **El coste de invocar** en Gemini, opencode y Codex ([#28](https://github.com/pichu2707/OxideGate/issues/28)).
 - **Cuántos bytes son comandos** y cuántos skills en el listado. Aquí se
   estableció que conviven, no la proporción exacta de cada uno.

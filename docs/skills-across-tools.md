@@ -98,15 +98,48 @@ coincidan, manda el cable.
 
 ---
 
-## 6. Lo que queda sin medir
+## 6. `AGENTS.md`: tres de cuatro lo mandan, y a precios distintos
+
+`AGENTS.md` de **74 B** en el directorio del proyecto, medido por delta con y
+sin el fichero:
+
+| Herramienta | Dónde cae | Coste | Sobrecoste sobre el fichero |
+|---|---|---:|---:|
+| **Claude Code** 2.1.220 | — | **0 B — no lo manda** | — |
+| **Codex** 0.142.5 | `input` | **+159 B** | +85 B |
+| **opencode** 1.18.5 | `messages` | **+160 B** | +86 B |
+| **pi** 0.80.10 | `system` | **+200 B** | +126 B |
+
+Las tres que lo leen lo envuelven con un marcador y **la ruta absoluta del
+fichero**: Codex con `--- project-doc ---` dentro de `<INSTRUCTIONS>`, opencode
+con `Instructions from: /ruta/completa/AGENTS.md`. Es el mismo patrón que
+encarece sus listados de skills (§2): pagan por decirle al modelo dónde está un
+fichero que el modelo no va a abrir.
+
+El sobrecoste es **fijo por fichero**, no proporcional: en un `AGENTS.md` real
+de varios kB se amortiza. Sobre uno de 74 B, más que dobla el contenido.
+
+> **Para quien use `AGENTS.md` como fuente única entre herramientas:** en
+> Claude Code el fichero es gratis porque **se ignora** —hay que convertirlo a
+> `CLAUDE.md` o no se aplica— y en las otras tres se paga en cada petición.
+> El mismo fichero, cuatro comportamientos.
+
+### Un indicio que resultó falso
+
+El binario de `pi` no contiene **ninguna** mención de `AGENTS.md` —cero, frente
+a las 7 del binario de Claude Code— y aun así **es la herramienta que más caro
+lo cobra**. Buscar cadenas en un binario empaquetado no prueba una ausencia:
+prueba que el empaquetador las escondió. Si esa señal se hubiera tomado por
+buena, la conclusión habría sido exactamente la contraria a la medida.
+
+---
+
+## 7. Lo que queda sin medir
 
 - **El coste de invocar** en Gemini, opencode y Codex. En Claude Code está
   medido (`docs/optimizer-skills.md` §7): el cuerpo del `SKILL.md` menos el
   frontmatter. Las otras tres usan una herramienta de activación propia
   (`activate_skill` en Gemini) y el mecanismo puede diferir.
-- **`AGENTS.md` en estas herramientas.** opencode tiene uno en su directorio de
-  configuración. Claude Code no lo manda (`optimizer-skills.md` §4); en las
-  demás está sin medir.
 - **Todas las cifras son de UNA instalación**: la de este equipo, con este
   conjunto de skills. El coste POR SKILL es comparable entre herramientas; el
   total depende de cuántas tenga cada una instaladas.
