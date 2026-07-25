@@ -132,7 +132,8 @@ seguirla son lo mismo.
 | Invocar una skill en Gemini, opencode y Codex | ✅ Medido: opencode **3.335 B**; Codex **no tiene mecanismo** (lee el fichero); Gemini anuncia `activate_skill` y **no la declara** — ver [§7](docs/skills-across-tools.md) |
 | **`activate_skill` en el modo interactivo de Gemini** | ❌ Sin medir: aquí se probó `gemini -p` |
 | Bytes de bajada | ✅ Campo `response_bytes` — **sin comprimir**, ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.9 |
-| **Comparar herramientas sobre la misma TAREA** (no solo config) | ❌ Sin medir — [#29](https://github.com/pichu2707/OxideGate/issues/29) |
+| El **peaje fijo** de cada herramienta (misma tarea trivial) | ✅ Medido en las cuatro — ver [`docs/floor-across-tools.md`](docs/floor-across-tools.md) |
+| **Comparar herramientas sobre una tarea REAL** (con n>1 y tarea verificable) | ❌ Sin medir: gasta cuota y no es determinista — [#29](https://github.com/pichu2707/OxideGate/issues/29) |
 | Agregación por sesión | ✅ `GET /sessions` — ver [`docs/telemetry-by-session.md`](docs/telemetry-by-session.md) |
 | Panel de sesión en el monitor TUI | ✅ Tecla `e` — ver [`docs/monitor-tui.md`](docs/monitor-tui.md) §10 |
 | **Ventana temporal y persistencia del agregado por sesión** | ❌ Sin hacer: es desde que arrancó el proceso, igual que `/stats` |
@@ -555,6 +556,7 @@ por función con su contrato) y **responsabilidad única estricta** por módulo.
 | [`docs/optimizer-prompt-cache.md`](docs/optimizer-prompt-cache.md) | Palanca A: forzado de prompt caching de Anthropic |
 | [`docs/optimizer-dedup.md`](docs/optimizer-dedup.md) | Palanca B: dedup de respuestas por `prompt_hash` (descartada para tráfico conversacional, con evidencia) |
 | [`docs/optimizer-claude-md.md`](docs/optimizer-claude-md.md) | El `CLAUDE.md` lean: −29.509 B/petición medidos en el cable, y un A/B de comportamiento (la delegación sobrevive al lean; el guardado proactivo no es medible en modo `-p`) |
+| [`docs/floor-across-tools.md`](docs/floor-across-tools.md) | El peaje fijo: qué manda cada herramienta solo por existir, con la misma tarea trivial. Y por qué el desglose importa más que el ranking |
 | [`docs/skills-across-tools.md`](docs/skills-across-tools.md) | La misma convención `SKILL.md` en cuatro herramientas y cuatro precios: dónde manda cada una el listado y por qué Claude Code cuesta menos de la mitad que Codex |
 | [`docs/optimizer-skills.md`](docs/optimizer-skills.md) | Skills y `AGENTS.md`: declarar una skill cuesta 138 B en cada petición; invocarla, el cuerpo entero del `SKILL.md` dentro del historial. Y por qué Claude Code no manda `AGENTS.md`. Incluye una retractación y el control que la forzó |
 | [`docs/context-tax.md`](docs/context-tax.md) | El impuesto de contexto: descomposición medida de costo y latencia de una sesión real de agente, y el piso del harness |
