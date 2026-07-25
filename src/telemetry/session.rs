@@ -62,6 +62,20 @@ pub enum SessionSource {
     /// identidad inventada.
     Unattributed,
 }
+impl SessionSource {
+    /// Etiqueta estable del origen, la misma que serializa serde.
+    ///
+    /// Se usa como parte de la CLAVE de agregación por sesión: la misma `key`
+    /// bajo distinto origen no debe fusionarse (ver `telemetry::stats`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SessionSource::Explicit => "explicit",
+            SessionSource::Native => "native",
+            SessionSource::Unattributed => "unattributed",
+        }
+    }
+}
+
 
 /// Sesión resuelta para un request puntual: procedencia (`source`) y valor
 /// opaco (`key`), inseparables por construcción (ver doc del módulo).

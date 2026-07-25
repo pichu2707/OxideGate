@@ -57,6 +57,7 @@ RUTAS QUE SIRVE:
                      enrutan por aquí; si devuelve 404 caen al proveedor
                      directo en silencio, sin error y sin log.
     GET  /stats      Agregado en vivo por (proveedor, modelo).
+    GET  /sessions   Agregado por sesion: que costo cada sesion de trabajo.
     GET  /requests   Detalle de los últimos requests individuales.
 
 VER TAMBIÉN:
@@ -658,6 +659,9 @@ async fn main() {
         .route("/health", get(middleware::health::handle_health))
         // Agregación en vivo por (proveedor, modelo): qué optimizar ahora.
         .route("/stats", get(middleware::stats::handle_stats))
+        // Agregación por SESIÓN: qué costó cada sesión de trabajo, no cada
+        // modelo. Endpoint aparte para no romper la forma de `/stats`.
+        .route("/sessions", get(middleware::sessions::handle_sessions))
         // Detalle en vivo de los últimos requests individuales: qué request
         // puntual es atípico (outlier de coste/latencia).
         .route("/requests", get(middleware::requests::handle_requests))

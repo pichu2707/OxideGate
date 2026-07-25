@@ -2,4 +2,5 @@
 pub mod health;
 pub mod proxy;
 pub mod requests;
+pub mod sessions;
 pub mod stats;

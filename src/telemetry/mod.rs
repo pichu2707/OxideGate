@@ -12,4 +12,4 @@ pub use logger::{RequestMetric, TelemetrySink};
 pub use metered::{MeteredBody, MetricBase};
 pub use recent::{RecentRequest, RecentRequests};
 pub use session::{SessionAttribution, SessionSource};
-pub use stats::{StatsRegistry, StatsSnapshot};
+pub use stats::{SessionRegistry, SessionSnapshot, StatsRegistry, StatsSnapshot};

@@ -8,7 +8,9 @@
 //! agregación y el detalle reciente en vivo sin tocar el JSONL. Así el I/O de
 //! log NUNCA se suma a la latencia que le devolvemos a gentle-ai.
 use crate::provider::{ContextBreakdown, SkillsBlock, ToolSearchSignal, ToolServerBytes};
-use crate::telemetry::{CodexQuota, RecentRequests, SessionAttribution, StatsRegistry};
+use crate::telemetry::{
+    CodexQuota, RecentRequests, SessionAttribution, SessionRegistry, StatsRegistry,
+};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -387,6 +389,8 @@ pub struct TelemetrySink {
     /// la misma task de drenaje. Se comparte con el handler de `/requests`
     /// vía `recent()`.
     recent: Arc<RwLock<RecentRequests>>,
+    /// Agregación por sesión, alimentada en la misma task de drenaje.
+    sessions: Arc<RwLock<SessionRegistry>>,
 }
 
 /// Línea de confirmación que se imprime UNA sola vez, la primera vez que el
@@ -431,6 +435,8 @@ impl TelemetrySink {
         let stats_writer = Arc::clone(&stats);
         let recent = Arc::new(RwLock::new(RecentRequests::default()));
         let recent_writer = Arc::clone(&recent);
+        let sessions = Arc::new(RwLock::new(SessionRegistry::default()));
+        let sessions_writer = Arc::clone(&sessions);
 
         let mut path = storage_dir;
         path.push("telemetry.jsonl");
@@ -493,6 +499,13 @@ impl TelemetrySink {
                     recent.ingest(&metric);
                 }
 
+                {
+                    let mut sessions = sessions_writer
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    sessions.ingest(&metric);
+                }
+
                 if let Ok(mut line) = serde_json::to_string(&metric) {
                     line.push('\n');
                     if let Err(e) = file.write_all(line.as_bytes()).await {
@@ -502,7 +515,12 @@ impl TelemetrySink {
             }
         });
 
-        Self { tx, stats, recent }
+        Self {
+            tx,
+            stats,
+            recent,
+            sessions,
+        }
     }
 
     /// No bloquea: si el canal se cerró, descartamos la métrica en silencio.
@@ -521,6 +539,11 @@ impl TelemetrySink {
     /// disco.
     pub fn recent(&self) -> Arc<RwLock<RecentRequests>> {
         Arc::clone(&self.recent)
+    }
+
+    /// Handle compartido de la agregación por sesión, para `GET /sessions`.
+    pub fn sessions(&self) -> Arc<RwLock<SessionRegistry>> {
+        Arc::clone(&self.sessions)
     }
 }
 
