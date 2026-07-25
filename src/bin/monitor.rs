@@ -2702,7 +2702,7 @@ mod tests {
 
     #[test]
     fn monitor_argv_zero_is_never_a_flag() {
-        assert!(!wants_flag(&vec!["-h".to_string()], "--help", "-h"));
+        assert!(!wants_flag(&["-h".to_string()], "--help", "-h"));
     }
 
     #[test]
