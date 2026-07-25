@@ -171,6 +171,21 @@ oxidegate run opencode                   # explica cómo (OpenCode va por ficher
 Si el proxy no está levantado, `run` lo dice y se detiene, en vez de dejarte un
 cliente hablando con un puerto muerto.
 
+**¿Y si algo no cuadra?** `oxidegate doctor` responde la pregunta directamente:
+
+```
+$ oxidegate doctor
+✓ OxideGate está sirviendo en 127.0.0.1:8899.
+✗ Pero no ha medido ni una petición.
+  El tráfico no está pasando por aquí. Casi siempre es el cableado:
+    oxidegate run claude        (pone la variable correcta y lanza)
+```
+
+Distingue los cuatro estados que importan: nada escuchando, **algo escuchando
+que no es OxideGate** (el 8080 lo ocupan Apache y Tomcat más a menudo de lo que
+parece), el proxy vivo sin medir nada, y midiendo. Sale con `0` solo en el
+último — un proxy que no mide no es un éxito.
+
 <details>
 <summary>Cablearlo a mano, sin <code>run</code></summary>
 
