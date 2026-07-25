@@ -665,4 +665,103 @@ mod tests {
         let snapshot = registry.snapshot();
         assert_eq!(snapshot.0[0].model, "unknown");
     }
+
+    // --- Snapshot del contrato publicado por `/stats` y `/sessions` ---
+
+    /// Snapshot de las claves de una fila de `GET /stats`.
+    ///
+    /// Mismo contrato que el equivalente en `telemetry::recent`: añadir es
+    /// aditivo y solo pide actualizar esta lista; renombrar, quitar o cambiar
+    /// el tipo de un campo es ruptura y obliga a subir
+    /// [`CONTRACT_VERSION`](crate::middleware::version::CONTRACT_VERSION).
+    #[test]
+    fn las_claves_de_stats_no_cambian_sin_querer() {
+        let mut registry = StatsRegistry::default();
+        registry.ingest(&base_metric("anthropic", "claude-opus-4"));
+        let fila = serde_json::to_value(&registry.snapshot().0[0]).unwrap();
+
+        let publicadas: Vec<&str> = fila
+            .as_object()
+            .expect("cada fila de /stats es un objeto")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        let esperadas = [
+            "avg_cost_usd",
+            "avg_input_tokens",
+            "avg_output_tokens",
+            "avg_tokens_per_sec",
+            "avg_total_ms",
+            "avg_ttft_ms",
+            "cache_forced_rate",
+            "cache_hit_rate",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "cost_usd",
+            "distinct_prompts",
+            "error_rate",
+            "errors",
+            "input_tokens",
+            "max_ttft_ms",
+            "min_ttft_ms",
+            "model",
+            "output_tokens",
+            "redundancy_rate",
+            "redundancy_saturated",
+            "redundant_requests",
+            "requests",
+            "tokens_per_sec_count",
+            "tokens_per_sec_sum",
+            "total_ms_sum",
+            "ttft_ms_count",
+            "ttft_ms_sum",
+            "upstream",
+        ];
+
+        assert_eq!(
+            publicadas, esperadas,
+            "el contrato de /stats cambió. Si es ADITIVO, actualiza esta \
+             lista. Si RENOMBRA, QUITA o cambia el tipo de un campo, sube \
+             ademas CONTRACT_VERSION en middleware::version y anótalo en \
+             docs/telemetry-per-request.md §8."
+        );
+    }
+
+    /// Snapshot de las claves de una fila de `GET /sessions`.
+    ///
+    /// El sobre del endpoint (`{sessions, saturated}`) lo arma el handler; lo
+    /// que se congela aquí es la FILA, que es lo que consume el monitor.
+    #[test]
+    fn las_claves_de_sessions_no_cambian_sin_querer() {
+        let mut registry = SessionRegistry::default();
+        registry.ingest(&base_metric("anthropic", "claude-opus-4"));
+        let fila = serde_json::to_value(&registry.snapshot().0[0]).unwrap();
+
+        let publicadas: Vec<&str> = fila
+            .as_object()
+            .expect("cada fila de /sessions es un objeto")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        let esperadas = [
+            "cache_read_tokens",
+            "cost_usd",
+            "input_tokens",
+            "is_session",
+            "key",
+            "output_tokens",
+            "requests",
+            "source",
+        ];
+
+        assert_eq!(
+            publicadas, esperadas,
+            "el contrato de /sessions cambió. Si es ADITIVO, actualiza esta \
+             lista. Si RENOMBRA, QUITA o cambia el tipo de un campo, sube \
+             ademas CONTRACT_VERSION en middleware::version y anótalo en \
+             docs/telemetry-per-request.md §8."
+        );
+    }
 }

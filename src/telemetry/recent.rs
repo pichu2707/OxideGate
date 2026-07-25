@@ -839,4 +839,141 @@ mod tests {
 
         assert!(parsed["client"].is_null());
     }
+
+    // --- Snapshot del contrato publicado por `GET /requests` ---
+
+    /// Recolecta TODA clave del JSON, incluidas las anidadas.
+    ///
+    /// Anidadas también a propósito: `tool_names` no vive en la raíz de la
+    /// fila sino dentro de `tools_by_server`, y es justo el campo cuya
+    /// ausencia dejó a `oxidegate-lens` sin hacer nada contra un proxy 0.3.1.
+    fn claves_recursivas(v: &serde_json::Value, out: &mut std::collections::BTreeSet<String>) {
+        match v {
+            serde_json::Value::Object(map) => {
+                for (k, sub) in map {
+                    out.insert(k.clone());
+                    claves_recursivas(sub, out);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for sub in items {
+                    claves_recursivas(sub, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Snapshot de las claves de PRIMER NIVEL de una fila de `/requests`.
+    ///
+    /// Este test no juzga si el contrato es bueno: solo hace que cambiarlo
+    /// cueste tocarlo aquí. Renombrar un campo, cambiarle el tipo o quitarlo
+    /// rompe a `oxidegate-monitor` y a `oxidegate-lens` en silencio, y hasta
+    /// ahora no había nada que lo contara antes que un usuario.
+    ///
+    /// **Añadir** un campo es aditivo: se agrega a esta lista y ya. **Quitar
+    /// o renombrar** es ruptura y obliga a subir
+    /// [`CONTRACT_VERSION`](crate::middleware::version::CONTRACT_VERSION).
+    #[test]
+    fn las_claves_de_requests_no_cambian_sin_querer() {
+        let mut recent = RecentRequests::default();
+        recent.ingest(&base_metric("t1"));
+        let fila = serde_json::to_value(&recent.snapshot()[0]).unwrap();
+
+        let publicadas: Vec<&str> = fila
+            .as_object()
+            .expect("cada fila de /requests es un objeto")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        let esperadas = [
+            "cache_control_forced",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "client",
+            "codex_quota",
+            "context_history_bytes",
+            "context_last_turn_bytes",
+            "context_measured_bytes",
+            "context_messages_count",
+            "context_other_bytes",
+            "context_system_bytes",
+            "context_tax_ratio",
+            "context_tools_bytes",
+            "cost_estimate_usd",
+            "input_tokens",
+            "model",
+            "output_tokens",
+            "prepare_us",
+            "requested_effort",
+            "requested_speed",
+            "response_bytes",
+            "route",
+            "served_speed",
+            "session",
+            "skills",
+            "status",
+            "stream",
+            "timestamp",
+            "tool_search",
+            "tools_by_server",
+            "tools_flattened",
+            "tools_overhead_bytes",
+            "total_ms",
+            "ttft_ms",
+            "upstream",
+        ];
+
+        assert_eq!(
+            publicadas, esperadas,
+            "el contrato de /requests cambió. Si es ADITIVO, actualiza esta \
+             lista. Si RENOMBRA, QUITA o cambia el tipo de un campo, sube \
+             ademas CONTRACT_VERSION en middleware::version y anótalo en \
+             docs/telemetry-per-request.md §8."
+        );
+    }
+
+    /// `prompt_hash` y `prompt_bytes` NO están en el contrato publicado. La
+    /// invariante de privacidad del módulo, afirmada sobre el JSON real y no
+    /// solo sobre la definición del tipo.
+    #[test]
+    fn el_contrato_de_requests_nunca_publica_la_huella_del_prompt() {
+        let mut recent = RecentRequests::default();
+        recent.ingest(&base_metric("t1"));
+        let fila = serde_json::to_value(&recent.snapshot()[0]).unwrap();
+
+        let mut claves = std::collections::BTreeSet::new();
+        claves_recursivas(&fila, &mut claves);
+
+        for prohibida in ["prompt_hash", "prompt_bytes"] {
+            assert!(
+                !claves.contains(prohibida),
+                "`{prohibida}` se filtró a /requests: {claves:?}"
+            );
+        }
+    }
+
+    /// Toda capacidad que `/version` anuncia existe de verdad en el JSON.
+    ///
+    /// Es lo que hace que `fields` sea una respuesta y no una promesa: sin
+    /// este test, `/version` podría anunciar un campo que el proxy no publica
+    /// y el consumidor volvería a quedarse sin saber si el hueco es del proxy
+    /// o del dato.
+    #[test]
+    fn version_no_anuncia_campos_que_requests_no_publique() {
+        let mut recent = RecentRequests::default();
+        recent.ingest(&base_metric("t1"));
+        let fila = serde_json::to_value(&recent.snapshot()[0]).unwrap();
+
+        let mut claves = std::collections::BTreeSet::new();
+        claves_recursivas(&fila, &mut claves);
+
+        for campo in crate::middleware::version::FIELDS {
+            assert!(
+                claves.contains(campo),
+                "/version anuncia `{campo}` y /requests no lo publica"
+            );
+        }
+    }
 }
