@@ -735,4 +735,115 @@ el historial completo, o algo más viejo que las últimas 200 peticiones, la
 | `src/telemetry/codex_quota.rs` | `CodexQuota`, `CodexQuota::from_headers` — parseo y saneo de las doce cabeceras `x-codex-*`, sin ningún campo en USD (§4.7) |
 | `src/telemetry/logger.rs` | `TelemetrySink::spawn` alimenta el buffer en la misma task que escribe el JSONL; `TelemetrySink::recent()` expone el `Arc<RwLock<RecentRequests>>` |
 | `src/middleware/requests.rs` | `handle_requests` — el handler HTTP de `GET /requests` |
-| `src/main.rs` | Registra la ruta `/requests` en el `Router` |
+| `src/middleware/version.rs` | `handle_version`, `CONTRACT_VERSION`, `ENDPOINTS`, `FIELDS` — el contrato declarado de `GET /version` (§8) |
+| `src/main.rs` | Registra las rutas `/requests` y `/version` en el `Router` |
+
+---
+
+## 8. El contrato: qué se puede cambiar y qué no
+
+`/requests`, `/stats` y `/sessions` son la API pública de facto del
+ecosistema. Hoy dependen de sus campos, como mínimo, `oxidegate-monitor` y
+`oxidegate-lens` (`oxidegate-savings`, `oxidegate-mcp`). Esta sección dice
+qué puede cambiar sin avisar y qué no.
+
+### 8.1. `GET /version`: preguntar en vez de deducir
+
+Antes de esta ruta, la única forma que tenía un consumidor de saber si un
+campo existía era hacer una petición real, mirar el JSON y deducirlo — es
+decir, **sondear por ausencia**. Y sondear por ausencia no distingue *«este
+proxy no lo soporta»* de *«aquí no había dato»*, que es exactamente la
+confusión que el resto de este documento se niega a cometer: **un hueco
+honesto no es un cero.**
+
+```
+GET /version → {
+  "oxidegate": "0.3.1",
+  "contract": 1,
+  "endpoints": ["/health", "/stats", "/sessions", "/requests"],
+  "fields": ["tool_names", "tool_search", "tools_flattened", "skills",
+             "response_bytes", "codex_quota", "session", "prepare_us"]
+}
+```
+
+- **`oxidegate`** — `CARGO_PKG_VERSION` del binario que responde.
+- **`contract`** — versión del contrato, **independiente** de la del crate.
+  Sube solo al ROMPER (ver §8.2). Arranca en `1`: es el primer contrato
+  declarado.
+- **`endpoints`** — rutas que sirve este binario, absolutas y concatenables
+  a la base-URL tal cual.
+- **`fields`** — el subconjunto de campos que marca una CAPACIDAD. No es la
+  lista completa de claves: es la lista de campos cuya **ausencia significa
+  "actualiza el proxy"**, no "aquí no había dato". Es lo que permite a
+  `oxidegate-savings --doctor` decir *«tu OxideGate es antiguo, actualiza
+  para ver esta columna»* en vez de enseñar una tabla vacía sin explicar por
+  qué.
+
+La ruta es **aditiva**: un proxy anterior devuelve `404`, y eso ya es una
+respuesta útil — «esto es previo al contrato». `GET /health` **no se toca**:
+sigue devolviendo `{"status":"ok"}` y nada más, porque es liveness y hay
+clientes que dependen de que su payload no cambie.
+
+### 8.2. Qué es aditivo y qué es ruptura
+
+| Cambio | ¿Rompe? | ¿Sube `contract`? |
+|---|---|---|
+| Añadir un campo nuevo a una fila | No | No — se añade a `fields` si es una capacidad sondeable |
+| Añadir un endpoint nuevo | No | No — se añade a `endpoints` |
+| Añadir una variante a un enum ya publicado | No | No — el consumidor debe tolerar valores desconocidos |
+| **Renombrar** un campo | **Sí** | **Sí** |
+| **Quitar** un campo | **Sí** | **Sí** |
+| **Cambiar el tipo** de un campo (`string` → `int`, escalar → objeto) | **Sí** | **Sí** |
+| **Cambiar la unidad** de un campo (bytes → tokens, ms → µs) | **Sí**, y en silencio | **Sí** |
+
+El último es el peor de todos: un cambio de unidad no rompe ningún parser.
+El consumidor sigue leyendo un número, lo pinta, y el usuario lee una cifra
+mil veces mayor sin que nada falle. Si alguna vez hay que hacerlo, **el campo
+se renombra** (`total_ms` → `total_us`) para que la ruptura sea ruidosa.
+
+### 8.3. Qué debe hacer un consumidor
+
+1. **Ignorar todo campo que no conozca.** Un campo nuevo nunca es un error.
+2. **Tratar `404` en `/version` como «proxy anterior al contrato»**, no como
+   «proxy caído» — para eso está `/health`.
+3. **Sondear `fields`, no comparar versiones.** `contract` dice si algo se
+   rompió; `fields` dice si una capacidad concreta está. Casi siempre lo que
+   se necesita es lo segundo.
+4. **No confundir `null` con ausencia de la clave.** Todas las claves de una
+   fila se publican siempre; `null` es un hueco honesto y significa «no se
+   pudo medir», nunca cero (§4.1).
+
+### 8.4. Los tests que lo guardan
+
+Tres snapshots congelan las claves publicadas, uno por endpoint:
+
+| Test | Archivo | Cubre |
+|---|---|---|
+| `las_claves_de_requests_no_cambian_sin_querer` | `src/telemetry/recent.rs` | `GET /requests` |
+| `las_claves_de_stats_no_cambian_sin_querer` | `src/telemetry/stats.rs` | `GET /stats` |
+| `las_claves_de_sessions_no_cambian_sin_querer` | `src/telemetry/stats.rs` | `GET /sessions` |
+
+Si alguien renombra un campo, el test lo cuenta antes que un usuario. El
+mensaje de fallo dice qué hacer según el cambio sea aditivo o ruptura.
+
+Y un cuarto, `version_no_anuncia_campos_que_requests_no_publique`, comprueba
+que **cada entrada de `fields` existe de verdad en el JSON** —incluidas las
+anidadas, como `tool_names` dentro de `tools_by_server`—. Sin él, `/version`
+podría anunciar una capacidad que el proxy no tiene, y el consumidor volvería
+justo al agujero que esta ruta viene a tapar.
+
+### 8.5. Por qué existe esta sección
+
+Porque el patrón ya falló dos veces, y las dos igual: **dos piezas correctas
+a ambos lados y un fallo silencioso en medio.**
+
+- **`tool_names`** — `oxidegate-lens` consume el campo, testeado y en su
+  `main`, y no hacía nada contra un proxy 0.3.1 porque el campo no existía
+  todavía en la build instalada.
+- **`GET /health`** — existía en el código desde 0.3.0 mientras el tap de
+  Homebrew servía 0.2.1. El plugin sondeaba la ruta, recibía `404` y caía al
+  proveedor directo **en silencio**, sin error y sin log. El monitor estuvo
+  vacío meses por eso.
+
+El coste de versionar un contrato crece con el número de consumidores. Ahora
+mismo son dos.
