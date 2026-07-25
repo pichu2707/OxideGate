@@ -35,6 +35,51 @@ donde ver el gasto de todos los modelos y todas las herramientas a la vez.
 
 ---
 
+## El ecosistema
+
+OxideGate no es una herramienta suelta: es **el medidor** de un sistema con
+varias piezas. La separación importa más de lo que parece.
+
+| Repo | Papel |
+|---|---|
+| **OxideGate** | Mide en el cable. Única fuente de verdad. Publica `GET /stats`, `GET /requests` y `GET /sessions` |
+| **`oxidegate-monitor`** | Dashboard TUI en vivo. Vive en **este mismo repo** y se instala con el proxy |
+| [`oxidegate-lens`](https://github.com/pichu2707/oxidegate-lens) | Lente **read-only**: bytes por servidor MCP y ahorro por petición (`oxidegate-savings`, `oxidegate-mcp`) |
+| [`homebrew-tap`](https://github.com/pichu2707/homebrew-tap) | Distribución — `brew install pichu2707/tap/oxidegate` |
+| [`mcp-savings`](https://github.com/pichu2707/mcp-savings) | Enfoque anterior: medía desde el host, no desde el cable. **Superseded** (ver [mcp-savings#1](https://github.com/pichu2707/mcp-savings/issues/1)) |
+
+### La dirección del dato
+
+Es lo único que hay que entender de verdad:
+
+```mermaid
+flowchart LR
+    OG["OxideGate<br/>MIDE en el cable"]
+    OG -->|"HTTP read-only"| MON["oxidegate-monitor<br/>panel TUI"]
+    OG -->|"HTTP read-only"| LENS["oxidegate-lens<br/>bytes por servidor MCP"]
+    OG -->|"HTTP read-only"| TUYA["tu propia lente"]
+```
+
+**El dato solo fluye del proxy hacia las lentes, nunca al revés.** Las lentes
+interpretan, agrupan y presentan; **ninguna mide nada por su cuenta**. Si un
+número no salió de OxideGate, no existe.
+
+Eso es lo que hace que un desacuerdo entre dos vistas sea siempre un bug de
+presentación y nunca dos mediciones que compiten — la trampa en la que cayó
+`mcp-savings`, que medía desde el host y por eso podía contradecir al cable.
+
+### El contrato HTTP es público
+
+`GET /stats`, `GET /requests` y `GET /sessions` son JSON sin autenticación
+sobre `127.0.0.1`. **Cualquiera puede escribir su propia lente**: no hace
+falta permiso, ni un plugin, ni tocar este repo. Basta con leer esas rutas.
+
+El contrato campo a campo está en
+[`docs/telemetry-per-request.md`](docs/telemetry-per-request.md), y lo que
+debe hacer un consumidor ante un campo que no conoce (ignorarlo) también.
+
+---
+
 ## El hallazgo: tu pregunta es el 0,03% de lo que pagas
 
 Petición real de un agente, **225.798 bytes**. Esto es lo que iba dentro:
