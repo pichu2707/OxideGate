@@ -114,7 +114,9 @@ misma disciplina que el resto del proyecto: un dato ausente se declara ausente.
 | `AGENTS.md` | ✅ Medido: **Claude Code no lo manda**, 0 B — ver [§4](docs/optimizer-skills.md) |
 | **Skills de plugin** | ❌ Sin medir: solo se midieron las de usuario |
 | **`AGENTS.md` en Codex, `pi` y OpenCode** | ❌ Sin medir; esos sí lo usan |
-| **Comparar herramientas distintas sobre la misma tarea** | ❌ Sin medir |
+| Comparar el coste de skills entre herramientas | ✅ Medido en 4 clientes: **138 B/skill en Claude Code, 390 B en Codex** — ver [`docs/skills-across-tools.md`](docs/skills-across-tools.md) |
+| **Invocar una skill en Gemini, opencode y Codex** | ❌ Sin medir; solo está medido en Claude Code |
+| **Comparar herramientas sobre la misma TAREA** (no solo config) | ❌ Sin medir |
 | Agregación por sesión y panel de sesión en el TUI | 🚧 La captura existe; la vista, no |
 
 ---
@@ -532,6 +534,7 @@ por función con su contrato) y **responsabilidad única estricta** por módulo.
 | [`docs/optimizer-prompt-cache.md`](docs/optimizer-prompt-cache.md) | Palanca A: forzado de prompt caching de Anthropic |
 | [`docs/optimizer-dedup.md`](docs/optimizer-dedup.md) | Palanca B: dedup de respuestas por `prompt_hash` (descartada para tráfico conversacional, con evidencia) |
 | [`docs/optimizer-claude-md.md`](docs/optimizer-claude-md.md) | El `CLAUDE.md` lean: −29.509 B/petición medidos en el cable, y un A/B de comportamiento (la delegación sobrevive al lean; el guardado proactivo no es medible en modo `-p`) |
+| [`docs/skills-across-tools.md`](docs/skills-across-tools.md) | La misma convención `SKILL.md` en cuatro herramientas y cuatro precios: dónde manda cada una el listado y por qué Claude Code cuesta menos de la mitad que Codex |
 | [`docs/optimizer-skills.md`](docs/optimizer-skills.md) | Skills y `AGENTS.md`: declarar una skill cuesta 138 B en cada petición; invocarla, el cuerpo entero del `SKILL.md` dentro del historial. Y por qué Claude Code no manda `AGENTS.md`. Incluye una retractación y el control que la forzó |
 | [`docs/context-tax.md`](docs/context-tax.md) | El impuesto de contexto: descomposición medida de costo y latencia de una sesión real de agente, y el piso del harness |
 | [`docs/telemetry-by-model.md`](docs/telemetry-by-model.md) | El endpoint `GET /stats` y qué señala cada métrica |
