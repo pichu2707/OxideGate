@@ -10,10 +10,16 @@
 
 | Superficie | Coste medido | Dónde viaja |
 |---|---|---|
-| **Una skill de usuario** | **138 B** por skill | `context_last_turn_bytes` |
-| 11 skills de usuario | 1.520 B | idem |
-| Skills integradas del harness (8) | 3.411 B | idem — se pagan siempre |
+| **Una skill declarada** (listado) | **138 B**, en CADA petición | `context_last_turn_bytes` |
+| 11 skills de usuario | 1.520 B por petición | idem |
+| Skills integradas del harness (8) | 3.411 B por petición | idem — se pagan siempre |
+| **Invocar una skill** (§7) | **el cuerpo del `SKILL.md` menos el frontmatter, +~300 B** | historial, y ahí se queda |
 | **`AGENTS.md`** | **0 B — no se manda** | en ninguna parte |
+
+Las dos primeras filas y la cuarta son monedas distintas y conviene no
+confundirlas: **declarar** una skill cuesta 138 B repetidos para siempre;
+**invocarla** cuesta miles de bytes una vez, que luego el historial reenvía en
+cada turno.
 
 Y la cifra que cambia la intuición:
 
@@ -141,16 +147,83 @@ La captura del body lo cerró: cero ocurrencias.
 
 ## 6. Lo que queda sin medir
 
-- **El coste de invocar una skill.** Al cargarse, el cuerpo del `SKILL.md`
-  entra en el contexto y se queda en el historial el resto de la sesión. Aquí
-  solo se midió el listado, que es el coste permanente. El de invocación exige
-  una sonda que fuerce la carga.
 - **Las skills de plugin.** Las 10 `sdd-*` de la instalación real no llegaron
   al cable en este experimento porque vienen de un plugin y el sandbox no copió
   `plugins/`. Que las de usuario cuesten 138 B no prueba que las de plugin
   cuesten lo mismo.
 - **`AGENTS.md` en otros clientes.** Aquí se midió Claude Code. Codex, `pi` y
   OpenCode sí lo usan; cuánto cuesta ahí está sin medir.
+
+---
+
+## 7. Invocar una skill: la otra moneda
+
+Declarar una skill cuesta 138 B en cada petición. **Invocarla cuesta otra
+cosa, de otra forma.**
+
+| skill | `SKILL.md` en disco | frontmatter | texto inyectado | delta total del body |
+|---|---:|---:|---:|---:|
+| `judgment-day` | 2.846 B | 245 B | 2.703 B | **2.998 B** |
+| `branch-pr` | 5.498 B | 231 B | 5.366 B | **5.815 B** |
+
+**El frontmatter no se reenvía.** Lo que entra es el CUERPO del `SKILL.md`, y
+la descripción del frontmatter ya se había pagado en el listado. No hay doble
+cobro — un detalle que la intuición no da por supuesto.
+
+Al cuerpo se le antepone una línea con la ruta de la skill (`Base directory
+for this skill: …`), que costó **+102 B** y **+99 B** en las dos medidas: es
+constante y depende de la longitud de la ruta, no del tamaño del fichero.
+
+El resto hasta el delta total son el bloque `tool_use` (~96 B), el
+`tool_result` —que solo dice `Launching skill: <nombre>`, 29 B de texto— y el
+escapado JSON del contenido.
+
+> **Modelo completo:**
+> `invocar ≈ (SKILL.md − frontmatter) + ~100 B de ruta + ~200 B de andamiaje`
+
+**Y aquí está lo que de verdad importa.** Ese coste NO es de una vez. Entra en
+el historial como un mensaje más, y el historial se reenvía **entero en cada
+turno** (`docs/context-tax.md` §1: el coste de una conversación crece N², no
+N). Invocar `branch-pr` en el turno 3 de una sesión de 50 turnos no cuesta
+5.815 B: cuesta 5.815 B **multiplicados por los 47 turnos restantes**.
+
+Comparado con el listado, la asimetría es brutal:
+
+| | Coste | Frecuencia |
+|---|---|---|
+| Declarar `branch-pr` | 138 B | cada petición, siempre |
+| Invocar `branch-pr` una vez | 5.815 B | cada petición desde ese turno |
+
+Invocar una skill equivale a declarar **42 más**, con la diferencia de que el
+listado es plano y la invocación entra en el historial que crece.
+
+**La palanca práctica**, entonces, son dos y tiran en direcciones distintas:
+
+- **Descripciones cortas** en el frontmatter — recortan el coste permanente de
+  declarar.
+- **Cuerpos concisos** en el `SKILL.md` — recortan el coste de invocar, que se
+  multiplica por los turnos que queden de sesión.
+
+Un `SKILL.md` de 30 kB invocado pronto en una sesión larga es, con diferencia,
+la forma más cara de configurar un agente que se ha medido en este repositorio.
+
+### Cómo se midió, sin gastar cuota
+
+Forzando la invocación desde el servidor de captura: se responde a la petición
+del agente con un `tool_use` fabricado de la herramienta `Skill`, Claude Code
+la ejecuta **en local** y manda la siguiente petición con el contenido dentro.
+Ningún modelo interviene.
+
+Dos obstáculos que costaron un rato y conviene no reaprender:
+
+1. **`claude -p` intercala llamadas auxiliares pequeñas (~2 kB) con la del
+   agente (~135 kB).** Responder el `tool_use` a una auxiliar no hace nada.
+   Hay que discriminar por tamaño.
+2. **Claude Code pide SSE.** Respondiéndole JSON plano, el stream muere con
+   `Stream completed without receiving message_start event`, cae al modo no
+   streaming y **reintenta la petición entera** — lo que hacía parecer que el
+   `tool_use` se ignoraba, cuando lo que pasaba es que nunca llegó a leerse.
+   Hay que hablar el protocolo de eventos.
 
 ---
 
