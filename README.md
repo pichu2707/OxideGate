@@ -154,19 +154,27 @@ Desde el código: `cargo run --bin oxidegate`.
 ## Arranque rápido
 
 ```sh
-# 1. Levantar el proxy. Por defecto escucha en 8080; usar OXIDEGATE_PORT si ese
-#    puerto está ocupado — lo está más a menudo de lo que parece.
-OXIDEGATE_PORT=8899 oxidegate
+# 1. Medidor y panel, de una vez. `up` arranca el proxy como proceso hijo (su
+#    salida va a un log) y le deja el terminal al panel. Ctrl-C para los dos.
+OXIDEGATE_PORT=8899 oxidegate up
 
 # 2. Lanzar el cliente ya cableado, en otra terminal. `run` pone la variable
 #    correcta con la forma correcta — incluido el /v1, que va en unos clientes
 #    sí y en otros no.
 OXIDEGATE_PORT=8899 oxidegate run claude
 
-# 3. Usar el agente como siempre. OxideGate reenvía la petición INTACTA y la mide
-#    de paso. Después:
-curl 127.0.0.1:8899/stats     # agregado por modelo
-oxidegate-monitor             # o el dashboard en vivo (misma OXIDEGATE_PORT)
+# 3. Usar el agente como siempre. OxideGate reenvía la petición INTACTA y la
+#    mide de paso, y el panel lo enseña en vivo.
+```
+
+Si ya tenías un proxy corriendo, `up` **lo reutiliza** en vez de arrancar otro
+—un segundo moriría con `AddrInUse`— y al cerrar el panel no lo para: no es
+suyo. Los dos procesos por separado siguen disponibles:
+
+```sh
+OXIDEGATE_PORT=8899 oxidegate      # solo el medidor
+oxidegate-monitor                  # solo el panel (misma OXIDEGATE_PORT)
+curl 127.0.0.1:8899/stats          # agregado por modelo, sin panel
 ```
 
 `run` acepta cualquier comando detrás del cliente, y propaga su código de salida:

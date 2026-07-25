@@ -28,6 +28,7 @@ fn usage_text() -> String {
 
 USO:
     oxidegate                          Levanta el proxy y se queda escuchando
+    oxidegate up                       Medidor + panel de una vez, en un terminal
     oxidegate run <cliente> [cmd...]   Lanza un cliente ya cableado a este proxy
     oxidegate doctor                   ¿Está funcionando? Diagnostica y explica
     oxidegate --help                   Muestra esta ayuda
@@ -208,6 +209,43 @@ fn proxy_is_listening(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
+/// Qué tiene que hacer `up` según lo que ya haya corriendo.
+#[derive(Debug, PartialEq, Eq)]
+enum UpPlan {
+    /// Ya hay un proxy en el puerto: solo abrir el panel.
+    SoloMonitor,
+    /// No hay nada: arrancar el proxy y hacerse responsable de pararlo.
+    ProxyYMonitor,
+}
+
+/// Decide el plan de `up`.
+fn up_plan(ya_escuchando: bool) -> UpPlan {
+    if ya_escuchando {
+        UpPlan::SoloMonitor
+    } else {
+        UpPlan::ProxyYMonitor
+    }
+}
+
+/// Cabecera que `up` imprime antes de ceder el terminal al panel.
+///
+/// `log` es `Some` solo cuando `up` arrancó el proxy él mismo. Si el proxy ya
+/// estaba corriendo no se inventa una ruta: su salida es de quien lo arrancó.
+fn up_banner(port: u16, log: Option<&std::path::Path>) -> String {
+    match log {
+        Some(p) => format!(
+            "oxidegate: proxy arrancado en 127.0.0.1:{port}\n\
+             salida del proxy: {}\n\
+             abriendo el panel… (Ctrl-C para parar los dos)",
+            p.display()
+        ),
+        None => format!(
+            "oxidegate: ya había un proxy en 127.0.0.1:{port}, se reutiliza\n\
+             abriendo el panel… (Ctrl-C cierra solo el panel)"
+        ),
+    }
+}
+
 /// Qué encontró `doctor` al mirar el puerto.
 ///
 /// Las cuatro variantes son mutuamente excluyentes y cubren el espacio
@@ -273,6 +311,115 @@ fn doctor_exit_code(finding: &DoctorFinding) -> i32 {
     match finding {
         DoctorFinding::Measuring(_) => 0,
         _ => 1,
+    }
+}
+
+/// Localiza un binario hermano del que se está ejecutando.
+///
+/// `oxidegate` y `oxidegate-monitor` se instalan juntos (misma fórmula, mismo
+/// `cargo install`), así que el hermano está al lado. Se prefiere esa ruta
+/// antes que el PATH para no lanzar la versión de otra instalación.
+fn sibling_binary(name: &str) -> std::path::PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(name)))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| std::path::PathBuf::from(name))
+}
+
+/// Ejecuta `oxidegate up`: deja el medidor y el panel funcionando con un solo
+/// comando.
+///
+/// # El conflicto que resuelve
+///
+/// El proxy escribe en stdout y el panel necesita el terminal entero: por eso
+/// vivían en dos terminales distintas. Aquí el proxy va de proceso hijo con su
+/// salida a un fichero, y el panel se queda con el TTY.
+///
+/// Si ya hay un proxy escuchando NO se arranca otro —moriría con `AddrInUse`
+/// justo cuando todo está bien— y tampoco se para al salir: no es nuestro.
+async fn up_subcommand(port: u16, storage_dir: std::path::PathBuf) -> i32 {
+    let plan = up_plan(proxy_is_listening(port));
+
+    let mut hijo = None;
+    let mut log_path = None;
+
+    if plan == UpPlan::ProxyYMonitor {
+        let path = storage_dir.join("proxy.log");
+        let log = match std::fs::File::create(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("oxidegate up: no se pudo crear {}: {e}", path.display());
+                return 1;
+            }
+        };
+        let errlog = match log.try_clone() {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("oxidegate up: no se pudo duplicar el log: {e}");
+                return 1;
+            }
+        };
+
+        match std::process::Command::new(sibling_binary("oxidegate"))
+            .env("OXIDEGATE_PORT", port.to_string())
+            .stdout(log)
+            .stderr(errlog)
+            .spawn()
+        {
+            Ok(c) => hijo = Some(c),
+            Err(e) => {
+                eprintln!("oxidegate up: no se pudo arrancar el proxy: {e}");
+                return 1;
+            }
+        }
+
+        // Esperar a que el listener ate el puerto antes de ceder el terminal:
+        // abrir el panel contra un proxy que aún no sirve lo muestra vacío y
+        // parece que no funciona.
+        let mut listo = false;
+        for _ in 0..40 {
+            if proxy_is_listening(port) {
+                listo = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        if !listo {
+            eprintln!(
+                "oxidegate up: el proxy no llegó a escuchar en {port}. Mira {}",
+                path.display()
+            );
+            if let Some(mut c) = hijo {
+                let _ = c.kill();
+            }
+            return 1;
+        }
+        log_path = Some(path);
+    }
+
+    println!("{}", up_banner(port, log_path.as_deref()));
+
+    let estado = std::process::Command::new(sibling_binary("oxidegate-monitor"))
+        .env("OXIDEGATE_PORT", port.to_string())
+        .status();
+
+    // Solo se para lo que se arrancó aquí.
+    if let Some(mut c) = hijo {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+
+    match estado {
+        Ok(s) => s.code().unwrap_or(0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("oxidegate up: no encuentro `oxidegate-monitor` junto a este binario ni en el PATH.");
+            127
+        }
+        Err(e) => {
+            eprintln!("oxidegate up: no se pudo abrir el panel: {e}");
+            1
+        }
     }
 }
 
@@ -415,6 +562,18 @@ async fn main() {
             .and_then(|p| p.parse().ok())
             .unwrap_or(8080);
         std::process::exit(run_subcommand(&args[2..], port));
+    }
+
+    // `up` tampoco bindea en este proceso: arranca el proxy como HIJO y se
+    // queda de supervisor. Bindear aquí dejaría al hijo sin puerto.
+    if args.get(1).is_some_and(|a| a == "up") {
+        let port = std::env::var("OXIDEGATE_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(8080);
+        let dir = AppConfig::load().storage_dir;
+        std::fs::create_dir_all(&dir).unwrap_or_default();
+        std::process::exit(up_subcommand(port, dir).await);
     }
 
     // `doctor` tampoco bindea: inspecciona un proxy ajeno, el que ya esté
@@ -739,6 +898,49 @@ mod cli_tests {
             default_binary("openai"),
             None,
             "`openai` es una familia de SDKs, no un ejecutable"
+        );
+    }
+
+    // --- `oxidegate up` ---
+
+    /// Si ya hay un proxy escuchando, `up` NO arranca otro: solo abre el
+    /// panel. Arrancar un segundo moriría con AddrInUse justo cuando todo
+    /// está bien, que es el peor momento para un error.
+    #[test]
+    fn up_no_arranca_un_segundo_proxy_si_ya_hay_uno() {
+        assert_eq!(up_plan(true), UpPlan::SoloMonitor);
+    }
+
+    /// Sin proxy, `up` arranca uno propio y se hace responsable de pararlo.
+    #[test]
+    fn up_arranca_el_proxy_si_no_hay_ninguno() {
+        assert_eq!(up_plan(false), UpPlan::ProxyYMonitor);
+    }
+
+    /// El aviso dice DÓNDE queda la salida del proxy. Un proceso hijo cuyo
+    /// stdout desaparece sin decir dónde es un proceso que no se puede
+    /// depurar cuando falle.
+    #[test]
+    fn up_dice_donde_queda_el_log_del_proxy() {
+        let msg = up_banner(8899, Some(std::path::Path::new("/tmp/oxi/proxy.log")));
+
+        assert!(msg.contains("8899"), "no nombra el puerto: {msg}");
+        assert!(
+            msg.contains("/tmp/oxi/proxy.log"),
+            "no dice dónde queda la salida: {msg}"
+        );
+    }
+
+    /// Cuando el proxy ya estaba corriendo, `up` no inventa un log que no ha
+    /// creado: lo dice y punto.
+    #[test]
+    fn up_sin_log_propio_no_menciona_ninguno() {
+        let msg = up_banner(8899, None);
+
+        assert!(msg.contains("8899"), "no nombra el puerto: {msg}");
+        assert!(
+            !msg.contains(".log"),
+            "menciona un log que no ha creado: {msg}"
         );
     }
 
