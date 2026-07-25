@@ -63,8 +63,61 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// muestra/seg). Acotado para no crecer sin límite en una sesión larga.
 const HISTORY_CAP: usize = 120;
 
+/// Busca un flag saltándose SIEMPRE `argv[0]`, igual que en `main.rs`. Está
+/// duplicado a propósito: el crate no tiene target de librería, así que los
+/// dos binarios no comparten código. Duplicar seis líneas es preferible a
+/// introducir un `lib.rs` solo para esto.
+fn wants_flag(args: &[String], long: &str, short: &str) -> bool {
+    args.iter().skip(1).any(|a| a == long || a == short)
+}
+
+fn usage_text() -> String {
+    format!(
+        "oxidegate-monitor {version} — panel en vivo sobre un proxy OxideGate
+
+USO:
+    oxidegate-monitor                TUI interactiva (necesita un terminal)
+    oxidegate-monitor --once         Vuelca el estado en texto plano y sale
+    oxidegate-monitor --url <url>    Apunta a un /stats concreto
+    oxidegate-monitor --help         Muestra esta ayuda
+    oxidegate-monitor --version      Muestra la versión
+
+    --once es el único modo que funciona sin TUI: úsalo por pipe, en CI, o
+    cuando no haya un TTY detrás.
+
+DE DÓNDE SACA LA URL DE /stats (por orden de prioridad):
+    1. --url <url>
+    2. OXIDEGATE_STATS_URL
+    3. http://127.0.0.1:$OXIDEGATE_PORT/stats  (puerto por defecto 8080, el
+       mismo que usa el proxy: con ambos en la misma OXIDEGATE_PORT no hace
+       falta configurar nada)
+
+    La URL de /requests se deriva de la anterior, salvo que
+    OXIDEGATE_REQUESTS_URL la fije explícitamente.
+",
+        version = env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn version_text() -> String {
+    format!("oxidegate-monitor {}", env!("CARGO_PKG_VERSION"))
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+
+    // Antes de `setup_terminal()`: pedir ayuda sin un TTY detrás fallaba con
+    // "No such device or address", que hacía el binario indescriptible desde
+    // un pipe o un script.
+    if wants_flag(&args, "--help", "-h") {
+        print!("{}", usage_text());
+        return Ok(());
+    }
+    if wants_flag(&args, "--version", "-V") {
+        println!("{}", version_text());
+        return Ok(());
+    }
+
     let once = args.iter().any(|a| a == "--once");
     let url = resolve_url(&args);
     let requests_url = resolve_requests_url(&url);
@@ -2632,6 +2685,49 @@ impl StatsRow {
 
 #[cfg(test)]
 mod tests {
+    // --- Ayuda y version del CLI (ver `wants_flag` / `usage_text`) ---
+
+    fn argv(rest: &[&str]) -> Vec<String> {
+        std::iter::once("oxidegate-monitor".to_string())
+            .chain(rest.iter().map(|s| s.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn monitor_asks_for_help_with_either_spelling() {
+        assert!(wants_flag(&argv(&["--help"]), "--help", "-h"));
+        assert!(wants_flag(&argv(&["-h"]), "--help", "-h"));
+        assert!(!wants_flag(&argv(&["--once"]), "--help", "-h"));
+    }
+
+    #[test]
+    fn monitor_argv_zero_is_never_a_flag() {
+        assert!(!wants_flag(&vec!["-h".to_string()], "--help", "-h"));
+    }
+
+    #[test]
+    fn monitor_usage_documents_every_knob_it_actually_reads() {
+        let text = usage_text();
+        // Estas cuatro son las entradas que `resolve_url` y
+        // `resolve_requests_url` consultan de verdad. Documentar menos deja
+        // al usuario adivinando por que el monitor mira a otro sitio.
+        for knob in ["--once", "--url", "OXIDEGATE_STATS_URL", "OXIDEGATE_PORT"] {
+            assert!(text.contains(knob), "falta {knob}: {text}");
+        }
+    }
+
+    #[test]
+    fn monitor_usage_mentions_the_headless_mode_first_class() {
+        // `--once` es el unico modo que funciona sin TTY. Un usuario en CI o
+        // leyendo por pipe necesita encontrarlo sin leer el codigo.
+        assert!(usage_text().contains("sin TUI") || usage_text().contains("TTY"));
+    }
+
+    #[test]
+    fn monitor_version_text_carries_the_crate_version() {
+        assert!(version_text().contains(env!("CARGO_PKG_VERSION")));
+    }
+
     use super::*;
 
     #[test]
