@@ -56,6 +56,31 @@ fn version_text() -> String {
     format!("oxidegate {}", env!("CARGO_PKG_VERSION"))
 }
 
+/// Mensaje de un bind fallido. Es función pura para poder afirmar en tests
+/// que el consejo cambia con la causa: sugerir `OXIDEGATE_PORT` ante un
+/// fallo de permisos manda al usuario a perseguir el problema equivocado.
+fn bind_error_message(port: u16, kind: std::io::ErrorKind, detail: &str) -> String {
+    if kind == std::io::ErrorKind::AddrInUse {
+        // El ejemplo se mueve con el puerto que falló. Un ejemplo fijo hacía
+        // que quien ya estaba en 8899 leyera "el 8899 está ocupado, usa el
+        // 8899", que no es un consejo. Por defecto se sugiere el mismo puerto
+        // que recomiendan el README y los caveats de la fórmula.
+        const RECOMENDADO: u16 = 8899;
+        let sugerido = if port == RECOMENDADO {
+            RECOMENDADO + 1
+        } else {
+            RECOMENDADO
+        };
+        format!(
+            "oxidegate: el puerto {port} ya está ocupado.\n  \
+             Puede ser otra instancia de OxideGate ya corriendo, o cualquier\n  \
+             otro servidor. Elige uno libre:  OXIDEGATE_PORT={sugerido} oxidegate"
+        )
+    } else {
+        format!("oxidegate: no se pudo escuchar en el puerto {port}: {detail}")
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Ayuda y versión se responden ANTES de tocar nada: ni configuración, ni
@@ -141,7 +166,15 @@ async fn main() {
         .with_state(Arc::new(state));
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    // Un `.unwrap()` aquí convertía el caso más común de todos — el puerto
+    // ocupado — en un panic con backtrace, que no le dice a nadie qué hacer.
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        Err(e) => {
+            eprintln!("{}", bind_error_message(port, e.kind(), &e.to_string()));
+            std::process::exit(1);
+        }
+    };
 
     println!("🛰️  Escuchando en http://{addr}");
     println!("💚 Liveness en http://{addr}/health");
@@ -194,5 +227,63 @@ mod cli_tests {
     #[test]
     fn version_text_carries_the_crate_version() {
         assert!(version_text().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn address_in_use_says_which_port_and_how_to_change_it() {
+        let msg = bind_error_message(
+            8080,
+            std::io::ErrorKind::AddrInUse,
+            "Address already in use",
+        );
+        assert!(msg.contains("8080"), "no nombra el puerto: {msg}");
+        assert!(
+            msg.contains("OXIDEGATE_PORT"),
+            "no dice como cambiarlo: {msg}"
+        );
+    }
+
+    #[test]
+    fn the_suggested_port_is_never_the_occupied_one() {
+        // Un primer intento sugería `OXIDEGATE_PORT=8899` con un ejemplo fijo,
+        // así que quien ya estaba en 8899 leía "el 8899 está ocupado, usa el
+        // 8899". El ejemplo tiene que moverse con el puerto que falló.
+        for port in [8080u16, 8899, 9999] {
+            let msg = bind_error_message(
+                port,
+                std::io::ErrorKind::AddrInUse,
+                "Address already in use",
+            );
+            let suggestion = msg
+                .split("OXIDEGATE_PORT=")
+                .nth(1)
+                .expect("el mensaje debe sugerir un puerto concreto");
+            let suggested: u16 = suggestion
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse().ok())
+                .expect("la sugerencia debe ser un puerto parseable");
+            assert_ne!(
+                suggested, port,
+                "sugiere el puerto que acaba de fallar: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn other_bind_errors_do_not_claim_the_port_is_taken() {
+        // Un fallo de permisos no es un puerto ocupado. Sugerir
+        // OXIDEGATE_PORT ahi manda al usuario a perseguir el problema
+        // equivocado.
+        let msg = bind_error_message(
+            80,
+            std::io::ErrorKind::PermissionDenied,
+            "Permission denied",
+        );
+        assert!(!msg.contains("OXIDEGATE_PORT"), "consejo equivocado: {msg}");
+        assert!(
+            msg.contains("Permission denied"),
+            "pierde la causa real: {msg}"
+        );
     }
 }
