@@ -210,12 +210,21 @@ seguirla son lo mismo.
 brew install pichu2707/tap/oxidegate
 ```
 
+La fórmula vive en [`pichu2707/homebrew-tap`](https://github.com/pichu2707/homebrew-tap)
+— ahí están la url y el `sha256` de cada versión, por si hay que verificarlos o
+reportar un problema de distribución.
+
 Instala dos ejecutables: **`oxidegate`** (el proxy) y **`oxidegate-monitor`** (el
 dashboard de terminal). Hay un tercero, `oxidegate-bench`, que es una barrida de
 benchmark para desarrollo y **no se instala**: no tiene nada que hacer en el PATH
 de nadie.
 
 Desde el código: `cargo run --bin oxidegate`.
+
+Y si lo que quieres es **leer** lo que OxideGate mide en vez de medir tú, la
+lente ya escrita es [`oxidegate-lens`](https://github.com/pichu2707/oxidegate-lens)
+(`oxidegate-savings`, `oxidegate-mcp`): bytes por servidor MCP sobre el proxy
+que acabas de instalar.
 
 ---
 
@@ -611,6 +620,17 @@ por función con su contrato) y **responsabilidad única estricta** por módulo.
 | [`docs/speed.md`](docs/speed.md) | Tokens y tiempo son monedas distintas: por qué el TTFT no correlaciona con nada medido, y las dos palancas que sí mueven el tok/s |
 | [`docs/monitor-tui.md`](docs/monitor-tui.md) | El monitor de terminal en tiempo real |
 | [`docs/benchmark.md`](docs/benchmark.md) | El harness de benchmark (`bench`) |
+
+### Ver también, fuera de este repo
+
+Toda esta carpeta documenta **el medidor**. Las otras piezas del
+[ecosistema](#el-ecosistema) tienen la suya:
+
+| Repo | Qué documenta |
+|---|---|
+| [`oxidegate-lens`](https://github.com/pichu2707/oxidegate-lens) | Cómo se lee lo que aquí se mide: `oxidegate-savings` y `oxidegate-mcp`, la primera lente del contrato |
+| [`homebrew-tap`](https://github.com/pichu2707/homebrew-tap) | La fórmula: url, `sha256` y el `test do` que sondea `/health` antes de dar por buena una versión |
+| [`mcp-savings`](https://github.com/pichu2707/mcp-savings) | El enfoque anterior y **por qué se abandonó**: medía desde el host, no desde el cable — [mcp-savings#1](https://github.com/pichu2707/mcp-savings/issues/1) |
 
 ---
 
