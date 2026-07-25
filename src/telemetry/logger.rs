@@ -372,6 +372,40 @@ pub struct TelemetrySink {
     recent: Arc<RwLock<RecentRequests>>,
 }
 
+/// Línea de confirmación que se imprime UNA sola vez, la primera vez que el
+/// proxy mide una petición.
+///
+/// # Por qué existe
+///
+/// Un cableado mal puesto no da error: el agente sigue funcionando —hablando
+/// directamente con el proveedor— y OxideGate se queda callado con `/stats`
+/// vacío. El usuario no tiene forma de distinguir "todavía no he lanzado nada"
+/// de "lo he lanzado y no pasa por aquí" sin ir a consultar el endpoint a mano.
+/// Este banner convierte ese silencio en una respuesta inmediata y no
+/// solicitada.
+///
+/// # Qué NO hace
+///
+/// No fabrica el nombre del cliente. Sin `User-Agent` legible lo declara
+/// ausente, igual que el resto de la telemetría distingue un dato que falta de
+/// un cero real. Y no afirma "todo bien" ante un status que no es 2xx: el
+/// cableado funcionó (la petición llegó y se midió), pero el código real se
+/// muestra tal cual para que un 401 no se lea como éxito.
+fn first_request_banner(client: Option<&str>, upstream: &str, route: &str, status: u16) -> String {
+    let quien = client.unwrap_or("cliente sin identificar");
+    let veredicto = if (200..300).contains(&status) {
+        "el cableado funciona"
+    } else {
+        "el cableado funciona, pero esta petición no fue un 2xx"
+    };
+
+    format!(
+        "✅ Primera petición medida — {veredicto}.\n   \
+         {quien} → {upstream} {route} {status}\n   \
+         Dashboard en vivo: oxidegate-monitor"
+    )
+}
+
 impl TelemetrySink {
     /// Arranca la task escritora y devuelve el handle para emitir métricas.
     pub fn spawn(storage_dir: PathBuf) -> Self {
@@ -398,7 +432,27 @@ impl TelemetrySink {
                 }
             };
 
+            // La confirmación es de la PRIMERA petición, así que basta un bool
+            // local: esta task es la única dueña del flag y consume las
+            // métricas en serie, sin necesidad de atómicos ni locks. Vive en el
+            // drenaje —fuera del camino crítico— para que anunciar no le cueste
+            // latencia a la petición que se está midiendo.
+            let mut ya_anunciada = false;
+
             while let Some(metric) = rx.recv().await {
+                if !ya_anunciada {
+                    ya_anunciada = true;
+                    println!(
+                        "{}",
+                        first_request_banner(
+                            metric.client.as_deref(),
+                            &metric.upstream,
+                            &metric.route,
+                            metric.status,
+                        )
+                    );
+                }
+
                 // Lock breve y SIN `.await` dentro: tomamos, actualizamos y
                 // soltamos antes de tocar el archivo (I/O async). Nunca debe
                 // sostenerse un lock a través de un punto de suspensión.
@@ -501,6 +555,72 @@ mod tests {
             codex_quota: None,
             session,
         }
+    }
+
+    /// El banner nombra al cliente que mandó la petición: es el dato que
+    /// responde "¿es MI agente el que está pasando por aquí?", y sin él la
+    /// confirmación no distingue el tráfico propio de una sonda cualquiera.
+    #[test]
+    fn banner_nombra_al_cliente_cuando_viene() {
+        let banner = first_request_banner(Some("claude-cli/2.0.1"), "anthropic", "/v1/messages", 200);
+
+        assert!(
+            banner.contains("claude-cli/2.0.1"),
+            "no nombra al cliente: {banner}"
+        );
+    }
+
+    /// Sin `User-Agent` legible, el banner NO fabrica un nombre: lo dice.
+    /// Mismo contrato de honestidad que el resto de la telemetría — un dato
+    /// ausente se declara ausente, nunca se rellena con un valor plausible.
+    #[test]
+    fn banner_sin_cliente_lo_declara_en_vez_de_inventarlo() {
+        let banner = first_request_banner(None, "anthropic", "/v1/messages", 200);
+
+        assert!(
+            banner.contains("sin identificar"),
+            "no declara la ausencia: {banner}"
+        );
+        assert!(
+            !banner.contains("unknown") && !banner.contains("null"),
+            "rellena el hueco con un valor fabricado: {banner}"
+        );
+    }
+
+    /// El banner sitúa la petición: proveedor, ruta y código. Sin los tres, el
+    /// usuario sabe que "algo" pasó pero no si es lo que esperaba.
+    #[test]
+    fn banner_situa_la_peticion_con_upstream_ruta_y_status() {
+        let banner = first_request_banner(Some("opencode/1.0"), "openai", "/v1/chat/completions", 200);
+
+        assert!(banner.contains("openai"), "falta el upstream: {banner}");
+        assert!(
+            banner.contains("/v1/chat/completions"),
+            "falta la ruta: {banner}"
+        );
+        assert!(banner.contains("200"), "falta el status: {banner}");
+    }
+
+    /// El banner deja el siguiente paso a la vista. Confirmar que el cableado
+    /// funciona sin decir dónde mirar deja al usuario en el mismo sitio.
+    #[test]
+    fn banner_apunta_al_monitor() {
+        let banner = first_request_banner(Some("claude-cli/2.0.1"), "anthropic", "/v1/messages", 200);
+
+        assert!(
+            banner.contains("oxidegate-monitor"),
+            "no dice dónde mirar: {banner}"
+        );
+    }
+
+    /// Una primera petición que falló NO se anuncia como éxito de cableado:
+    /// el cableado sí funcionó (la petición llegó), pero el banner debe
+    /// mostrar el código real para que un 401 no se lea como "todo bien".
+    #[test]
+    fn banner_con_status_de_error_muestra_el_codigo_real() {
+        let banner = first_request_banner(Some("claude-cli/2.0.1"), "anthropic", "/v1/messages", 401);
+
+        assert!(banner.contains("401"), "oculta el status real: {banner}");
     }
 
     /// Round-trip serde con `session.source = Explicit`: el JSON serializa
