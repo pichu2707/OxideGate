@@ -124,6 +124,33 @@ de varios kB se amortiza. Sobre uno de 74 B, más que dobla el contenido.
 > `CLAUDE.md` o no se aplica— y en las otras tres se paga en cada petición.
 > El mismo fichero, cuatro comportamientos.
 
+### `pi` comprime, y eso cambia cómo leer la cifra
+
+Re-medido con captura de body a cero cuota (la primera medida fue por delta a
+través del proxy, y no podía ver esto): **`pi` manda su body comprimido con
+zstd.** Es el único de los cuatro que lo hace.
+
+| | con `AGENTS.md` | sin | delta |
+|---|---:|---:|---:|
+| Lógico (JSON) | 138.655 B | 138.461 B | **+194 B** |
+| **Cable (zstd)** | 43.379 B | 43.306 B | **+73 B** |
+
+Sobre un fichero de 67 B. Concuerda con la primera medida —74 B daban +200 B—:
+el sobrecoste es constante, ~127 B, y confirma el modelo.
+
+> **Las cifras de la tabla de arriba son LÓGICAS.** Para `pi`, el coste real en
+> el cable es **~1/3**, porque comprime. Las otras tres mandan JSON plano, así
+> que en ellas lógico y cable coinciden. Comparar el +200 B de `pi` con el
+> +159 B de Codex sin decir esto **penaliza a `pi` por partida doble**: se le
+> cuenta el bloque descomprimido y se le ignora la compresión.
+
+Lo lógico sigue siendo lo que se factura —el proveedor tokeniza el JSON, no el
+zstd— así que la tabla no está mal. Pero si lo que se mira es **ancho de banda**
+y no tokens, `pi` es el más barato de los cuatro, no el más caro.
+
+El envoltorio es `<project_instructions path="/ruta/absoluta/AGENTS.md">` dentro
+de un bloque `<project_context>`, en el bucket `instructions`.
+
 ### Un indicio que resultó falso
 
 El binario de `pi` no contiene **ninguna** mención de `AGENTS.md` —cero, frente
