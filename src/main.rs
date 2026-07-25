@@ -29,6 +29,7 @@ fn usage_text() -> String {
 USO:
     oxidegate                          Levanta el proxy y se queda escuchando
     oxidegate run <cliente> [cmd...]   Lanza un cliente ya cableado a este proxy
+    oxidegate doctor                   ¿Está funcionando? Diagnostica y explica
     oxidegate --help                   Muestra esta ayuda
     oxidegate --version                Muestra la versión
 
@@ -207,6 +208,129 @@ fn proxy_is_listening(port: u16) -> bool {
     TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
 }
 
+/// Qué encontró `doctor` al mirar el puerto.
+///
+/// Las cuatro variantes son mutuamente excluyentes y cubren el espacio
+/// completo. La distinción entre [`NothingListening`](DoctorFinding::NothingListening)
+/// y [`SomethingElseListening`](DoctorFinding::SomethingElseListening) es la
+/// que más trabajo ahorra: el 8080 lo ocupan Apache o Tomcat más a menudo de
+/// lo que parece, y decirle a alguien "arranca el proxy" cuando el puerto ya
+/// está cogido lo manda a perseguir el problema equivocado.
+enum DoctorFinding {
+    /// Nadie acepta conexiones en ese puerto.
+    NothingListening,
+    /// Algo contesta, pero no habla el `/health` de OxideGate.
+    SomethingElseListening,
+    /// OxideGate está sirviendo, pero no ha medido ni una petición.
+    UpButIdle,
+    /// OxideGate está midiendo. Lleva cuántas peticiones hay en el buffer.
+    Measuring(usize),
+}
+
+/// Diagnóstico legible del estado del proxy.
+///
+/// Cada rama termina en una acción concreta. Un diagnóstico que solo describe
+/// el síntoma deja al usuario donde estaba.
+fn doctor_report(port: u16, finding: &DoctorFinding) -> String {
+    match finding {
+        DoctorFinding::NothingListening => format!(
+            "✗ No hay nada escuchando en 127.0.0.1:{port}.\n  \
+             El proxy no está levantado. Arráncalo:\n    \
+             OXIDEGATE_PORT={port} oxidegate"
+        ),
+        DoctorFinding::SomethingElseListening => format!(
+            "✗ Algo contesta en 127.0.0.1:{port}, pero NO ES OXIDEGATE.\n  \
+             Acepta conexiones; lo que no devuelve es el /health de OxideGate.\n  \
+             El 8080 lo ocupan Apache y Tomcat más a menudo de lo que parece, y\n  \
+             un cliente apuntando a su servidor no da ningún error evidente.\n  \
+             Elige otro puerto para el proxy y usa EL MISMO en el cliente:\n    \
+             OXIDEGATE_PORT=8899 oxidegate"
+        ),
+        DoctorFinding::UpButIdle => format!(
+            "✓ OxideGate está sirviendo en 127.0.0.1:{port}.\n\
+             ✗ Pero no ha medido ni una petición.\n  \
+             El tráfico no está pasando por aquí. Casi siempre es el cableado:\n    \
+             oxidegate run claude        (pone la variable correcta y lanza)\n  \
+             Si lo cableas a mano, cuidado con el /v1: Claude Code y Gemini van\n  \
+             SIN él, los clientes OpenAI-compatible CON él. Equivocarse da un 404\n  \
+             que parece que la herramienta está rota."
+        ),
+        DoctorFinding::Measuring(n) => format!(
+            "✓ OxideGate está sirviendo en 127.0.0.1:{port}.\n\
+             ✓ {n} peticiones medidas en el buffer.\n  \
+             Todo en orden. Para verlas:\n    \
+             oxidegate-monitor  — panel en vivo\n    \
+             curl 127.0.0.1:{port}/stats  — agregado por modelo"
+        ),
+    }
+}
+
+/// Código de salida de `doctor`, para poder usarlo desde un script.
+///
+/// `0` SOLO cuando de verdad está midiendo: un proxy vivo que no mide nada no
+/// es un éxito, es exactamente el fallo que este subcomando busca.
+fn doctor_exit_code(finding: &DoctorFinding) -> i32 {
+    match finding {
+        DoctorFinding::Measuring(_) => 0,
+        _ => 1,
+    }
+}
+
+/// Ejecuta `oxidegate doctor`: mira el puerto y explica qué pasa.
+async fn doctor_subcommand(port: u16) -> i32 {
+    let finding = if !proxy_is_listening(port) {
+        DoctorFinding::NothingListening
+    } else {
+        let http = reqwest::Client::new();
+        let health = http
+            .get(format!("http://127.0.0.1:{port}/health"))
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await;
+
+        // Que conteste 200 no basta: cualquier servidor puede devolver 200 en
+        // una ruta desconocida. Se exige el payload de `/health` para no
+        // confundir a un vecino de puerto con el proxy.
+        let is_oxidegate = match health {
+            Ok(r) if r.status().is_success() => r
+                .text()
+                .await
+                .map(|b| b.contains("\"status\"") && b.contains("\"ok\""))
+                .unwrap_or(false),
+            _ => false,
+        };
+
+        if !is_oxidegate {
+            DoctorFinding::SomethingElseListening
+        } else {
+            let measured = http
+                .get(format!("http://127.0.0.1:{port}/requests"))
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+                .ok();
+
+            let count = match measured {
+                Some(r) => r
+                    .json::<Vec<serde_json::Value>>()
+                    .await
+                    .map(|rows| rows.len())
+                    .unwrap_or(0),
+                None => 0,
+            };
+
+            if count == 0 {
+                DoctorFinding::UpButIdle
+            } else {
+                DoctorFinding::Measuring(count)
+            }
+        }
+    };
+
+    println!("{}", doctor_report(port, &finding));
+    doctor_exit_code(&finding)
+}
+
 /// Ejecuta `oxidegate run <cliente> [comando...]`.
 ///
 /// Devuelve el código de salida con el que debe terminar el proceso. Nunca
@@ -291,6 +415,16 @@ async fn main() {
             .and_then(|p| p.parse().ok())
             .unwrap_or(8080);
         std::process::exit(run_subcommand(&args[2..], port));
+    }
+
+    // `doctor` tampoco bindea: inspecciona un proxy ajeno, el que ya esté
+    // corriendo. Bindear aquí haría que el diagnóstico se autodestruyera.
+    if args.get(1).is_some_and(|a| a == "doctor") {
+        let port = std::env::var("OXIDEGATE_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(8080);
+        std::process::exit(doctor_subcommand(port).await);
     }
 
     if wants_flag(&args, "--help", "-h") {
@@ -585,6 +719,15 @@ mod cli_tests {
         }
     }
 
+    /// La ayuda anuncia `doctor`. Un diagnóstico que el usuario no sabe que
+    /// existe no diagnostica nada.
+    #[test]
+    fn la_ayuda_anuncia_el_subcomando_doctor() {
+        let text = usage_text();
+
+        assert!(text.contains("doctor"), "no menciona `doctor`: {text}");
+    }
+
     /// Sin comando explícito, `run claude` lanza el binario del propio
     /// cliente. `openai` no tiene uno: es una familia de SDKs, no un
     /// ejecutable, así que ahí el comando es obligatorio.
@@ -597,6 +740,78 @@ mod cli_tests {
             None,
             "`openai` es una familia de SDKs, no un ejecutable"
         );
+    }
+
+    // --- `oxidegate doctor` ---
+
+    /// Sin nada escuchando, el diagnóstico nombra el puerto y dice cómo
+    /// arrancar el proxy. Es el caso más común y el más fácil de resolver.
+    #[test]
+    fn doctor_sin_nada_escuchando_dice_como_arrancarlo() {
+        let msg = doctor_report(8899, &DoctorFinding::NothingListening);
+
+        assert!(msg.contains("8899"), "no nombra el puerto: {msg}");
+        assert!(
+            msg.contains("OXIDEGATE_PORT=8899 oxidegate"),
+            "no dice cómo arrancarlo: {msg}"
+        );
+    }
+
+    /// Hay algo en el puerto pero NO es OxideGate — el caso de Apache o Tomcat
+    /// ocupando el 8080. Decir "arranca el proxy" aquí manda al usuario a
+    /// perseguir el problema equivocado: el proxy quizá ya está corriendo en
+    /// otro sitio, o el puerto simplemente no está libre.
+    #[test]
+    fn doctor_distingue_otro_servidor_de_un_proxy_ausente() {
+        let msg = doctor_report(8080, &DoctorFinding::SomethingElseListening);
+
+        assert!(msg.contains("8080"), "no nombra el puerto: {msg}");
+        assert!(
+            !msg.contains("OXIDEGATE_PORT=8080 oxidegate"),
+            "sugiere arrancar en el puerto que ya está ocupado: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("no es oxidegate"),
+            "no dice que quien contesta es otro: {msg}"
+        );
+    }
+
+    /// El proxy está vivo pero no ha medido nada: el cableado es la causa
+    /// probable, y el diagnóstico apunta a `run` y al `/v1` en vez de dejar
+    /// al usuario adivinando.
+    #[test]
+    fn doctor_vivo_sin_medir_senala_el_cableado() {
+        let msg = doctor_report(8899, &DoctorFinding::UpButIdle);
+
+        assert!(
+            msg.contains("oxidegate run"),
+            "no ofrece la salida fácil: {msg}"
+        );
+        assert!(msg.contains("/v1"), "no menciona la trampa del /v1: {msg}");
+    }
+
+    /// Midiendo: dice cuántas y dónde mirar. Un diagnóstico que solo dice
+    /// "todo bien" no ayuda a confirmar que lo medido es lo esperado.
+    #[test]
+    fn doctor_midiendo_dice_cuantas_y_donde_mirar() {
+        let msg = doctor_report(8899, &DoctorFinding::Measuring(42));
+
+        assert!(msg.contains("42"), "no dice cuántas: {msg}");
+        assert!(
+            msg.contains("oxidegate-monitor"),
+            "no dice dónde mirar: {msg}"
+        );
+    }
+
+    /// El código de salida hace `doctor` usable desde un script: 0 solo
+    /// cuando de verdad está midiendo. Un proxy vivo que no mide nada NO es
+    /// un éxito — es justo el fallo que este subcomando existe para detectar.
+    #[test]
+    fn doctor_solo_sale_con_cero_cuando_mide() {
+        assert_eq!(doctor_exit_code(&DoctorFinding::Measuring(1)), 0);
+        assert_ne!(doctor_exit_code(&DoctorFinding::UpButIdle), 0);
+        assert_ne!(doctor_exit_code(&DoctorFinding::NothingListening), 0);
+        assert_ne!(doctor_exit_code(&DoctorFinding::SomethingElseListening), 0);
     }
 
     /// Lanzar un cliente contra un proxy que no está levantado produce
