@@ -7,7 +7,7 @@
 //! para que `/stats` y `/requests` puedan leer, respectivamente, la
 //! agregación y el detalle reciente en vivo sin tocar el JSONL. Así el I/O de
 //! log NUNCA se suma a la latencia que le devolvemos a gentle-ai.
-use crate::provider::{ContextBreakdown, ToolSearchSignal, ToolServerBytes};
+use crate::provider::{ContextBreakdown, SkillsBlock, ToolSearchSignal, ToolServerBytes};
 use crate::telemetry::{CodexQuota, RecentRequests, SessionAttribution, StatsRegistry};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -225,6 +225,11 @@ pub struct RequestMetric {
     ///   puede ocultar MCP aplanado (medido en `pi`/`opencode`). Observación
     ///   estructural, NUNCA una atribución inventada: no nombra servidores.
     pub tools_flattened: Option<bool>,
+    /// Listado de skills declarado en el body: `{declared, listing_bytes,
+    /// format}`, o `null`. El coste se paga en CADA petición, se invoque una
+    /// skill o no. `null` significa "no se reconoció ningún listado" — nunca
+    /// "cero skills": ver `provider::skills` y `docs/skills-across-tools.md`.
+    pub skills: Option<SkillsBlock>,
 
     /// Microsegundos que `middleware::proxy::run` pasó DENTRO de
     /// `Provider::prepare` (parseo del body + `decompose` + mutación
@@ -537,6 +542,7 @@ mod tests {
             served_speed: None,
             tool_search: None,
             tools_flattened: None,
+            skills: None,
             status: 200,
             ttft_ms: None,
             total_ms: 0.0,

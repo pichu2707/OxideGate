@@ -10,6 +10,7 @@
 pub mod anthropic;
 pub mod gemini;
 pub mod openai;
+pub mod skills;
 
 use crate::config::AppConfig;
 use serde::Serialize;
@@ -20,6 +21,7 @@ use std::hash::{Hash, Hasher};
 
 pub use anthropic::ANTHROPIC;
 pub use gemini::GEMINI;
+pub use skills::SkillsBlock;
 pub use openai::{OPENAI_CHAT, OPENAI_CODEX_RESPONSES, OPENAI_RESPONSES};
 
 /// Lo que el proxy sabe del request entrante, antes de saber a qué proveedor
@@ -147,6 +149,12 @@ pub struct Outgoing {
     /// Solo lo llenan los proveedores del dialecto Responses/Codex; el resto
     /// devuelve `None` (su `mcp__` sí es fiable, no hay nada que advertir).
     pub tools_flattened: Option<bool>,
+    /// Listado de skills declarado en el body, si se reconoció alguna de las
+    /// tres formas medidas (ver `skills::detect_skills` y
+    /// `docs/skills-across-tools.md`). `None` significa "no se pudo ver" —
+    /// nunca "cero skills": las marcas son cadenas de cada herramienta y si
+    /// cambian hay que declarar la ausencia, no fabricar un cero.
+    pub skills: Option<SkillsBlock>,
 }
 
 /// Acumulador de tokens medidos desde la respuesta del proveedor.
