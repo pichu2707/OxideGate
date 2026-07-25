@@ -115,7 +115,7 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
 | `p` | Mostrar/ocultar el panel de requests recientes (ver §7) |
 | `c` | Ciclar la vista de columnas del panel de requests recientes — `Latency` ⇄ `Context` (ver §7.1). **No-op si el panel está oculto**: no cambia nada mientras `p` lo tenga escondido |
 | `s` | Mostrar/ocultar el panel de tools por servidor (ver §8). **INDEPENDIENTE** de `p`/`c`: ninguna de las tres teclas afecta el estado de las otras |
-| `e` | Mostrar/ocultar el panel de **gasto por sesión** — `e` de s**e**sión, porque `s` ya es tools (ver §10). **INDEPENDIENTE** de `p`/`c`/`s`/`u` |
+| `e` | Mostrar/ocultar el panel de **gasto por sesión** — `e` de s**e**sión, porque `s` ya es tools (ver §8). **INDEPENDIENTE** de `p`/`c`/`s`/`u` |
 | `u` | Mostrar/ocultar el panel de cuota de suscripción Codex — "uso de cuota" (ver §9). **INDEPENDIENTE** de `p`/`c`/`s` |
 
 ## 5. Layout de la pantalla
@@ -610,7 +610,7 @@ hay nada que ocultar.
 
 ---
 
-## 10. Panel de gasto por sesión (`e`)
+## 12. Panel de gasto por sesión (`e`)
 
 Consume `GET /sessions` (ver [`telemetry-by-session.md`](telemetry-by-session.md)),
 no `/requests`. Responde una pregunta que ningún otro panel responde:

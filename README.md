@@ -135,8 +135,8 @@ seguirla son lo mismo.
 | El **peaje fijo** de cada herramienta (misma tarea trivial) | ✅ Medido en las cuatro — ver [`docs/floor-across-tools.md`](docs/floor-across-tools.md) |
 | **Comparar herramientas sobre una tarea REAL** (con n>1 y tarea verificable) | ❌ Sin medir: gasta cuota y no es determinista — [#29](https://github.com/pichu2707/OxideGate/issues/29) |
 | Agregación por sesión | ✅ `GET /sessions` — ver [`docs/telemetry-by-session.md`](docs/telemetry-by-session.md) |
-| Panel de sesión en el monitor TUI | ✅ Tecla `e` — ver [`docs/monitor-tui.md`](docs/monitor-tui.md) §10 |
-| **Ventana temporal y persistencia del agregado por sesión** | ❌ Sin hacer: es desde que arrancó el proceso, igual que `/stats` |
+| Panel de sesión en el monitor TUI | ✅ Tecla `e` — ver [`docs/monitor-tui.md`](docs/monitor-tui.md) §12 |
+| **Ventana temporal y persistencia del agregado por sesión** | ❌ Sin hacer: es desde que arrancó el proceso, igual que `/stats`, y la respuesta no declara desde cuándo mide. El histórico ya está en disco (`telemetry.jsonl`) y nadie lo lee — [#42](https://github.com/pichu2707/OxideGate/issues/42) |
 
 ---
 
@@ -155,7 +155,7 @@ seguirla son lo mismo.
 | **Cuota de suscripción (Codex/ChatGPT)** | Mide el tráfico de suscripción por OAuth de ChatGPT —que no se factura por token sino por cuota— parseando las cabeceras `x-codex-*` en un objeto `codex_quota` por petición (`GET /requests`), y lo muestra en el panel `u` del monitor: plan, % de ventana usado y cuenta atrás del reset. Contrato campo a campo en [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.7; cómo cablear Codex por OAuth para medirlo, en [`docs/telemetry-level-1.md`](docs/telemetry-level-1.md) §5.3. | ✅ |
 | **Nombres de tools por fila** | Cada entrada de `tools_by_server` lleva los `tool_names` que viajaron. OxideGate **no atribuye** las aplanadas —no puede— pero publica el hecho para que lo cruce quien tenga la lista autoritativa. Acotado a 64 nombres por fila; si `tool_names.len() < tools`, está recortada. Ver §4.2. | ✅ |
 | **Skills por petición** | Detecta el listado de skills en el body sea cual sea la herramienta —tres formatos medidos en Claude Code, Gemini CLI, opencode y Codex— y lo expone en `GET /requests` como `{declared, listing_bytes, format}`. Un bloque sin entradas no cuenta: la marca aparece también en el texto del usuario. Ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.8. | ✅ |
-| **Atribución de sesiones (rebanada 1)** | Resuelve una clave de sesión por precedencia de cabeceras (`X-OxideGate-Session` explícito → `x-claude-code-session-id` nativo de Claude Code → fallback honesto por `User-Agent`), capturada por petición y expuesta en `GET /requests` + `telemetry.jsonl` (`session.source`/`session.key`). Ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.6. Agregación por sesión en `/stats` y panel en el monitor TUI son rebanadas futuras, todavía sin construir. | 🚧 |
+| **Atribución por sesión** | Resuelve una clave de sesión por precedencia de cabeceras (`X-OxideGate-Session` explícito → `x-claude-code-session-id` nativo de Claude Code → fallback honesto por `User-Agent`), capturada por petición y expuesta en `GET /requests` + `telemetry.jsonl` (`session.source`/`session.key`). Ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.6. **Agregada** en `GET /sessions` —endpoint aparte, no un campo en `/stats`, para no romper la forma que ya consumen sus clientes— y con **panel propio en el monitor** (tecla `e`). Ver [`docs/telemetry-by-session.md`](docs/telemetry-by-session.md) y [`docs/monitor-tui.md`](docs/monitor-tui.md) §12. | ✅ |
 
 ---
 
