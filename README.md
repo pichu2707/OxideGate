@@ -122,7 +122,7 @@ seguirla son lo mismo.
 | `AGENTS.md` | ✅ Medido: **Claude Code no lo manda**, 0 B — ver [§4](docs/optimizer-skills.md) |
 | Skills de plugin | ✅ **182 B**, igual que una propia — el origen no exime. Ver [§6](docs/optimizer-skills.md) |
 | **Cuántos bytes del listado son comandos** y cuántos skills | ❌ Sin medir: se estableció que conviven, no la proporción |
-| **`AGENTS.md` en Codex, `pi` y OpenCode** | ❌ Sin medir; esos sí lo usan — [#27](https://github.com/pichu2707/OxideGate/issues/27) |
+| `AGENTS.md` en Codex, `pi` y OpenCode | ✅ Los tres lo mandan: **+159 B / +200 B / +160 B** sobre un fichero de 74 B. Claude Code, 0 B. Ver [§6](docs/skills-across-tools.md) |
 | **Skills atribuidas POR PETICIÓN** en `/requests` | ✅ Campo `skills` con `declared`, `listing_bytes` y `format` — ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.8 |
 | Comparar el coste de skills entre herramientas | ✅ Medido en 4 clientes: **138 B/skill en Claude Code, 390 B en Codex** — ver [`docs/skills-across-tools.md`](docs/skills-across-tools.md) |
 | **Invocar una skill en Gemini, opencode y Codex** | ❌ Sin medir; solo está medido en Claude Code — [#28](https://github.com/pichu2707/OxideGate/issues/28) |
