@@ -308,6 +308,7 @@ async fn send_and_meter(
                 // en el camino con respuesta.
                 tool_search: out.tool_search,
                 tools_flattened: out.tools_flattened,
+                skills: out.skills,
                 // No hubo respuesta del upstream que inspeccionar: sin
                 // `resp`, no hay cabeceras `x-codex-*` que leer. `None`
                 // honesto, no un dato inventado.
@@ -343,6 +344,7 @@ async fn send_and_meter(
         requested_speed: out.requested_speed,
         tool_search: out.tool_search,
         tools_flattened: out.tools_flattened,
+        skills: out.skills,
         provider: prov,
         // `resp` está vivo acá: `resp.status()` ya se leyó arriba (préstamo
         // inmutable) y el bucle de copia de cabeceras a la respuesta

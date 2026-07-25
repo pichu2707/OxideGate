@@ -50,6 +50,7 @@ impl Provider for Gemini {
         let logical = maybe_decompress(&incoming.body, incoming.content_encoding.as_deref());
         let parsed = parse_body(&logical);
         let context = parsed.as_ref().and_then(|v| self.decompose(v));
+        let skills = parsed.as_ref().and_then(crate::provider::skills::detect_skills_in_body);
         let by_server = parsed
             .as_ref()
             .map(|v| self.tools_by_server(v))
@@ -78,6 +79,7 @@ impl Provider for Gemini {
             // vía `cachedContent`), no con esta palanca: no aplica acá.
             cache_control_forced: false,
             context,
+            skills,
             tools_by_server: by_server,
             tools_overhead_bytes: overhead,
             // `output_config.effort` y `speed` (raíz) son dialecto exclusivo

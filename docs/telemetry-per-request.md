@@ -144,6 +144,7 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `tool_search` | Señal de carga diferida de herramientas del dialecto Responses/Codex: `{used, deferred_loaded}`, o `null`. `used: false` ⇒ EAGER confirmado este turno; `used: true` ⇒ LAZY (el cliente cargó tools a mitad de sesión) | `null` en Anthropic/Gemini/OpenAI-Chat (no aplica) o si el body no parseó. Es el diferenciador eager-vs-lazy por cliente que `tools_by_server` NO puede dar — ver §4.3 |
 | `tools_flattened` | Honestidad de la atribución de `tools_by_server`: `true` ⇒ el cliente NO usa el namespacing `mcp__`, así que su cubo `(native)` puede ocultar MCP aplanado; `false` ⇒ hay tools `mcp__`, el `(native)` es de fiar; `null` ⇒ no aplica (Anthropic/Gemini/Chat) o sin tools | Solo dialecto Responses/Codex. `pi` manda nombres crudos y `opencode` usa `<server>_<tool>` (ambiguo) — ninguno con `mcp__`. Es una advertencia estructural, NUNCA una atribución inventada: no nombra servidores. Ver §4.4 |
 | `session` | Sesión resuelta por precedencia de cabeceras del request: `{source, key}`. Nunca `null` — la peor rama es un fallback honesto (`source: "unattributed"`), no una ausencia | Ver §4.6 para la tabla de precedencia completa y cómo estampar el header desde cada harness |
+| `skills` | Listado de skills declarado en el body: `{declared, listing_bytes, format}`, o `null`. Se paga en CADA petición, se invoque una skill o no | `null` = no se reconoció ningún listado, **nunca "cero skills"**. `format` dice qué forma se encontró y, de paso, de qué herramienta viene el tráfico sin fiarse del `User-Agent` — ver §4.8 |
 | `codex_quota` | Estado de la cuota de suscripción de Codex (OAuth de `chatgpt.com`), parseado de las doce cabeceras `x-codex-*` de la RESPUESTA del upstream: doce campos, todos opcionales. `null` si la petición no fue a Codex vía OAuth, o si el upstream falló antes de responder | Es el ÚNICO campo de esta fila que se lee de la respuesta y no del request ni del body. Cuota NUNCA son dólares: no alimenta ni puede alimentar `cost_estimate_usd` — ver §4.7 |
 
 Ninguno de los campos de latencia/coste/identidad es nuevo: todos ya existían
@@ -537,6 +538,54 @@ credenciales: las cabeceras `x-codex-*` describen la cuota, no autentican.
 
 ---
 
+### 4.8. `skills`: el listado, atribuido dentro de su bucket
+
+`context_last_turn_bytes` te dice que el último turno pesó 7.103 B.
+`skills` te dice que **3.811 de esos son el listado de skills** — el 54%. Es
+la misma clase de atribución que `tools_by_server` hace dentro de
+`context_tools_bytes`: el total sin desglosar no acciona nada.
+
+**Forma:**
+
+```json
+"skills": { "declared": 11, "listing_bytes": 3811, "format": "flat_list" }
+```
+
+| Campo | Qué es |
+|---|---|
+| `declared` | Cuántas skills declara el listado |
+| `listing_bytes` | Bytes del bloque completo. Se pagan en CADA petición, se invoque una skill o no |
+| `format` | `flat_list` \| `available_skills_xml` \| `skills_instructions` |
+
+**`format` identifica la herramienta sin fiarse del `User-Agent`**, que es
+contenido controlado por el cliente (§4.5). Cada una manda el listado a su
+manera y en un sitio distinto del body — medido en las cuatro, con precios de
+138 B a 390 B por skill: ver `docs/skills-across-tools.md`.
+
+| `format` | Herramienta | Dónde cae |
+|---|---|---|
+| `flat_list` | Claude Code | `context_last_turn_bytes` |
+| `available_skills_xml` | Gemini CLI, opencode | `context_system_bytes` / `context_history_bytes` |
+| `skills_instructions` | Codex | `context_history_bytes` / `context_last_turn_bytes` |
+
+**Un bloque sólo cuenta si contiene entradas.** No es un tecnicismo: en tráfico
+real de opencode la cadena `<available_skills>` aparece **cinco veces** y sólo
+UNA es el listado — las otras son el `AGENTS.md` del usuario hablando del
+bloque entre comillas. Un detector que se conforme con encontrar la marca
+cuenta una mención como si fuera un listado y **inventa skills que nadie
+declaró**.
+
+**`null` significa "no se pudo ver", nunca "cero skills".** Las marcas son
+cadenas en inglés de cada herramienta: si cambian, el detector deja de
+encontrarlas y debe declarar la ausencia. Mismo contrato que el resto de la
+fila.
+
+**No dobla bytes.** Esos bytes ya los cuentan los campos `context_*` — viven
+dentro de uno de sus buckets. `skills` sólo **atribuye**; nunca vuelve a
+sumarlos.
+
+---
+
 ## 5. Límite de memoria: 200 filas, y se pierden al reiniciar
 
 `RECENT_CAPACITY = 200` (`src/telemetry/recent.rs`): el buffer es un
@@ -589,6 +638,7 @@ el historial completo, o algo más viejo que las últimas 200 peticiones, la
 | Archivo | Responsabilidad |
 |---|---|
 | `src/telemetry/recent.rs` | `RecentRequests`, `RecentRequest` — buffer FIFO acotado y proyección, sin axum |
+| `src/provider/skills.rs` | `detect_skills`, `detect_skills_in_body` — reconoce las tres formas medidas; un bloque sin entradas no cuenta (§4.8) |
 | `src/telemetry/codex_quota.rs` | `CodexQuota`, `CodexQuota::from_headers` — parseo y saneo de las doce cabeceras `x-codex-*`, sin ningún campo en USD (§4.7) |
 | `src/telemetry/logger.rs` | `TelemetrySink::spawn` alimenta el buffer en la misma task que escribe el JSONL; `TelemetrySink::recent()` expone el `Arc<RwLock<RecentRequests>>` |
 | `src/middleware/requests.rs` | `handle_requests` — el handler HTTP de `GET /requests` |

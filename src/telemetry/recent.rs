@@ -39,7 +39,7 @@
 //! tanto por `GET /requests` como al `telemetry.jsonl` en texto plano. Léase
 //! `docs/telemetry-per-request.md` §4.3 antes de exponer este endpoint fuera de
 //! localhost.
-use crate::provider::{ToolSearchSignal, ToolServerBytes};
+use crate::provider::{SkillsBlock, ToolSearchSignal, ToolServerBytes};
 use crate::telemetry::logger::RequestMetric;
 use crate::telemetry::{CodexQuota, SessionAttribution};
 use serde::Serialize;
@@ -166,6 +166,10 @@ pub struct RecentRequest {
     /// (`pi`/`opencode`). No compromete la invariante de privacidad: es solo un
     /// booleano estructural, jamás nombres de herramienta ni de servidor.
     pub tools_flattened: Option<bool>,
+    /// Listado de skills declarado en el body: `{declared, listing_bytes,
+    /// format}`, o `null`. Se paga en CADA petición, se invoque una skill o
+    /// no. `null` = no se reconoció ningún listado, NUNCA "cero skills".
+    pub skills: Option<SkillsBlock>,
     /// Microsegundos que el proxy pasó dentro de `Provider::prepare`
     /// (parseo, `decompose` y mutación opcional del body). No incluye la
     /// lectura del body del socket ni el round-trip upstream.
@@ -228,6 +232,7 @@ impl From<&RequestMetric> for RecentRequest {
             tools_overhead_bytes: m.tools_overhead_bytes,
             tool_search: m.tool_search.clone(),
             tools_flattened: m.tools_flattened,
+            skills: m.skills,
             prepare_us: m.prepare_us,
             codex_quota: m.codex_quota.clone(),
             session: m.session.clone(),
@@ -320,6 +325,7 @@ mod tests {
             tools_overhead_bytes: Some(4),
             tool_search: None,
             tools_flattened: None,
+            skills: None,
             prepare_us: 42,
             codex_quota: None,
             session: SessionAttribution {

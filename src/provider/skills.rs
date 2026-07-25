@@ -1,0 +1,319 @@
+//! Detección del listado de skills en el body, sea cual sea la herramienta.
+//!
+//! `SKILL.md` es una convención compartida —cuatro de las cinco herramientas
+//! medidas la usan— pero **cada una manda el listado a su manera**: sitio
+//! distinto del body, formato distinto y precio por skill distinto (de 138 B
+//! a 390 B, ver `docs/skills-across-tools.md`). Este módulo reconoce las tres
+//! formas medidas en tráfico real y se calla ante lo que no conoce.
+//!
+//! # Por qué no basta con buscar una marca
+//!
+//! Los propios ficheros de instrucciones del usuario **mencionan** las marcas.
+//! Medido en tráfico real de opencode: `<available_skills>` aparece cinco
+//! veces en el body y sólo UNA es el listado; las otras son el `AGENTS.md` del
+//! usuario hablando del bloque entre comillas. Un detector que se conforme con
+//! encontrar la cadena cuenta una mención como si fuera un listado.
+//!
+//! Por eso un bloque **sólo cuenta si contiene entradas**. Sin entradas no es
+//! un listado: es alguien hablando de uno.
+//!
+//! # Ausencia honesta
+//!
+//! [`detect_skills`] devuelve `None` cuando no reconoce ningún listado, y eso
+//! significa *"no se pudo ver"*, **nunca "hay cero skills"**. Las marcas son
+//! cadenas en inglés de cada herramienta: si cambian, el detector deja de
+//! encontrarlas y debe declararlo ausente, no fabricar un cero. Mismo contrato
+//! que el resto de la telemetría.
+
+/// Formato del listado de skills reconocido en el body.
+///
+/// La variante importa además de los bytes: dice de qué herramienta viene el
+/// tráfico sin depender del `User-Agent`, que es contenido controlado por el
+/// cliente.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillsFormat {
+    /// Lista plana `- nombre: descripción` tras la cabecera de Claude Code.
+    /// Medido: 138 B por skill, el más barato de los tres — no manda rutas.
+    FlatList,
+    /// XML `<available_skills><skill><name>…</name>…</skill></available_skills>`.
+    /// Lo usan Gemini CLI (288 B/skill) y opencode (323 B/skill).
+    AvailableSkillsXml,
+    /// Bloque `<skills_instructions>` con entradas `(file: <ruta>)`.
+    /// Lo usa Codex: 390 B por skill, el más caro de los medidos.
+    SkillsInstructions,
+}
+
+/// Listado de skills encontrado en el body de una petición.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct SkillsBlock {
+    /// Cuántas skills declara el listado.
+    pub declared: usize,
+    /// Bytes del bloque completo, cabecera incluida. Es lo que se paga en
+    /// CADA petición, se invoque una skill o no.
+    pub listing_bytes: usize,
+    /// Qué forma se reconoció.
+    pub format: SkillsFormat,
+}
+
+/// Cabecera del listado plano de Claude Code.
+const CLAUDE_HEADER: &str = "The following skills are available for use with the Skill tool:";
+
+/// Busca el listado de skills en un texto plano del body.
+///
+/// Devuelve `None` si no reconoce ninguna de las tres formas medidas, o si lo
+/// que encuentra es una mención sin entradas.
+pub fn detect_skills(texto: &str) -> Option<SkillsBlock> {
+    detect_flat_list(texto)
+        .or_else(|| detect_xml(texto))
+        .or_else(|| detect_skills_instructions(texto))
+}
+
+/// Lista plana de Claude Code: cabecera y a continuación líneas `- nombre: …`
+/// hasta la primera que no lo sea.
+fn detect_flat_list(texto: &str) -> Option<SkillsBlock> {
+    let inicio = texto.find(CLAUDE_HEADER)?;
+    let resto = &texto[inicio + CLAUDE_HEADER.len()..];
+
+    let mut entradas = 0usize;
+    let mut fin = 0usize;
+    for linea in resto.split_inclusive('\n') {
+        let limpia = linea.trim_end_matches(['\n', '\r']);
+        if limpia.starts_with("- ") {
+            entradas += 1;
+            fin += linea.len();
+        } else if entradas > 0 {
+            break;
+        } else if limpia.trim().is_empty() {
+            // Línea en blanco entre la cabecera y la primera entrada.
+            fin += linea.len();
+        } else {
+            break;
+        }
+    }
+
+    if entradas == 0 {
+        return None;
+    }
+    Some(SkillsBlock {
+        declared: entradas,
+        listing_bytes: CLAUDE_HEADER.len() + fin,
+        format: SkillsFormat::FlatList,
+    })
+}
+
+/// XML `<available_skills>` de Gemini CLI y opencode.
+///
+/// Recorre TODAS las aperturas y se queda con la primera que contenga al menos
+/// un `<skill>`: las demás son menciones del bloque en el texto del usuario.
+fn detect_xml(texto: &str) -> Option<SkillsBlock> {
+    bloque_con_entradas(texto, "<available_skills>", "</available_skills>", "<skill>")
+        .map(|(bytes, n)| SkillsBlock {
+            declared: n,
+            listing_bytes: bytes,
+            format: SkillsFormat::AvailableSkillsXml,
+        })
+}
+
+/// Bloque `<skills_instructions>` de Codex, con entradas `(file: <ruta>)`.
+fn detect_skills_instructions(texto: &str) -> Option<SkillsBlock> {
+    bloque_con_entradas(
+        texto,
+        "<skills_instructions>",
+        "</skills_instructions>",
+        "(file:",
+    )
+    .map(|(bytes, n)| SkillsBlock {
+        declared: n,
+        listing_bytes: bytes,
+        format: SkillsFormat::SkillsInstructions,
+    })
+}
+
+/// Primer bloque delimitado por `abre`/`cierra` que contenga al menos una
+/// `entrada`, junto con cuántas contiene.
+///
+/// Buscar sólo la primera apertura no sirve: en tráfico real la primera suele
+/// ser una mención entrecomillada dentro de las instrucciones del usuario.
+fn bloque_con_entradas(
+    texto: &str,
+    abre: &str,
+    cierra: &str,
+    entrada: &str,
+) -> Option<(usize, usize)> {
+    let mut desde = 0usize;
+    while let Some(rel) = texto[desde..].find(abre) {
+        let i = desde + rel;
+        let rel_fin = texto[i..].find(cierra)?;
+        let fin = i + rel_fin + cierra.len();
+        let bloque = &texto[i..fin];
+        let n = bloque.matches(entrada).count();
+        if n > 0 {
+            return Some((bloque.len(), n));
+        }
+        desde = i + abre.len();
+    }
+    None
+}
+
+/// Busca el listado de skills en un body completo, sea cual sea el dialecto.
+///
+/// Las cuatro herramientas medidas lo ponen en sitios distintos —último turno
+/// en Claude Code, `systemInstruction` en Gemini, `messages` en opencode,
+/// `input` en Codex—, así que en vez de una regla por proveedor se recorre el
+/// JSON entero y se prueba cada cadena.
+///
+/// Se examina **cadena a cadena, sin concatenar**: unir textos podría formar
+/// una marca a caballo entre dos campos que en el body no existe.
+pub fn detect_skills_in_body(body: &serde_json::Value) -> Option<SkillsBlock> {
+    match body {
+        serde_json::Value::String(s) => detect_skills(s),
+        serde_json::Value::Array(xs) => xs.iter().find_map(detect_skills_in_body),
+        serde_json::Value::Object(o) => o.values().find_map(detect_skills_in_body),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Claude Code: lista plana tras su cabecera. Medido a 138 B por skill.
+    #[test]
+    fn reconoce_la_lista_plana_de_claude_code() {
+        let texto = format!(
+            "bla bla\n\n{CLAUDE_HEADER}\n\n- branch-pr: Crea PRs.\n- judgment-day: Revisión doble.\n\nY sigue el mensaje."
+        );
+
+        let b = detect_skills(&texto).expect("debe reconocer la lista plana");
+
+        assert_eq!(b.declared, 2);
+        assert_eq!(b.format, SkillsFormat::FlatList);
+        assert!(b.listing_bytes > 60, "bytes irrisorios: {}", b.listing_bytes);
+    }
+
+    /// Gemini CLI y opencode comparten el XML `<available_skills>`.
+    #[test]
+    fn reconoce_el_xml_de_gemini_y_opencode() {
+        let texto = "<available_skills>\n  <skill>\n    <name>a</name>\n    <location>/x/SKILL.md</location>\n  </skill>\n  <skill>\n    <name>b</name>\n  </skill>\n</available_skills>";
+
+        let b = detect_skills(texto).expect("debe reconocer el XML");
+
+        assert_eq!(b.declared, 2);
+        assert_eq!(b.format, SkillsFormat::AvailableSkillsXml);
+        assert_eq!(b.listing_bytes, texto.len());
+    }
+
+    /// Codex: `<skills_instructions>` con entradas `(file: …)`.
+    #[test]
+    fn reconoce_el_bloque_de_codex() {
+        let texto = "<skills_instructions>\n## Skills\n- a: hace algo (file: /x/a/SKILL.md)\n- b: hace otra (file: /x/b/SKILL.md)\n</skills_instructions>";
+
+        let b = detect_skills(texto).expect("debe reconocer el bloque de Codex");
+
+        assert_eq!(b.declared, 2);
+        assert_eq!(b.format, SkillsFormat::SkillsInstructions);
+    }
+
+    /// **El caso que de verdad importa.** En tráfico real de opencode la marca
+    /// `<available_skills>` aparece CINCO veces y sólo una es el listado: las
+    /// otras son el `AGENTS.md` del usuario hablando del bloque. Contar una
+    /// mención como listado inventaría skills que nadie declaró.
+    #[test]
+    fn una_mencion_sin_entradas_no_es_un_listado() {
+        let texto = "El bloque `<available_skills>` de tu prompt es autoritativo. \
+                     ¿Coincide algo con `<available_skills>`? Entonces lee el SKILL.md.";
+
+        assert!(
+            detect_skills(texto).is_none(),
+            "una mención no es un listado"
+        );
+    }
+
+    /// Mención primero, listado real después: hay que saltarse la mención y
+    /// quedarse con el bloque bueno, no rendirse en el primer intento.
+    #[test]
+    fn encuentra_el_listado_real_aunque_haya_menciones_antes() {
+        let texto = "Habla del bloque `<available_skills>` sin abrirlo de verdad.\n\
+                     Y más abajo:\n\
+                     <available_skills>\n  <skill>\n    <name>real</name>\n  </skill>\n</available_skills>";
+
+        let b = detect_skills(texto).expect("debe saltarse la mención");
+
+        assert_eq!(b.declared, 1);
+        assert_eq!(b.format, SkillsFormat::AvailableSkillsXml);
+    }
+
+    /// Sin ninguna marca, `None` significa "no se pudo ver", nunca "cero
+    /// skills". Es el contrato de honestidad del resto de la telemetría.
+    #[test]
+    fn sin_marcas_devuelve_none_y_no_un_cero_fabricado() {
+        assert!(detect_skills("un body cualquiera sin skills").is_none());
+        assert!(detect_skills("").is_none());
+    }
+
+    /// Una apertura sin cierre no puede tumbar el proxy ni inventar un bloque.
+    #[test]
+    fn un_bloque_sin_cerrar_no_hace_panic_ni_fabrica_nada() {
+        assert!(detect_skills("<available_skills>\n  <skill>\n    <name>a</name>").is_none());
+        assert!(detect_skills("<skills_instructions>\n- a: x (file: /y)").is_none());
+    }
+
+    /// La cabecera de Claude Code sin ninguna entrada detrás tampoco es un
+    /// listado: mismo criterio que con las menciones del XML.
+    #[test]
+    fn la_cabecera_de_claude_sin_entradas_no_cuenta() {
+        let texto = format!("{CLAUDE_HEADER}\n\nY aquí no hay ninguna entrada.");
+
+        assert!(detect_skills(&texto).is_none());
+    }
+
+    /// El listado se encuentra esté donde esté: cada herramienta lo pone en un
+    /// sitio distinto del body y el recorrido no depende del dialecto.
+    #[test]
+    fn lo_encuentra_en_cualquier_rama_del_body() {
+        let gemini = serde_json::json!({
+            "systemInstruction": {"parts": [{"text":
+                "<available_skills>\n  <skill>\n    <name>a</name>\n  </skill>\n</available_skills>"}]},
+            "contents": []
+        });
+        let codex = serde_json::json!({
+            "input": [{"content": [{"text":
+                "<skills_instructions>\n- a: x (file: /y/SKILL.md)\n</skills_instructions>"}]}]
+        });
+
+        assert_eq!(
+            detect_skills_in_body(&gemini).map(|b| b.format),
+            Some(SkillsFormat::AvailableSkillsXml)
+        );
+        assert_eq!(
+            detect_skills_in_body(&codex).map(|b| b.format),
+            Some(SkillsFormat::SkillsInstructions)
+        );
+    }
+
+    /// Un body sin listado no fabrica uno, y los tipos que no son texto no
+    /// rompen el recorrido.
+    #[test]
+    fn un_body_sin_listado_devuelve_none() {
+        let body = serde_json::json!({
+            "model": "x", "max_tokens": 1024, "stream": true,
+            "messages": [{"role": "user", "content": "hola"}],
+            "nada": null, "n": 3.5
+        });
+
+        assert!(detect_skills_in_body(&body).is_none());
+    }
+
+    /// Las cadenas se examinan por separado: dos campos que juntos formarían
+    /// una marca no son un listado, porque en el body no están juntos.
+    #[test]
+    fn no_concatena_cadenas_para_fabricar_una_marca() {
+        let body = serde_json::json!({
+            "a": "<available_skills>\n  <skill>\n",
+            "b": "    <name>x</name>\n  </skill>\n</available_skills>"
+        });
+
+        assert!(detect_skills_in_body(&body).is_none());
+    }
+}
