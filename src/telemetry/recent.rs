@@ -170,6 +170,9 @@ pub struct RecentRequest {
     /// format}`, o `null`. Se paga en CADA petición, se invoque una skill o
     /// no. `null` = no se reconoció ningún listado, NUNCA "cero skills".
     pub skills: Option<SkillsBlock>,
+    /// Bytes del cuerpo de la respuesta, SIN COMPRIMIR (el proxy descarta
+    /// `Accept-Encoding`). `None` si no hubo respuesta. Ver §4.9.
+    pub response_bytes: Option<usize>,
     /// Microsegundos que el proxy pasó dentro de `Provider::prepare`
     /// (parseo, `decompose` y mutación opcional del body). No incluye la
     /// lectura del body del socket ni el round-trip upstream.
@@ -233,6 +236,7 @@ impl From<&RequestMetric> for RecentRequest {
             tool_search: m.tool_search.clone(),
             tools_flattened: m.tools_flattened,
             skills: m.skills,
+            response_bytes: m.response_bytes,
             prepare_us: m.prepare_us,
             codex_quota: m.codex_quota.clone(),
             session: m.session.clone(),
@@ -326,6 +330,7 @@ mod tests {
             tool_search: None,
             tools_flattened: None,
             skills: None,
+            response_bytes: None,
             prepare_us: 42,
             codex_quota: None,
             session: SessionAttribution {

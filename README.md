@@ -117,7 +117,7 @@ misma disciplina que el resto del proyecto: un dato ausente se declara ausente.
 | **Skills atribuidas POR PETICIÓN** en `/requests` | ✅ Campo `skills` con `declared`, `listing_bytes` y `format` — ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.8 |
 | Comparar el coste de skills entre herramientas | ✅ Medido en 4 clientes: **138 B/skill en Claude Code, 390 B en Codex** — ver [`docs/skills-across-tools.md`](docs/skills-across-tools.md) |
 | **Invocar una skill en Gemini, opencode y Codex** | ❌ Sin medir; solo está medido en Claude Code |
-| **Bytes de BAJADA** (todo el conteo en bytes es de subida) | ❌ Sin medir — [#22](https://github.com/pichu2707/OxideGate/issues/22) |
+| Bytes de bajada | ✅ Campo `response_bytes` — **sin comprimir**, ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.9 |
 | **Comparar herramientas sobre la misma TAREA** (no solo config) | ❌ Sin medir |
 | Agregación por sesión y panel de sesión en el TUI | 🚧 La captura existe; la vista, no |
 
