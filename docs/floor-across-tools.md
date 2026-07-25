@@ -77,7 +77,14 @@ Cada una lleva un juego distinto de skills, MCP y configuración en esta máquin
 opencode—. **Los totales no son comparables entre instalaciones**; la
 estructura de §2 sí.
 
-**3. Modelos distintos.** Claude Code habla con Opus, Codex con `gpt-5.5`,
+**3. `pi` comprime; los demás no.** No está en esta tabla porque no tiene
+mecanismo de skills, pero al medirlo aparte se vio que manda su body con
+**zstd**: 138.655 B lógicos viajan como 43.379 B de cable. Las cuatro de aquí
+mandan JSON plano, así que sus totales son a la vez lógicos y de cable. Si
+alguna vez se añade `pi` a esta tabla, **hay que decir cuál de los dos números
+se está comparando** (ver `skills-across-tools.md` §6).
+
+**4. Modelos distintos.** Claude Code habla con Opus, Codex con `gpt-5.5`,
 Gemini con `gemini-3.1-pro-preview`, opencode con lo que se le configure. La
 comparación es de **bytes enviados**, no de coste en dinero ni de calidad de
 respuesta.
