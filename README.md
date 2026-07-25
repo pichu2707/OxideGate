@@ -148,15 +148,40 @@ Desde el código: `cargo run --bin oxidegate`.
 #    puerto está ocupado — lo está más a menudo de lo que parece.
 OXIDEGATE_PORT=8899 oxidegate
 
-# 2. Apuntar el cliente a OxideGate en vez de al proveedor. Aquí, Claude Code;
-#    para OpenCode, Gemini CLI y OpenAI, ver "Cablear cada cliente" más abajo.
-export ANTHROPIC_BASE_URL=http://127.0.0.1:8899
+# 2. Lanzar el cliente ya cableado, en otra terminal. `run` pone la variable
+#    correcta con la forma correcta — incluido el /v1, que va en unos clientes
+#    sí y en otros no.
+OXIDEGATE_PORT=8899 oxidegate run claude
 
 # 3. Usar el agente como siempre. OxideGate reenvía la petición INTACTA y la mide
 #    de paso. Después:
 curl 127.0.0.1:8899/stats     # agregado por modelo
 oxidegate-monitor             # o el dashboard en vivo (misma OXIDEGATE_PORT)
 ```
+
+`run` acepta cualquier comando detrás del cliente, y propaga su código de salida:
+
+```sh
+oxidegate run claude --continue          # Claude Code con sus propios flags
+oxidegate run gemini                     # Gemini CLI
+oxidegate run openai python mi_app.py    # cualquier SDK OpenAI-compatible
+oxidegate run opencode                   # explica cómo (OpenCode va por fichero)
+```
+
+Si el proxy no está levantado, `run` lo dice y se detiene, en vez de dejarte un
+cliente hablando con un puerto muerto.
+
+<details>
+<summary>Cablearlo a mano, sin <code>run</code></summary>
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8899   # Claude Code, SIN /v1
+```
+
+Cada cliente usa su propia variable y su propia forma: ver
+[Cablear cada cliente](#cablear-cada-cliente) más abajo.
+
+</details>
 
 **No hace falta ir a comprobar si funcionó.** La primera vez que OxideGate mide
 algo lo dice él, sin que se lo pidan:
