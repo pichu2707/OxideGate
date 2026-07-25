@@ -56,6 +56,10 @@ RUTAS QUE SIRVE:
     GET  /health     Liveness barata. Los clientes la sondean para decidir si
                      enrutan por aquí; si devuelve 404 caen al proveedor
                      directo en silencio, sin error y sin log.
+    GET  /version    Capacidades: versión, versión del contrato, endpoints y
+                     campos publicados. Es lo que permite a un consumidor
+                     distinguir «este proxy no lo soporta» de «aquí no había
+                     dato». Un 404 aquí significa build anterior al contrato.
     GET  /stats      Agregado en vivo por (proveedor, modelo).
     GET  /sessions   Agregado por sesion: que costo cada sesion de trabajo.
     GET  /requests   Detalle de los últimos requests individuales.
@@ -657,6 +661,12 @@ async fn main() {
         // telemetría. La usa el plugin de OpenCode para decidir si redirige
         // tráfico de Codex hacia acá antes de tocar nada más pesado.
         .route("/health", get(middleware::health::handle_health))
+        // Capacidades: qué versión es este proxy y qué campos publica. Ruta
+        // hermana de `/health` y ADITIVA — una build anterior devuelve 404,
+        // que ya le dice al consumidor «esto es anterior al contrato». Sin
+        // ella, la única forma de saber si un campo existe era hacer una
+        // petición real y deducirlo: sondear por ausencia.
+        .route("/version", get(middleware::version::handle_version))
         // Agregación en vivo por (proveedor, modelo): qué optimizar ahora.
         .route("/stats", get(middleware::stats::handle_stats))
         // Agregación por SESIÓN: qué costó cada sesión de trabajo, no cada
@@ -680,6 +690,7 @@ async fn main() {
 
     println!("🛰️  Escuchando en http://{addr}");
     println!("💚 Liveness en http://{addr}/health");
+    println!("🪪 Capacidades y versión del contrato en http://{addr}/version");
     println!("📊 Estadísticas en vivo por modelo en http://{addr}/stats");
     println!("🧾 Últimos requests en vivo en http://{addr}/requests");
     axum::serve(listener, app).await.unwrap();
@@ -724,6 +735,24 @@ mod cli_tests {
         for route in ["/health", "/stats", "/requests"] {
             assert!(text.contains(route), "falta la ruta {route}: {text}");
         }
+    }
+
+    /// La ayuda documenta TODA ruta que `/version` anuncia. Si `/version`
+    /// declarara un endpoint que la ayuda no menciona, el usuario tendría que
+    /// descubrirlo por sondeo — que es exactamente el agujero que esa ruta
+    /// existe para tapar.
+    #[test]
+    fn la_ayuda_documenta_cada_endpoint_que_version_anuncia() {
+        let text = usage_text();
+
+        for route in middleware::version::ENDPOINTS {
+            assert!(
+                text.contains(route),
+                "/version anuncia {route} y la ayuda no lo documenta: {text}"
+            );
+        }
+        // Y la propia ruta de capacidades, que no se lista a sí misma.
+        assert!(text.contains("/version"), "la ayuda no menciona /version");
     }
 
     #[test]
