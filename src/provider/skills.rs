@@ -1,4 +1,10 @@
-//! Detección del listado de skills en el body, sea cual sea la herramienta.
+//! Detección del listado de capacidades invocables en el body, sea cual sea
+//! la herramienta.
+//!
+//! Se le llama "skills" porque es como lo llama el propio harness —*"the
+//! following skills are available for use with the Skill tool"*— pero el
+//! bloque enumera **todo lo invocable**: skills de usuario, de plugin,
+//! integradas y slash commands. Medido: no hay marca que los distinga.
 //!
 //! `SKILL.md` es una convención compartida —cuatro de las cinco herramientas
 //! medidas la usan— pero **cada una manda el listado a su manera**: sitio
@@ -47,7 +53,22 @@ pub enum SkillsFormat {
 /// Listado de skills encontrado en el body de una petición.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub struct SkillsBlock {
-    /// Cuántas skills declara el listado.
+    /// Cuántas entradas declara el listado.
+    ///
+    /// **NO es el número de directorios en `~/.claude/skills/`.** El bloque
+    /// enumera todo lo que el modelo puede invocar con la herramienta `Skill`,
+    /// y eso incluye skills de usuario, de plugin, integradas del harness y
+    /// **slash commands** invocables por el modelo.
+    ///
+    /// Medido: un comando aparece en el MISMO bloque, con el MISMO formato
+    /// `- nombre: descripción` y **sin ninguna marca** que lo distinga de una
+    /// skill. Separarlos aquí exigiría inventar la distinción, que es lo que
+    /// este proyecto no hace. Para el modelo son todos lo mismo; la diferencia
+    /// vive en el disco del usuario, no en el cable.
+    ///
+    /// Y a la inversa: una skill con `disable-model-invocation: true` NO se
+    /// lista, así que no cuenta aquí ni cuesta un byte (ver
+    /// `docs/optimizer-skills.md` §6).
     pub declared: usize,
     /// Bytes del bloque completo, cabecera incluida. Es lo que se paga en
     /// CADA petición, se invoque una skill o no.
@@ -266,6 +287,24 @@ mod tests {
         let texto = format!("{CLAUDE_HEADER}\n\nY aquí no hay ninguna entrada.");
 
         assert!(detect_skills(&texto).is_none());
+    }
+
+    /// Un slash command aparece en el MISMO bloque y con el MISMO formato que
+    /// una skill, sin marca que lo distinga: medido en tráfico real. Así que
+    /// `declared` cuenta ambos, y el contrato lo dice en vez de fingir una
+    /// separación que el cable no permite.
+    #[test]
+    fn declared_cuenta_tambien_los_slash_commands() {
+        let texto = format!(
+            "{CLAUDE_HEADER}\n\n- branch-pr: Crea PRs.\n- micomando: Un slash command cualquiera.\n- engram:memory: Una de plugin.\n\nfin."
+        );
+
+        let b = detect_skills(&texto).expect("debe reconocer el listado");
+
+        assert_eq!(
+            b.declared, 3,
+            "cuenta las tres entradas: skill, comando y plugin"
+        );
     }
 
     /// El listado se encuentra esté donde esté: cada herramienta lo pone en un

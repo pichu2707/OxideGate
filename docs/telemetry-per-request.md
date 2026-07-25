@@ -594,9 +594,23 @@ la misma clase de atribución que `tools_by_server` hace dentro de
 
 | Campo | Qué es |
 |---|---|
-| `declared` | Cuántas skills declara el listado |
+| `declared` | Cuántas ENTRADAS declara el listado — no cuántas skills tienes en disco. Ver el aviso de abajo |
 | `listing_bytes` | Bytes del bloque completo. Se pagan en CADA petición, se invoque una skill o no |
 | `format` | `flat_list` \| `available_skills_xml` \| `skills_instructions` |
+
+> **`declared` no es "cuántas skills tengo".** El bloque enumera todo lo que el
+> modelo puede invocar con la herramienta `Skill`: skills de usuario, de
+> plugin, integradas del harness y **slash commands**. Medido: un comando
+> aparece en el mismo bloque, con el mismo formato `- nombre: descripción` y
+> **sin ninguna marca** que lo distinga.
+>
+> Separarlos aquí exigiría inventar la distinción — el cable no la trae. Para
+> el modelo son todos lo mismo; la diferencia vive en el disco del usuario.
+>
+> Y en la otra dirección: una skill con `disable-model-invocation: true` **no
+> se lista**, así que no cuenta aquí ni cuesta un byte
+> (`docs/optimizer-skills.md` §6). Un usuario con 22 directorios de skills
+> puede ver perfectamente `declared: 11`.
 
 **`format` identifica la herramienta sin fiarse del `User-Agent`**, que es
 contenido controlado por el cliente (§4.5). Cada una manda el listado a su
