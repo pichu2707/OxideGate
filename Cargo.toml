@@ -1,8 +1,33 @@
 [package]
 name = "oxidegate"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
+# `edition = "2024"` requires Rust 1.85. Declaring it explicitly turns a cryptic
+# compile error on older toolchains into a clear "update your Rust" message.
+rust-version = "1.85"
 license = "MIT"
+description = "Local proxy that measures cost, tokens and latency of every LLM request across Anthropic, OpenAI and Gemini — and optimizes the traffic without breaking transparency."
+repository = "https://github.com/pichu2707/OxideGate"
+homepage = "https://github.com/pichu2707/OxideGate"
+# Binary-only crate: docs.rs has no public API to render, so point readers at
+# the repository instead of an empty documentation build.
+documentation = "https://github.com/pichu2707/OxideGate"
+readme = "README.md"
+keywords = ["llm", "proxy", "telemetry", "observability", "tokens"]
+categories = [
+    "command-line-utilities",
+    "development-tools",
+    "web-programming::http-server",
+    "network-programming",
+]
+# Internal agent/spec tooling is useless to anyone installing the binary.
+exclude = [
+    "openspec/",
+    ".claude/",
+    ".atl/",
+    "presentations/",
+    ".env",
+]
 
 # Los binarios se declaran a mano: la autodetección de Cargo los llamaría
 # `monitor` y `bench`, nombres demasiado genéricos para instalarse en el PATH
