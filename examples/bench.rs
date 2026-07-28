@@ -13,8 +13,13 @@
 //! (Claude Max/OAuth) se alimenta a mano por la sesión redirigida; sus filas
 //! caen en la misma telemetría y entran al mismo reporte.
 //!
+//! Vive en `examples/` y no en `src/bin/` a propósito: **Cargo no instala
+//! examples**. Una barrida de desarrollo no tiene nada que hacer en el PATH de
+//! nadie, y aquí esa garantía la sostiene la estructura del proyecto en vez de
+//! un filtro a mano en la fórmula de Homebrew (que `cargo install` ignoraba).
+//!
 //! Uso:
-//!   OXIDEGATE_PORT=8899 GEMINI_API_KEY=... OPENAI_API_KEY=... cargo run --bin oxidegate-bench
+//!   OXIDEGATE_PORT=8899 GEMINI_API_KEY=... OPENAI_API_KEY=... cargo run --example bench
 //!
 //! Las keys se leen de un archivo `.env` en la raíz (cargado con dotenvy) o del
 //! entorno. Variables:

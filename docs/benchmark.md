@@ -1,6 +1,6 @@
 # Benchmark — Caracterización de proveedores por tamaño de input
 
-> Herramienta: `src/bin/bench.rs`. Mide cómo escalan TTFT, latencia y coste con
+> Herramienta: `examples/bench.rs`. Mide cómo escalan TTFT, latencia y coste con
 > el tamaño del INPUT, a igualdad de condiciones, comparando proveedores.
 
 ---
@@ -49,7 +49,7 @@ GEMINI_MODEL=gemini-2.5-flash
 Con OxideGate corriendo:
 
 ```bash
-OXIDEGATE_PORT=8899 cargo run --bin oxidegate-bench
+OXIDEGATE_PORT=8899 cargo run --example bench
 ```
 
 Variables (todas opcionales salvo al menos una key):

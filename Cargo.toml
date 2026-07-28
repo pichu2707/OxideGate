@@ -30,9 +30,15 @@ exclude = [
 ]
 
 # Los binarios se declaran a mano: la autodetección de Cargo los llamaría
-# `monitor` y `bench`, nombres demasiado genéricos para instalarse en el PATH
-# del usuario (`cargo install`, formula de Homebrew). El prefijo `oxidegate-`
-# los mantiene inconfundibles.
+# `monitor`, nombre demasiado genérico para instalarse en el PATH del usuario
+# (`cargo install`, formula de Homebrew). El prefijo `oxidegate-` lo mantiene
+# inconfundible.
+#
+# Aquí SOLO va lo que debe acabar en el PATH de alguien. `bench` es una barrida
+# de desarrollo y vive en `examples/`: Cargo no instala examples, así que la
+# garantía —que bench no se instale— la sostiene la estructura del proyecto y
+# no la documentación. Antes dependía de que la fórmula de Homebrew filtrara a
+# mano, y `cargo install` no filtra nada: en 0.5.0 instalaba los tres.
 [[bin]]
 name = "oxidegate"
 path = "src/main.rs"
@@ -40,10 +46,6 @@ path = "src/main.rs"
 [[bin]]
 name = "oxidegate-monitor"
 path = "src/bin/monitor.rs"
-
-[[bin]]
-name = "oxidegate-bench"
-path = "src/bin/bench.rs"
 
 [dependencies]
 tokio = { version = "1.38", features = ["full"] }
