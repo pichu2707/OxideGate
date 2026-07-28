@@ -226,22 +226,20 @@ La fórmula vive en [`pichu2707/homebrew-tap`](https://github.com/pichu2707/home
 reportar un problema de distribución.
 
 Instala dos ejecutables: **`oxidegate`** (el proxy) y **`oxidegate-monitor`** (el
-dashboard de terminal). Hay un tercero, `oxidegate-bench`, que es una barrida de
-benchmark para desarrollo y **no se instala**: no tiene nada que hacer en el PATH
-de nadie.
+dashboard de terminal). Hay una barrida de benchmark para desarrollo,
+[`examples/bench.rs`](docs/benchmark.md), que **no se instala por ningún canal**:
+vive en `examples/` y Cargo no instala examples, así que no tiene forma de acabar
+en el PATH de nadie.
 
 ### Con Cargo
 
 Si ya tienes Rust (**1.85+**, lo exige `edition = "2024"`):
 
 ```sh
-cargo install oxidegate --bin oxidegate --bin oxidegate-monitor
+cargo install oxidegate
 ```
 
-Los dos `--bin` no sobran. A diferencia de la fórmula de Homebrew, `cargo
-install` **instala todos los binarios declarados** salvo que elijas: sin esos
-flags te deja también `oxidegate-bench` en el PATH, que es justo lo que la
-fórmula evita. Si prefieres los tres, `cargo install oxidegate` a secas.
+Instala los mismos dos ejecutables que la fórmula, sin flags que recordar.
 
 Desde el código: `cargo run --bin oxidegate`.
 
@@ -366,6 +364,7 @@ propio reporte, en vez de presentar un ahorro que no existe.
 | Variable | Para qué | Default |
 |---|---|---|
 | `OXIDEGATE_PORT` | Puerto local del proxy (y del monitor) | `8080` |
+| `OXIDEGATE_HOST` | Interfaz donde bindea el proxy. `0.0.0.0` para alcanzarlo desde fuera (Docker, LAN) — **lee el aviso de abajo antes** | `127.0.0.1` (solo esta máquina) |
 | `ANTHROPIC_API_BASE` / `OPENAI_API_BASE` / `GEMINI_API_BASE` | Host de cada proveedor | API pública de cada uno |
 | `OXIDEGATE_FORCE_CACHE` | Palanca A: fuerza el prompt caching de Anthropic | `false` (apagado) |
 | `OXIDEGATE_STATS_URL` | URL que consulta el monitor para `/stats` | `http://127.0.0.1:{OXIDEGATE_PORT}/stats` |
@@ -373,6 +372,23 @@ propio reporte, en vez de presentar un ahorro que no existe.
 
 La telemetría se escribe en `~/.config/oxidegate/telemetry.jsonl` (una línea
 JSON por petición), fuera del camino crítico del request.
+
+#### Sobre `OXIDEGATE_HOST`: qué expones al abrirlo
+
+El default es `127.0.0.1` y lo es a propósito. Bindear fuera de loopback no es
+solo cambiar cuatro octetos — **el proxy no tiene autenticación**, así que quien
+alcance el puerto puede:
+
+- **Leer `GET /requests`**, es decir tu telemetría, incluido el campo `client`
+  con el `User-Agent` crudo — ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.5.
+- **Usar el proxy como pasarela** hacia los proveedores.
+
+Por eso el arranque lo grita por `stderr` en cuanto el bind sale de loopback.
+Si lo abres, ponlo detrás de un firewall o en una red de confianza.
+
+Y **falla cerrado**: si `OXIDEGATE_HOST` trae un valor ilegible, el proxy vuelve
+a `127.0.0.1` y lo dice, en vez de arrancar expuesto por un typo. El error
+opuesto es el único de los dos que no se puede deshacer.
 
 ---
 
