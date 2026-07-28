@@ -336,6 +336,8 @@ mod tests {
     fn test_config() -> AppConfig {
         AppConfig {
             local_port: 8080,
+            bind_host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            bind_host_warning: None,
             target_openai_url: "https://api.openai.com/v1".to_string(),
             target_anthropic_url: "https://api.anthropic.com/v1".to_string(),
             target_gemini_url: "https://generativelanguage.googleapis.com".to_string(),

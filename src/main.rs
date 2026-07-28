@@ -624,6 +624,12 @@ async fn main() {
     let telemetry = TelemetrySink::spawn(config.storage_dir.clone());
 
     let port = config.local_port;
+    let bind_host = config.bind_host;
+    // Si `OXIDEGATE_HOST` traía basura ya se cayó a loopback: aquí solo se
+    // cuenta, porque un bind más cerrado del que pediste tiene que ser ruidoso.
+    if let Some(aviso) = &config.bind_host_warning {
+        eprintln!("{aviso}");
+    }
     let state = AppState {
         config: Arc::new(config),
         http: reqwest::Client::new(),
@@ -677,7 +683,7 @@ async fn main() {
         .route("/requests", get(middleware::requests::handle_requests))
         .with_state(Arc::new(state));
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let addr = SocketAddr::new(bind_host, port);
     // Un `.unwrap()` aquí convertía el caso más común de todos — el puerto
     // ocupado — en un panic con backtrace, que no le dice a nadie qué hacer.
     let listener = match tokio::net::TcpListener::bind(addr).await {
@@ -687,6 +693,12 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // El aviso va DESPUÉS del bind y antes de las rutas: si el proxy quedó
+    // expuesto, que sea lo primero que se lee al arrancar.
+    if let Some(aviso) = config::exposure_warning(bind_host) {
+        eprintln!("{aviso}");
+    }
 
     println!("🛰️  Escuchando en http://{addr}");
     println!("💚 Liveness en http://{addr}/health");
