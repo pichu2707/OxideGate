@@ -1,5 +1,6 @@
 # OxideGate
 
+[![crates.io](https://img.shields.io/crates/v/oxidegate.svg)](https://crates.io/crates/oxidegate)
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/pichu2707/OxideGate)
 
 > Proxy local en Rust que se sienta entre los clientes de IA (gentle-ai,
@@ -228,6 +229,19 @@ Instala dos ejecutables: **`oxidegate`** (el proxy) y **`oxidegate-monitor`** (e
 dashboard de terminal). Hay un tercero, `oxidegate-bench`, que es una barrida de
 benchmark para desarrollo y **no se instala**: no tiene nada que hacer en el PATH
 de nadie.
+
+### Con Cargo
+
+Si ya tienes Rust (**1.85+**, lo exige `edition = "2024"`):
+
+```sh
+cargo install oxidegate --bin oxidegate --bin oxidegate-monitor
+```
+
+Los dos `--bin` no sobran. A diferencia de la fórmula de Homebrew, `cargo
+install` **instala todos los binarios declarados** salvo que elijas: sin esos
+flags te deja también `oxidegate-bench` en el PATH, que es justo lo que la
+fórmula evita. Si prefieres los tres, `cargo install oxidegate` a secas.
 
 Desde el código: `cargo run --bin oxidegate`.
 
