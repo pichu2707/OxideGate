@@ -145,6 +145,7 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `tools_flattened` | Honestidad de la atribución de `tools_by_server`: `true` ⇒ el cliente NO usa el namespacing `mcp__`, así que su cubo `(native)` puede ocultar MCP aplanado; `false` ⇒ hay tools `mcp__`, el `(native)` es de fiar; `null` ⇒ no aplica (Anthropic/Gemini/Chat) o sin tools | Solo dialecto Responses/Codex. `pi` manda nombres crudos y `opencode` usa `<server>_<tool>` (ambiguo) — ninguno con `mcp__`. Es una advertencia estructural, NUNCA una atribución inventada: no nombra servidores. Ver §4.4 |
 | `session` | Sesión resuelta por precedencia de cabeceras del request: `{source, key}`. Nunca `null` — la peor rama es un fallback honesto (`source: "unattributed"`), no una ausencia | Ver §4.6 para la tabla de precedencia completa y cómo estampar el header desde cada harness |
 | `skills` | Listado de skills declarado en el body: `{declared, listing_bytes, format}`, o `null`. Se paga en CADA petición, se invoque una skill o no | `null` = no se reconoció ningún listado, **nunca "cero skills"**. `format` dice qué forma se encontró y, de paso, de qué herramienta viene el tráfico sin fiarse del `User-Agent` — ver §4.8 |
+| `prompt_bytes` | Bytes del body que MANDÓ EL CLIENTE, en su forma lógica | **No es wire** (en `/v1/codex/responses` y `/v1beta/*` se mide descomprimido), **no es lo que subió al proveedor** (con `cache_control_forced` el body reenviado es mayor) y **no es la suma del desglose**. Ver §4.10 antes de usarlo |
 | `response_bytes` | Bytes del CUERPO DE LA RESPUESTA que cruzaron el proxy. `null` si no llegó a haber respuesta | **Sin comprimir**, y por eso no es ancho de banda: el proxy descarta `Accept-Encoding` para poder leer el SSE. Ver §4.9 antes de compararlo con `prompt_bytes` |
 | `codex_quota` | Estado de la cuota de suscripción de Codex (OAuth de `chatgpt.com`), parseado de las doce cabeceras `x-codex-*` de la RESPUESTA del upstream: doce campos, todos opcionales. `null` si la petición no fue a Codex vía OAuth, o si el upstream falló antes de responder | Es el ÚNICO campo de esta fila que se lee de la respuesta y no del request ni del body. Cuota NUNCA son dólares: no alimenta ni puede alimentar `cost_estimate_usd` — ver §4.7 |
 
@@ -676,6 +677,79 @@ devolvió un cuerpo vacío". Un `0` fabricado ahí confundiría un fallo de
 conexión con una respuesta vacía legítima. Si el stream se cortó a mitad,
 `response_bytes` lleva lo que SÍ cruzó —una medición real de un cuerpo
 parcial— y es el `status` de la fila quien dice que hubo error.
+
+---
+
+### 4.10. `prompt_bytes`: la otra mitad, y tres cosas que NO es
+
+`response_bytes` (§4.9) cerró la bajada. `prompt_bytes` cierra la subida: los
+bytes del body que **mandó el cliente**.
+
+Estuvo omitido de este endpoint desde el principio, junto a `prompt_hash`,
+pero por un motivo distinto: el hash por la invariante de privacidad (§3), y
+`prompt_bytes` porque era *«un detalle de implementación que no aporta a
+detectar outliers»*. Ese razonamiento se escribió cuando esta vista servía
+solo para cazar filas atípicas. Desde que `/requests` es el contrato público
+del ecosistema (§8) y publica `response_bytes`, la asimetría dejaba a un
+consumidor **pudiendo responder cuántos bytes bajaron y no cuántos subieron**.
+
+No compromete la invariante: es un entero, no identifica ningún prompt.
+`prompt_hash` sigue sin salir de aquí.
+
+**Ahora las tres advertencias, y ninguna es menor.**
+
+#### 1. No es el tamaño de wire
+
+Depende de la ruta:
+
+| Ruta | Se mide sobre |
+|---|---|
+| `POST /v1/messages` | `incoming.body` crudo |
+| `POST /v1/chat/completions`, `POST /v1/responses` | `incoming.body` crudo |
+| `POST /v1/codex/responses` | body **descomprimido** (`maybe_decompress`) |
+| `POST /v1beta/*` | body **descomprimido** (`maybe_decompress`) |
+
+En las dos últimas se mide el JSON **lógico**, no el que viajó. Y no es
+teórico: **`pi` manda el body en zstd**. Para ese tráfico, por el cable
+subieron bastantes menos bytes de los que dice este campo.
+
+Se mide así a propósito —medir sobre el wire comprimido daría un
+`prompt_hash` y un `context` inútiles— pero significa que **no se puede
+sumar tráfico de rutas distintas y llamarlo «bytes subidos»** sin decir cuál
+es cuál. Además, en todas las rutas excluye el framing HTTP.
+
+#### 2. No es lo que subió al proveedor
+
+Se calcula sobre el body **ORIGINAL**, antes de cualquier mutación. Con la
+Palanca A activa, OxideGate inyecta un breakpoint de `cache_control` y **el
+body reenviado es MAYOR que este número**.
+
+Quien delata la intervención es `cache_control_forced`: si viene `true`, esta
+fila mide lo que el cliente mandó, no lo que el proxy reenvió. Una medición
+sobre un body que el propio medidor alteró y no lo dijera sería el peor fallo
+posible en este proyecto — por eso ese booleano ya estaba, y por eso hay que
+leerlo junto a este campo.
+
+#### 3. No es la suma del desglose
+
+`context_measured_bytes` es JSON canónico **re-serializado**; `prompt_bytes`
+es el body tal como llegó. Son dos mediciones de cosas relacionadas tomadas
+en puntos distintos del pipeline, y §4.1 ya prohíbe combinarlas en un
+cociente. Publicar las dos juntas hace ese error mucho más fácil de cometer,
+así que conviene repetirlo: **`context_measured_bytes / prompt_bytes` no
+significa nada estable.**
+
+Un test (`los_bytes_de_subida_no_son_la_suma_del_desglose`) fija que no se
+exige que coincidan: si alguien «arreglara» la diferencia igualándolas,
+estaría falseando una de las dos.
+
+#### Y tampoco lo dividas por `response_bytes`
+
+§4.9 ya lo avisaba cuando el numerador solo existía en el JSONL. Ahora que
+los dos campos están en la misma fila, el aviso pasa de recomendación a
+obligación: un cociente subida/bajada mezcla **contenido lógico de subida**
+con **contenido sin comprimir de bajada**. Es útil si se declaran los dos
+términos, y engañoso si no.
 
 ---
 

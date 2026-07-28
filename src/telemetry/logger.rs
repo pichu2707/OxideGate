@@ -55,7 +55,18 @@ pub struct RequestMetric {
     pub client: Option<String>,
 
     // --- Coste ---
-    /// Tamaño en bytes del body del request (sombra barata del tamaño real).
+    /// Tamaño en bytes del body que MANDÓ EL CLIENTE, en su forma lógica.
+    ///
+    /// **No es el tamaño de wire**, aunque sea lo más cercano que se mide:
+    /// excluye el framing HTTP, y en `/v1/codex/responses` y `/v1beta/*` se
+    /// calcula sobre el body ya DESCOMPRIMIDO (ver `provider::maybe_decompress`)
+    /// — si el cliente comprimió, por el cable subieron menos bytes.
+    ///
+    /// **Tampoco es lo que subió al proveedor**: se toma sobre el body
+    /// ORIGINAL, antes de cualquier mutación, así que con
+    /// `cache_control_forced` el body reenviado es MAYOR que este número.
+    ///
+    /// Contrato completo en `docs/telemetry-per-request.md` §4.10.
     pub prompt_bytes: usize,
     /// Tokens de entrada exactos, tal como los reporta el proveedor en `usage`.
     pub input_tokens: Option<u64>,
@@ -135,10 +146,11 @@ pub struct RequestMetric {
     /// `context_system_bytes`.
     pub context_other_bytes: Option<usize>,
     /// Suma de los cinco campos de contexto anteriores. DIFIERE levemente de
-    /// `prompt_bytes` (que sí es el tamaño exacto sobre el cable): este es el
-    /// tamaño del JSON canónico re-serializado, no el de los bytes que
-    /// realmente mandó el cliente. Nunca combinar `context_measured_bytes`
-    /// con `prompt_bytes` en un mismo cociente.
+    /// `prompt_bytes` (que mide el body tal como lo mandó el cliente): este es
+    /// el tamaño del JSON canónico RE-SERIALIZADO, no el de los bytes que
+    /// realmente llegaron. Nunca combinar `context_measured_bytes` con
+    /// `prompt_bytes` en un mismo cociente: son dos mediciones tomadas en
+    /// puntos distintos del pipeline.
     pub context_measured_bytes: Option<usize>,
     /// Número de mensajes del historial completo (incluyendo el último).
     pub context_messages_count: Option<usize>,
