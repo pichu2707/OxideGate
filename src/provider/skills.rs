@@ -199,6 +199,35 @@ pub fn detect_skills_in_body(body: &serde_json::Value) -> Option<SkillsBlock> {
 mod tests {
     use super::*;
 
+    /// GUARDA DE FORMA de `SkillsBlock` (`skills` en `GET /requests`).
+    ///
+    /// `FIELDS` declara `skills`, así que el NOMBRE del objeto está cubierto por
+    /// el test recursivo de `/version`. Sus tres claves internas no lo estaban:
+    /// el snapshot de contrato solo congela el primer nivel de la fila.
+    #[test]
+    fn la_forma_de_skills_no_cambia_sin_querer() {
+        let v = serde_json::to_value(SkillsBlock {
+            declared: 66,
+            listing_bytes: 15_977,
+            format: SkillsFormat::FlatList,
+        })
+        .expect("serializa");
+
+        let claves: std::collections::BTreeSet<&str> =
+            v.as_object().expect("objeto").keys().map(String::as_str).collect();
+
+        assert_eq!(
+            claves,
+            ["declared", "format", "listing_bytes"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "cambió la forma de skills. Si es ADITIVO, actualiza esta lista. Si \
+             RENOMBRA, QUITA o cambia el tipo de una clave, sube además \
+             CONTRACT_VERSION en middleware::version y anótalo en \
+             docs/telemetry-per-request.md §8"
+        );
+    }
+
     /// Claude Code: lista plana tras su cabecera. Medido a 138 B por skill.
     #[test]
     fn reconoce_la_lista_plana_de_claude_code() {

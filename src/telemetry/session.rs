@@ -91,3 +91,68 @@ pub struct SessionAttribution {
     /// interpretable — nunca se expone ni se acarrea por separado.
     pub key: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GUARDA DE FORMA de `SessionAttribution` (`session` en `GET /requests`).
+    ///
+    /// `FIELDS` declara `session`, así que el NOMBRE del objeto lo cubre el test
+    /// recursivo de `/version`. Sus dos claves internas no las cubría nada: el
+    /// snapshot de contrato de `telemetry::recent` congela únicamente las claves
+    /// de PRIMER NIVEL de la fila, nunca mira dentro de los objetos anidados.
+    ///
+    /// Este par en concreto no se puede partir: `key` sin su `source` no es
+    /// interpretable —una etiqueta explícita, un id nativo y un `User-Agent` de
+    /// fallback caben todos ahí—, así que perder cualquiera de las dos claves
+    /// rompe al consumidor aunque la otra siga.
+    #[test]
+    fn la_forma_de_session_no_cambia_sin_querer() {
+        let v = serde_json::to_value(SessionAttribution {
+            source: SessionSource::Native,
+            key: "sess-abc123".to_string(),
+        })
+        .expect("serializa");
+
+        let claves: std::collections::BTreeSet<&str> = v
+            .as_object()
+            .expect("objeto")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        assert_eq!(
+            claves,
+            ["key", "source"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "cambió la forma de session. Si es ADITIVO, actualiza esta lista. Si \
+             RENOMBRA, QUITA o cambia el tipo de una clave, sube además \
+             CONTRACT_VERSION en middleware::version y anótalo en \
+             docs/telemetry-per-request.md §8"
+        );
+    }
+
+    /// El VALOR de `source` también es contrato: un consumidor ramifica sobre
+    /// estas tres cadenas. `rename_all = "snake_case"` las produce, y cambiar
+    /// ese atributo las rompería sin tocar ningún nombre de campo — por eso se
+    /// afirman aparte de la guarda de claves.
+    #[test]
+    fn las_etiquetas_de_source_no_cambian_sin_querer() {
+        let etiqueta = |s: SessionSource| {
+            serde_json::to_value(SessionAttribution {
+                source: s,
+                key: "k".to_string(),
+            })
+            .expect("serializa")["source"]
+                .as_str()
+                .expect("source es string")
+                .to_string()
+        };
+
+        assert_eq!(etiqueta(SessionSource::Explicit), "explicit");
+        assert_eq!(etiqueta(SessionSource::Native), "native");
+        assert_eq!(etiqueta(SessionSource::Unattributed), "unattributed");
+    }
+}

@@ -935,6 +935,68 @@ pub(crate) fn model_and_stream_from_value(value: &Value) -> (Option<String>, boo
 mod tests {
     use super::*;
 
+    /// GUARDA DE FORMA de `ToolServerBytes`, el objeto que viaja dentro de
+    /// `tools_by_server` en `GET /requests`.
+    ///
+    /// El snapshot de contrato (`telemetry::recent`) congela solo las claves de
+    /// PRIMER NIVEL de la fila: nunca mira dentro de los objetos anidados. Y el
+    /// test recursivo de `/version` solo exige que las entradas de `FIELDS`
+    /// existan en algún sitio, así que cubre `tool_names` —que sí está en
+    /// `FIELDS`— y ninguna de las otras cinco. Sin esta guarda, renombrar
+    /// `bytes` o `deferred_tools` no rompe nada, y son claves que una lente
+    /// consume.
+    #[test]
+    fn la_forma_de_tool_server_bytes_no_cambia_sin_querer() {
+        let v = serde_json::to_value(ToolServerBytes {
+            server: "(native)".to_string(),
+            kind: ToolServerKind::Native,
+            tools: 3,
+            bytes: 1234,
+            tool_names: vec!["Read".to_string()],
+            deferred_tools: 1,
+        })
+        .expect("serializa");
+
+        let claves: std::collections::BTreeSet<&str> =
+            v.as_object().expect("objeto").keys().map(String::as_str).collect();
+
+        assert_eq!(
+            claves,
+            ["bytes", "deferred_tools", "kind", "server", "tool_names", "tools"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "cambió la forma de tools_by_server. Si es ADITIVO, actualiza esta \
+             lista. Si RENOMBRA, QUITA o cambia el tipo de una clave, sube además \
+             CONTRACT_VERSION en middleware::version y anótalo en \
+             docs/telemetry-per-request.md §8"
+        );
+    }
+
+    /// GUARDA DE FORMA de `ToolSearchSignal` (`tool_search` en `/requests`).
+    ///
+    /// `FIELDS` declara `tool_search`, así que el nombre del objeto está
+    /// cubierto; `used` y `deferred_loaded` no lo estaban por nada.
+    #[test]
+    fn la_forma_de_tool_search_signal_no_cambia_sin_querer() {
+        let v = serde_json::to_value(ToolSearchSignal {
+            used: true,
+            deferred_loaded: 7,
+        })
+        .expect("serializa");
+
+        let claves: std::collections::BTreeSet<&str> =
+            v.as_object().expect("objeto").keys().map(String::as_str).collect();
+
+        assert_eq!(
+            claves,
+            ["deferred_loaded", "used"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "cambió la forma de tool_search: mismo criterio que el resto de \
+             guardas de forma (ver docs/telemetry-per-request.md §8)"
+        );
+    }
+
     /// Un desglose completamente en cero (nada medido todavía) debe devolver
     /// `None` en la ratio, nunca `NaN`: dividir 0/0 en `f64` da `NaN`, que es
     /// justo lo que este método existe para evitar.

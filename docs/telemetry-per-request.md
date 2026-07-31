@@ -1017,13 +1017,45 @@ Tres snapshots congelan las claves publicadas, uno por endpoint:
 Si alguien renombra un campo, el test lo cuenta antes que un usuario. El
 mensaje de fallo dice qué hacer según el cambio sea aditivo o ruptura.
 
-Los snapshots recorren claves de forma recursiva, pero solo ven lo que la fila
-de prueba trae poblado: un sub-objeto en `null` deja sus claves internas sin
-cubrir. Por eso `cache_by_section` guarda su propia forma en
-`el_json_publicado_conserva_method_y_las_cinco_secciones`
-(`src/telemetry/cache_attribution.rs`) — sin él, renombrar
-`tools_cached_bytes` no rompería ningún test, y es justo el nombre que consume
-una lente.
+#### Los snapshots NO miran dentro de los objetos anidados
+
+Los tres snapshots de arriba congelan las claves de **primer nivel** de la fila
+(`fila.as_object().keys()`). No recorren nada recursivamente, así que ninguno
+cubre lo que va dentro de `tools_by_server`, `codex_quota`, `skills`, `session`,
+`tool_search` o `cache_by_section`.
+
+El que sí es recursivo es otro: `version_no_anuncia_campos_que_requests_no_publique`
+recorre el JSON entero, pero solo comprueba que cada entrada de `FIELDS` aparezca
+en algún sitio. Eso cubre el NOMBRE de cada objeto anidado —y la clave interna
+`tool_names`, que está en `FIELDS` por sí misma— y nada más.
+
+**El hueco se cierra con una guarda de forma por objeto**, cada una junto al tipo
+que la define:
+
+| Objeto | Guarda | Dónde |
+|---|---|---|
+| `tools_by_server` | `la_forma_de_tool_server_bytes_no_cambia_sin_querer` | `src/provider/mod.rs` |
+| `tool_search` | `la_forma_de_tool_search_signal_no_cambia_sin_querer` | `src/provider/mod.rs` |
+| `skills` | `la_forma_de_skills_no_cambia_sin_querer` | `src/provider/skills.rs` |
+| `codex_quota` | `la_forma_de_codex_quota_no_cambia_sin_querer` | `src/telemetry/codex_quota.rs` |
+| `session` | `la_forma_de_session_no_cambia_sin_querer` | `src/telemetry/session.rs` |
+| `cache_by_section` | `el_json_publicado_conserva_method_y_las_cinco_secciones` | `src/telemetry/cache_attribution.rs` |
+
+Cada una serializa el objeto POBLADO y afirma el conjunto exacto de claves, con
+un mensaje que dice qué hacer según el cambio sea aditivo o ruptura. La de
+`codex_quota` construye por `from_headers` en vez de a mano, así que además
+guarda que el camino de producción siga rellenando las doce claves.
+
+Y `session` lleva una segunda guarda,
+`las_etiquetas_de_source_no_cambian_sin_querer`: el VALOR de `source`
+(`explicit`/`native`/`unattributed`) también es contrato, porque un consumidor
+ramifica sobre esas cadenas, y lo produce un `rename_all` que se podría cambiar
+sin tocar ningún nombre de campo.
+
+**Lo que cazan, comprobado**: aplicar un `#[serde(rename = "deferred")]` a
+`deferred_tools` hace fallar la guarda con el diff exacto de claves. Un renombrado
+de campo Rust rompe la compilación por otros sitios; el peligroso es este otro, el
+que cambia el cable sin tocar el código que lo lee.
 
 Y un cuarto, `version_no_anuncia_campos_que_requests_no_publique`, comprueba
 que **cada entrada de `fields` existe de verdad en el JSON** —incluidas las
