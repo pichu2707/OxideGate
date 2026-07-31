@@ -196,7 +196,8 @@ seguirla son lo mismo.
 | Esquemas MCP, `CLAUDE.md`, historial, `system`, último turno | ✅ Medido en bytes, por petición |
 | Tokens, coste, TTFT y latencia por proveedor y modelo | ✅ Medido, del `usage` real |
 | Cuota de suscripción (Codex/ChatGPT) | ✅ Medida, de las cabeceras `x-codex-*` |
-| Declarar una skill (el listado) | ✅ **138 B por skill**, en cada petición — ver [§3](docs/optimizer-skills.md) |
+| Declarar una skill (el listado) | ✅ **138 B por skill** con 11 skills; **242 B** con 66, donde el 86% son de plugin — ver [`docs/fixed-toll-claude-code.md`](docs/fixed-toll-claude-code.md) §3 |
+| **El peaje fijo de una sesión** | ✅ **69.613 B** antes de escribir nada: `CLAUDE.md` 48% + hooks 29% + listado de skills 23% — ver [`docs/fixed-toll-claude-code.md`](docs/fixed-toll-claude-code.md) |
 | Invocar una skill (el cuerpo) | ✅ **`SKILL.md` − frontmatter + ~300 B**, y el historial lo reenvía cada turno — ver [§7](docs/optimizer-skills.md) |
 | `AGENTS.md` | ✅ Medido: **Claude Code no lo manda**, 0 B — ver [§4](docs/optimizer-skills.md) |
 | Skills de plugin | ✅ **182 B**, igual que una propia — el origen no exime. Ver [§6](docs/optimizer-skills.md) |

@@ -206,6 +206,35 @@ suerte no es reproducible.
 
 ---
 
+### El peaje fijo se midió con un delta y estaba mal atribuido
+
+Primera lectura: "los hooks cuestan +28.529 B", sacado de restar una captura
+con `settings.json` menos otra sin él. **Falso**: a la segunda captura le
+faltaban además los plugins y el MCP, así que el delta incluía cosas que no
+eran hooks. Leyendo `messages[1]` directamente: **19.918 B**.
+
+Y una segunda dentro de la misma medición: `## CONFLICT SURFACING` medido en
+17.002 B cortando "hasta el siguiente `#`". No había siguiente `#`, así que el
+corte se comió el listado de skills entero. **Real: 1.025 B.**
+
+Las dos son la misma lección de siempre, con otra cara: **un delta prueba que
+algo cambió, no que lo cambiara tu variable**. Y un bloque delimitado solo por
+su apertura no está delimitado.
+
+### "Las skills subieron a 686 B" — comparaba dos harnesses distintos
+
+Se comparó la medición de julio de Claude Code (138 B/skill, lista plana)
+contra el coste actual medido en `telemetry.jsonl` (686 B/skill, XML). Pero las
+355 filas con bloque `skills` de ese fichero son **100% de opencode**, que usa
+otro formato de inyección. Dos harnesses, dos formatos: no comparables.
+
+Al medirlo bien, Claude Code sí había subido —de 138 B a 242 B por skill, y de
+11 a 66 skills— pero por otra razón: los skills de plugin, que la sonda de
+julio no cargaba y que su propia nota ya avisaba como limitación.
+
+Es el mismo error que "no agregues modelos para estimar tasas de tokens",
+aplicado a harnesses en vez de a modelos.
+
 ## H. Lecciones de método
 
 La parte que sobrevive al proyecto, aunque el proyecto cambie.
