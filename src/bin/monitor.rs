@@ -416,6 +416,15 @@ struct RequestRow {
     context_measured_bytes: Option<usize>,
     context_messages_count: Option<usize>,
     context_tax_ratio: Option<f64>,
+    /// Qué cubo cayó dentro del prefijo cacheado, ESTIMADO por el proxy
+    /// (espejo de `RecentRequest::cache_by_section`).
+    ///
+    /// `None` cubre dos casos que el monitor NO puede distinguir y por eso no
+    /// intenta: un proxy anterior a este campo, y un proxy actual que no pudo
+    /// atribuir. Los dos se pintan igual —con el guion de dato ausente— porque
+    /// inventar una diferencia que no se puede observar sería peor que no
+    /// mostrarla.
+    cache_by_section: Option<CacheBySectionRow>,
     /// Microsegundos que el proxy pasó dentro de `Provider::prepare`.
     ///
     /// En `RecentRequest` (lado servidor) este campo NO es `Option`: el proxy
@@ -577,6 +586,32 @@ fn session_lines(rows: &[SessionRow], saturated: bool) -> Vec<String> {
         out.push(format!("… y {} sesiones más", rows.len() - 6));
     }
     out
+}
+
+/// Bytes de cada sección que cayeron dentro del prefijo cacheado: espejo de
+/// `telemetry::cache_attribution::CacheBySection`.
+///
+/// **Es una ESTIMACIÓN del proxy, no una medición**, y el monitor la trata
+/// como tal: vive en su propia vista y nunca se mezcla con las columnas de
+/// `Context`, que son bytes medidos. Ver `docs/telemetry-per-request.md` §4.11.
+///
+/// `method` se deserializa para poder MOSTRARLO, no para ramificar: si el
+/// proxy cambia de algoritmo, quien mira la tabla tiene que poder verlo sin
+/// que el monitor decida nada por su cuenta.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct CacheBySectionRow {
+    /// Algoritmo con el que el proxy estimó el reparto (`prefix_walk_v1`).
+    method: String,
+    tools_cached_bytes: usize,
+    system_cached_bytes: usize,
+    history_cached_bytes: usize,
+    /// Bytes del ÚLTIMO TURNO atribuidos a caché. Debería ser 0 casi siempre
+    /// —el turno nuevo es contenido nuevo—, así que un valor alto y sostenido
+    /// es la señal de que el método dejó de describir el tráfico. Se pinta
+    /// como columna propia justamente para que se pueda vigilar.
+    last_turn_cached_bytes: usize,
+    #[allow(dead_code)]
+    other_cached_bytes: usize,
 }
 
 /// Fila del desglose de `tools` por servidor: espejo local y liviano de
@@ -1532,15 +1567,32 @@ enum RequestsView {
     /// contexto que el proxy induce por su propia presencia, no una anomalía
     /// sin explicación.
     Context,
+    /// Columnas de la ATRIBUCIÓN DE CACHÉ por sección (`cache_by_section`):
+    /// qué cubo cayó dentro del prefijo cacheado, y qué fracción de cada uno.
+    ///
+    /// **Vive aparte de `Context` a propósito, no por falta de sitio.** Las
+    /// columnas de `Context` son bytes MEDIDOS; estas son una ESTIMACIÓN del
+    /// proxy (§4.11). Ponerlas en la misma tabla invitaría a leerlas con la
+    /// misma confianza, que es exactamente el error que el campo anidado del
+    /// lado del proxy existe para evitar. La separación de vistas es la misma
+    /// decisión, llevada a la UI.
+    ///
+    /// Incluye `lt$` (`last_turn_cached_bytes`) aunque casi siempre valga
+    /// cero: es el FALSADOR del método. Un valor alto y sostenido ahí
+    /// significa que el paseo por el prefijo dejó de describir el tráfico, y
+    /// una columna que solo se mira cuando algo va mal no sirve si no está
+    /// siempre visible.
+    Cache,
 }
 
 impl RequestsView {
-    /// Cicla a la siguiente vista. Función PURA y TOTAL (cubre ambas
-    /// variantes sin rama de error): Latency → Context → Latency.
+    /// Cicla a la siguiente vista. Función PURA y TOTAL (cubre las tres
+    /// variantes sin rama de error): Latency → Context → Cache → Latency.
     fn next(self) -> Self {
         match self {
             RequestsView::Latency => RequestsView::Context,
-            RequestsView::Context => RequestsView::Latency,
+            RequestsView::Context => RequestsView::Cache,
+            RequestsView::Cache => RequestsView::Latency,
         }
     }
 
@@ -1550,6 +1602,7 @@ impl RequestsView {
         match self {
             RequestsView::Latency => "latency",
             RequestsView::Context => "context",
+            RequestsView::Cache => "cache",
         }
     }
 }
@@ -2318,6 +2371,11 @@ fn requests_table_header<'a>(view: RequestsView) -> Row<'a> {
                 "cliente", "tsearch", "flat", "outlier",
             ]
         }
+        RequestsView::Cache => {
+            vec![
+                "hora", "modelo", "total", "cch_B", "cch%", "tools%", "system%", "hist%", "lt$", "metodo", "outlier",
+            ]
+        }
     };
     Row::new(labels).style(Style::default().add_modifier(Modifier::BOLD))
 }
@@ -2364,11 +2422,81 @@ fn requests_table_widths(view: RequestsView) -> Vec<Constraint> {
             Constraint::Length(5),
             Constraint::Length(14),
         ],
+        RequestsView::Cache => vec![
+            Constraint::Length(9),
+            Constraint::Length(16),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(8),
+            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(15),
+            Constraint::Length(14),
+        ],
     }
 }
 
+/// Fracción de una sección que el proxy estimó dentro del prefijo cacheado.
+///
+/// Devuelve el guion de dato ausente cuando la sección MIDE cero bytes: no
+/// hay fracción que calcular sobre una sección vacía, y un `0%` ahí se leería
+/// como "no se cacheó nada" en vez de "no había nada que cachear". Es la misma
+/// distinción hueco-vs-cero que el resto del monitor respeta.
+fn cached_pct_cell(cached: Option<usize>, total: Option<usize>) -> String {
+    match (cached, total) {
+        (Some(_), Some(0)) | (None, _) | (_, None) => "-".to_string(),
+        (Some(c), Some(t)) => format!("{:.0}%", 100.0 * c as f64 / t as f64),
+    }
+}
+
+/// Celdas de la vista de atribución de caché.
+///
+/// Se calcula aparte de [`requests_row_cells`] solo por longitud; la vista
+/// sigue siendo una rama más de ese `match`.
+fn cache_row_cells(r: &RequestRow) -> Vec<String> {
+    let Some(c) = r.cache_by_section.as_ref() else {
+        // Sin atribución no se rellena con ceros: se marca ausente en cada
+        // columna. Un proxy viejo y un proxy que no pudo atribuir se ven
+        // igual porque el monitor no puede distinguirlos (ver el doc del
+        // campo en `RequestRow`).
+        return vec![
+            format_time(&r.timestamp),
+            truncate_model(r.model.as_deref()),
+            opt_bytes(r.context_measured_bytes),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+            "-".to_string(),
+        ];
+    };
+    let cacheado = c.tools_cached_bytes
+        + c.system_cached_bytes
+        + c.history_cached_bytes
+        + c.last_turn_cached_bytes
+        + c.other_cached_bytes;
+    vec![
+        format_time(&r.timestamp),
+        truncate_model(r.model.as_deref()),
+        opt_bytes(r.context_measured_bytes),
+        opt_bytes(Some(cacheado)),
+        cached_pct_cell(Some(cacheado), r.context_measured_bytes),
+        cached_pct_cell(Some(c.tools_cached_bytes), r.context_tools_bytes),
+        cached_pct_cell(Some(c.system_cached_bytes), r.context_system_bytes),
+        cached_pct_cell(Some(c.history_cached_bytes), r.context_history_bytes),
+        // El FALSADOR, en bytes absolutos y no en porcentaje: lo que importa
+        // vigilar es si deja de ser cero, no sobre qué base.
+        opt_bytes(Some(c.last_turn_cached_bytes)),
+        c.method.clone(),
+    ]
+}
+
 /// Celdas de datos de una fila (SIN el marcador de outlier, que el llamador
-/// agrega al final: es común a ambas vistas y se calcula una sola vez por
+/// agrega al final: es común a las tres vistas y se calcula una sola vez por
 /// fila en [`draw_requests_panel`] / [`print_requests_table`] /
 /// [`print_context_table`]), según la vista activa.
 fn requests_row_cells(view: RequestsView, r: &RequestRow) -> Vec<String> {
@@ -2407,6 +2535,7 @@ fn requests_row_cells(view: RequestsView, r: &RequestRow) -> Vec<String> {
             tsearch_cell(r),
             flattened_cell(r),
         ],
+        RequestsView::Cache => cache_row_cells(r),
     }
 }
 
@@ -3080,6 +3209,7 @@ mod tests {
             context_measured_bytes: Some(163_527),
             context_messages_count: Some(12),
             context_tax_ratio: Some(0.9994),
+            cache_by_section: None,
             prepare_us: Some(850),
             tools_by_server: None,
             tools_overhead_bytes: None,
@@ -3743,10 +3873,59 @@ mod tests {
     // RequestsView — enum total, ciclado con `c`
     // -----------------------------------------------------------------
 
+    /// El ciclo cubre las TRES variantes y vuelve al inicio. Que cierre el
+    /// bucle es la parte que importa: una vista alcanzable pero de la que no
+    /// se pueda salir sin reiniciar sería peor que no tenerla.
     #[test]
-    fn requests_view_next_cicla_entre_las_dos_variantes() {
+    fn requests_view_next_cicla_entre_las_tres_variantes() {
         assert_eq!(RequestsView::Latency.next(), RequestsView::Context);
-        assert_eq!(RequestsView::Context.next(), RequestsView::Latency);
+        assert_eq!(RequestsView::Context.next(), RequestsView::Cache);
+        assert_eq!(RequestsView::Cache.next(), RequestsView::Latency);
+    }
+
+    /// Cabecera, anchos y celdas tienen que medir lo mismo EN CADA VISTA.
+    /// Sin esto, agregar una columna a una sola de las tres piezas desalinea
+    /// la tabla en silencio: `ratatui` no se queja, simplemente pinta mal.
+    #[test]
+    fn las_tres_vistas_tienen_cabecera_anchos_y_celdas_del_mismo_ancho() {
+        let r = req("anthropic", "claude-opus-4-8", 200, Some(500.0), 1200.0, Some(80), Some(1000));
+        for vista in [RequestsView::Latency, RequestsView::Context, RequestsView::Cache] {
+            let anchos = requests_table_widths(vista).len();
+            let celdas = requests_row_cells(vista, &r).len();
+            // Los anchos incluyen la columna `outlier`, que el llamador
+            // agrega aparte; por eso las celdas son una menos.
+            assert_eq!(
+                celdas + 1,
+                anchos,
+                "{vista:?}: {celdas} celdas (+outlier) contra {anchos} anchos"
+            );
+        }
+    }
+
+    /// Sin `cache_by_section` la vista no inventa ceros: marca ausente cada
+    /// columna derivada. Un `0%` ahí se leería como "no se cacheó nada", que
+    /// es una afirmación distinta de "no se sabe".
+    #[test]
+    fn la_vista_cache_marca_ausente_cuando_el_proxy_no_atribuyo() {
+        let mut r = req("anthropic", "claude-opus-4-8", 200, Some(500.0), 1200.0, Some(80), Some(1000));
+        r.cache_by_section = None;
+
+        let celdas = requests_row_cells(RequestsView::Cache, &r);
+
+        assert!(
+            celdas.iter().filter(|c| c.as_str() == "-").count() >= 7,
+            "deberia marcar ausente casi todo: {celdas:?}"
+        );
+    }
+
+    /// Una sección que mide cero bytes no tiene fracción cacheada: es hueco,
+    /// no cero. Dividir daria `NaN` y un `0%` mentiría.
+    #[test]
+    fn cached_pct_distingue_seccion_vacia_de_seccion_sin_cachear() {
+        assert_eq!(cached_pct_cell(Some(0), Some(0)), "-");
+        assert_eq!(cached_pct_cell(Some(0), Some(100)), "0%");
+        assert_eq!(cached_pct_cell(Some(50), Some(100)), "50%");
+        assert_eq!(cached_pct_cell(None, Some(100)), "-");
     }
 
     #[test]
@@ -3771,6 +3950,9 @@ mod tests {
 
         app.cycle_requests_view();
         assert_eq!(app.requests_view, RequestsView::Context);
+
+        app.cycle_requests_view();
+        assert_eq!(app.requests_view, RequestsView::Cache);
 
         app.cycle_requests_view();
         assert_eq!(app.requests_view, RequestsView::Latency);
