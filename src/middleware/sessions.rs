@@ -14,14 +14,27 @@ use crate::telemetry::SessionSnapshot;
 ///
 /// Responde qué costó cada SESIÓN, no cada modelo. Para quien corre varios
 /// agentes a la vez, el gasto por modelo no dice quién lo generó.
-pub async fn handle_sessions(State(state): State<Arc<AppState>>) -> Response {
+pub async fn handle_sessions(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(q): axum::extract::Query<crate::middleware::SinceQuery>,
+) -> Response {
+    // Mismo contrato de `?since=` que `/stats`: fecha o días, y 400 si no se
+    // entiende. Las dos rutas tienen que comportarse igual o el parámetro deja
+    // de ser aprendible.
+    let desde = match crate::middleware::parse_since(
+        q.since.as_deref(),
+        chrono::Utc::now().date_naive(),
+    ) {
+        Ok(d) => d,
+        Err(e) => return (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
+    };
     let registry = state.telemetry.sessions();
 
     // Read-lock BREVE, sin `.await` dentro: se toma, se construye el snapshot
     // (todo síncrono) y se suelta antes de responder.
     let snapshot: SessionSnapshot = match registry.read() {
-        Ok(guard) => guard.snapshot(),
-        Err(poisoned) => poisoned.into_inner().snapshot(),
+        Ok(guard) => guard.snapshot(desde),
+        Err(poisoned) => poisoned.into_inner().snapshot(desde),
     };
 
     Json(serde_json::json!({

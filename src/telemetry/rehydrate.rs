@@ -246,7 +246,7 @@ mod tests {
         assert_eq!(r.skipped_old, 0);
         assert_eq!(r.skipped_bad, 0);
         assert_eq!(r.oldest.as_deref(), Some("2026-07-30T10:00:00Z"));
-        assert_eq!(s.snapshot().0.len(), 1, "un solo (upstream, model)");
+        assert_eq!(s.snapshot(None).0.len(), 1, "un solo (upstream, model)");
     }
 
     /// Lo que queda fuera de la ventana se cuenta como VIEJO, no como error:
@@ -347,7 +347,7 @@ mod tests {
         let r = rehydrate(f.path(), 0, ahora(), &mut s, &mut ses);
 
         assert_eq!(r, Rehydrated::default());
-        assert!(s.snapshot().0.is_empty());
+        assert!(s.snapshot(None).0.is_empty());
     }
 
     /// Un primer arranque no tiene fichero, y eso no es un error.

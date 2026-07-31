@@ -217,7 +217,7 @@ seguirla son lo mismo.
 | Agregación por sesión | ✅ `GET /sessions` — ver [`docs/telemetry-by-session.md`](docs/telemetry-by-session.md) |
 | Panel de sesión en el monitor TUI | ✅ Tecla `e` — ver [`docs/monitor-tui.md`](docs/monitor-tui.md) §12 |
 | **Persistencia del agregado entre reinicios** | ✅ **Al arrancar se relee `telemetry.jsonl`** y se reconstruyen `/stats` y `/sessions`. Ventana de 7 días por defecto, `OXIDEGATE_HISTORY_DAYS` la cambia y `0` la desactiva. `GET /history` dice desde cuándo mide — ver [`docs/history-rehydration.md`](docs/history-rehydration.md) |
-| **Consultar los agregados por rango** (`?since=`) | ❌ Sin hacer: hoy la ventana se fija al arrancar y vale para toda la ejecución — [#42](https://github.com/pichu2707/OxideGate/issues/42) |
+| **Consultar los agregados por rango** | ✅ `GET /stats?since=7d` y `?since=2026-07-24`, igual en `/sessions`. Un `since` ilegible da **400**, nunca todo el histórico — ver [`docs/history-rehydration.md`](docs/history-rehydration.md) §6 |
 
 ---
 
