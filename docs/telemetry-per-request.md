@@ -669,9 +669,43 @@ esquemas MCP —*parte de lo que se ve existe porque el medidor está en el
 camino*— solo que en la dirección contraria: aquí el medidor **quita** una
 optimización que sin él estaría, y la bajada se ve más grande de lo que sería.
 
-**No lo dividas por `prompt_bytes` sin decirlo en voz alta.** Un cociente
-subida/bajada mezcla wire de subida con contenido de bajada. Es una ratio útil
-si se declara qué son sus dos términos, y engañosa si no.
+#### La asimetría de las dos direcciones
+
+Las dos direcciones están medidas y publicadas —`prompt_bytes` desde #51,
+`response_bytes` desde #22— pero **no miden lo mismo**, y el parecido de los
+nombres invita a tratarlas como si sí:
+
+| | Qué mide de verdad |
+|---|---|
+| `prompt_bytes` | El body **lógico** que compuso el cliente. Excluye el framing HTTP. En `/v1/codex/responses` y `/v1beta/*` se mide **descomprimido**: si el cliente comprimió, por el cable subió menos (en `pi` con zstd, 3x menos). Y se toma **antes** de mutar, así que con `cache_control_forced` al proveedor sube más que este número |
+| `response_bytes` | Los bytes de cuerpo que **cruzaron** el proxy, **sin comprimir** porque el medidor quitó la compresión que sin él habría estado |
+
+Una es *«lo que el cliente compuso»*; la otra, *«lo que pasó por el cable con
+la compresión desactivada por nuestra culpa»*. **Ninguna de las dos es wire.**
+Y las dos se desvían del wire **en direcciones opuestas**: la subida real por
+el cable es MENOR que `prompt_bytes` cuando el cliente comprime, y la bajada
+real sería MENOR que `response_bytes` si no hubiéramos quitado la compresión.
+
+**Por eso el cociente subida/bajada no es una ratio de ancho de banda.** No lo
+publiques sin declarar sus dos términos. Cuando `prompt_bytes` solo existía en
+el JSONL esto era una recomendación; con los dos campos en la misma fila de la
+API pública, es una obligación.
+
+#### Y una razón más fuerte, medida: la caché los desacopla
+
+Aunque se declaren los términos, hay un cociente que deja de significar lo que
+aparenta en cuanto la caché entra en juego: **euros por byte de subida**.
+
+Medido sobre 904 peticiones reales, con caché activa los **bytes subidos y los
+tokens que se pagan están DESACOPLADOS**: el `input_tokens` no cacheado es
+esencialmente impredecible desde los bytes del body (APE ~100%). En el cohorte
+medido, el **54,0% de 89.743.537 tokens de entrada** llegó cacheado, a tarifa
+10%. Dos peticiones con los mismos `prompt_bytes` pueden costar diez veces
+distinto según qué parte del prefijo estuviera caliente.
+
+No es una advertencia sobre precisión: es que la magnitud del denominador deja
+de gobernar el numerador. Para atribuir coste, la pieza que manda es qué
+sección cayó dentro del prefijo cacheado —ver §4.11—, no cuántos bytes subieron.
 
 **`null` significa "no hubo respuesta que recorrer"**, nunca "el proveedor
 devolvió un cuerpo vacío". Un `0` fabricado ahí confundiría un fallo de
@@ -746,11 +780,11 @@ estaría falseando una de las dos.
 
 #### Y tampoco lo dividas por `response_bytes`
 
-§4.9 ya lo avisaba cuando el numerador solo existía en el JSONL. Ahora que
-los dos campos están en la misma fila, el aviso pasa de recomendación a
-obligación: un cociente subida/bajada mezcla **contenido lógico de subida**
-con **contenido sin comprimir de bajada**. Es útil si se declaran los dos
-términos, y engañoso si no.
+El contrato completo de esa asimetría vive en **§4.9**, que es donde están las
+dos columnas enfrentadas y la razón medida por la que la caché desacopla bytes
+de tokens. En corto: un cociente subida/bajada mezcla **contenido lógico de
+subida** con **contenido sin comprimir de bajada**, y las dos se desvían del
+wire en direcciones opuestas. Útil si se declaran los términos, engañoso si no.
 
 ### 4.11. `cache_by_section`: el único campo estimado, y por qué va aparte
 
