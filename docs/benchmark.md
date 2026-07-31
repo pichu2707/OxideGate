@@ -3,6 +3,16 @@
 > Herramienta: `examples/bench.rs`. Mide cómo escalan TTFT, latencia y coste con
 > el tamaño del INPUT, a igualdad de condiciones, comparando proveedores.
 
+> **Por qué el bench se compila con `cargo test`.** Vive en `examples/` para
+> que `cargo install` no pueda meterlo en el PATH de nadie, y Cargo compila los
+> examples durante `cargo test`. Eso significa que un error aquí rompe la suite
+> entera, y es **a propósito**: este repo no tiene CI que compile nada, así que
+> `cargo test` es lo único que impide que esta herramienta se pudra en
+> silencio. Excluirlo con `required-features` funciona técnicamente y cambia
+> una molestia ocasional por una garantía perdida. Decidido en
+> [#52](https://github.com/pichu2707/OxideGate/issues/52); el razonamiento
+> completo está en el comentario de `Cargo.toml`.
+
 ---
 
 ## 1. Qué es y por qué

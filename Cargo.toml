@@ -39,6 +39,29 @@ exclude = [
 # garantía —que bench no se instale— la sostiene la estructura del proyecto y
 # no la documentación. Antes dependía de que la fórmula de Homebrew filtrara a
 # mano, y `cargo install` no filtra nada: en 0.5.0 instalaba los tres.
+#
+# NO HAY BLOQUE `[[example]]` CON `required-features`, Y ES DELIBERADO (#52).
+#
+# Cargo compila los examples durante `cargo test`, así que un error en
+# `examples/bench.rs` rompe la suite entera aunque el PR no lo toque. La
+# tentación es excluirlo:
+#
+#     [features]
+#     bench = []
+#     [[example]]
+#     name = "bench"
+#     required-features = ["bench"]
+#
+# Funciona —está probado— y hace exactamente lo contrario de lo que hace falta:
+# este repo NO TIENE CI que compile nada (el único check de los PR es escaneo
+# de secretos). `cargo test` es lo ÚNICO que mantiene vivo el bench. Excluirlo
+# no le quitaría el ruido a alguien: garantizaría que se pudra sin que nadie
+# se entere, que es el fallo silencioso que este proyecto persigue en todas
+# partes.
+#
+# Si algún día el ruido molesta de verdad, la salida es añadir CI que compile
+# el bench en un job aparte —no quitarlo de la suite mientras no haya nada que
+# lo sustituya. Ver `docs/benchmark.md`.
 [[bin]]
 name = "oxidegate"
 path = "src/main.rs"
