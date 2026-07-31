@@ -36,7 +36,7 @@
 /// La variante importa además de los bytes: dice de qué herramienta viene el
 /// tráfico sin depender del `User-Agent`, que es contenido controlado por el
 /// cliente.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillsFormat {
     /// Lista plana `- nombre: descripción` tras la cabecera de Claude Code.
@@ -51,7 +51,7 @@ pub enum SkillsFormat {
 }
 
 /// Listado de skills encontrado en el body de una petición.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SkillsBlock {
     /// Cuántas entradas declara el listado.
     ///

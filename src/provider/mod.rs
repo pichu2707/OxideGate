@@ -13,7 +13,7 @@ pub mod openai;
 pub mod skills;
 
 use crate::config::AppConfig;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -420,7 +420,7 @@ const MAX_TOOL_NAME_LEN: usize = 128;
 /// Serializa en minúsculas (`"native"`, `"mcp"`, `"others"`) vía
 /// `#[serde(rename_all = "lowercase")]`: es la forma que consume
 /// `RequestMetric::tools_by_server` en el JSONL y cualquier UI que lo lea.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ToolServerKind {
     /// Herramienta nativa: nombre que no sigue el patrón `mcp__<server>__<tool>`.
@@ -434,7 +434,7 @@ pub enum ToolServerKind {
 
 /// Bytes de las herramientas del body agrupadas por servidor MCP que las
 /// declara. Ver [`Provider::tools_by_server`] y [`group_tools_by_server`].
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolServerBytes {
     /// Servidor propietario. `mcp__claude_ai_Gmail` -> `claude_ai_Gmail`.
     /// Las herramientas nativas (sin prefijo `mcp__`) caen en `NATIVE_TOOLS_LABEL`.
@@ -460,6 +460,7 @@ pub struct ToolServerBytes {
     /// Acotada a [`MAX_TOOL_NAMES`] entradas de [`MAX_TOOL_NAME_LEN`] bytes.
     /// Si `tool_names.len() < tools`, la lista está truncada y el conteo
     /// `tools` es el bueno.
+    #[serde(default)]
     pub tool_names: Vec<String>,
     /// Cuántas de las `tools` de ESTE servidor traían `defer_loading: true`
     /// en su propia definición dentro del body ENTRANTE. OBSERVACIÓN PURA,
@@ -485,6 +486,7 @@ pub struct ToolServerBytes {
     /// "estos bytes no viajaron" comete el mismo error que este proyecto ya
     /// midió y corrigió una vez (`docs/optimizer-tool-search.md` §3.2): no
     /// mezclar la marca con el ahorro de cable.
+    #[serde(default)]
     pub deferred_tools: usize,
 }
 
@@ -513,7 +515,7 @@ pub struct ToolServerBytes {
 /// dialecto Responses/Codex medido, sin `tool_search_*` este turno: EAGER
 /// confirmado (no ausencia de dato). `Some { used: true }` = LAZY: el cliente
 /// usó la búsqueda diferida en ESTA petición.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolSearchSignal {
     /// `true` si el body traía al menos un item `tool_search_call` o
     /// `tool_search_output` en `input[]`: el mecanismo de carga diferida se

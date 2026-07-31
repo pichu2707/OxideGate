@@ -211,12 +211,13 @@ seguirla son lo mismo.
 | **`activate_skill` en el modo interactivo de Gemini** | ❌ Sin medir: aquí se probó `gemini -p` |
 | Bytes de bajada | ✅ Campo `response_bytes` — **sin comprimir**, ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.9 |
 | Bytes de subida, en `GET /requests` | ✅ Campo `prompt_bytes` — **no es wire**: en Codex y Gemini se mide descomprimido, y con la Palanca A el body reenviado es mayor. Ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.10 |
-| **Gasto por sección** (euros por cubo, no bytes) | ❌ Sin hacer: el proveedor reporta `input_tokens` TOTAL, sin desglose, y repartir por bytes está sesgado contra `tools` — [#50](https://github.com/pichu2707/OxideGate/issues/50) |
+| **Gasto por sección** (euros por cubo, no bytes) | 🟡 A medias: `cache_by_section` ya dice qué cubo se cacheó, y el sesgo contra `tools` que este issue daba por conocido **no existe** (medido dos veces). Falta publicar el reparto como campo — [#50](https://github.com/pichu2707/OxideGate/issues/50) |
 | El **peaje fijo** de cada herramienta (misma tarea trivial) | ✅ Medido en las cuatro — ver [`docs/floor-across-tools.md`](docs/floor-across-tools.md) |
 | **Comparar herramientas sobre una tarea REAL** (con n>1 y tarea verificable) | ❌ Sin medir: gasta cuota y no es determinista — [#29](https://github.com/pichu2707/OxideGate/issues/29) |
 | Agregación por sesión | ✅ `GET /sessions` — ver [`docs/telemetry-by-session.md`](docs/telemetry-by-session.md) |
 | Panel de sesión en el monitor TUI | ✅ Tecla `e` — ver [`docs/monitor-tui.md`](docs/monitor-tui.md) §12 |
-| **Ventana temporal y persistencia del agregado por sesión** | ❌ Sin hacer: es desde que arrancó el proceso, igual que `/stats`, y la respuesta no declara desde cuándo mide. El histórico ya está en disco (`telemetry.jsonl`) y nadie lo lee — [#42](https://github.com/pichu2707/OxideGate/issues/42) |
+| **Persistencia del agregado entre reinicios** | ✅ **Al arrancar se relee `telemetry.jsonl`** y se reconstruyen `/stats` y `/sessions`. Ventana de 7 días por defecto, `OXIDEGATE_HISTORY_DAYS` la cambia y `0` la desactiva. `GET /history` dice desde cuándo mide — ver [`docs/history-rehydration.md`](docs/history-rehydration.md) |
+| **Consultar los agregados por rango** (`?since=`) | ❌ Sin hacer: hoy la ventana se fija al arrancar y vale para toda la ejecución — [#42](https://github.com/pichu2707/OxideGate/issues/42) |
 
 ---
 

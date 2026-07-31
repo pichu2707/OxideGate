@@ -4,6 +4,11 @@
 > en memoria lo que el Nivel 1 (`docs/telemetry-level-1.md`) ya mide por fila;
 > no cambia la captura ni agrega ningún campo nuevo a `RequestMetric`.
 
+> **Desde la rehidratación del histórico, este agregado NO empieza vacío**: al
+> arrancar se relee `telemetry.jsonl` dentro de una ventana (7 días por
+> defecto). `GET /history` dice desde cuándo mide — ver
+> [`history-rehydration.md`](history-rehydration.md).
+
 ---
 
 ## 1. Qué es y para qué sirve
