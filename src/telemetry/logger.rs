@@ -9,7 +9,7 @@
 //! log NUNCA se suma a la latencia que le devolvemos a gentle-ai.
 use crate::provider::{ContextBreakdown, SkillsBlock, ToolSearchSignal, ToolServerBytes};
 use crate::telemetry::{
-    CacheBySection, CodexQuota, RecentRequests, SessionAttribution, SessionRegistry, StatsRegistry,
+    CacheBySection, SectionShare, CodexQuota, RecentRequests, SessionAttribution, SessionRegistry, StatsRegistry,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -223,6 +223,21 @@ pub struct RequestMetric {
     /// evita tener que hacer deserializable un `&'static str`, que no lo es.
     #[serde(skip_deserializing)]
     pub cache_by_section: Option<CacheBySection>,
+    /// Fracción del input PAGADO que corresponde a cada sección, ESTIMADA.
+    ///
+    /// Se apoya en `cache_by_section`, así que es **una estimación sobre otra**
+    /// y hereda su misma disciplina: objeto anidado, `method` versionado
+    /// dentro, `None` honesto en cuanto falta una pieza.
+    ///
+    /// **Son fracciones de 0 a 1, nunca dinero**, y ninguna clave lleva la
+    /// palabra `cost` — hay test que lo guarda. Convertirlas en euros exige
+    /// multiplicar por `cost_estimate_usd`, y quien lo haga pasa por leer qué
+    /// es ese campo. Ver `telemetry::section_share` y §4.12.
+    ///
+    /// Mismo motivo que `cache_by_section` para no deserializarse: es un campo
+    /// de `/requests`, y la rehidratación alimenta `/stats` y `/sessions`.
+    #[serde(skip_deserializing)]
+    pub input_share_by_section: Option<SectionShare>,
 
     // --- Desglose de herramientas por servidor MCP (ver `provider::ToolServerBytes`) ---
     /// Desglose de `tools` por servidor MCP: cuántas herramientas y cuántos
@@ -672,6 +687,7 @@ mod tests {
             context_messages_count: None,
             context_tax_ratio: None,
             cache_by_section: None,
+            input_share_by_section: None,
             tools_by_server: None,
             tools_overhead_bytes: None,
             prepare_us: 0,

@@ -20,6 +20,7 @@
 //! en `self.scanner.usage.speed`, no en `MetricBase`.
 use crate::provider::{SkillsBlock, ContextBreakdown, Provider, ToolSearchSignal, ToolServerBytes, Usage};
 use crate::telemetry::cache_attribution;
+use crate::telemetry::section_share;
 use crate::telemetry::logger::{flatten_context_breakdown, tools_fields};
 use crate::telemetry::pricing;
 use crate::telemetry::{CodexQuota, RequestMetric, SessionAttribution, TelemetrySink};
@@ -294,6 +295,15 @@ impl MeteredBody {
             self.scanner.usage.cache_write_tokens,
         );
 
+        // El reparto se apoya en la atribución de caché recién calculada: sin
+        // ella daría el reparto por bytes, que es justo el que la medición
+        // desmiente. Por eso va después y toma su resultado, no el body.
+        let input_share_by_section = section_share::attribute_share(
+            self.base.model.as_deref(),
+            self.base.context.as_ref(),
+            cache_by_section.as_ref(),
+        );
+
         let (tools_by_server, tools_overhead_bytes) = tools_fields(
             self.base.context.as_ref(),
             self.base.tools_by_server.clone(),
@@ -329,6 +339,7 @@ impl MeteredBody {
             context_messages_count,
             context_tax_ratio,
             cache_by_section,
+            input_share_by_section,
             tools_by_server,
             tools_overhead_bytes,
             prepare_us: self.base.prepare_us,
