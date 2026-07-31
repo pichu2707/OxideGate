@@ -96,17 +96,35 @@ pub fn model_pricing(model: &str) -> Option<ModelPricing> {
     }
 
     // OpenAI (GPT / o-series): `cache_read` es subconjunto del input.
-    let openai_cache = CacheAccounting::Subset {
-        read_multiplier: OPENAI_CACHE_READ_MULTIPLIER,
+    //
+    // OJO: el descuento de caché NO es uniforme dentro de OpenAI. La familia 4o
+    // cobra la lectura al 50% del input y la familia 5 al 10%. Por eso hay dos
+    // multiplicadores y no uno — ver las constantes para la verificación.
+    let openai_4o_cache = CacheAccounting::Subset {
+        read_multiplier: OPENAI_4O_CACHE_READ_MULTIPLIER,
     };
+    let openai_5_cache = CacheAccounting::Subset {
+        read_multiplier: OPENAI_5_CACHE_READ_MULTIPLIER,
+    };
+
+    // Familia 5. El orden importa: `gpt-5.6-sol` y `gpt-5.5` antes que `gpt-5`,
+    // porque el emparejamiento es por subcadena y `gpt-5` los tragaría a los dos
+    // con un precio cuatro veces menor.
+    if m.contains("gpt-5.6-sol") || m.contains("gpt-5.5") {
+        return Some(ModelPricing { price_in: 5.0, price_out: 30.0, cache: openai_5_cache });
+    }
+    if m.contains("gpt-5") {
+        return Some(ModelPricing { price_in: 1.25, price_out: 10.0, cache: openai_5_cache });
+    }
+
     if m.contains("gpt-4o-mini") {
-        return Some(ModelPricing { price_in: 0.15, price_out: 0.60, cache: openai_cache });
+        return Some(ModelPricing { price_in: 0.15, price_out: 0.60, cache: openai_4o_cache });
     }
     if m.contains("gpt-4o") {
-        return Some(ModelPricing { price_in: 2.50, price_out: 10.0, cache: openai_cache });
+        return Some(ModelPricing { price_in: 2.50, price_out: 10.0, cache: openai_4o_cache });
     }
     if m.contains("gpt-4-turbo") {
-        return Some(ModelPricing { price_in: 10.0, price_out: 30.0, cache: openai_cache });
+        return Some(ModelPricing { price_in: 10.0, price_out: 30.0, cache: openai_4o_cache });
     }
 
     // Google (Gemini): `cachedContentTokenCount` es subconjunto del input. El
@@ -147,9 +165,25 @@ const ANTHROPIC_CACHE_WRITE_MULTIPLIER: f64 = 1.25;
 /// relativo al precio de input. DEFAULT editable.
 const GEMINI_CACHE_READ_MULTIPLIER: f64 = 0.25;
 
-/// Multiplicador de OpenAI para la porción de input servida desde caché,
-/// relativo al precio de input. DEFAULT editable.
-const OPENAI_CACHE_READ_MULTIPLIER: f64 = 0.5;
+/// Multiplicador de la familia **4o** de OpenAI para la porción de input
+/// servida desde caché, relativo al precio de input. DEFAULT editable.
+///
+/// Verificado contra la tarifa pública (2026-07-31): `gpt-4o` cobra $2,50 el
+/// input y $1,25 la lectura de caché; `gpt-4o-mini`, $0,15 y $0,075. Las dos
+/// dan exactamente 0,5.
+const OPENAI_4O_CACHE_READ_MULTIPLIER: f64 = 0.5;
+
+/// Multiplicador de la familia **5** de OpenAI. DEFAULT editable.
+///
+/// **No es el mismo que el de la familia 4o, y esa es la razón de que existan
+/// dos constantes.** Verificado contra la tarifa pública (2026-07-31):
+/// `gpt-5.5` y `gpt-5.6-sol` cobran $5,00 el input y $0,50 la lectura de caché;
+/// `gpt-5`, $1,25 y $0,125. Las tres dan 0,1 — no 0,5.
+///
+/// Usar aquí el multiplicador de 4o inflaría el coste de la porción cacheada
+/// por cinco, y en el tráfico medido de este proyecto más de la mitad del
+/// volumen llega cacheado: el error no sería marginal.
+const OPENAI_5_CACHE_READ_MULTIPLIER: f64 = 0.1;
 
 /// Estima el coste en USD de un request a partir de los tokens medidos.
 ///
@@ -295,5 +329,34 @@ mod tests {
         let expected = 2000.0 * 0.5 * 2.50 / 1_000_000.0;
         assert!((cost - expected).abs() < EPS, "cost={cost} expected={expected}");
         assert!(cost >= 0.0);
+    }
+
+    /// LA FAMILIA 5 NO COBRA LA CACHE COMO LA 4o.
+    ///
+    /// Verificado contra la tarifa publica (2026-07-31). Este test existe para
+    /// que nadie "simplifique" las dos constantes en una: hacerlo inflaria por
+    /// cinco el coste de la porcion cacheada de gpt-5.5/gpt-5.6-sol, que son el
+    /// 86% del trafico medido y donde mas de la mitad del volumen va cacheado.
+    #[test]
+    fn la_familia_5_y_la_4o_tienen_multiplicadores_de_cache_distintos() {
+        let mult = |modelo: &str| match model_pricing(modelo).unwrap().cache {
+            CacheAccounting::Subset { read_multiplier } => read_multiplier,
+            CacheAccounting::Separate { .. } => panic!("{modelo} deberia ser Subset"),
+        };
+        for m in ["gpt-5.5", "gpt-5.6-sol", "gpt-5"] {
+            assert!((mult(m) - 0.1).abs() < EPS, "{m}: la familia 5 lee cache al 0,1");
+        }
+        for m in ["gpt-4o", "gpt-4o-mini"] {
+            assert!((mult(m) - 0.5).abs() < EPS, "{m}: la familia 4o lee cache al 0,5");
+        }
+    }
+
+    /// `gpt-5` NO puede tragarse a `gpt-5.5` ni a `gpt-5.6-sol` por subcadena:
+    /// su input cuesta cuatro veces menos y el emparejamiento es por `contains`.
+    #[test]
+    fn los_modelos_de_la_familia_5_no_se_solapan_por_subcadena() {
+        assert_eq!(model_pricing("gpt-5.5").unwrap().price_in, 5.0);
+        assert_eq!(model_pricing("gpt-5.6-sol").unwrap().price_in, 5.0);
+        assert_eq!(model_pricing("gpt-5").unwrap().price_in, 1.25);
     }
 }
