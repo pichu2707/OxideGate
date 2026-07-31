@@ -203,6 +203,52 @@ fn parse_bool(headers: &HeaderMap, name: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// GUARDA DE FORMA de `CodexQuota` (`codex_quota` en `GET /requests`).
+    ///
+    /// Doce claves, ninguna cubierta hasta ahora: `FIELDS` declara el nombre del
+    /// objeto y el snapshot de contrato solo congela el primer nivel de la fila.
+    /// Es el objeto anidado más grande del contrato y el que más superficie
+    /// tiene para que un renombrado pase inadvertido.
+    #[test]
+    fn la_forma_de_codex_quota_no_cambia_sin_querer() {
+        // Se construye por el camino REAL (`from_headers`) y no a mano: así la
+        // guarda cubre además que el constructor de producción siga rellenando
+        // las doce claves. Una cabecera basta — el resto quedan en `None` y
+        // serializan igual, porque no hay `skip_serializing_if` en el tipo.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-codex-plan-type", HeaderValue::from_static("pro"));
+        let q = CodexQuota::from_headers(&headers).expect("una cabecera basta");
+
+        let v = serde_json::to_value(q).expect("serializa");
+
+        let claves: std::collections::BTreeSet<&str> =
+            v.as_object().expect("objeto").keys().map(String::as_str).collect();
+
+        assert_eq!(
+            claves,
+            [
+                "active_limit",
+                "credits_balance",
+                "credits_has_credits",
+                "credits_unlimited",
+                "plan_type",
+                "primary_reset_after_seconds",
+                "primary_reset_at",
+                "primary_used_percent",
+                "primary_window_minutes",
+                "secondary_reset_at",
+                "secondary_used_percent",
+                "secondary_window_minutes",
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+            "cambió la forma de codex_quota. Si es ADITIVO, actualiza esta lista. \
+             Si RENOMBRA, QUITA o cambia el tipo de una clave, sube además \
+             CONTRACT_VERSION en middleware::version y anótalo en \
+             docs/telemetry-per-request.md §8"
+        );
+    }
     use reqwest::header::{HeaderName, HeaderValue};
 
     /// Inserta una cabecera cruda en un `HeaderMap` de prueba.
