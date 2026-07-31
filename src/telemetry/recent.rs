@@ -45,7 +45,7 @@
 //! localhost.
 use crate::provider::{SkillsBlock, ToolSearchSignal, ToolServerBytes};
 use crate::telemetry::logger::RequestMetric;
-use crate::telemetry::{CodexQuota, SessionAttribution};
+use crate::telemetry::{CacheBySection, CodexQuota, SessionAttribution};
 use serde::Serialize;
 use std::collections::VecDeque;
 
@@ -146,6 +146,14 @@ pub struct RecentRequest {
     /// o si no se pudo calcular el desglose (asimetría documentada en
     /// `ContextBreakdown::context_tax_ratio`).
     pub context_tax_ratio: Option<f64>,
+    /// Qué cubo del contexto cayó dentro del prefijo cacheado, ESTIMADO.
+    ///
+    /// Objeto ANIDADO a propósito: los `context_*_bytes` de arriba son medición
+    /// directa, esto es una estimación derivada de convertir tokens a bytes.
+    /// La estructura mantiene visible esa frontera para que una lente no pueda
+    /// pintarlas en la misma columna sin darse cuenta. Lleva dentro su propio
+    /// `method` versionado. Ver `telemetry::cache_attribution`.
+    pub cache_by_section: Option<CacheBySection>,
     /// Desglose de `tools` por servidor MCP (ver
     /// `telemetry::logger::RequestMetric::tools_by_server` para el contrato
     /// completo `None`/`Some(vec![])`). Expone SOLO etiqueta de servidor +
@@ -261,6 +269,7 @@ impl From<&RequestMetric> for RecentRequest {
             context_measured_bytes: m.context_measured_bytes,
             context_messages_count: m.context_messages_count,
             context_tax_ratio: m.context_tax_ratio,
+            cache_by_section: m.cache_by_section,
             tools_by_server: m.tools_by_server.clone(),
             tools_overhead_bytes: m.tools_overhead_bytes,
             tool_search: m.tool_search.clone(),
@@ -350,6 +359,7 @@ mod tests {
             context_measured_bytes: Some(52),
             context_messages_count: Some(3),
             context_tax_ratio: Some(30.0 / 52.0),
+            cache_by_section: None,
             tools_by_server: Some(vec![ToolServerBytes {
                 server: "claude_ai_Gmail".to_string(),
                 kind: crate::provider::ToolServerKind::Mcp,
@@ -924,6 +934,7 @@ mod tests {
             .collect();
 
         let esperadas = [
+            "cache_by_section",
             "cache_control_forced",
             "cache_read_tokens",
             "cache_write_tokens",

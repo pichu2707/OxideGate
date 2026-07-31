@@ -297,6 +297,11 @@ async fn send_and_meter(
                 context_measured_bytes,
                 context_messages_count,
                 context_tax_ratio,
+                // Sin respuesta del upstream no hay `cache_read_tokens` que
+                // colocar en el prefijo. `None` = "no atribuible", que es
+                // exactamente el caso; un objeto con ceros diría "medido y
+                // nada cacheado", y aquí no se midió nada.
+                cache_by_section: None,
                 tools_by_server,
                 tools_overhead_bytes,
                 prepare_us,

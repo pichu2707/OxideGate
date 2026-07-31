@@ -113,7 +113,7 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
 | `r` | Resetear baseline |
 | `↑` / `↓` | Elegir el modelo (fila resaltada, afecta el panel ANTES/DESPUÉS y los sparklines) |
 | `p` | Mostrar/ocultar el panel de requests recientes (ver §7) |
-| `c` | Ciclar la vista de columnas del panel de requests recientes — `Latency` ⇄ `Context` (ver §7.1). **No-op si el panel está oculto**: no cambia nada mientras `p` lo tenga escondido |
+| `c` | Ciclar la vista de columnas del panel de requests recientes — `Latency` → `Context` → `Cache` → `Latency` (ver §7.1). **No-op si el panel está oculto**: no cambia nada mientras `p` lo tenga escondido |
 | `s` | Mostrar/ocultar el panel de tools por servidor (ver §8). **INDEPENDIENTE** de `p`/`c`: ninguna de las tres teclas afecta el estado de las otras |
 | `e` | Mostrar/ocultar el panel de **gasto por sesión** — `e` de s**e**sión, porque `s` ya es tools (ver §8). **INDEPENDIENTE** de `p`/`c`/`s`/`u` |
 | `u` | Mostrar/ocultar el panel de cuota de suscripción Codex — "uso de cuota" (ver §9). **INDEPENDIENTE** de `p`/`c`/`s` |
@@ -168,18 +168,27 @@ peticiones individuales atendidas por el proxy, no un agregado. Sirve para
 ver la fila puntual que un promedio esconde — el cache-miss aislado, el TTFT
 que se disparó una sola vez. Se alterna con la tecla `p`; arranca visible.
 
-### 7.1. Dos vistas, una tecla (`c`)
+### 7.1. Tres vistas, una tecla (`c`)
 
 El panel ya tiene ~12 columnas — cramear más ahí lo haría ilegible. En vez de
-eso, el panel tiene **dos vistas mutuamente excluyentes**, cicladas con `c`:
+eso, el panel tiene **tres vistas mutuamente excluyentes**, cicladas con `c`:
 
 | Vista | Para qué sirve | Se muestra con... |
 |---|---|---|
 | `Latency` (default) | Latencia, tokens y coste por request — la que ya existía | `q`/`b`/`r` recién arrancado el monitor |
 | `Context` | Desglose de bytes de contexto por request: cuánto pesa cada bucket del body (`tools`, `history`, `system`, `last_turn`, `other`) | apretando `c` una vez |
+| `Cache` | Atribución de caché por sección: qué cubo cayó dentro del prefijo cacheado (ver §7.3.2) | apretando `c` dos veces |
 
-El título del panel muestra la vista activa (`vista:latency` /
-`vista:context`) y el estado del último poll a `/requests`.
+**`Cache` es una vista aparte y no columnas añadidas a `Context`, y la razón no
+es la falta de sitio.** Las columnas de `Context` son bytes MEDIDOS; las de
+`Cache` son una ESTIMACIÓN que hace el proxy
+([`telemetry-per-request.md`](telemetry-per-request.md) §4.11). Mezclarlas en
+una tabla invitaría a leerlas con la misma confianza — exactamente el error que
+el campo anidado del lado del proxy existe para evitar. La separación de vistas
+es esa misma decisión llevada a la UI.
+
+El título del panel muestra la vista activa (`vista:latency` / `vista:context`
+/ `vista:cache`) y el estado del último poll a `/requests`.
 
 **`c` es un no-op si el panel está oculto** (`p` lo escondió): no tiene
 sentido cambiar qué columnas se muestran en algo que no se está mostrando, y
@@ -281,6 +290,53 @@ no hay una constante que sirva para todos los proveedores):
 `B/tok` se muestra como `-` (nunca `0.0`) cuando falta `input_tokens`, falta
 `context_measured_bytes`, o `prompt_tokens_total` da `0` — un denominador
 indefinido nunca se colapsa a un número inventado.
+
+### 7.3.2. Columnas — vista `Cache`
+
+Espejo de `cache_by_section` en `GET /requests`
+([`telemetry-per-request.md`](telemetry-per-request.md) §4.11). **Todo lo de
+esta vista es una ESTIMACIÓN del proxy**, no una medición: el proveedor reporta
+los tokens cacheados en total, nunca por sección, así que la frontera se deduce
+convirtiendo tokens a bytes. Léase §4.11 antes de sacar conclusiones.
+
+| Columna | Qué es | Cómo leerla |
+|---|---|---|
+| `hora`, `modelo` | Igual que en las otras vistas | — |
+| `total` | `context_measured_bytes`, para tener la referencia a la vista | Es el único dato MEDIDO de esta tabla |
+| `cch_B` | Suma de los cinco `*_cached_bytes` | Cuántos bytes del cuerpo cayeron dentro del prefijo cacheado |
+| `cch%` | `cch_B / total` | Cerca de 1 ⇒ casi todo el cuerpo llegó cacheado y se paga al 10% |
+| `tools%` | `tools_cached_bytes / context_tools_bytes` | Los esquemas suelen ir enteros dentro del prefijo: aquí se ve si es así |
+| `system%` | Ídem para `system` | — |
+| `hist%` | Ídem para `history` | Baja cuando el historial creció desde el turno anterior: es el borde vivo del prefijo |
+| `lt$` | `last_turn_cached_bytes`, en bytes ABSOLUTOS | **Es el falsador. Debería ser 0 casi siempre** — ver abajo |
+| `metodo` | El `method` que declara el proxy (`prefix_walk_v1`) | Si cambia, cambió cómo se calcula todo lo demás de esta fila |
+
+#### Por qué `lt$` está siempre a la vista aunque casi siempre valga cero
+
+El último turno es contenido NUEVO: no puede venir de una caché anterior. Si el
+paseo por el prefijo empieza a afirmar que sí, el método dejó de describir el
+tráfico.
+
+Se muestra en **bytes absolutos y no en porcentaje** a propósito: lo que hay que
+vigilar es que deje de ser cero, no sobre qué base. Y va como columna fija
+porque una señal que solo se mira cuando algo va mal no sirve de nada si hay que
+activarla para verla.
+
+Medido sobre 2.647 peticiones reales, dispara en el 0,0% de `codex/gpt-5.5`,
+el 0,4% de `openai/gpt-5.5` y el 6,0% de `anthropic/claude-opus-4-8` — este
+último con desbordamiento p95 de solo 0,051, consistente con el error de ±10%
+de la tasa tokens/byte.
+
+#### Huecos honestos, otra vez
+
+Si el proxy no pudo atribuir —o es una build anterior al campo— **todas las
+columnas derivadas salen con `-`, no con ceros**. El monitor no puede
+distinguir "proxy viejo" de "no atribuible", así que no finge que sí: pinta las
+dos igual.
+
+Lo mismo con una sección que mide cero bytes: su porcentaje es `-`, no `0%`. No
+hay fracción que calcular sobre una sección vacía, y un `0%` se leería como "no
+se cacheó nada" en vez de "no había nada que cachear".
 
 ### 7.4. Marcadores de outlier
 

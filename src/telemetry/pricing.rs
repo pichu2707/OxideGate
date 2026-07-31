@@ -96,17 +96,35 @@ pub fn model_pricing(model: &str) -> Option<ModelPricing> {
     }
 
     // OpenAI (GPT / o-series): `cache_read` es subconjunto del input.
-    let openai_cache = CacheAccounting::Subset {
-        read_multiplier: OPENAI_CACHE_READ_MULTIPLIER,
+    //
+    // OJO: el descuento de caché NO es uniforme dentro de OpenAI. La familia 4o
+    // cobra la lectura al 50% del input y la familia 5 al 10%. Por eso hay dos
+    // multiplicadores y no uno — ver las constantes para la verificación.
+    let openai_4o_cache = CacheAccounting::Subset {
+        read_multiplier: OPENAI_4O_CACHE_READ_MULTIPLIER,
     };
+    let openai_5_cache = CacheAccounting::Subset {
+        read_multiplier: OPENAI_5_CACHE_READ_MULTIPLIER,
+    };
+
+    // Familia 5. El orden importa: `gpt-5.6-sol` y `gpt-5.5` antes que `gpt-5`,
+    // porque el emparejamiento es por subcadena y `gpt-5` los tragaría a los dos
+    // con un precio cuatro veces menor.
+    if m.contains("gpt-5.6-sol") || m.contains("gpt-5.5") {
+        return Some(ModelPricing { price_in: 5.0, price_out: 30.0, cache: openai_5_cache });
+    }
+    if m.contains("gpt-5") {
+        return Some(ModelPricing { price_in: 1.25, price_out: 10.0, cache: openai_5_cache });
+    }
+
     if m.contains("gpt-4o-mini") {
-        return Some(ModelPricing { price_in: 0.15, price_out: 0.60, cache: openai_cache });
+        return Some(ModelPricing { price_in: 0.15, price_out: 0.60, cache: openai_4o_cache });
     }
     if m.contains("gpt-4o") {
-        return Some(ModelPricing { price_in: 2.50, price_out: 10.0, cache: openai_cache });
+        return Some(ModelPricing { price_in: 2.50, price_out: 10.0, cache: openai_4o_cache });
     }
     if m.contains("gpt-4-turbo") {
-        return Some(ModelPricing { price_in: 10.0, price_out: 30.0, cache: openai_cache });
+        return Some(ModelPricing { price_in: 10.0, price_out: 30.0, cache: openai_4o_cache });
     }
 
     // Google (Gemini): `cachedContentTokenCount` es subconjunto del input. El
@@ -147,9 +165,89 @@ const ANTHROPIC_CACHE_WRITE_MULTIPLIER: f64 = 1.25;
 /// relativo al precio de input. DEFAULT editable.
 const GEMINI_CACHE_READ_MULTIPLIER: f64 = 0.25;
 
-/// Multiplicador de OpenAI para la porción de input servida desde caché,
-/// relativo al precio de input. DEFAULT editable.
-const OPENAI_CACHE_READ_MULTIPLIER: f64 = 0.5;
+/// Multiplicador de la familia **4o** de OpenAI para la porción de input
+/// servida desde caché, relativo al precio de input. DEFAULT editable.
+///
+/// Verificado contra la tarifa pública (2026-07-31): `gpt-4o` cobra $2,50 el
+/// input y $1,25 la lectura de caché; `gpt-4o-mini`, $0,15 y $0,075. Las dos
+/// dan exactamente 0,5.
+const OPENAI_4O_CACHE_READ_MULTIPLIER: f64 = 0.5;
+
+/// Multiplicador de la familia **5** de OpenAI. DEFAULT editable.
+///
+/// **No es el mismo que el de la familia 4o, y esa es la razón de que existan
+/// dos constantes.** Verificado contra la tarifa pública (2026-07-31):
+/// `gpt-5.5` y `gpt-5.6-sol` cobran $5,00 el input y $0,50 la lectura de caché;
+/// `gpt-5`, $1,25 y $0,125. Las tres dan 0,1 — no 0,5.
+///
+/// Usar aquí el multiplicador de 4o inflaría el coste de la porción cacheada
+/// por cinco, y en el tráfico medido de este proyecto más de la mitad del
+/// volumen llega cacheado: el error no sería marginal.
+const OPENAI_5_CACHE_READ_MULTIPLIER: f64 = 0.1;
+
+/// FORMA de la contabilidad de caché, sin los multiplicadores.
+///
+/// Separar la forma del precio no es cosmético: la forma («¿los tokens de caché
+/// van aparte del input o ya están dentro?») es estable dentro de una familia de
+/// proveedor, pero **los multiplicadores NO**. Medido contra la tarifa pública:
+/// dentro de OpenAI, la familia 4o cobra la lectura de caché al 0,5 y la familia
+/// 5 al 0,1. Una función que devolviera «la contabilidad de OpenAI» tendría que
+/// elegir uno de los dos y acertaría solo la mitad de las veces.
+///
+/// Quien necesita solo la forma —[`telemetry::cache_attribution`]— se lleva esto
+/// y no puede leer por accidente un multiplicador que no le corresponde. Quien
+/// necesita facturar usa [`model_pricing`], que trae precio y multiplicadores
+/// juntos y por modelo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheShape {
+    /// Los tokens de caché van APARTE del input reportado (Anthropic): para
+    /// tener el prompt completo hay que sumarlos.
+    Separate,
+    /// Los tokens de caché ya están DENTRO del input reportado (OpenAI, Gemini).
+    Subset,
+}
+
+impl CacheAccounting {
+    /// La forma de esta contabilidad, descartando los multiplicadores.
+    ///
+    /// **Solo existe para la guarda de divergencia** (ver el test
+    /// `la_forma_por_upstream_coincide_con_la_de_la_tabla_de_precios`): en
+    /// producción nadie necesita degradar una contabilidad completa a su forma,
+    /// porque quien factura ya tiene los multiplicadores y quien atribuye pide
+    /// la forma directamente a [`cache_shape_for_upstream`]. Va bajo
+    /// `cfg(test)` para que eso quede dicho y no como código muerto silencioso.
+    #[cfg(test)]
+    pub fn shape(self) -> CacheShape {
+        match self {
+            CacheAccounting::Separate { .. } => CacheShape::Separate,
+            CacheAccounting::Subset { .. } => CacheShape::Subset,
+        }
+    }
+}
+
+/// Forma de la contabilidad de caché de una FAMILIA de proveedor, sin pasar por
+/// el precio.
+///
+/// Existe porque hay una pregunta —«¿los tokens de caché van aparte del input o
+/// dentro?»— que NO depende de la tarifa del modelo, sino de qué proveedor lo
+/// sirve. Atarla a [`model_pricing`] dejaría sin atribuir a cualquier modelo que
+/// todavía no esté en la tabla de precios.
+///
+/// **Invariante**: para un modelo que SÍ esté en [`model_pricing`], su `arm`
+/// debe declarar esta misma FORMA. Los multiplicadores quedan deliberadamente
+/// fuera del contrato porque divergen dentro de una familia. Un test lo
+/// comprueba para los modelos conocidos.
+///
+/// `None` para un upstream que no reconocemos: preferimos no atribuir a
+/// atribuir con la fórmula equivocada, que desplazaría la frontera del prefijo.
+pub fn cache_shape_for_upstream(upstream: &str) -> Option<CacheShape> {
+    match upstream {
+        "anthropic" => Some(CacheShape::Separate),
+        // `codex` es la ruta de Codex/Responses de OpenAI: misma forma.
+        "openai" | "codex" | "gemini" => Some(CacheShape::Subset),
+        _ => None,
+    }
+}
 
 /// Estima el coste en USD de un request a partir de los tokens medidos.
 ///
@@ -295,5 +393,98 @@ mod tests {
         let expected = 2000.0 * 0.5 * 2.50 / 1_000_000.0;
         assert!((cost - expected).abs() < EPS, "cost={cost} expected={expected}");
         assert!(cost >= 0.0);
+    }
+
+    /// GUARDA DE DIVERGENCIA.
+    ///
+    /// [`cache_shape_for_upstream`] y [`model_pricing`] responden a la misma
+    /// pregunta desde dos claves distintas (familia de proveedor vs modelo
+    /// concreto). Mientras existan las dos, pueden separarse en silencio. Este
+    /// test cierra ese hueco: para cada modelo que SÍ está en la tabla de
+    /// precios, ambas rutas tienen que declarar la misma FORMA.
+    ///
+    /// **Compara formas, NO multiplicadores, y eso es deliberado.** Los
+    /// multiplicadores divergen legítimamente dentro de una familia (4o cobra
+    /// la lectura de caché al 0,5 y la familia 5 al 0,1, verificado contra la
+    /// tarifa pública). Exigir que coincidieran obligaría a mentir en uno de
+    /// los dos sitios. La forma sí es estable, y es lo único que consume la
+    /// atribución.
+    #[test]
+    fn la_forma_por_upstream_coincide_con_la_de_la_tabla_de_precios() {
+        // (modelo tal como llega en el body, upstream que lo sirve)
+        let casos = [
+            ("claude-opus-4-8", "anthropic"),
+            ("claude-haiku-4-5", "anthropic"),
+            ("claude-sonnet-4-5-20250929", "anthropic"),
+            ("gpt-5.6-sol", "codex"),
+            ("gpt-5.5", "openai"),
+            ("gpt-5", "openai"),
+            ("gpt-4o", "openai"),
+            ("gpt-4o-mini", "openai"),
+            ("gpt-4-turbo", "openai"),
+            ("gemini-2.5-flash", "gemini"),
+            ("gemini-2.5-pro", "gemini"),
+        ];
+
+        for (modelo, upstream) in casos {
+            let por_modelo = model_pricing(modelo)
+                .unwrap_or_else(|| panic!("{modelo} debería estar en la tabla de precios"))
+                .cache
+                .shape();
+            let por_upstream = cache_shape_for_upstream(upstream)
+                .unwrap_or_else(|| panic!("{upstream} debería tener forma de familia"));
+            assert_eq!(
+                por_modelo, por_upstream,
+                "divergencia de FORMA para {modelo} vía {upstream}"
+            );
+        }
+    }
+
+    /// La ruta de Codex es OpenAI por debajo: misma forma, o la atribución de
+    /// caché colocaría la frontera del prefijo con la fórmula equivocada en el
+    /// 74% del tráfico medido.
+    #[test]
+    fn codex_tiene_la_misma_forma_que_openai() {
+        assert_eq!(
+            cache_shape_for_upstream("codex").expect("codex reconocido"),
+            cache_shape_for_upstream("openai").expect("openai reconocido"),
+        );
+    }
+
+    /// Un upstream que no conocemos no puede caer en una forma por defecto:
+    /// elegir mal desplaza la frontera del prefijo. `None` explícito.
+    #[test]
+    fn upstream_desconocido_no_tiene_forma() {
+        assert!(cache_shape_for_upstream("proveedor-nuevo").is_none());
+        assert!(cache_shape_for_upstream("").is_none());
+    }
+
+    /// LA FAMILIA 5 NO COBRA LA CACHE COMO LA 4o.
+    ///
+    /// Verificado contra la tarifa publica (2026-07-31). Este test existe para
+    /// que nadie "simplifique" las dos constantes en una: hacerlo inflaria por
+    /// cinco el coste de la porcion cacheada de gpt-5.5/gpt-5.6-sol, que son el
+    /// 86% del trafico medido y donde mas de la mitad del volumen va cacheado.
+    #[test]
+    fn la_familia_5_y_la_4o_tienen_multiplicadores_de_cache_distintos() {
+        let mult = |modelo: &str| match model_pricing(modelo).unwrap().cache {
+            CacheAccounting::Subset { read_multiplier } => read_multiplier,
+            CacheAccounting::Separate { .. } => panic!("{modelo} deberia ser Subset"),
+        };
+        for m in ["gpt-5.5", "gpt-5.6-sol", "gpt-5"] {
+            assert!((mult(m) - 0.1).abs() < EPS, "{m}: la familia 5 lee cache al 0,1");
+        }
+        for m in ["gpt-4o", "gpt-4o-mini"] {
+            assert!((mult(m) - 0.5).abs() < EPS, "{m}: la familia 4o lee cache al 0,5");
+        }
+    }
+
+    /// `gpt-5` NO puede tragarse a `gpt-5.5` ni a `gpt-5.6-sol` por subcadena:
+    /// su input cuesta cuatro veces menos y el emparejamiento es por `contains`.
+    #[test]
+    fn los_modelos_de_la_familia_5_no_se_solapan_por_subcadena() {
+        assert_eq!(model_pricing("gpt-5.5").unwrap().price_in, 5.0);
+        assert_eq!(model_pricing("gpt-5.6-sol").unwrap().price_in, 5.0);
+        assert_eq!(model_pricing("gpt-5").unwrap().price_in, 1.25);
     }
 }

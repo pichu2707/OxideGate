@@ -1,4 +1,5 @@
 //! Telemetría del proxy: mide sin estorbar el camino crítico del request.
+pub mod cache_attribution;
 pub mod codex_quota;
 pub mod logger;
 pub mod metered;
@@ -7,6 +8,7 @@ pub mod recent;
 pub mod session;
 pub mod stats;
 
+pub use cache_attribution::CacheBySection;
 pub use codex_quota::CodexQuota;
 pub use logger::{RequestMetric, TelemetrySink};
 pub use metered::{MeteredBody, MetricBase};

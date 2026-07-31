@@ -88,7 +88,7 @@ de qué es aditivo y qué es ruptura, en su
 
 ---
 
-## El hallazgo: tu pregunta es el 0,03% de lo que pagas
+## El hallazgo: tu pregunta es el 0,03% de lo que subes
 
 Petición real de un agente, **225.798 bytes**. Esto es lo que iba dentro:
 
@@ -110,8 +110,30 @@ pie showData
 | `system` del harness | 8.928 | 4,0% |
 | **El mensaje del usuario** | **75** | **0,03%** |
 
-Del coste total, el **78,2%** es maquinaria de contexto —releer y reescribir el
+Del body, el **78,2%** es maquinaria de contexto —releer y reescribir el
 prefijo— y solo el **3,0%** es input genuinamente nuevo.
+
+> **Estos porcentajes son de BYTES, no de dinero — y la diferencia es grande.**
+>
+> Con caché activa, los bytes que subes y los tokens que pagas están
+> **desacoplados**: el prefijo estable se lee al 10% de la tarifa y tu turno
+> nuevo se paga entero. Medido sobre 133 peticiones de `claude-opus-4-8`, la
+> misma sección cambia de peso según en qué unidad la mires:
+>
+> | Sección | % de los BYTES | % de lo PAGADO |
+> |---|---:|---:|
+> | `tools` | 56,1% | 22,5% |
+> | `history` | 31,9% | 43,5% |
+> | **el turno nuevo** | **7,8%** | **31,1%** |
+>
+> O sea que **medir en bytes SUBESTIMA unas 4x lo que cuesta tu pregunta**. El
+> 0,03% de arriba es una cifra real y sigue siendo el argumento —la mayor parte
+> de lo que subes no lo escribiste tú—, pero es una cifra de bytes: no la leas
+> como tu factura.
+>
+> Por eso `GET /requests` publica `cache_by_section`, que estima qué cubo cayó
+> dentro del prefijo cacheado. Ver
+> [`docs/telemetry-per-request.md` §4.11](docs/telemetry-per-request.md).
 
 ---
 
@@ -174,7 +196,8 @@ seguirla son lo mismo.
 | Esquemas MCP, `CLAUDE.md`, historial, `system`, último turno | ✅ Medido en bytes, por petición |
 | Tokens, coste, TTFT y latencia por proveedor y modelo | ✅ Medido, del `usage` real |
 | Cuota de suscripción (Codex/ChatGPT) | ✅ Medida, de las cabeceras `x-codex-*` |
-| Declarar una skill (el listado) | ✅ **138 B por skill**, en cada petición — ver [§3](docs/optimizer-skills.md) |
+| Declarar una skill (el listado) | ✅ **138 B por skill** con 11 skills; **242 B** con 66, donde el 86% son de plugin — ver [`docs/fixed-toll-claude-code.md`](docs/fixed-toll-claude-code.md) §3 |
+| **El peaje fijo de una sesión** | ✅ **69.613 B** antes de escribir nada: `CLAUDE.md` 48% + hooks 29% + listado de skills 23% — ver [`docs/fixed-toll-claude-code.md`](docs/fixed-toll-claude-code.md) |
 | Invocar una skill (el cuerpo) | ✅ **`SKILL.md` − frontmatter + ~300 B**, y el historial lo reenvía cada turno — ver [§7](docs/optimizer-skills.md) |
 | `AGENTS.md` | ✅ Medido: **Claude Code no lo manda**, 0 B — ver [§4](docs/optimizer-skills.md) |
 | Skills de plugin | ✅ **182 B**, igual que una propia — el origen no exime. Ver [§6](docs/optimizer-skills.md) |
