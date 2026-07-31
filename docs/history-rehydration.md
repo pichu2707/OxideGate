@@ -122,17 +122,65 @@ test de regresión (`una_fila_con_tools_by_server_sin_tool_names_se_rehidrata_ig
 
 ---
 
-## 6. Qué queda fuera de este slice
+## 6. Consultar por rango: `?since=`
 
-- **Consultar por rango (`?since=`)**: hoy la ventana se fija al arrancar y vale
-  para toda la ejecución. Un `/stats?since=` sería otro eje —el de consulta— y
-  no está hecho.
-- **Rotación o agregado previo del `.jsonl`**: el fichero sigue creciendo sin
-  límite. La ventana acota lo que se LEE, no lo que se guarda.
+`GET /stats` y `GET /sessions` aceptan `?since=`, en dos formas:
+
+| Forma | Ejemplo | Para |
+|---|---|---|
+| Fecha ISO | `?since=2026-07-24` | «desde el lunes» |
+| Días atrás | `?since=7d` | «la última semana» |
+
+Las dos existen porque contestan preguntas distintas, y obligar a traducir una
+en la otra desde fuera es trabajo que el servidor puede hacer.
+
+**Sin el parámetro, el comportamiento es el de siempre** — todo lo acumulado —,
+así que las dos rutas siguen siendo compatibles.
+
+### Un `since` ilegible devuelve 400
+
+No cae a «todo el histórico». Servir un rango distinto del pedido, en silencio,
+dejaría al consumidor mirando una ventana que no es la suya y creyendo que sí.
+Es la misma regla que `OXIDEGATE_HISTORY_DAYS`, que tampoco se traga un valor
+mal escrito.
+
+### Lo que NO aparece en una ventana
+
+Un `(upstream, modelo)` o una sesión **sin tráfico en el rango no sale en el
+resultado**, en vez de salir con ceros. «No se usó» y «se usó y costó cero» son
+afirmaciones distintas, y una fila a cero se lee como la segunda.
+
+### Cómo se implementa, y qué costó
+
+Los acumuladores no tenían **ninguna** dimensión temporal: eran sumas corridas
+desde que arrancaba el proceso. `?since=` no era añadir un parámetro, era
+cambiar cómo agregan.
+
+Ahora la unidad es **el día**: `ModelAccumulator` y `SessionAccumulator`
+guardan un cubo por día y el total de siempre es la fusión de todos. **Una sola
+fuente de verdad** — no hay un total corriendo en paralelo a los cubos que
+pudiera desviarse.
+
+Por hora multiplicaría por 24 el número de cubos para contestar una pregunta
+que nadie hace con precisión de minutos.
+
+**La fusión de huellas es lo único que no se puede hacer sumando.** Un mismo
+prompt visto dos días es UNA huella distinta, no dos: los mapas se **unen**
+sumando ocurrencias. Sumar `len()` de dos cubos daría el doble de
+`distinct_prompts`. Hay test.
+
+Y el cap de huellas (`MAX_DISTINCT_PROMPTS_PER_MODEL`) es **compartido entre
+cubos**, no por cubo: si fuera por cubo, la memoria se multiplicaría por los
+días de ventana —que configura el usuario— y dejaría de estar acotada.
+
+## 7. Qué queda fuera
+
+**Rotación o agregado previo del `.jsonl`**: el fichero sigue creciendo sin
+límite. La ventana acota lo que se LEE, no lo que se guarda.
 
 ---
 
-## 7. Lo que deliberadamente NO se hizo
+## 8. Lo que deliberadamente NO se hizo
 
 Sustituir el JSONL por una base de datos «porque escala». El fichero plano es
 inspeccionable con `jq`, se comparte adjuntándolo y ya es la fuente de verdad
@@ -142,7 +190,7 @@ guardaba**.
 
 ---
 
-## 8. Dónde vive cada cosa
+## 9. Dónde vive cada cosa
 
 | Archivo | Responsabilidad |
 |---|---|
@@ -150,3 +198,5 @@ guardaba**.
 | `src/middleware/history.rs` | `handle_history` — la ruta HTTP y su estado congelado |
 | `src/main.rs` | Llama a `rehydrate` **antes** de servir la primera petición |
 | `src/telemetry/logger.rs` | `RequestMetric: Deserialize`, con la tolerancia declarada campo a campo |
+| `src/telemetry/stats.rs` | `DayBucket`, `ModelAccumulator::merge`, `snapshot_since` — la agregación por día |
+| `src/middleware/mod.rs` | `parse_since` — el contrato de `?since=`, compartido por las dos rutas |

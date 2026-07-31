@@ -19,14 +19,21 @@ use std::collections::HashMap;
 /// honesta de la redundancia real, no un número inflado ni un OOM.
 const MAX_DISTINCT_PROMPTS_PER_MODEL: usize = 50_000;
 
-/// Acumulador incremental de un `(upstream, model)`.
+/// Acumulador de UN DÍA de un `(upstream, model)`.
 ///
-/// Cada campo se actualiza en `O(1)` por request salvo el mapa de huellas
-/// (`prompt_counts`), que es la única estructura que crece con el tráfico
-/// (acotada por [`MAX_DISTINCT_PROMPTS_PER_MODEL`]). Todo lo demás son sumas,
-/// contadores y min/max: no se recalcula nada desde cero en cada `ingest`.
-#[derive(Debug, Default)]
-struct ModelAccumulator {
+/// Antes esto era el acumulador entero y no tenía dimensión temporal: una suma
+/// corrida desde que arrancó el proceso. Eso hacía imposible contestar «¿y solo
+/// la semana pasada?» sin releer el fichero en cada consulta.
+///
+/// Ahora el día es la unidad, y el total de siempre es la fusión de todos los
+/// cubos ([`ModelAccumulator::merge`]). **Una sola fuente de verdad**: no hay
+/// un total corriendo en paralelo a los cubos que pudiera desviarse de ellos.
+///
+/// El día es la granularidad a propósito. Por hora multiplicaría por 24 el
+/// número de cubos —y con ellos el mapa de huellas— para contestar una pregunta
+/// («¿gasté más esta semana?») que nadie hace con precisión de minutos.
+#[derive(Debug, Default, Clone)]
+struct DayBucket {
     requests: u64,
 
     input_tokens: u64,
@@ -54,9 +61,104 @@ struct ModelAccumulator {
     redundancy_saturated: bool,
 }
 
+/// Los cubos por día de un `(upstream, model)`, más el cap compartido.
+///
+/// El cap de huellas ([`MAX_DISTINCT_PROMPTS_PER_MODEL`]) es GLOBAL al modelo y
+/// no por cubo, a propósito: si fuera por cubo, la memoria se multiplicaría por
+/// los días de ventana —que configura el usuario— y dejaría de estar acotada.
+/// Con el cap compartido, el peor caso es exactamente el de antes.
+#[derive(Debug, Default)]
+struct ModelAccumulator {
+    days: std::collections::BTreeMap<chrono::NaiveDate, DayBucket>,
+    /// Huellas distintas ya admitidas en CUALQUIER cubo, para respetar el cap
+    /// compartido sin tener que recorrer todos los cubos en cada `ingest`.
+    distinct_seen: std::collections::HashSet<u64>,
+}
+
 impl ModelAccumulator {
-    /// Incorpora una métrica ya perteneciente a este `(upstream, model)`.
+    /// Encamina la métrica al cubo de su día.
+    ///
+    /// Una fila con `timestamp` ilegible va al cubo de la fecha más antigua
+    /// posible en vez de descartarse: perder una medición real por no saber
+    /// situarla sería peor que situarla mal, y `rehydrate` ya filtra por
+    /// timestamp antes de llegar aquí.
     fn ingest(&mut self, m: &RequestMetric) {
+        let dia = chrono::DateTime::parse_from_rfc3339(&m.timestamp)
+            .map(|t| t.with_timezone(&chrono::Utc).date_naive())
+            .unwrap_or(chrono::NaiveDate::MIN);
+        let cap_alcanzado = self.distinct_seen.len() >= MAX_DISTINCT_PROMPTS_PER_MODEL;
+        if let Ok(h) = u64::from_str_radix(&m.prompt_hash, 16) {
+            if !cap_alcanzado {
+                self.distinct_seen.insert(h);
+            }
+        }
+        self.days
+            .entry(dia)
+            .or_default()
+            .ingest_con_cap(m, cap_alcanzado);
+    }
+
+    /// Fusiona los cubos cuyo día es `>= desde` (o todos si es `None`).
+    ///
+    /// Devuelve `None` si la ventana no contiene ningún cubo: eso es un hueco
+    /// —«no hay datos en ese rango»— y no una fila de ceros, que se leería como
+    /// «hubo tráfico y costó cero».
+    fn merge(&self, desde: Option<chrono::NaiveDate>) -> Option<DayBucket> {
+        let mut it = self
+            .days
+            .iter()
+            .filter(|(d, _)| desde.is_none_or(|x| **d >= x))
+            .map(|(_, b)| b);
+        let primero = it.next()?;
+        let mut acc = primero.clone();
+        for b in it {
+            acc.merge(b);
+        }
+        Some(acc)
+    }
+}
+
+impl DayBucket {
+    /// Fusiona otro cubo dentro de este. Es la operación que hace que una
+    /// ventana se pueda contestar sumando días.
+    ///
+    /// Los min/max se fusionan como min de mins y max de maxes; las huellas se
+    /// UNEN sumando ocurrencias, que es lo único correcto: un mismo prompt
+    /// visto dos días es UNA huella distinta, no dos. Sumar `len()` de dos
+    /// mapas daría el doble.
+    fn merge(&mut self, otro: &DayBucket) {
+        self.requests += otro.requests;
+        self.input_tokens += otro.input_tokens;
+        self.output_tokens += otro.output_tokens;
+        self.cache_read_tokens += otro.cache_read_tokens;
+        self.cache_write_tokens += otro.cache_write_tokens;
+        self.cost_usd += otro.cost_usd;
+        self.ttft_ms_sum += otro.ttft_ms_sum;
+        self.ttft_ms_count += otro.ttft_ms_count;
+        self.ttft_ms_min = match (self.ttft_ms_min, otro.ttft_ms_min) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.ttft_ms_max = match (self.ttft_ms_max, otro.ttft_ms_max) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        self.total_ms_sum += otro.total_ms_sum;
+        self.tokens_per_sec_sum += otro.tokens_per_sec_sum;
+        self.tokens_per_sec_count += otro.tokens_per_sec_count;
+        self.cache_forced += otro.cache_forced;
+        self.errors += otro.errors;
+        for (h, c) in &otro.prompt_counts {
+            *self.prompt_counts.entry(*h).or_insert(0) += c;
+        }
+        self.redundancy_saturated |= otro.redundancy_saturated;
+    }
+
+    /// Incorpora una métrica ya perteneciente a este `(upstream, model)` y día.
+    ///
+    /// `cap_alcanzado` lo decide [`ModelAccumulator`], que es quien conoce el
+    /// cap compartido entre cubos. El cubo no puede saberlo por sí solo.
+    fn ingest_con_cap(&mut self, m: &RequestMetric, cap_alcanzado: bool) {
         self.requests += 1;
 
         if let Some(v) = m.input_tokens {
@@ -96,7 +198,7 @@ impl ModelAccumulator {
             self.errors += 1;
         }
 
-        self.ingest_prompt_hash(&m.prompt_hash);
+        self.ingest_prompt_hash(&m.prompt_hash, cap_alcanzado);
     }
 
     /// Registra la huella para el cálculo de redundancia, respetando el cap.
@@ -104,7 +206,7 @@ impl ModelAccumulator {
     /// La huella viaja como hex de 64 bits en `RequestMetric::prompt_hash`;
     /// si no parsea (formato inesperado) la ignoramos para redundancia sin
     /// afectar el resto de la métrica.
-    fn ingest_prompt_hash(&mut self, prompt_hash: &str) {
+    fn ingest_prompt_hash(&mut self, prompt_hash: &str, cap_alcanzado: bool) {
         let Ok(hash) = u64::from_str_radix(prompt_hash, 16) else {
             return;
         };
@@ -114,7 +216,7 @@ impl ModelAccumulator {
             return;
         }
 
-        if self.prompt_counts.len() >= MAX_DISTINCT_PROMPTS_PER_MODEL {
+        if cap_alcanzado {
             // Cap alcanzado: no admitimos huellas nuevas, pero seguimos
             // contando las ya presentes (rama de arriba). La redundancia
             // reportada queda como cota inferior honesta.
@@ -291,13 +393,23 @@ impl StatsRegistry {
         self.accumulators.entry(key).or_default().ingest(m);
     }
 
-    /// Construye la vista serializable del estado actual, ordenada por
-    /// tráfico (`requests` desc) para que lo más relevante quede primero.
-    pub fn snapshot(&self) -> StatsSnapshot {
+    /// Vista serializable, ordenada por tráfico (`requests` desc) para que lo
+    /// más relevante quede primero. `desde: None` = todo lo acumulado.
+    ///
+    /// Hay UN solo método y no un `snapshot()` sin parámetro al lado: dos
+    /// caminos para la misma pregunta se desvían en cuanto uno se toca.
+    ///
+    /// Un `(upstream, model)` SIN tráfico en la ventana **no aparece** en el
+    /// resultado, en vez de aparecer con ceros. Un modelo con `requests: 0` se
+    /// leería como «se usó y no costó nada», que es distinto de «no se usó».
+    pub fn snapshot(&self, desde: Option<chrono::NaiveDate>) -> StatsSnapshot {
         let mut rows: Vec<ModelStatsRow> = self
             .accumulators
             .iter()
-            .map(|((upstream, model), acc)| acc.to_row(upstream.clone(), model.clone()))
+            .filter_map(|((upstream, model), acc)| {
+                acc.merge(desde)
+                    .map(|b| b.to_row(upstream.clone(), model.clone()))
+            })
             .collect();
 
         rows.sort_by_key(|row| std::cmp::Reverse(row.requests));
@@ -319,6 +431,15 @@ const MAX_DISTINCT_SESSIONS: usize = 10_000;
 /// Acumulador de una sesión.
 #[derive(Debug, Default)]
 struct SessionAccumulator {
+    /// Cubos por día, igual que [`ModelAccumulator`] y por la misma razón: sin
+    /// dimensión temporal no se puede contestar una ventana. Aquí es más
+    /// barato — son cinco sumas puras, sin mapa de huellas que fusionar.
+    days: std::collections::BTreeMap<chrono::NaiveDate, SessionDay>,
+}
+
+/// Un día de una sesión: cinco sumas, todas fusionables sumando.
+#[derive(Debug, Default, Clone)]
+struct SessionDay {
     requests: u64,
     input_tokens: u64,
     output_tokens: u64,
@@ -328,11 +449,30 @@ struct SessionAccumulator {
 
 impl SessionAccumulator {
     fn ingest(&mut self, m: &RequestMetric) {
-        self.requests += 1;
-        self.input_tokens += m.input_tokens.unwrap_or(0);
-        self.output_tokens += m.output_tokens.unwrap_or(0);
-        self.cache_read_tokens += m.cache_read_tokens.unwrap_or(0);
-        self.cost_usd += m.cost_estimate_usd.unwrap_or(0.0);
+        let dia = chrono::DateTime::parse_from_rfc3339(&m.timestamp)
+            .map(|t| t.with_timezone(&chrono::Utc).date_naive())
+            .unwrap_or(chrono::NaiveDate::MIN);
+        let d = self.days.entry(dia).or_default();
+        d.requests += 1;
+        d.input_tokens += m.input_tokens.unwrap_or(0);
+        d.output_tokens += m.output_tokens.unwrap_or(0);
+        d.cache_read_tokens += m.cache_read_tokens.unwrap_or(0);
+        d.cost_usd += m.cost_estimate_usd.unwrap_or(0.0);
+    }
+
+    /// Fusiona los días `>= desde`. `None` si la ventana no tiene ninguno —
+    /// hueco, no una fila de ceros.
+    fn merge(&self, desde: Option<chrono::NaiveDate>) -> Option<SessionDay> {
+        let mut out: Option<SessionDay> = None;
+        for (_, d) in self.days.iter().filter(|(x, _)| desde.is_none_or(|f| **x >= f)) {
+            let acc = out.get_or_insert_with(SessionDay::default);
+            acc.requests += d.requests;
+            acc.input_tokens += d.input_tokens;
+            acc.output_tokens += d.output_tokens;
+            acc.cache_read_tokens += d.cache_read_tokens;
+            acc.cost_usd += d.cost_usd;
+        }
+        out
     }
 }
 
@@ -382,20 +522,27 @@ impl SessionRegistry {
         self.accumulators.entry(key).or_default().ingest(m);
     }
 
-    /// Vista serializable, ordenada por tráfico descendente.
-    pub fn snapshot(&self) -> SessionSnapshot {
+    /// Vista serializable, ordenada por tráfico desc. `desde: None` = todo.
+    ///
+    /// Un solo método, por la misma razón que en [`StatsRegistry`].
+    ///
+    /// Una sesión sin tráfico en la ventana **no aparece**, en vez de aparecer
+    /// con ceros: «no se usó» y «se usó y costó cero» son cosas distintas.
+    pub fn snapshot(&self, desde: Option<chrono::NaiveDate>) -> SessionSnapshot {
         let mut rows: Vec<SessionStatsRow> = self
             .accumulators
             .iter()
-            .map(|((source, key), acc)| SessionStatsRow {
-                is_session: source != "unattributed",
-                source: source.clone(),
-                key: key.clone(),
-                requests: acc.requests,
-                input_tokens: acc.input_tokens,
-                output_tokens: acc.output_tokens,
-                cache_read_tokens: acc.cache_read_tokens,
-                cost_usd: acc.cost_usd,
+            .filter_map(|((source, key), acc)| {
+                acc.merge(desde).map(|d| SessionStatsRow {
+                    is_session: source != "unattributed",
+                    source: source.clone(),
+                    key: key.clone(),
+                    requests: d.requests,
+                    input_tokens: d.input_tokens,
+                    output_tokens: d.output_tokens,
+                    cache_read_tokens: d.cache_read_tokens,
+                    cost_usd: d.cost_usd,
+                })
             })
             .collect();
         rows.sort_by_key(|r| std::cmp::Reverse(r.requests));
@@ -441,7 +588,7 @@ mod tests {
             0.2,
         ));
 
-        let filas = reg.snapshot().0;
+        let filas = reg.snapshot(None).0;
 
         assert_eq!(filas.len(), 2, "son dos cubos distintos: {filas:?}");
         assert!(filas.iter().any(|f| f.source == "native" && f.input_tokens == 10));
@@ -456,7 +603,7 @@ mod tests {
             reg.ingest(&metric_de_sesion(SessionSource::Explicit, "s1", 100, 0.5));
         }
 
-        let filas = reg.snapshot().0;
+        let filas = reg.snapshot(None).0;
 
         assert_eq!(filas.len(), 1);
         assert_eq!(filas[0].requests, 3);
@@ -471,7 +618,7 @@ mod tests {
         let mut reg = SessionRegistry::default();
         reg.ingest(&metric_de_sesion(SessionSource::Unattributed, "curl/8", 5, 0.0));
 
-        let f = &reg.snapshot().0[0];
+        let f = &reg.snapshot(None).0[0];
 
         assert!(!f.is_session, "un fallback no es una sesión identificada");
     }
@@ -494,7 +641,7 @@ mod tests {
         // Una clave YA conocida sigue acumulando pese a la saturación.
         reg.ingest(&metric_de_sesion(SessionSource::Explicit, "s0", 7, 0.0));
 
-        let snap = reg.snapshot();
+        let snap = reg.snapshot(None);
 
         assert_eq!(snap.0.len(), MAX_DISTINCT_SESSIONS, "no crece sin límite");
         assert!(snap.1, "la saturación se declara, no se esconde");
@@ -560,7 +707,7 @@ mod tests {
             registry.ingest(&m);
         }
 
-        let snapshot = registry.snapshot();
+        let snapshot = registry.snapshot(None);
         assert_eq!(snapshot.0.len(), 1);
         let row = &snapshot.0[0];
         assert_eq!(row.requests, 3);
@@ -593,7 +740,7 @@ mod tests {
         registry.ingest(&base_metric("anthropic", "claude-opus-4"));
         registry.ingest(&base_metric("anthropic", "claude-haiku-4"));
 
-        let snapshot = registry.snapshot();
+        let snapshot = registry.snapshot(None);
         assert_eq!(snapshot.0.len(), 2);
         let models: Vec<&str> = snapshot.0.iter().map(|r| r.model.as_str()).collect();
         assert!(models.contains(&"claude-opus-4"));
@@ -618,7 +765,7 @@ mod tests {
         m2.cache_control_forced = false;
         registry.ingest(&m2);
 
-        let snapshot = registry.snapshot();
+        let snapshot = registry.snapshot(None);
         let row = &snapshot.0[0];
         // cache_read total = 30, denominador = (10+10) + 30 + 0 = 50
         assert!((row.cache_hit_rate - 0.6).abs() < 1e-9);
@@ -633,7 +780,7 @@ mod tests {
             registry.ingest(&base_metric("anthropic", "claude-opus-4"));
         }
 
-        let snapshot = registry.snapshot();
+        let snapshot = registry.snapshot(None);
         let row = &snapshot.0[0];
         assert_eq!(row.distinct_prompts, 1);
         assert_eq!(row.redundant_requests, 2);
@@ -648,7 +795,7 @@ mod tests {
         m.tokens_per_sec = None;
         registry.ingest(&m);
 
-        let snapshot = registry.snapshot();
+        let snapshot = registry.snapshot(None);
         let row = &snapshot.0[0];
         assert_eq!(row.avg_ttft_ms, 0.0);
         assert_eq!(row.min_ttft_ms, None);
@@ -663,7 +810,7 @@ mod tests {
         m.model = None;
         registry.ingest(&m);
 
-        let snapshot = registry.snapshot();
+        let snapshot = registry.snapshot(None);
         assert_eq!(snapshot.0[0].model, "unknown");
     }
 
@@ -679,7 +826,7 @@ mod tests {
     fn las_claves_de_stats_no_cambian_sin_querer() {
         let mut registry = StatsRegistry::default();
         registry.ingest(&base_metric("anthropic", "claude-opus-4"));
-        let fila = serde_json::to_value(&registry.snapshot().0[0]).unwrap();
+        let fila = serde_json::to_value(&registry.snapshot(None).0[0]).unwrap();
 
         let publicadas: Vec<&str> = fila
             .as_object()
@@ -737,7 +884,7 @@ mod tests {
     fn las_claves_de_sessions_no_cambian_sin_querer() {
         let mut registry = SessionRegistry::default();
         registry.ingest(&base_metric("anthropic", "claude-opus-4"));
-        let fila = serde_json::to_value(&registry.snapshot().0[0]).unwrap();
+        let fila = serde_json::to_value(&registry.snapshot(None).0[0]).unwrap();
 
         let publicadas: Vec<&str> = fila
             .as_object()
@@ -765,4 +912,66 @@ mod tests {
              docs/telemetry-per-request.md §8."
         );
     }
+    /// La ventana suma solo los días que caen dentro.
+    #[test]
+    fn snapshot_since_suma_solo_los_dias_de_la_ventana() {
+        let mut r = StatsRegistry::default();
+        for (ts, tok) in [
+            ("2026-07-01T10:00:00Z", 100u64),
+            ("2026-07-30T10:00:00Z", 200),
+            ("2026-07-31T10:00:00Z", 300),
+        ] {
+            let mut m = base_metric("anthropic", "claude-opus-4-8");
+            m.timestamp = ts.to_string();
+            m.input_tokens = Some(tok);
+            r.ingest(&m);
+        }
+
+        let todo = r.snapshot(None).0;
+        assert_eq!(todo[0].input_tokens, 600, "sin ventana, todo");
+
+        let desde = chrono::NaiveDate::from_ymd_opt(2026, 7, 30);
+        let ventana = r.snapshot(desde).0;
+        assert_eq!(ventana[0].input_tokens, 500, "solo los dos ultimos dias");
+        assert_eq!(ventana[0].requests, 2);
+    }
+
+    /// UN MODELO SIN TRÁFICO EN LA VENTANA NO APARECE, en vez de aparecer con
+    /// ceros. «No se usó» y «se usó y costó cero» son afirmaciones distintas.
+    #[test]
+    fn un_modelo_sin_trafico_en_la_ventana_desaparece_en_vez_de_salir_a_cero() {
+        let mut r = StatsRegistry::default();
+        let mut viejo = base_metric("anthropic", "modelo-viejo");
+        viejo.timestamp = "2026-07-01T10:00:00Z".to_string();
+        r.ingest(&viejo);
+        let mut nuevo = base_metric("anthropic", "modelo-nuevo");
+        nuevo.timestamp = "2026-07-31T10:00:00Z".to_string();
+        r.ingest(&nuevo);
+
+        let filas = r
+            .snapshot(chrono::NaiveDate::from_ymd_opt(2026, 7, 30))
+            .0;
+
+        assert_eq!(filas.len(), 1);
+        assert_eq!(filas[0].model, "modelo-nuevo");
+    }
+
+    /// La redundancia se calcula UNIENDO huellas, no sumando `len()`: el mismo
+    /// prompt en dos días es UNA huella distinta, no dos.
+    #[test]
+    fn la_misma_huella_en_dos_dias_cuenta_como_una_sola_distinta() {
+        let mut r = StatsRegistry::default();
+        for ts in ["2026-07-30T10:00:00Z", "2026-07-31T10:00:00Z"] {
+            let mut m = base_metric("anthropic", "m");
+            m.timestamp = ts.to_string();
+            m.prompt_hash = "deadbeef".to_string();
+            r.ingest(&m);
+        }
+
+        let f = &r.snapshot(None).0[0];
+
+        assert_eq!(f.distinct_prompts, 1, "una huella, vista dos veces");
+        assert_eq!(f.requests, 2);
+    }
+
 }
