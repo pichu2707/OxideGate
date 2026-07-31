@@ -47,7 +47,7 @@
 
 /// Señal de precedencia que ganó la resolución de sesión: indica CÓMO
 /// interpretar la `key` que la acompaña en [`SessionAttribution`].
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionSource {
     /// `X-OxideGate-Session` presente y no vacío: etiqueta explícita
@@ -79,7 +79,7 @@ impl SessionSource {
 
 /// Sesión resuelta para un request puntual: procedencia (`source`) y valor
 /// opaco (`key`), inseparables por construcción (ver doc del módulo).
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SessionAttribution {
     /// Qué señal de precedencia ganó la resolución. Fija cómo interpretar
     /// `key`: una `key` de fallback bajo `Unattributed` NO es una identidad,
@@ -90,6 +90,25 @@ pub struct SessionAttribution {
     /// (`Unattributed`). Sin su `source` acompañante, `key` no es
     /// interpretable — nunca se expone ni se acarrea por separado.
     pub key: String,
+}
+
+/// `Default` = el bucket de fallback honesto, NO un valor vacío.
+///
+/// Existe para que `RequestMetric` pueda deserializar una fila antigua de
+/// `telemetry.jsonl` escrita antes de que este campo existiera (rehidratación,
+/// issue #42). Esa fila no traía sesión, y la respuesta correcta a «no venía
+/// sesión» ya está modelada en el tipo: `Unattributed`, que es un bucket
+/// explícito y no una ausencia disfrazada.
+///
+/// Un `derive(Default)` habría dado `key: ""` con un `source` arbitrario, que
+/// es justo la identidad inventada que el módulo se niega a producir.
+impl Default for SessionAttribution {
+    fn default() -> Self {
+        SessionAttribution {
+            source: SessionSource::Unattributed,
+            key: "unattributed".to_string(),
+        }
+    }
 }
 
 #[cfg(test)]

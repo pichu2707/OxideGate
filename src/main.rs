@@ -63,6 +63,10 @@ RUTAS QUE SIRVE:
     GET  /stats      Agregado en vivo por (proveedor, modelo).
     GET  /sessions   Agregado por sesion: que costo cada sesion de trabajo.
     GET  /requests   Detalle de los últimos requests individuales.
+    GET  /history    Desde cuando miden los agregados: ventana rehidratada al
+                     arrancar desde telemetry.jsonl, cuantas filas entraron y
+                     cual es la mas antigua. Se ajusta con
+                     OXIDEGATE_HISTORY_DAYS (0 lo desactiva).
 
 VER TAMBIÉN:
     oxidegate-monitor        Panel en vivo sobre este proxy (--once para
@@ -623,6 +627,53 @@ async fn main() {
     // Arrancamos la task de telemetría (escribe fuera del camino crítico).
     let telemetry = TelemetrySink::spawn(config.storage_dir.clone());
 
+    // Rehidratamos el histórico ANTES de servir la primera petición: si se
+    // hiciera después, `/stats` contestaría distinto según cuándo se lo
+    // preguntes, que es peor que no rehidratar. Es lectura síncrona a
+    // propósito — el arranque puede esperar, un agregado a medias no.
+    let (history_days, history_warning) = telemetry::rehydrate::history_days_from_env(
+        std::env::var("OXIDEGATE_HISTORY_DAYS").ok().as_deref(),
+    );
+    if let Some(aviso) = history_warning {
+        eprintln!("⚠️  {aviso}");
+    }
+    let rehydrated = {
+        let mut ruta = config.storage_dir.clone();
+        ruta.push("telemetry.jsonl");
+        let stats = telemetry.stats();
+        let sessions = telemetry.sessions();
+        let mut s = stats.write().expect("lock de stats envenenado al arrancar");
+        let mut ses = sessions
+            .write()
+            .expect("lock de sessions envenenado al arrancar");
+        telemetry::rehydrate::rehydrate(
+            &ruta,
+            history_days,
+            chrono::Utc::now(),
+            &mut s,
+            &mut ses,
+        )
+    };
+    if rehydrated.rows > 0 {
+        println!(
+            "📈 Histórico rehidratado: {} peticiones desde {} (ventana {} días)",
+            rehydrated.rows,
+            rehydrated.oldest.as_deref().unwrap_or("?"),
+            history_days
+        );
+    } else if history_days == 0 {
+        println!("📈 Rehidratación desactivada (OXIDEGATE_HISTORY_DAYS=0).");
+    }
+    // Las filas ilegibles se cuentan SIEMPRE, aunque haya habido rehidratación
+    // buena: un fichero que empieza a corromperse tiene que verse antes de que
+    // se coma el histórico entero.
+    if rehydrated.skipped_bad > 0 {
+        eprintln!(
+            "⚠️  {} filas de telemetry.jsonl no se pudieron leer (formato o línea truncada).",
+            rehydrated.skipped_bad
+        );
+    }
+
     let port = config.local_port;
     let bind_host = config.bind_host;
     // Si `OXIDEGATE_HOST` traía basura ya se cayó a loopback: aquí solo se
@@ -634,6 +685,13 @@ async fn main() {
         config: Arc::new(config),
         http: reqwest::Client::new(),
         telemetry,
+    };
+
+    // Estado congelado de la rehidratación: se resuelve una vez y no cambia,
+    // así que `/history` no necesita tocar el lock de telemetría.
+    let history_state = middleware::history::HistoryState {
+        window_days: history_days,
+        rehydrated: rehydrated.clone(),
     };
 
     // Definimos las rutas espejo del proxy para capturar las peticiones
@@ -673,6 +731,13 @@ async fn main() {
         // ella, la única forma de saber si un campo existe era hacer una
         // petición real y deducirlo: sondear por ausencia.
         .route("/version", get(middleware::version::handle_version))
+        // Desde cuándo miden los agregados. Ruta aparte y no un campo en
+        // `/stats` porque `/stats` es un ARRAY: añadirle la ventana lo
+        // convertiría en objeto, que es ruptura. Ver `middleware::history`.
+        .route(
+            "/history",
+            get(middleware::history::handle_history).with_state(history_state),
+        )
         // Agregación en vivo por (proveedor, modelo): qué optimizar ahora.
         .route("/stats", get(middleware::stats::handle_stats))
         // Agregación por SESIÓN: qué costó cada sesión de trabajo, no cada

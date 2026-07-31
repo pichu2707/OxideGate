@@ -65,7 +65,7 @@ const HEADER_NAMES: [&str; 12] = [
 /// upstream. Ver la documentación del módulo para el contrato de saneo
 /// compartido por los doce campos y la garantía de separación respecto de
 /// `cost_estimate_usd`.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CodexQuota {
     /// Tipo de plan de suscripción (`x-codex-plan-type`), crudo. `None` si
     /// la cabecera falta o llega vacía.

@@ -11,7 +11,7 @@ use crate::provider::{ContextBreakdown, SkillsBlock, ToolSearchSignal, ToolServe
 use crate::telemetry::{
     CacheBySection, CodexQuota, RecentRequests, SessionAttribution, SessionRegistry, StatsRegistry,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tokio::io::AsyncWriteExt;
@@ -24,7 +24,18 @@ use tokio::sync::mpsc;
 /// que de verdad importan en streaming). Los campos son `Option` cuando el dato
 /// puede faltar legítimamente (p. ej. el proveedor no mandó `usage`, o el modelo
 /// no está en la tabla de precios): preferimos un hueco honesto a un cero falso.
-#[derive(Debug, Serialize)]
+/// # Lectura desde `telemetry.jsonl` (rehidratación)
+///
+/// `Deserialize` existe para poder releer el histórico que ya está en disco
+/// (issue #42). La tolerancia a filas viejas se declara **campo a campo** y no
+/// con un `#[serde(default)]` a nivel de struct, a propósito: eso exigiría
+/// `Default` en todo el tipo y convertiría un `upstream` ausente en `""`, que
+/// es exactamente la clase de cero fabricado que este proyecto no admite. Una
+/// fila sin `upstream` está corrupta y debe fallar al parsear.
+///
+/// Los campos que SÍ llevan `default` son los que una build anterior no
+/// escribía: ahí la ausencia es legítima y el `None`/vacío es honesto.
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RequestMetric {
     // --- Identidad ---
     /// Instante en que se emite la métrica (RFC 3339, UTC).
@@ -34,6 +45,7 @@ pub struct RequestMetric {
     /// Proveedor destino (`anthropic`, `openai`).
     pub upstream: String,
     /// Modelo solicitado, leído del body del request. `None` si no venía.
+    #[serde(default)]
     pub model: Option<String>,
     /// Huella (hash no criptográfico) del body del request. Igual huella ⇒
     /// mismo prompt: base para detectar peticiones duplicadas o redundantes.
@@ -52,6 +64,7 @@ pub struct RequestMetric {
     /// `docs/optimizer-tool-search.md` §3): antes de este campo, "este
     /// tráfico era Claude Code" solo se podía INFERIR por los nombres de
     /// servidor MCP declarados, nunca confirmarse.
+    #[serde(default)]
     pub client: Option<String>,
 
     // --- Coste ---
@@ -67,30 +80,38 @@ pub struct RequestMetric {
     /// `cache_control_forced` el body reenviado es MAYOR que este número.
     ///
     /// Contrato completo en `docs/telemetry-per-request.md` §4.10.
+    #[serde(default)]
     pub prompt_bytes: usize,
     /// Tokens de entrada exactos, tal como los reporta el proveedor en `usage`.
+    #[serde(default)]
     pub input_tokens: Option<u64>,
     /// Tokens de salida exactos, tal como los reporta el proveedor en `usage`.
+    #[serde(default)]
     pub output_tokens: Option<u64>,
     /// Tokens servidos desde caché (lectura, tarifa reducida), crudos tal
     /// como los reporta el proveedor. `None` si no se midió o el proveedor
     /// no reportó caché en este request.
+    #[serde(default)]
     pub cache_read_tokens: Option<u64>,
     /// Tokens escritos a caché (creación, sobreprecio), crudos. Solo lo
     /// reportan algunos proveedores (p. ej. Anthropic); `None` en el resto.
+    #[serde(default)]
     pub cache_write_tokens: Option<u64>,
     /// Coste estimado en USD según la tabla de precios. `None` si no calculable.
+    #[serde(default)]
     pub cost_estimate_usd: Option<f64>,
     /// `true` si OxideGate inyectó el breakpoint de `cache_control` en este
     /// request (palanca A del optimizador, solo Anthropic). Permite
     /// correlacionar la inyección con los `cache_read_tokens` resultantes de
     /// las llamadas repetidas. `false` si la palanca estaba apagada, el
     /// cliente ya gestionaba su propio caching, o el proveedor no aplica.
+    #[serde(default)]
     pub cache_control_forced: bool,
     /// Nivel de esfuerzo de razonamiento PEDIDO por el cliente
     /// (`output_config.effort`, ver `provider::Outgoing::requested_effort`).
     /// Dialecto exclusivo de Anthropic: `None` en OpenAI/Gemini, o si el
     /// campo estaba ausente o no era un string en el body de Anthropic.
+    #[serde(default)]
     pub requested_effort: Option<String>,
     /// Modo de velocidad PEDIDO por el cliente (`speed` a nivel raíz del
     /// body, ver `provider::Outgoing::requested_speed`). Dialecto exclusivo
@@ -103,6 +124,7 @@ pub struct RequestMetric {
     /// este par de campos existe para exponer — un `requested_speed ==
     /// Some("fast")` con `served_speed != Some("fast")` es la señal de que el
     /// rate limit del modo rápido se activó para esta petición.
+    #[serde(default)]
     pub requested_speed: Option<String>,
     /// Velocidad con la que el proveedor SIRVIÓ REALMENTE la respuesta
     /// (`usage.speed`, ver `provider::Usage::speed`). Dialecto exclusivo de
@@ -112,6 +134,7 @@ pub struct RequestMetric {
     /// tráfico real de este proyecto (el modo `fast` no se ejercitó aún).
     /// `None` significa "el proveedor no lo reportó", nunca "sirvió a
     /// velocidad estándar" — no colapsar ambos casos.
+    #[serde(default)]
     pub served_speed: Option<String>,
 
     // --- Latencia ---
@@ -119,11 +142,13 @@ pub struct RequestMetric {
     pub status: u16,
     /// Time To First Token: ms desde que recibimos el request hasta el PRIMER
     /// chunk de la respuesta. La métrica que siente el usuario en streaming.
+    #[serde(default)]
     pub ttft_ms: Option<f64>,
     /// Latencia total: ms desde el request hasta que el stream se cierra.
     pub total_ms: f64,
     /// Velocidad de generación (tokens de salida por segundo). `None` si no
     /// tenemos tokens o el tramo de generación fue nulo.
+    #[serde(default)]
     pub tokens_per_sec: Option<f64>,
 
     // --- Desglose de contexto (ver `provider::ContextBreakdown`) ---
@@ -131,19 +156,24 @@ pub struct RequestMetric {
     /// de re-serializar el fragmento con `serde_json::to_vec`, JSON canónico,
     /// no bytes de wire). `None` si `Provider::decompose` no pudo calcular
     /// nada (body no parseó como JSON o no era un objeto).
+    #[serde(default)]
     pub context_system_bytes: Option<usize>,
     /// Bytes de los esquemas de herramientas. Mismo contrato de medición que
     /// `context_system_bytes`.
+    #[serde(default)]
     pub context_tools_bytes: Option<usize>,
     /// Bytes del historial (todos los mensajes menos el último). Mismo
     /// contrato de medición que `context_system_bytes`.
+    #[serde(default)]
     pub context_history_bytes: Option<usize>,
     /// Bytes del último mensaje (el turno nuevo). Mismo contrato de medición
     /// que `context_system_bytes`.
+    #[serde(default)]
     pub context_last_turn_bytes: Option<usize>,
     /// Bytes del resto de campos de control a nivel raíz (`model`,
     /// `temperature`, `max_tokens`…). Mismo contrato de medición que
     /// `context_system_bytes`.
+    #[serde(default)]
     pub context_other_bytes: Option<usize>,
     /// Suma de los cinco campos de contexto anteriores. DIFIERE levemente de
     /// `prompt_bytes` (que mide el body tal como lo mandó el cliente): este es
@@ -151,8 +181,10 @@ pub struct RequestMetric {
     /// realmente llegaron. Nunca combinar `context_measured_bytes` con
     /// `prompt_bytes` en un mismo cociente: son dos mediciones tomadas en
     /// puntos distintos del pipeline.
+    #[serde(default)]
     pub context_measured_bytes: Option<usize>,
     /// Número de mensajes del historial completo (incluyendo el último).
+    #[serde(default)]
     pub context_messages_count: Option<usize>,
     /// `(system + tools + history) / measured`: fracción del body que es
     /// prefijo estable (ver `ContextBreakdown::context_tax_ratio`).
@@ -163,6 +195,7 @@ pub struct RequestMetric {
     /// SÍ quedan en `Some(0)` (sabemos con certeza que no midieron nada). No
     /// es una inconsistencia: son dos preguntas distintas ("¿cuánto medimos?"
     /// vs. "¿qué fracción es prefijo estable?").
+    #[serde(default)]
     pub context_tax_ratio: Option<f64>,
 
     // --- Atribución de caché por sección (ver `telemetry::cache_attribution`) ---
@@ -182,6 +215,13 @@ pub struct RequestMetric {
     /// `None` significa **no atribuible** (sin desglose de contexto, sin
     /// `cache_read_tokens` reportados, o `upstream` desconocido). Todo a cero
     /// significa **medido y nada cacheado**. No colapsar ambos casos.
+    ///
+    /// **No se deserializa nunca** (`skip_deserializing`). Es un campo de
+    /// `GET /requests`, y la rehidratación del histórico alimenta `/stats` y
+    /// `/sessions` — que no lo usan. Saltarlo no es un atajo: es la frontera
+    /// que el propio issue #42 pide («tampoco rehidratar /requests»). De paso
+    /// evita tener que hacer deserializable un `&'static str`, que no lo es.
+    #[serde(skip_deserializing)]
     pub cache_by_section: Option<CacheBySection>,
 
     // --- Desglose de herramientas por servidor MCP (ver `provider::ToolServerBytes`) ---
@@ -216,6 +256,7 @@ pub struct RequestMetric {
     /// `context_*` de arriba: cada `bytes` de un `ToolServerBytes` es la
     /// longitud de re-serializar con `serde_json::to_vec` el fragmento de esa
     /// herramienta (JSON canónico, no bytes de wire ni tokens del modelo).
+    #[serde(default)]
     pub tools_by_server: Option<Vec<ToolServerBytes>>,
     /// Bytes de `tools` no atribuidos a ningún servidor (ver
     /// `provider::tools_overhead_bytes`): estructura del array `tools`
@@ -224,6 +265,7 @@ pub struct RequestMetric {
     /// `name`. Mismo contrato `None`/`Some` que `tools_by_server` — nacen del
     /// mismo `context.is_some()` calculado en `provider::*::prepare`, nunca
     /// se puede tener uno `Some` y el otro `None`.
+    #[serde(default)]
     pub tools_overhead_bytes: Option<usize>,
 
     /// Señal de carga diferida de herramientas (`tool_search`) del dialecto
@@ -242,6 +284,7 @@ pub struct RequestMetric {
     /// **No dobla bytes.** Los bytes de esos items ya los miden los campos
     /// `context_*` (viven en `input`): esta señal solo cuenta y clasifica, no
     /// vuelve a sumar bytes ni toca `tools_by_server`.
+    #[serde(default)]
     pub tool_search: Option<ToolSearchSignal>,
 
     /// Señal de honestidad sobre la ATRIBUCIÓN de `tools_by_server` en el
@@ -257,11 +300,13 @@ pub struct RequestMetric {
     /// - `Some(true)`: hay tools pero NINGUNA usa `mcp__` — el `(native)`
     ///   puede ocultar MCP aplanado (medido en `pi`/`opencode`). Observación
     ///   estructural, NUNCA una atribución inventada: no nombra servidores.
+    #[serde(default)]
     pub tools_flattened: Option<bool>,
     /// Listado de skills declarado en el body: `{declared, listing_bytes,
     /// format}`, o `null`. El coste se paga en CADA petición, se invoque una
     /// skill o no. `null` significa "no se reconoció ningún listado" — nunca
     /// "cero skills": ver `provider::skills` y `docs/skills-across-tools.md`.
+    #[serde(default)]
     pub skills: Option<SkillsBlock>,
     /// Bytes del CUERPO DE LA RESPUESTA que cruzaron el proxy. `None` si no
     /// llegó a haber respuesta del upstream.
@@ -274,6 +319,7 @@ pub struct RequestMetric {
     ///
     /// No se combina con `prompt_bytes` en un mismo ratio sin decir en voz
     /// alta que uno es wire de subida y el otro contenido de bajada.
+    #[serde(default)]
     pub response_bytes: Option<usize>,
 
     /// Microsegundos que `middleware::proxy::run` pasó DENTRO de
@@ -295,6 +341,7 @@ pub struct RequestMetric {
     /// serialización en el camino crítico. Se espera que `prepare_us` suba
     /// en la misma proporción en requests con muchas herramientas; no se
     /// optimiza acá a propósito (ver informe del cambio).
+    #[serde(default)]
     pub prepare_us: u64,
 
     // --- Cuota de suscripción de Codex (ver `telemetry::codex_quota`) ---
@@ -316,6 +363,7 @@ pub struct RequestMetric {
     /// porcentaje de ventana en un plan de precio fijo, nunca un importe en
     /// dólares. Ninguna función de este proyecto mezcla ambas entradas —
     /// ver la garantía estructural documentada en `telemetry::codex_quota`.
+    #[serde(default)]
     pub codex_quota: Option<CodexQuota>,
 
     // --- Atribución de sesión (ver `telemetry::session`) ---
@@ -334,6 +382,7 @@ pub struct RequestMetric {
     /// `session` se resuelve de las cabeceras del REQUEST y por eso está
     /// disponible idéntico tanto en el camino de éxito como en el de error
     /// de `middleware::proxy::send_and_meter`.
+    #[serde(default)]
     pub session: SessionAttribution,
 }
 

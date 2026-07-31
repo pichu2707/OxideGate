@@ -4,6 +4,11 @@
 > varios agentes a la vez esa no es la pregunta: el gasto por modelo **no dice
 > quién lo generó**. Este endpoint responde *"¿cuánto costó esta sesión?"*.
 
+> **Desde la rehidratación del histórico, este agregado NO empieza vacío**: al
+> arrancar se relee `telemetry.jsonl` dentro de una ventana (7 días por
+> defecto). `GET /history` dice desde cuándo mide — ver
+> [`history-rehydration.md`](history-rehydration.md).
+
 ---
 
 ## 1. Forma
