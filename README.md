@@ -204,6 +204,8 @@ seguirla son lo mismo.
 | Separar comandos de skills en el listado | ⛔ **Imposible desde el cable**: aparecen en el mismo bloque, mismo formato, sin marca. Medido — ver [§4.8](docs/telemetry-per-request.md) |
 | `AGENTS.md` en Codex, `pi` y OpenCode | ✅ Los tres lo mandan: **+159 B / +200 B / +160 B** sobre un fichero de 74 B. Claude Code, 0 B. Ver [§6](docs/skills-across-tools.md) |
 | **Skills atribuidas POR PETICIÓN** en `/requests` | ✅ Campo `skills` con `declared`, `listing_bytes` y `format` — ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.8 |
+| **Qué cubo cayó dentro del prefijo cacheado** | ✅ Campo `cache_by_section` — el único ESTIMADO del contrato, por eso va anidado y con su `method` versionado. Ver [§4.11](docs/telemetry-per-request.md) |
+| Coste de `gpt-5.5` y `gpt-5.6-sol` | ✅ Tarifados. Y el descuento de caché **no es uniforme dentro de OpenAI**: 0,5 en la familia 4o, 0,1 en la familia 5 |
 | Comparar el coste de skills entre herramientas | ✅ Medido en 4 clientes: **138 B/skill en Claude Code, 390 B en Codex** — ver [`docs/skills-across-tools.md`](docs/skills-across-tools.md) |
 | Invocar una skill en Gemini, opencode y Codex | ✅ Medido: opencode **3.335 B**; Codex **no tiene mecanismo** (lee el fichero); Gemini anuncia `activate_skill` y **no la declara** — ver [§7](docs/skills-across-tools.md) |
 | **`activate_skill` en el modo interactivo de Gemini** | ❌ Sin medir: aquí se probó `gemini -p` |

@@ -1,6 +1,6 @@
 [package]
 name = "oxidegate"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 # `edition = "2024"` requires Rust 1.85. Declaring it explicitly turns a cryptic
 # compile error on older toolchains into a clear "update your Rust" message.
