@@ -302,6 +302,9 @@ async fn send_and_meter(
                 // exactamente el caso; un objeto con ceros diría "medido y
                 // nada cacheado", y aquí no se midió nada.
                 cache_by_section: None,
+                // Sin caché atribuida no hay reparto: repartir por bytes sería
+                // el reparto que la medición desmiente.
+                input_share_by_section: None,
                 tools_by_server,
                 tools_overhead_bytes,
                 prepare_us,

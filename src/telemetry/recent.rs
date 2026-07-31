@@ -45,7 +45,7 @@
 //! localhost.
 use crate::provider::{SkillsBlock, ToolSearchSignal, ToolServerBytes};
 use crate::telemetry::logger::RequestMetric;
-use crate::telemetry::{CacheBySection, CodexQuota, SessionAttribution};
+use crate::telemetry::{CacheBySection, SectionShare, CodexQuota, SessionAttribution};
 use serde::Serialize;
 use std::collections::VecDeque;
 
@@ -154,6 +154,9 @@ pub struct RecentRequest {
     /// pintarlas en la misma columna sin darse cuenta. Lleva dentro su propio
     /// `method` versionado. Ver `telemetry::cache_attribution`.
     pub cache_by_section: Option<CacheBySection>,
+    /// Fracción del input PAGADO por sección, ESTIMADA sobre `cache_by_section`.
+    /// Fracciones de 0 a 1, nunca dinero. Ver §4.12.
+    pub input_share_by_section: Option<SectionShare>,
     /// Desglose de `tools` por servidor MCP (ver
     /// `telemetry::logger::RequestMetric::tools_by_server` para el contrato
     /// completo `None`/`Some(vec![])`). Expone SOLO etiqueta de servidor +
@@ -270,6 +273,7 @@ impl From<&RequestMetric> for RecentRequest {
             context_messages_count: m.context_messages_count,
             context_tax_ratio: m.context_tax_ratio,
             cache_by_section: m.cache_by_section,
+            input_share_by_section: m.input_share_by_section,
             tools_by_server: m.tools_by_server.clone(),
             tools_overhead_bytes: m.tools_overhead_bytes,
             tool_search: m.tool_search.clone(),
@@ -360,6 +364,7 @@ mod tests {
             context_messages_count: Some(3),
             context_tax_ratio: Some(30.0 / 52.0),
             cache_by_section: None,
+            input_share_by_section: None,
             tools_by_server: Some(vec![ToolServerBytes {
                 server: "claude_ai_Gmail".to_string(),
                 kind: crate::provider::ToolServerKind::Mcp,
@@ -949,6 +954,7 @@ mod tests {
             "context_tax_ratio",
             "context_tools_bytes",
             "cost_estimate_usd",
+            "input_share_by_section",
             "input_tokens",
             "model",
             "output_tokens",

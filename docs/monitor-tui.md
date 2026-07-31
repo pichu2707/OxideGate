@@ -309,7 +309,14 @@ convirtiendo tokens a bytes. Léase §4.11 antes de sacar conclusiones.
 | `system%` | Ídem para `system` | — |
 | `hist%` | Ídem para `history` | Baja cuando el historial creció desde el turno anterior: es el borde vivo del prefijo |
 | `lt$` | `last_turn_cached_bytes`, en bytes ABSOLUTOS | **Es el falsador. Debería ser 0 casi siempre** — ver abajo |
-| `metodo` | El `method` que declara el proxy (`prefix_walk_v1`) | Si cambia, cambió cómo se calcula todo lo demás de esta fila |
+| `$tools` | Fracción del input PAGADO que es `tools` | **Compárala con `tools%`**: la distancia entre las dos es el hallazgo entero |
+| `$hist` | Ídem para `history` | Suele subir respecto a su peso en bytes |
+| `$lt` | Ídem para el turno nuevo | La que más sube: pequeña en bytes, grande en factura |
+
+Las tres columnas `$` salen de `input_share_by_section`
+([`telemetry-per-request.md`](telemetry-per-request.md) §4.12). **Son fracciones,
+no dinero**: el monitor las pinta como porcentaje y nunca las multiplica por un
+coste. Convertirlas en euros es decisión de quien mira, no del panel.
 
 #### Por qué `lt$` está siempre a la vista aunque casi siempre valga cero
 

@@ -425,6 +425,9 @@ struct RequestRow {
     /// inventar una diferencia que no se puede observar sería peor que no
     /// mostrarla.
     cache_by_section: Option<CacheBySectionRow>,
+    /// Fracción del input PAGADO por sección. Mismo contrato `None` que
+    /// `cache_by_section`, del que depende.
+    input_share_by_section: Option<SectionShareRow>,
     /// Microsegundos que el proxy pasó dentro de `Provider::prepare`.
     ///
     /// En `RecentRequest` (lado servidor) este campo NO es `Option`: el proxy
@@ -612,6 +615,24 @@ struct CacheBySectionRow {
     last_turn_cached_bytes: usize,
     #[allow(dead_code)]
     other_cached_bytes: usize,
+}
+
+/// Fracción del input pagado por sección: espejo de
+/// `telemetry::section_share::SectionShare`.
+///
+/// Se deserializa `method` para MOSTRARLO, no para ramificar. Son fracciones
+/// de 0 a 1: el monitor las pinta como porcentaje y nunca las multiplica por
+/// nada — convertirlas en dinero es decisión de quien mira, no del panel.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct SectionShareRow {
+    #[allow(dead_code)]
+    method: String,
+    tools_share: f64,
+    system_share: f64,
+    history_share: f64,
+    last_turn_share: f64,
+    #[allow(dead_code)]
+    other_share: f64,
 }
 
 /// Fila del desglose de `tools` por servidor: espejo local y liviano de
@@ -2373,7 +2394,7 @@ fn requests_table_header<'a>(view: RequestsView) -> Row<'a> {
         }
         RequestsView::Cache => {
             vec![
-                "hora", "modelo", "total", "cch_B", "cch%", "tools%", "system%", "hist%", "lt$", "metodo", "outlier",
+                "hora", "modelo", "total", "cch%", "tools%", "hist%", "lt$", "$tools", "$hist", "$lt", "outlier",
             ]
         }
     };
@@ -2451,6 +2472,15 @@ fn cached_pct_cell(cached: Option<usize>, total: Option<usize>) -> String {
     }
 }
 
+/// Fracción del input pagado, como porcentaje. `-` si no hay reparto.
+///
+/// Se pinta como porcentaje y NUNCA se multiplica por un coste: convertir esto
+/// en dinero es decisión de quien mira, no del panel. Es la misma línea que el
+/// proxy traza al llamar al campo `*_share` y no `*_cost`.
+fn share_cell(v: Option<f64>) -> String {
+    v.map_or_else(|| "-".to_string(), |x| format!("{:.0}%", 100.0 * x))
+}
+
 /// Celdas de la vista de atribución de caché.
 ///
 /// Se calcula aparte de [`requests_row_cells`] solo por longitud; la vista
@@ -2483,15 +2513,18 @@ fn cache_row_cells(r: &RequestRow) -> Vec<String> {
         format_time(&r.timestamp),
         truncate_model(r.model.as_deref()),
         opt_bytes(r.context_measured_bytes),
-        opt_bytes(Some(cacheado)),
         cached_pct_cell(Some(cacheado), r.context_measured_bytes),
         cached_pct_cell(Some(c.tools_cached_bytes), r.context_tools_bytes),
-        cached_pct_cell(Some(c.system_cached_bytes), r.context_system_bytes),
         cached_pct_cell(Some(c.history_cached_bytes), r.context_history_bytes),
         // El FALSADOR, en bytes absolutos y no en porcentaje: lo que importa
         // vigilar es si deja de ser cero, no sobre qué base.
         opt_bytes(Some(c.last_turn_cached_bytes)),
-        c.method.clone(),
+        // Y las tres columnas que justifican la vista: lo mismo, pero en
+        // fracción de lo que se PAGA. La distancia entre `tools%` y `$tools`
+        // es el hallazgo entero en una línea.
+        share_cell(r.input_share_by_section.as_ref().map(|s| s.tools_share)),
+        share_cell(r.input_share_by_section.as_ref().map(|s| s.history_share)),
+        share_cell(r.input_share_by_section.as_ref().map(|s| s.last_turn_share)),
     ]
 }
 
@@ -3210,6 +3243,7 @@ mod tests {
             context_messages_count: Some(12),
             context_tax_ratio: Some(0.9994),
             cache_by_section: None,
+            input_share_by_section: None,
             prepare_us: Some(850),
             tools_by_server: None,
             tools_overhead_bytes: None,

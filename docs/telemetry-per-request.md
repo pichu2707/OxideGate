@@ -148,6 +148,7 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `prompt_bytes` | Bytes del body que MANDÓ EL CLIENTE, en su forma lógica | **No es wire** (en `/v1/codex/responses` y `/v1beta/*` se mide descomprimido), **no es lo que subió al proveedor** (con `cache_control_forced` el body reenviado es mayor) y **no es la suma del desglose**. Ver §4.10 antes de usarlo |
 | `response_bytes` | Bytes del CUERPO DE LA RESPUESTA que cruzaron el proxy. `null` si no llegó a haber respuesta | **Sin comprimir**, y por eso no es ancho de banda: el proxy descarta `Accept-Encoding` para poder leer el SSE. Ver §4.9 antes de compararlo con `prompt_bytes` |
 | `codex_quota` | Estado de la cuota de suscripción de Codex (OAuth de `chatgpt.com`), parseado de las doce cabeceras `x-codex-*` de la RESPUESTA del upstream: doce campos, todos opcionales. `null` si la petición no fue a Codex vía OAuth, o si el upstream falló antes de responder | Es el ÚNICO campo de esta fila que se lee de la respuesta y no del request ni del body. Cuota NUNCA son dólares: no alimenta ni puede alimentar `cost_estimate_usd` — ver §4.7 |
+| `input_share_by_section` | Fracción del input PAGADO por sección: `{method, tools_share, system_share, history_share, last_turn_share, other_share}`, o `null` | **Fracciones de 0 a 1 que suman 1 — nunca dinero.** Es una estimación SOBRE otra (se apoya en `cache_by_section`). Ver §4.12 antes de convertirlas en euros |
 | `cache_by_section` | Qué cubo del contexto cayó dentro del prefijo cacheado: `{method, tools_cached_bytes, system_cached_bytes, history_cached_bytes, last_turn_cached_bytes, other_cached_bytes}`, o `null` | **El ÚNICO campo ESTIMADO de esta fila**: todos los `context_*_bytes` son medición directa, este se deduce. Por eso va anidado y no suelto. `null` = no atribuible; todo a cero = medido y nada cacheado. Ver §4.11 ANTES de pintar nada con él |
 
 Ninguno de los campos de latencia/coste/identidad es nuevo: todos ya existían
@@ -868,6 +869,69 @@ Sobre 2.647 peticiones reales el falsador no dispara: 0,0% en `codex/gpt-5.5`
 
 ---
 
+### 4.12. `input_share_by_section`: el reparto de lo que se paga
+
+`context_*_bytes` dice cuánto **pesa** cada sección. No dice cuánto **cuesta**,
+y medido son cosas muy distintas.
+
+#### Por qué no lo puede calcular el consumidor
+
+Para repartir el input pagado hacen falta tres cosas:
+
+1. los bytes por sección — publicados,
+2. los bytes cacheados por sección — publicados (§4.11),
+3. **el multiplicador de lectura de caché del modelo** — *no publicado*.
+
+El tercero no está, y no puede estarlo sin publicar la tabla de precios entera.
+Por eso este campo existe: es la única forma de dar la respuesta sin dar la
+tabla.
+
+Y el multiplicador **es del modelo, no del proveedor**: dentro de OpenAI, la
+familia 4o lee caché al 0,5 y la familia 5 al 0,1. El mismo reparto de bytes da
+resultados distintos según el modelo, así que elegir un multiplicador por
+defecto sería inventar el número.
+
+#### Cómo se calcula
+
+```
+peso_i  = (bytes_i − cacheados_i) + cacheados_i × M
+share_i = peso_i / Σ peso
+```
+
+La **tarifa** del modelo se cancela al dividir, así que el reparto no depende
+del precio absoluto — solo de la proporción entre cacheado y no cacheado. Eso
+lo hace estable frente a un cambio de tarifa.
+
+#### No lleva `cost` en ningún sitio, y es deliberado
+
+El [issue #50](https://github.com/pichu2707/OxideGate/issues/50) marca esto como
+**el único error irreversible del contrato**: *«en cuanto una lente lo pinte en
+euros, nadie vuelve a leer la letra chica»*.
+
+Son fracciones de 0 a 1. No llevan moneda y no se pueden pintar como euros sin
+multiplicarlas por algo — y ese algo obliga a ir a buscar `cost_estimate_usd` y
+a leer qué es. Hay un test que falla si alguna clave publicada contiene `cost` o
+`usd`.
+
+#### Qué NO incluye
+
+**Solo el input.** El output no se reparte porque no pertenece a ninguna sección
+del contexto: es lo que el modelo generó, no lo que se le mandó. Un reparto que
+lo incluyera atribuiría a `tools` una parte de algo que `tools` no causó.
+
+#### Cuándo es `null`
+
+Es una estimación **sobre otra estimación**, así que hereda todos los huecos de
+§4.11 y añade uno propio:
+
+- sin desglose de contexto,
+- **sin `cache_by_section`** — y aquí no se reparte por bytes como consuelo: ese
+  es justo el reparto que la medición desmiente,
+- **sin el modelo en la tabla de precios** — no se conoce el multiplicador,
+- con `measured_bytes` a cero.
+
+---
+
 ## 5. Límite de memoria: 200 filas, y se pierden al reiniciar
 
 `RECENT_CAPACITY = 200` (`src/telemetry/recent.rs`): el buffer es un
@@ -1040,6 +1104,7 @@ que la define:
 | `codex_quota` | `la_forma_de_codex_quota_no_cambia_sin_querer` | `src/telemetry/codex_quota.rs` |
 | `session` | `la_forma_de_session_no_cambia_sin_querer` | `src/telemetry/session.rs` |
 | `cache_by_section` | `el_json_publicado_conserva_method_y_las_cinco_secciones` | `src/telemetry/cache_attribution.rs` |
+| `input_share_by_section` | `el_json_publicado_conserva_method_y_las_cinco_fracciones` | `src/telemetry/section_share.rs` |
 
 Cada una serializa el objeto POBLADO y afirma el conjunto exacto de claves, con
 un mensaje que dice qué hacer según el cambio sea aditivo o ruptura. La de
