@@ -148,6 +148,7 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `prompt_bytes` | Bytes del body que MANDÓ EL CLIENTE, en su forma lógica | **No es wire** (en `/v1/codex/responses` y `/v1beta/*` se mide descomprimido), **no es lo que subió al proveedor** (con `cache_control_forced` el body reenviado es mayor) y **no es la suma del desglose**. Ver §4.10 antes de usarlo |
 | `response_bytes` | Bytes del CUERPO DE LA RESPUESTA que cruzaron el proxy. `null` si no llegó a haber respuesta | **Sin comprimir**, y por eso no es ancho de banda: el proxy descarta `Accept-Encoding` para poder leer el SSE. Ver §4.9 antes de compararlo con `prompt_bytes` |
 | `codex_quota` | Estado de la cuota de suscripción de Codex (OAuth de `chatgpt.com`), parseado de las doce cabeceras `x-codex-*` de la RESPUESTA del upstream: doce campos, todos opcionales. `null` si la petición no fue a Codex vía OAuth, o si el upstream falló antes de responder | Es el ÚNICO campo de esta fila que se lee de la respuesta y no del request ni del body. Cuota NUNCA son dólares: no alimenta ni puede alimentar `cost_estimate_usd` — ver §4.7 |
+| `cache_by_section` | Qué cubo del contexto cayó dentro del prefijo cacheado: `{method, tools_cached_bytes, system_cached_bytes, history_cached_bytes, last_turn_cached_bytes, other_cached_bytes}`, o `null` | **El ÚNICO campo ESTIMADO de esta fila**: todos los `context_*_bytes` son medición directa, este se deduce. Por eso va anidado y no suelto. `null` = no atribuible; todo a cero = medido y nada cacheado. Ver §4.11 ANTES de pintar nada con él |
 
 Ninguno de los campos de latencia/coste/identidad es nuevo: todos ya existían
 en `RequestMetric` (Nivel 1). Los campos `context_*`, `prepare_us`,
@@ -751,6 +752,86 @@ obligación: un cociente subida/bajada mezcla **contenido lógico de subida**
 con **contenido sin comprimir de bajada**. Es útil si se declaran los dos
 términos, y engañoso si no.
 
+### 4.11. `cache_by_section`: el único campo estimado, y por qué va aparte
+
+Todo lo demás en esta fila es medición. Esto no. Va en un objeto anidado
+justamente para que esa frontera se vea en la ESTRUCTURA y no solo aquí.
+
+#### Qué problema resuelve
+
+Un token leído de caché cuesta el **10%** de la tarifa. El prefijo que se
+cachea es justo el estable —`system + tools + history`—, así que un reparto de
+coste por sección que ignore qué sección estaba cacheada se equivoca por un
+factor cercano a diez, y se equivoca precisamente en los cubos que más pesan.
+Medido: **el 54,0% de 89.743.537 tokens de entrada** del cohorte estaban
+cacheados.
+
+El efecto sobre el reparto, en `anthropic/claude-opus-4-8` (n=133):
+
+| Sección | Cuota de BYTES | Cuota de lo PAGADO | Delta |
+|---|---:|---:|---:|
+| `tools` | 56,1% | 22,5% | **−33,6 pt** |
+| `system` | 4,0% | 2,1% | −1,9 pt |
+| `history` | 31,9% | 43,5% | +11,6 pt |
+| `last_turn` | 7,8% | **31,1%** | **+23,4 pt** |
+| `other` | 0,2% | 0,7% | +0,5 pt |
+
+Leído en bytes, `tools` domina. Leído en lo que de verdad se paga, `tools` cae
+a menos de la mitad y **el turno nuevo del usuario multiplica por cuatro su
+peso**. Misma dirección, menor magnitud, en `codex/gpt-5.5` (`last_turn`
++5,7 pt) y `openai/gpt-5.5` (+3,8 pt).
+
+#### Cómo se calcula: paseo por el prefijo
+
+El caché hace *prefix match*: la región cacheada es un prefijo CONTIGUO del
+prompt. `cache_read_tokens` es **autoritativo** —lo reporta el proveedor—, así
+que el método no PREDICE la frontera: la convierte a una posición en bytes con
+la tasa plana de la propia petición y consume secciones en orden
+`tools → system → history → last_turn → other`.
+
+La contabilidad se toma del **upstream**, no del modelo: en Anthropic la caché
+va aparte del `input_tokens` reportado y hay que sumarla; en OpenAI y Gemini ya
+está dentro. Usar la fórmula equivocada desplaza la frontera y atribuye a la
+sección que no es.
+
+#### El falsador, publicado a propósito
+
+`last_turn_cached_bytes` **debería ser 0 casi siempre**: el último turno es
+contenido nuevo, no puede venir de una caché anterior. Que ese campo se dispare
+de forma sostenida es la señal de que el método dejó de describir el tráfico.
+Está publicado para que se pueda vigilar desde fuera, no escondido.
+
+Sobre 2.647 peticiones reales el falsador no dispara: 0,0% en `codex/gpt-5.5`
+(n=356), 0,4% en `openai/gpt-5.5` (n=281) y 6,0% en `anthropic/claude-opus-4-8`
+(n=133), este último con desbordamiento p95 de solo 0,051 — consistente con el
+±10% de error de la tasa tokens/byte.
+
+#### Límites declarados de `prefix_walk_v1`
+
+- **Solo se pasea `cache_read`, no `cache_write`.** La lectura se factura al 10%
+  (error de ~10x si se ignora); la escritura al 125% (error de 1,25x). El dinero
+  está en la lectura. Atribuir también la escritura es la evolución natural.
+- **Un solo orden de prefijo** para todos los proveedores. Anthropic lo
+  documenta; en OpenAI y Gemini es una hipótesis que el falsador no ha
+  conseguido tumbar, no una lectura de sus specs.
+- La conversión tokens→bytes usa la **tasa plana** de la petición. Las tasas por
+  sección quedan en 0,90x–1,06x dentro de un mismo modelo — pero **nunca mezcles
+  modelos** para estimarlas: agregar modelos fabrica un sesgo por sección que no
+  existe.
+- `n=10` en `claude-haiku-4-5` es demasiado poco para concluir nada; ahí el
+  falsador dispara al 20% y no se ha investigado.
+
+#### Qué NO hacer con este campo
+
+- **No lo pintes en la misma columna que los `context_*_bytes`.** Uno se mide,
+  el otro se deduce.
+- **No publiques euros por sección a partir de esto sin decir que es una
+  estimación.** Es el único error de este contrato que sería irreversible: en
+  cuanto una lente lo pinte en euros, nadie vuelve a leer la letra chica.
+- **No ignores `method`.** Va dentro del objeto para que un consumidor pueda
+  decidir si entiende el algoritmo ANTES de dibujar. Si el sufijo cambia,
+  cambió cómo se calcula.
+
 ---
 
 ## 5. Límite de memoria: 200 filas, y se pierden al reiniciar
@@ -807,6 +888,8 @@ el historial completo, o algo más viejo que las últimas 200 peticiones, la
 | `src/telemetry/recent.rs` | `RecentRequests`, `RecentRequest` — buffer FIFO acotado y proyección, sin axum |
 | `src/provider/skills.rs` | `detect_skills`, `detect_skills_in_body` — reconoce las tres formas medidas; un bloque sin entradas no cuenta (§4.8) |
 | `src/telemetry/codex_quota.rs` | `CodexQuota`, `CodexQuota::from_headers` — parseo y saneo de las doce cabeceras `x-codex-*`, sin ningún campo en USD (§4.7) |
+| `src/telemetry/cache_attribution.rs` | `CacheBySection`, `attribute_cache` — el paseo por el prefijo, función pura. Se llama desde `metered.rs` al emitir (único punto donde coinciden los cubos y los tokens de caché), nunca en el camino crítico (§4.11) |
+| `src/telemetry/pricing.rs` | `cache_accounting_for_upstream` — contabilidad de caché por FAMILIA, sin pasar por la tarifa: un modelo sin precio declarado sigue siendo atribuible. Un test guarda que no diverja de `model_pricing` (§4.11) |
 | `src/telemetry/logger.rs` | `TelemetrySink::spawn` alimenta el buffer en la misma task que escribe el JSONL; `TelemetrySink::recent()` expone el `Arc<RwLock<RecentRequests>>` |
 | `src/middleware/requests.rs` | `handle_requests` — el handler HTTP de `GET /requests` |
 | `src/middleware/version.rs` | `handle_version`, `CONTRACT_VERSION`, `ENDPOINTS`, `FIELDS` — el contrato declarado de `GET /version` (§8) |
@@ -899,6 +982,14 @@ Tres snapshots congelan las claves publicadas, uno por endpoint:
 
 Si alguien renombra un campo, el test lo cuenta antes que un usuario. El
 mensaje de fallo dice qué hacer según el cambio sea aditivo o ruptura.
+
+Los snapshots recorren claves de forma recursiva, pero solo ven lo que la fila
+de prueba trae poblado: un sub-objeto en `null` deja sus claves internas sin
+cubrir. Por eso `cache_by_section` guarda su propia forma en
+`el_json_publicado_conserva_method_y_las_cinco_secciones`
+(`src/telemetry/cache_attribution.rs`) — sin él, renombrar
+`tools_cached_bytes` no rompería ningún test, y es justo el nombre que consume
+una lente.
 
 Y un cuarto, `version_no_anuncia_campos_que_requests_no_publique`, comprueba
 que **cada entrada de `fields` existe de verdad en el JSON** —incluidas las

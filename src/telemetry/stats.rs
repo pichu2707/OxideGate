@@ -535,6 +535,7 @@ mod tests {
             context_measured_bytes: None,
             context_messages_count: None,
             context_tax_ratio: None,
+            cache_by_section: None,
             tools_by_server: None,
             tools_overhead_bytes: None,
             tool_search: None,

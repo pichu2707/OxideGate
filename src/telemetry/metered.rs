@@ -19,6 +19,7 @@
 //! el escáner de `usage` recién conoce al leer la respuesta — por eso viaja
 //! en `self.scanner.usage.speed`, no en `MetricBase`.
 use crate::provider::{SkillsBlock, ContextBreakdown, Provider, ToolSearchSignal, ToolServerBytes, Usage};
+use crate::telemetry::cache_attribution;
 use crate::telemetry::logger::{flatten_context_breakdown, tools_fields};
 use crate::telemetry::pricing;
 use crate::telemetry::{CodexQuota, RequestMetric, SessionAttribution, TelemetrySink};
@@ -279,6 +280,20 @@ impl MeteredBody {
             context_tax_ratio,
         ) = flatten_context_breakdown(self.base.context.as_ref());
 
+        // Atribución de la caché por sección. Se calcula AQUÍ y no en
+        // `Provider::prepare` porque necesita las dos mitades a la vez: los
+        // cubos de bytes (que solo existen en `prepare`) y los tokens de caché
+        // (que no existen hasta que el proveedor responde). Este es el único
+        // punto del recorrido donde ambas coinciden, y ya está fuera del
+        // camino crítico: la respuesta se cerró antes de entrar en `emit`.
+        let cache_by_section = cache_attribution::attribute_cache(
+            &self.base.upstream,
+            self.base.context.as_ref(),
+            self.scanner.usage.input_tokens,
+            self.scanner.usage.cache_read_tokens,
+            self.scanner.usage.cache_write_tokens,
+        );
+
         let (tools_by_server, tools_overhead_bytes) = tools_fields(
             self.base.context.as_ref(),
             self.base.tools_by_server.clone(),
@@ -313,6 +328,7 @@ impl MeteredBody {
             context_measured_bytes,
             context_messages_count,
             context_tax_ratio,
+            cache_by_section,
             tools_by_server,
             tools_overhead_bytes,
             prepare_us: self.base.prepare_us,

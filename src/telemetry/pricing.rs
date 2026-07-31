@@ -185,6 +185,70 @@ const OPENAI_4O_CACHE_READ_MULTIPLIER: f64 = 0.5;
 /// volumen llega cacheado: el error no sería marginal.
 const OPENAI_5_CACHE_READ_MULTIPLIER: f64 = 0.1;
 
+/// FORMA de la contabilidad de caché, sin los multiplicadores.
+///
+/// Separar la forma del precio no es cosmético: la forma («¿los tokens de caché
+/// van aparte del input o ya están dentro?») es estable dentro de una familia de
+/// proveedor, pero **los multiplicadores NO**. Medido contra la tarifa pública:
+/// dentro de OpenAI, la familia 4o cobra la lectura de caché al 0,5 y la familia
+/// 5 al 0,1. Una función que devolviera «la contabilidad de OpenAI» tendría que
+/// elegir uno de los dos y acertaría solo la mitad de las veces.
+///
+/// Quien necesita solo la forma —[`telemetry::cache_attribution`]— se lleva esto
+/// y no puede leer por accidente un multiplicador que no le corresponde. Quien
+/// necesita facturar usa [`model_pricing`], que trae precio y multiplicadores
+/// juntos y por modelo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheShape {
+    /// Los tokens de caché van APARTE del input reportado (Anthropic): para
+    /// tener el prompt completo hay que sumarlos.
+    Separate,
+    /// Los tokens de caché ya están DENTRO del input reportado (OpenAI, Gemini).
+    Subset,
+}
+
+impl CacheAccounting {
+    /// La forma de esta contabilidad, descartando los multiplicadores.
+    ///
+    /// **Solo existe para la guarda de divergencia** (ver el test
+    /// `la_forma_por_upstream_coincide_con_la_de_la_tabla_de_precios`): en
+    /// producción nadie necesita degradar una contabilidad completa a su forma,
+    /// porque quien factura ya tiene los multiplicadores y quien atribuye pide
+    /// la forma directamente a [`cache_shape_for_upstream`]. Va bajo
+    /// `cfg(test)` para que eso quede dicho y no como código muerto silencioso.
+    #[cfg(test)]
+    pub fn shape(self) -> CacheShape {
+        match self {
+            CacheAccounting::Separate { .. } => CacheShape::Separate,
+            CacheAccounting::Subset { .. } => CacheShape::Subset,
+        }
+    }
+}
+
+/// Forma de la contabilidad de caché de una FAMILIA de proveedor, sin pasar por
+/// el precio.
+///
+/// Existe porque hay una pregunta —«¿los tokens de caché van aparte del input o
+/// dentro?»— que NO depende de la tarifa del modelo, sino de qué proveedor lo
+/// sirve. Atarla a [`model_pricing`] dejaría sin atribuir a cualquier modelo que
+/// todavía no esté en la tabla de precios.
+///
+/// **Invariante**: para un modelo que SÍ esté en [`model_pricing`], su `arm`
+/// debe declarar esta misma FORMA. Los multiplicadores quedan deliberadamente
+/// fuera del contrato porque divergen dentro de una familia. Un test lo
+/// comprueba para los modelos conocidos.
+///
+/// `None` para un upstream que no reconocemos: preferimos no atribuir a
+/// atribuir con la fórmula equivocada, que desplazaría la frontera del prefijo.
+pub fn cache_shape_for_upstream(upstream: &str) -> Option<CacheShape> {
+    match upstream {
+        "anthropic" => Some(CacheShape::Separate),
+        // `codex` es la ruta de Codex/Responses de OpenAI: misma forma.
+        "openai" | "codex" | "gemini" => Some(CacheShape::Subset),
+        _ => None,
+    }
+}
+
 /// Estima el coste en USD de un request a partir de los tokens medidos.
 ///
 /// Requiere modelo conocido y al menos algún token de entrada/salida medido;
@@ -329,6 +393,70 @@ mod tests {
         let expected = 2000.0 * 0.5 * 2.50 / 1_000_000.0;
         assert!((cost - expected).abs() < EPS, "cost={cost} expected={expected}");
         assert!(cost >= 0.0);
+    }
+
+    /// GUARDA DE DIVERGENCIA.
+    ///
+    /// [`cache_shape_for_upstream`] y [`model_pricing`] responden a la misma
+    /// pregunta desde dos claves distintas (familia de proveedor vs modelo
+    /// concreto). Mientras existan las dos, pueden separarse en silencio. Este
+    /// test cierra ese hueco: para cada modelo que SÍ está en la tabla de
+    /// precios, ambas rutas tienen que declarar la misma FORMA.
+    ///
+    /// **Compara formas, NO multiplicadores, y eso es deliberado.** Los
+    /// multiplicadores divergen legítimamente dentro de una familia (4o cobra
+    /// la lectura de caché al 0,5 y la familia 5 al 0,1, verificado contra la
+    /// tarifa pública). Exigir que coincidieran obligaría a mentir en uno de
+    /// los dos sitios. La forma sí es estable, y es lo único que consume la
+    /// atribución.
+    #[test]
+    fn la_forma_por_upstream_coincide_con_la_de_la_tabla_de_precios() {
+        // (modelo tal como llega en el body, upstream que lo sirve)
+        let casos = [
+            ("claude-opus-4-8", "anthropic"),
+            ("claude-haiku-4-5", "anthropic"),
+            ("claude-sonnet-4-5-20250929", "anthropic"),
+            ("gpt-5.6-sol", "codex"),
+            ("gpt-5.5", "openai"),
+            ("gpt-5", "openai"),
+            ("gpt-4o", "openai"),
+            ("gpt-4o-mini", "openai"),
+            ("gpt-4-turbo", "openai"),
+            ("gemini-2.5-flash", "gemini"),
+            ("gemini-2.5-pro", "gemini"),
+        ];
+
+        for (modelo, upstream) in casos {
+            let por_modelo = model_pricing(modelo)
+                .unwrap_or_else(|| panic!("{modelo} debería estar en la tabla de precios"))
+                .cache
+                .shape();
+            let por_upstream = cache_shape_for_upstream(upstream)
+                .unwrap_or_else(|| panic!("{upstream} debería tener forma de familia"));
+            assert_eq!(
+                por_modelo, por_upstream,
+                "divergencia de FORMA para {modelo} vía {upstream}"
+            );
+        }
+    }
+
+    /// La ruta de Codex es OpenAI por debajo: misma forma, o la atribución de
+    /// caché colocaría la frontera del prefijo con la fórmula equivocada en el
+    /// 74% del tráfico medido.
+    #[test]
+    fn codex_tiene_la_misma_forma_que_openai() {
+        assert_eq!(
+            cache_shape_for_upstream("codex").expect("codex reconocido"),
+            cache_shape_for_upstream("openai").expect("openai reconocido"),
+        );
+    }
+
+    /// Un upstream que no conocemos no puede caer en una forma por defecto:
+    /// elegir mal desplaza la frontera del prefijo. `None` explícito.
+    #[test]
+    fn upstream_desconocido_no_tiene_forma() {
+        assert!(cache_shape_for_upstream("proveedor-nuevo").is_none());
+        assert!(cache_shape_for_upstream("").is_none());
     }
 
     /// LA FAMILIA 5 NO COBRA LA CACHE COMO LA 4o.

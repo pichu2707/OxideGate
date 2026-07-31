@@ -9,7 +9,7 @@
 //! log NUNCA se suma a la latencia que le devolvemos a gentle-ai.
 use crate::provider::{ContextBreakdown, SkillsBlock, ToolSearchSignal, ToolServerBytes};
 use crate::telemetry::{
-    CodexQuota, RecentRequests, SessionAttribution, SessionRegistry, StatsRegistry,
+    CacheBySection, CodexQuota, RecentRequests, SessionAttribution, SessionRegistry, StatsRegistry,
 };
 use serde::Serialize;
 use std::path::PathBuf;
@@ -164,6 +164,25 @@ pub struct RequestMetric {
     /// es una inconsistencia: son dos preguntas distintas ("¿cuánto medimos?"
     /// vs. "¿qué fracción es prefijo estable?").
     pub context_tax_ratio: Option<f64>,
+
+    // --- Atribución de caché por sección (ver `telemetry::cache_attribution`) ---
+    /// Qué cubo del contexto cayó dentro del prefijo cacheado, ESTIMADO.
+    ///
+    /// **Va en un objeto anidado y no suelto entre los campos de arriba a
+    /// propósito.** Todo lo demás en este bloque es medición directa de bytes;
+    /// esto es una estimación: el proveedor reporta los tokens cacheados en
+    /// total, nunca por sección, así que la frontera se deduce convirtiendo
+    /// tokens a bytes. Mezclarlos al mismo nivel invitaría a pintarlos en la
+    /// misma columna, que es justo el error que el issue #50 marca como el
+    /// único irreversible.
+    ///
+    /// Lleva dentro su propio `method` versionado: un consumidor puede decidir
+    /// si entiende el algoritmo antes de dibujar nada con él.
+    ///
+    /// `None` significa **no atribuible** (sin desglose de contexto, sin
+    /// `cache_read_tokens` reportados, o `upstream` desconocido). Todo a cero
+    /// significa **medido y nada cacheado**. No colapsar ambos casos.
+    pub cache_by_section: Option<CacheBySection>,
 
     // --- Desglose de herramientas por servidor MCP (ver `provider::ToolServerBytes`) ---
     /// Desglose de `tools` por servidor MCP: cuántas herramientas y cuántos
@@ -603,6 +622,7 @@ mod tests {
             context_measured_bytes: None,
             context_messages_count: None,
             context_tax_ratio: None,
+            cache_by_section: None,
             tools_by_server: None,
             tools_overhead_bytes: None,
             prepare_us: 0,
