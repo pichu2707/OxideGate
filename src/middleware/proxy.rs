@@ -317,6 +317,7 @@ async fn send_and_meter(
                 tool_search: out.tool_search,
                 tools_flattened: out.tools_flattened,
                 skills: out.skills,
+                instructions: out.instructions,
                 // No hubo respuesta que recorrer: `None` honesto, no un `0`
                 // que se leería como "el proveedor devolvió un cuerpo vacío".
                 response_bytes: None,
@@ -356,6 +357,7 @@ async fn send_and_meter(
         tool_search: out.tool_search,
         tools_flattened: out.tools_flattened,
         skills: out.skills,
+        instructions: out.instructions,
         provider: prov,
         // `resp` está vivo acá: `resp.status()` ya se leyó arriba (préstamo
         // inmutable) y el bucle de copia de cabeceras a la respuesta

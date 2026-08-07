@@ -75,7 +75,7 @@ pub const ENDPOINTS: [&str; 5] = ["/health", "/stats", "/sessions", "/requests",
 /// Un test (`telemetry::recent`) comprueba que cada entrada de aquí aparece de
 /// verdad en el JSON de `/requests`: esta lista no puede anunciar una
 /// capacidad que el proxy no tenga.
-pub const FIELDS: [&str; 11] = [
+pub const FIELDS: [&str; 12] = [
     "cache_by_section",
     "input_share_by_section",
     "prompt_bytes",
@@ -83,6 +83,7 @@ pub const FIELDS: [&str; 11] = [
     "tool_search",
     "tools_flattened",
     "skills",
+    "instructions",
     "response_bytes",
     "codex_quota",
     "session",

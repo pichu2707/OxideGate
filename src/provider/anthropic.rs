@@ -71,6 +71,9 @@ impl Provider for Anthropic {
             .unwrap_or((None, false));
         let context = parsed.as_ref().and_then(|v| self.decompose(v));
         let skills = parsed.as_ref().and_then(crate::provider::skills::detect_skills_in_body);
+        let instructions = parsed
+            .as_ref()
+            .and_then(crate::provider::instructions::detect_instructions_in_body);
         let by_server = parsed
             .as_ref()
             .map(|v| self.tools_by_server(v))
@@ -100,6 +103,7 @@ impl Provider for Anthropic {
             cache_control_forced,
             context,
             skills,
+            instructions,
             tools_by_server: by_server,
             tools_overhead_bytes: overhead,
             requested_effort,

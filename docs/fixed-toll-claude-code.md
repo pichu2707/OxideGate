@@ -24,6 +24,23 @@ El prompt de la sonda fue `"Responde solo: ok"` — 42 B. Todo lo demás es peaj
 Para escala: el cuerpo completo de esa petición fue 183.861 B, de los cuales
 103.136 B eran esquemas de `tools`.
 
+> **El primer bloque ya se ve por petición.** El `CLAUDE.md` tiene desde
+> entonces campo propio en `GET /requests` —`instructions: {bytes, format}`, ver
+> [`telemetry-per-request.md`](telemetry-per-request.md) §4.13— así que no hay
+> que recapturar para saber lo que cuesta en cada petición.
+>
+> Ese campo publica **33.716 B**. No es la misma captura: esta tabla es del
+> 2026-07-31 (cuerpo de 183.861 B); el campo se verificó el 2026-08-07 (cuerpo
+> de 188.180 B), y ahí sí está medido: sobre ESE cuerpo, la parte de texto
+> entera da 33.718 B y el bloque delimitado por las marcas da 33.716 B —los
+> 2 B son el `\n\n` que queda fuera del cierre. Que esta tabla dé la misma
+> cifra que esa parte de texto es coincidencia, no una relación de 2 B entre
+> ambos documentos. La cifra del campo es la reproducible por un tercero,
+> porque sus fronteras están en el propio body.
+>
+> Los otros dos bloques siguen **sin instrumentar**: la salida de hooks tiene su
+> propia marca y espera issue; el listado de skills se ve en `skills` (§4.8).
+
 ---
 
 ## 2. Dónde cae cada cosa, y por qué eso decide el precio
@@ -100,6 +117,22 @@ diferencia es lo que hizo fallar dos veces esta medición:
 - Cortar una sección "hasta el siguiente `#`" midió `CONFLICT SURFACING` en
   17.002 B. Falso: no había siguiente `#` y el corte se tragó el listado de
   skills entero. Real: **1.025 B**.
+
+El mismo corte falla en la otra dirección, y ahora con número. Al instrumentar
+el bloque (§4.13 de [`telemetry-per-request.md`](telemetry-per-request.md)) se
+midieron las dos formas sobre una misma captura — la del **2026-08-07**, cuerpo
+de 188.180 B, no la de esta página:
+
+| Corte | Bytes |
+|---|---:|
+| `<system-reminder>`…`</system-reminder>` | **33.716** |
+| desde `# claudeMd` hasta la siguiente cabecera `# ` | 8.254 |
+
+El corte por cabecera se para en `# Agent Teams Lite — Orchestrator
+Instructions`, que es una cabecera **del propio `CLAUDE.md`**. Da el 24% de la
+cifra real y no tiene ninguna pinta de estar mal. **Las fronteras las pone el
+envoltorio del harness, nunca el contenido**: ese contenido es markdown escrito
+por una persona y puede tener cualquier cabecera.
 
 ### Precauciones
 
