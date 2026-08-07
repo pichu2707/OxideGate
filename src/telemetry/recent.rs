@@ -43,7 +43,7 @@
 //! tanto por `GET /requests` como al `telemetry.jsonl` en texto plano. Léase
 //! `docs/telemetry-per-request.md` §4.3 antes de exponer este endpoint fuera de
 //! localhost.
-use crate::provider::{SkillsBlock, ToolSearchSignal, ToolServerBytes};
+use crate::provider::{InstructionsBlock, SkillsBlock, ToolSearchSignal, ToolServerBytes};
 use crate::telemetry::logger::RequestMetric;
 use crate::telemetry::{CacheBySection, SectionShare, CodexQuota, SessionAttribution};
 use serde::Serialize;
@@ -190,6 +190,14 @@ pub struct RecentRequest {
     /// format}`, o `null`. Se paga en CADA petición, se invoque una skill o
     /// no. `null` = no se reconoció ningún listado, NUNCA "cero skills".
     pub skills: Option<SkillsBlock>,
+    /// Bloque de instrucciones del usuario declarado en el body:
+    /// `{bytes, format}`, o `null`. Se paga en CADA petición. `null` = no se
+    /// reconoció ningún bloque, NUNCA "el usuario no tiene instrucciones".
+    ///
+    /// No compromete la invariante de privacidad del módulo: lleva un entero y
+    /// una etiqueta de dialecto, **jamás una línea del contenido** del fichero
+    /// —que es texto privado del usuario— ni una huella de él.
+    pub instructions: Option<InstructionsBlock>,
     /// Bytes del body que MANDÓ EL CLIENTE, en su forma lógica. La mitad de
     /// subida que le faltaba a [`Self::response_bytes`].
     ///
@@ -279,6 +287,7 @@ impl From<&RequestMetric> for RecentRequest {
             tool_search: m.tool_search.clone(),
             tools_flattened: m.tools_flattened,
             skills: m.skills,
+            instructions: m.instructions,
             prompt_bytes: m.prompt_bytes,
             response_bytes: m.response_bytes,
             prepare_us: m.prepare_us,
@@ -377,6 +386,7 @@ mod tests {
             tool_search: None,
             tools_flattened: None,
             skills: None,
+            instructions: None,
             response_bytes: None,
             prepare_us: 42,
             codex_quota: None,
@@ -956,6 +966,7 @@ mod tests {
             "cost_estimate_usd",
             "input_share_by_section",
             "input_tokens",
+            "instructions",
             "model",
             "output_tokens",
             "prepare_us",

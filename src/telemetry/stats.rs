@@ -689,6 +689,7 @@ mod tests {
             tool_search: None,
             tools_flattened: None,
             skills: None,
+            instructions: None,
             response_bytes: None,
             prepare_us: 0,
             codex_quota: None,

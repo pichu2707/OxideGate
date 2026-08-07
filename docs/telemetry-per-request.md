@@ -145,6 +145,7 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `tools_flattened` | Honestidad de la atribución de `tools_by_server`: `true` ⇒ el cliente NO usa el namespacing `mcp__`, así que su cubo `(native)` puede ocultar MCP aplanado; `false` ⇒ hay tools `mcp__`, el `(native)` es de fiar; `null` ⇒ no aplica (Anthropic/Gemini/Chat) o sin tools | Solo dialecto Responses/Codex. `pi` manda nombres crudos y `opencode` usa `<server>_<tool>` (ambiguo) — ninguno con `mcp__`. Es una advertencia estructural, NUNCA una atribución inventada: no nombra servidores. Ver §4.4 |
 | `session` | Sesión resuelta por precedencia de cabeceras del request: `{source, key}`. Nunca `null` — la peor rama es un fallback honesto (`source: "unattributed"`), no una ausencia | Ver §4.6 para la tabla de precedencia completa y cómo estampar el header desde cada harness |
 | `skills` | Listado de skills declarado en el body: `{declared, listing_bytes, format}`, o `null`. Se paga en CADA petición, se invoque una skill o no | `null` = no se reconoció ningún listado, **nunca "cero skills"**. `format` dice qué forma se encontró y, de paso, de qué herramienta viene el tráfico sin fiarse del `User-Agent` — ver §4.8 |
+| `instructions` | Bloque de instrucciones del usuario (`CLAUDE.md`) declarado en el body: `{bytes, format}`, o `null`. Se paga en CADA petición. Medido: el 48% del peaje fijo de una sesión de Claude Code | `null` = no se reconoció ningún bloque, **nunca "el usuario no tiene instrucciones"** — Claude Code IGNORA `AGENTS.md`, así que ahí `null` es correcto. Ver §4.13 |
 | `prompt_bytes` | Bytes del body que MANDÓ EL CLIENTE, en su forma lógica | **No es wire** (en `/v1/codex/responses` y `/v1beta/*` se mide descomprimido), **no es lo que subió al proveedor** (con `cache_control_forced` el body reenviado es mayor) y **no es la suma del desglose**. Ver §4.10 antes de usarlo |
 | `response_bytes` | Bytes del CUERPO DE LA RESPUESTA que cruzaron el proxy. `null` si no llegó a haber respuesta | **Sin comprimir**, y por eso no es ancho de banda: el proxy descarta `Accept-Encoding` para poder leer el SSE. Ver §4.9 antes de compararlo con `prompt_bytes` |
 | `codex_quota` | Estado de la cuota de suscripción de Codex (OAuth de `chatgpt.com`), parseado de las doce cabeceras `x-codex-*` de la RESPUESTA del upstream: doce campos, todos opcionales. `null` si la petición no fue a Codex vía OAuth, o si el upstream falló antes de responder | Es el ÚNICO campo de esta fila que se lee de la respuesta y no del request ni del body. Cuota NUNCA son dólares: no alimenta ni puede alimentar `cost_estimate_usd` — ver §4.7 |
@@ -638,6 +639,12 @@ cadenas en inglés de cada herramienta: si cambian, el detector deja de
 encontrarlas y debe declarar la ausencia. Mismo contrato que el resto de la
 fila.
 
+**Dos límites, los mismos que en §4.13** — el recorrido es compartido
+(`src/provider/block_scan.rs`). Si el texto del usuario menciona literalmente
+`<available_skills>` o `<skills_instructions>` **dentro** de un listado real, ese
+listado se salta y sale `null`; si menciona la etiqueta de cierre, la cifra sale
+corta. Los dos miden de menos, nunca de más.
+
 **No dobla bytes.** Esos bytes ya los cuentan los campos `context_*` — viven
 dentro de uno de sus buckets. `skills` sólo **atribuye**; nunca vuelve a
 sumarlos.
@@ -932,6 +939,114 @@ Es una estimación **sobre otra estimación**, así que hereda todos los huecos 
 
 ---
 
+### 4.13. `instructions`: el bloque más caro, que hasta ahora no se veía
+
+Tu `CLAUDE.md` es, medido, el **48% del peaje fijo** de una sesión de Claude
+Code (`docs/fixed-toll-claude-code.md` §1) — el doble que todas las skills
+juntas. Era el único de los tres bloques del peaje sin campo propio: sus bytes
+viajan en `messages[0]`, y como `history = messages[:-1]`, caían dentro de
+`context_history_bytes` mezclados con toda la conversación. De ahí no se podían
+sacar.
+
+Importa porque el catálogo publica una palanca **ya medida** sobre este bloque
+—`CLAUDE.md` lean ⇒ −29.509 B/petición, la mayor de las cinco
+(`docs/optimizer-claude-md.md`)— y el proxy no medía el objeto al que esa
+palanca se aplica.
+
+**Forma:**
+
+```json
+"instructions": { "bytes": 33716, "format": "claude_md" }
+```
+
+| Campo | Qué es |
+|---|---|
+| `bytes` | Bytes del bloque completo, envoltorio incluido. Se pagan en CADA petición |
+| `format` | `claude_md` (por ahora, ver abajo) |
+
+#### El bloque se delimita por su ENVOLTORIO, nunca por una cabecera
+
+Medido sobre una captura real a coste cero (Claude Code 2.1.220, cuerpo de
+188.180 B):
+
+| Corte | Bytes | |
+|---|---:|---|
+| `<system-reminder>`…`</system-reminder>` que contiene `# claudeMd` | **33.716** | lo que se publica |
+| desde `# claudeMd` hasta la siguiente cabecera `# ` | 8.254 | **falso** |
+
+El corte por cabecera se para en `# Agent Teams Lite — Orchestrator
+Instructions`, que es una cabecera **del propio `CLAUDE.md` del usuario**: da el
+24% de la cifra real y tiene toda la pinta de un número. El contenido del bloque
+es markdown arbitrario escrito por una persona, así que **ninguna cabecera puede
+servir de frontera**. Es el mismo error que `docs/fixed-toll-claude-code.md` §4
+ya documentaba en prosa; ahora tiene número.
+
+#### Y encontrar el envoltorio tampoco basta
+
+En ese MISMO cuerpo, `<system-reminder>` aparece en otros dos sitios:
+`$.system[2].text` (9.588 B, **abierto y nunca cerrado**) y
+`$.tools[0].description` (1.582 B, la descripción de la herramienta `Agent`
+mencionando la etiqueta). Por eso un bloque **sólo cuenta si contiene la marca
+interna** — el mismo criterio que hace que una mención de `<available_skills>`
+no sea un listado (§4.8), y por el mismo motivo: las marcas son cadenas en
+inglés que también aparecen en lo que escribe el usuario.
+
+Y por eso el recorrido va **cadena a cadena sin concatenar**: uniendo
+`system[2]` con `messages[0]` se fabricaría un bloque cerrado que en el cable no
+existe.
+
+#### `null` no significa "el usuario no tiene instrucciones"
+
+Significa "no se reconoció ningún bloque". Hay un caso real y perfectamente
+correcto: **Claude Code ignora `AGENTS.md`** — `null` con ese fichero en el
+proyecto es la respuesta buena, no un fallo del detector. El mismo fichero,
+cuatro comportamientos (`docs/skills-across-tools.md` §6).
+
+#### Un solo `format`, y es a propósito
+
+`claude_md` es el único dialecto **verificado en el cable**. Codex, opencode y
+`pi` también inyectan el fichero y tienen marca propia documentada
+(`docs/skills-across-tools.md` §6), pero esa tabla se escribió contra versiones
+anteriores —opencode iba por 1.18.5 y hoy va por 1.18.14— y una marca es una
+cadena literal. Añadirlas sin recapturar sería inventar exactamente la medición
+que este campo existe para no inventar. Cada una entra cuando tenga su captura.
+
+#### Dos avisos sobre la cifra
+
+- **No es el tamaño del fichero en disco.** El harness añade su envoltorio, y el
+  `CLAUDE.md` de proyecto y el global viajan concatenados en el mismo bloque.
+  Esto es lo que sube por el cable, que es lo que se factura.
+- **No es el 33.718 del documento.** `docs/fixed-toll-claude-code.md` §1 es de
+  otra captura (2026-07-31, cuerpo de 183.861 B); esta cifra es de la captura
+  del 2026-08-07 (cuerpo de 188.180 B), donde la parte de texto entera mide
+  33.718 B y el bloque delimitado por las marcas mide 33.716 B —los 2 B son el
+  `\n\n` que queda fuera del cierre. Que la captura antigua coincida con esa
+  cifra es casualidad, no una relación entre los dos documentos.
+
+#### Límites conocidos, declarados
+
+Los dos vienen de que el contenido del bloque es **texto libre del usuario**, y
+los dos van en la misma dirección: miden de MENOS o declaran ausencia, nunca de
+más.
+
+1. **Si tu `CLAUDE.md` menciona literalmente `<system-reminder>`** —la etiqueta
+   de APERTURA— ese bloque se **salta entero**, y el campo puede salir `null`.
+   El recorrido ve dos aperturas y ninguna que el cierre final cierre de forma
+   inequívoca, así que no se queda con ninguna. Distinguir "apertura mencionada"
+   de "apertura sin cerrar" exigiría inventarse una gramática del contenido.
+2. **Si menciona la etiqueta de CIERRE**, `</system-reminder>`, el recorrido
+   para ahí y la cifra sale **corta**.
+
+Medir de menos en un caso raro y decirlo es honesto; medir de más en silencio,
+no. Y sobremedir es un riesgo real, no hipotético: una versión anterior de este
+recorrido fusionaba una apertura sin cerrar con el bloque siguiente y publicaba
+123 B donde había 67. Lo encontró una revisión adversarial, no el tráfico.
+
+**No dobla bytes.** Ya los cuenta `context_history_bytes`. `instructions` sólo
+**atribuye**; nunca vuelve a sumarlos.
+
+---
+
 ## 5. Límite de memoria: 200 filas, y se pierden al reiniciar
 
 `RECENT_CAPACITY = 200` (`src/telemetry/recent.rs`): el buffer es un
@@ -985,6 +1100,8 @@ el historial completo, o algo más viejo que las últimas 200 peticiones, la
 |---|---|
 | `src/telemetry/recent.rs` | `RecentRequests`, `RecentRequest` — buffer FIFO acotado y proyección, sin axum |
 | `src/provider/skills.rs` | `detect_skills`, `detect_skills_in_body` — reconoce las tres formas medidas; un bloque sin entradas no cuenta (§4.8) |
+| `src/provider/instructions.rs` | `detect_instructions`, `detect_instructions_in_body` — el bloque de `CLAUDE.md`, delimitado por su envoltorio y no por una cabecera (§4.13) |
+| `src/provider/block_scan.rs` | `primer_bloque_con` — el recorrido que comparten los dos detectores: un bloque sólo cuenta si trae su marca interna, y una mención no interrumpe la búsqueda |
 | `src/telemetry/codex_quota.rs` | `CodexQuota`, `CodexQuota::from_headers` — parseo y saneo de las doce cabeceras `x-codex-*`, sin ningún campo en USD (§4.7) |
 | `src/telemetry/cache_attribution.rs` | `CacheBySection`, `attribute_cache` — el paseo por el prefijo, función pura. Se llama desde `metered.rs` al emitir (único punto donde coinciden los cubos y los tokens de caché), nunca en el camino crítico (§4.11) |
 | `src/telemetry/pricing.rs` | `cache_accounting_for_upstream` — contabilidad de caché por FAMILIA, sin pasar por la tarifa: un modelo sin precio declarado sigue siendo atribuible. Un test guarda que no diverja de `model_pricing` (§4.11) |
@@ -1016,7 +1133,7 @@ GET /version → {
   "oxidegate": "0.3.1",
   "contract": 1,
   "endpoints": ["/health", "/stats", "/sessions", "/requests"],
-  "fields": ["tool_names", "tool_search", "tools_flattened", "skills",
+  "fields": ["tool_names", "tool_search", "tools_flattened", "skills", "instructions",
              "response_bytes", "codex_quota", "session", "prepare_us"]
 }
 ```
@@ -1101,6 +1218,7 @@ que la define:
 | `tools_by_server` | `la_forma_de_tool_server_bytes_no_cambia_sin_querer` | `src/provider/mod.rs` |
 | `tool_search` | `la_forma_de_tool_search_signal_no_cambia_sin_querer` | `src/provider/mod.rs` |
 | `skills` | `la_forma_de_skills_no_cambia_sin_querer` | `src/provider/skills.rs` |
+| `instructions` | `la_forma_de_instructions_no_cambia_sin_querer` | `src/provider/instructions.rs` |
 | `codex_quota` | `la_forma_de_codex_quota_no_cambia_sin_querer` | `src/telemetry/codex_quota.rs` |
 | `session` | `la_forma_de_session_no_cambia_sin_querer` | `src/telemetry/session.rs` |
 | `cache_by_section` | `el_json_publicado_conserva_method_y_las_cinco_secciones` | `src/telemetry/cache_attribution.rs` |

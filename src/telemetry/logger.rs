@@ -7,7 +7,9 @@
 //! para que `/stats` y `/requests` puedan leer, respectivamente, la
 //! agregación y el detalle reciente en vivo sin tocar el JSONL. Así el I/O de
 //! log NUNCA se suma a la latencia que le devolvemos a gentle-ai.
-use crate::provider::{ContextBreakdown, SkillsBlock, ToolSearchSignal, ToolServerBytes};
+use crate::provider::{
+    ContextBreakdown, InstructionsBlock, SkillsBlock, ToolSearchSignal, ToolServerBytes,
+};
 use crate::telemetry::{
     CacheBySection, SectionShare, CodexQuota, RecentRequests, SessionAttribution, SessionRegistry, StatsRegistry,
 };
@@ -323,6 +325,17 @@ pub struct RequestMetric {
     /// "cero skills": ver `provider::skills` y `docs/skills-across-tools.md`.
     #[serde(default)]
     pub skills: Option<SkillsBlock>,
+    /// Bloque de instrucciones del usuario declarado en el body:
+    /// `{bytes, format}`, o `null`. En Claude Code es el **48% del peaje fijo**
+    /// de la sesión (`docs/fixed-toll-claude-code.md` §1), y hasta este campo
+    /// sus bytes solo existían diluidos dentro de `context_history_bytes`.
+    ///
+    /// `null` significa "no se reconoció ningún bloque" — nunca "el usuario no
+    /// tiene instrucciones". El caso que lo hace inevitable está medido: Claude
+    /// Code IGNORA `AGENTS.md`, así que `null` con ese fichero en el proyecto
+    /// es la respuesta correcta. Ver `provider::instructions`.
+    #[serde(default)]
+    pub instructions: Option<InstructionsBlock>,
     /// Bytes del CUERPO DE LA RESPUESTA que cruzaron el proxy. `None` si no
     /// llegó a haber respuesta del upstream.
     ///
@@ -673,6 +686,7 @@ mod tests {
             tool_search: None,
             tools_flattened: None,
             skills: None,
+            instructions: None,
             response_bytes: None,
             status: 200,
             ttft_ms: None,

@@ -8,7 +8,9 @@
 //! trait [`Provider`]: quien agregue un proveedor nuevo solo toca este
 //! módulo, sin tocar el transporte genérico ni la mecánica de medición.
 pub mod anthropic;
+mod block_scan;
 pub mod gemini;
+pub mod instructions;
 pub mod openai;
 pub mod skills;
 
@@ -21,6 +23,7 @@ use std::hash::{Hash, Hasher};
 
 pub use anthropic::ANTHROPIC;
 pub use gemini::GEMINI;
+pub use instructions::InstructionsBlock;
 pub use skills::SkillsBlock;
 pub use openai::{OPENAI_CHAT, OPENAI_CODEX_RESPONSES, OPENAI_RESPONSES};
 
@@ -155,6 +158,13 @@ pub struct Outgoing {
     /// nunca "cero skills": las marcas son cadenas de cada herramienta y si
     /// cambian hay que declarar la ausencia, no fabricar un cero.
     pub skills: Option<SkillsBlock>,
+    /// Bloque de instrucciones del usuario (`CLAUDE.md`) declarado en el body,
+    /// si se reconoció el dialecto (ver `instructions::detect_instructions`).
+    /// Mismo contrato de ausencia honesta que [`Self::skills`]: `None` es "no
+    /// se pudo ver", nunca "el usuario no tiene instrucciones" — y en Claude
+    /// Code con un `AGENTS.md` en el proyecto, `None` es la respuesta CORRECTA
+    /// porque esa herramienta no lo manda.
+    pub instructions: Option<InstructionsBlock>,
 }
 
 /// Acumulador de tokens medidos desde la respuesta del proveedor.
