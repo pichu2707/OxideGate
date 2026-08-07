@@ -279,9 +279,23 @@ Dos obstáculos que costaron un rato y conviene no reaprender:
 
 - ~~**`AGENTS.md` en otros clientes**~~ — medido: los tres lo mandan, entre
   +159 B y +200 B sobre un fichero de 74 B. Ver `docs/skills-across-tools.md` §6.
-- **El coste de invocar** en Gemini, opencode y Codex ([#28](https://github.com/pichu2707/OxideGate/issues/28)).
-- **Cuántos bytes son comandos** y cuántos skills en el listado. Aquí se
-  estableció que conviven, no la proporción exacta de cada uno.
+- ~~**El coste de invocar** en Gemini, opencode y Codex~~ — medido, [#28](https://github.com/pichu2707/OxideGate/issues/28)
+  cerrado: opencode **3.335 B**; Codex no tiene mecanismo (entrega un `file:`
+  locator y el modelo lee el fichero); Gemini anuncia `activate_skill` y **no la
+  declara** — pero eso está medido con `gemini -p`, y el modo interactivo sigue
+  sin comprobar ([#68](https://github.com/pichu2707/OxideGate/issues/68)). Ver
+  `docs/skills-across-tools.md` §7.
+- ~~**Cuántos bytes son comandos** y cuántos skills en el listado~~ — **no es
+  un hueco pendiente, es una pregunta cerrada en negativo.** Desde el cable es
+  **imposible**: comandos y skills llegan en el mismo bloque, con el mismo
+  formato `- nombre: descripción` y **sin ninguna marca** que los distinga.
+  Medido, y es el motivo de que `skills.declared` cuente ambos en vez de fingir
+  una separación (`docs/telemetry-per-request.md` §4.8).
+
+  Contarlos por separado exigiría mirar el DISCO, y eso responde a otra
+  pregunta: el disco dice qué tienes instalado, el cable dice qué se paga. Ya
+  discreparon una vez —657 skills en disco frente a 43 en el cable
+  (`docs/skills-across-tools.md` §5)— y ahí se estableció que manda el cable.
 
 ---
 
