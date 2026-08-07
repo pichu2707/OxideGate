@@ -30,6 +30,12 @@
 //! cadenas en inglés de cada herramienta: si cambian, el detector deja de
 //! encontrarlas y debe declararlo ausente, no fabricar un cero. Mismo contrato
 //! que el resto de la telemetría.
+//!
+//! Hay un segundo camino a la ausencia, y es el precio de no sobremedir nunca:
+//! si el texto del usuario menciona la etiqueta de APERTURA **dentro** de un
+//! listado real, ese listado se salta (ver [`super::block_scan`]); si menciona
+//! la de cierre, la cifra sale corta. Los dos límites miden de MENOS, y están
+//! publicados en `docs/telemetry-per-request.md` §4.8.
 
 /// Formato del listado de skills reconocido en el body.
 ///
@@ -154,28 +160,11 @@ fn detect_skills_instructions(texto: &str) -> Option<SkillsBlock> {
 /// Primer bloque delimitado por `abre`/`cierra` que contenga al menos una
 /// `entrada`, junto con cuántas contiene.
 ///
-/// Buscar sólo la primera apertura no sirve: en tráfico real la primera suele
-/// ser una mención entrecomillada dentro de las instrucciones del usuario.
-fn bloque_con_entradas(
-    texto: &str,
-    abre: &str,
-    cierra: &str,
-    entrada: &str,
-) -> Option<(usize, usize)> {
-    let mut desde = 0usize;
-    while let Some(rel) = texto[desde..].find(abre) {
-        let i = desde + rel;
-        let rel_fin = texto[i..].find(cierra)?;
-        let fin = i + rel_fin + cierra.len();
-        let bloque = &texto[i..fin];
-        let n = bloque.matches(entrada).count();
-        if n > 0 {
-            return Some((bloque.len(), n));
-        }
-        desde = i + abre.len();
-    }
-    None
-}
+/// Vive en [`super::block_scan`] porque el detector de instrucciones necesita
+/// exactamente el mismo recorrido, y por exactamente la misma razón: sus marcas
+/// también aparecen en el texto que escribe el usuario. Relajar la regla en uno
+/// de los dos volvería mentiroso al otro.
+use super::block_scan::primer_bloque_con as bloque_con_entradas;
 
 /// Busca el listado de skills en un body completo, sea cual sea el dialecto.
 ///

@@ -8,6 +8,7 @@
 //! trait [`Provider`]: quien agregue un proveedor nuevo solo toca este
 //! módulo, sin tocar el transporte genérico ni la mecánica de medición.
 pub mod anthropic;
+mod block_scan;
 pub mod gemini;
 pub mod openai;
 pub mod skills;
