@@ -198,6 +198,14 @@ pub struct RecentRequest {
     /// una etiqueta de dialecto, **jamás una línea del contenido** del fichero
     /// —que es texto privado del usuario— ni una huella de él.
     pub instructions: Option<InstructionsBlock>,
+    /// Nivel de esfuerzo que IMPUSO la palanca B, o `null` si el proxy no
+    /// intervino. Se lee junto a `requested_effort` (lo que pidió el cliente),
+    /// nunca en su lugar: es lo que impide confundir un ahorro del cliente con
+    /// una intervención del medidor. Ver §4.14.
+    ///
+    /// No compromete la invariante de privacidad del módulo: es una etiqueta
+    /// de un enum documentado por el proveedor, no contenido de prompt.
+    pub effort_forced: Option<String>,
     /// Bytes del body que MANDÓ EL CLIENTE, en su forma lógica. La mitad de
     /// subida que le faltaba a [`Self::response_bytes`].
     ///
@@ -292,6 +300,7 @@ impl From<&RequestMetric> for RecentRequest {
             tools_flattened: m.tools_flattened,
             skills: m.skills,
             instructions: m.instructions,
+            effort_forced: m.effort_forced.clone(),
             prompt_bytes: m.prompt_bytes,
             response_bytes: m.response_bytes,
             prepare_us: m.prepare_us,
@@ -391,6 +400,7 @@ mod tests {
             tools_flattened: None,
             skills: None,
             instructions: None,
+            effort_forced: None,
             response_bytes: None,
             prepare_us: 42,
             codex_quota: None,
@@ -968,6 +978,7 @@ mod tests {
             "context_tax_ratio",
             "context_tools_bytes",
             "cost_estimate_usd",
+            "effort_forced",
             "input_share_by_section",
             "input_tokens",
             "instructions",

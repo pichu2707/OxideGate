@@ -54,6 +54,55 @@ pub fn exposure_warning(host: IpAddr) -> Option<String> {
     ))
 }
 
+/// Niveles de esfuerzo que acepta el dialecto de Anthropic.
+///
+/// Se usa **solo como lista de valores válidos** para [`parse_force_effort`].
+/// El orden en que están escritos es el del dialecto, de menos a más, pero
+/// **nada lo consulta**: la palanca B mueve el nivel en las DOS direcciones.
+///
+/// Es deliberado, y conviene decirlo porque la intuición dice lo contrario:
+/// un "optimizador" que solo bajara dejaría de servir como instrumento. El
+/// A/B que midió el −20% de tokens de salida necesitó forzar `high` y forzar
+/// `low` sobre la misma tarea para poder compararlas. Esta palanca es
+/// *forzar* un nivel, no *bajarlo*.
+///
+/// Consecuencia que el operador tiene que saber: configurar un nivel más alto
+/// del que pide el cliente **sube el coste**. La fila lo declara igual
+/// (`effort_forced`), pero el proxy no va a impedírtelo ni a adivinar tu
+/// intención.
+pub const NIVELES_DE_ESFUERZO: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// Resuelve la palanca B desde el valor crudo de `OXIDEGATE_FORCE_EFFORT`.
+/// Función pura para poder afirmar en tests sin tocar el entorno del proceso.
+///
+/// **Falla CERRADO**, igual que [`parse_bind_host`]: un valor que no reconoce
+/// deja la palanca APAGADA y devuelve el aviso. El error opuesto —mutar cada
+/// petición por un typo, en un proxy cuya promesa es no tocar nada— es el
+/// único de los dos que no se nota hasta que ya has medido mal un día entero.
+///
+/// Devuelve `(objetivo, aviso)`. `objetivo` es `None` si la variable está
+/// ausente, vacía, o no es uno de [`NIVELES_DE_ESFUERZO`].
+pub fn parse_force_effort(raw: Option<&str>) -> (Option<String>, Option<String>) {
+    let Some(valor) = raw.map(str::trim).filter(|v| !v.is_empty()) else {
+        return (None, None);
+    };
+
+    let normalizado = valor.to_ascii_lowercase();
+    if NIVELES_DE_ESFUERZO.contains(&normalizado.as_str()) {
+        return (Some(normalizado), None);
+    }
+
+    (
+        None,
+        Some(format!(
+            "oxidegate: OXIDEGATE_FORCE_EFFORT={valor:?} no es un nivel de esfuerzo.\n  \
+             La palanca queda APAGADA: el proxy no muta ninguna petición.\n  \
+             Niveles válidos: {}",
+            NIVELES_DE_ESFUERZO.join(", ")
+        )),
+    )
+}
+
 pub struct AppConfig {
     pub local_port: u16,
     /// Interfaz donde bindea el proxy. Por defecto loopback: abrirse a la red
@@ -83,6 +132,25 @@ pub struct AppConfig {
     /// arranca APAGADO y hay que prenderlo a propósito con
     /// `OXIDEGATE_FORCE_CACHE=true`.
     pub force_prompt_cache: bool,
+    /// Palanca B del optimizador: fuerza `output_config.effort` en las
+    /// peticiones a Anthropic. `None` = apagada, que es el default.
+    ///
+    /// Medida: `--effort low` da **−20,0% de tokens de salida y −22,0% de
+    /// reloj** sin coste de exactitud sobre razonamiento de respuesta cerrada
+    /// (45/45 en 25 problemas). Lo que NO está medido son las tareas
+    /// abiertas —código, diseño—, y por eso esto arranca apagado y se
+    /// documenta con el hueco a la vista (ver `docs/optimizer-effort.md`).
+    ///
+    /// A diferencia de la palanca A, esta SOBRESCRIBE lo que el cliente pidió:
+    /// medido, Claude Code manda `{"effort": "high"}` explícito en cada
+    /// petición, así que una palanca que solo actuara ante su ausencia no
+    /// haría nada nunca. Por eso la fila de telemetría publica las DOS cosas:
+    /// `requested_effort` (lo que pidió el cliente, leído antes de mutar) y
+    /// `effort_forced` (lo que impuso el proxy).
+    pub force_effort: Option<String>,
+    /// Aviso pendiente de imprimir si `OXIDEGATE_FORCE_EFFORT` traía basura.
+    /// Se arrastra por el mismo motivo que [`Self::bind_host_warning`].
+    pub force_effort_warning: Option<String>,
 }
 
 impl AppConfig {
@@ -95,6 +163,8 @@ impl AppConfig {
 
         let (bind_host, bind_host_warning) =
             parse_bind_host(env::var("OXIDEGATE_HOST").ok().as_deref());
+        let (force_effort, force_effort_warning) =
+            parse_force_effort(env::var("OXIDEGATE_FORCE_EFFORT").ok().as_deref());
 
         Self {
             local_port: env::var("OXIDEGATE_PORT")
@@ -117,6 +187,8 @@ impl AppConfig {
             force_prompt_cache: env::var("OXIDEGATE_FORCE_CACHE")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
+            force_effort,
+            force_effort_warning,
         }
     }
 
@@ -127,6 +199,73 @@ impl AppConfig {
         path.push(".config");
         path.push("opencode");
         path.exists()
+    }
+}
+
+#[cfg(test)]
+mod force_effort_tests {
+    use super::*;
+
+    /// El default es NO tocar nada. Es la promesa entera del proxy.
+    #[test]
+    fn sin_variable_la_palanca_esta_apagada() {
+        let (objetivo, aviso) = parse_force_effort(None);
+
+        assert!(objetivo.is_none());
+        assert!(aviso.is_none());
+    }
+
+    /// Una variable vacía o en blanco es "no la he puesto", no un error.
+    /// Mismo criterio que `OXIDEGATE_HOST=`.
+    #[test]
+    fn una_variable_vacia_no_enciende_ni_avisa() {
+        for crudo in ["", "   ", "\t"] {
+            let (objetivo, aviso) = parse_force_effort(Some(crudo));
+            assert!(objetivo.is_none(), "{crudo:?} no debe encender la palanca");
+            assert!(aviso.is_none(), "{crudo:?} no es un error, es una ausencia");
+        }
+    }
+
+    /// Los cinco niveles del dialecto, y sin sensibilidad a mayúsculas ni a
+    /// espacios: quien exporta una variable de entorno no debería pelearse
+    /// con eso.
+    #[test]
+    fn reconoce_los_cinco_niveles_normalizados() {
+        for (crudo, esperado) in [
+            ("low", "low"),
+            ("MEDIUM", "medium"),
+            (" high ", "high"),
+            ("XHigh", "xhigh"),
+            ("max", "max"),
+        ] {
+            let (objetivo, aviso) = parse_force_effort(Some(crudo));
+            assert_eq!(objetivo.as_deref(), Some(esperado), "crudo: {crudo:?}");
+            assert!(aviso.is_none());
+        }
+    }
+
+    /// **Falla CERRADO, y es la decisión que importa de esta función.** Un
+    /// typo deja la palanca apagada en vez de mutar cada petición con un valor
+    /// que el proveedor no entiende. El aviso nombra el valor y los válidos.
+    #[test]
+    fn un_valor_desconocido_apaga_la_palanca_y_avisa() {
+        for basura in ["lowest", "bajo", "1", "true", "off"] {
+            let (objetivo, aviso) = parse_force_effort(Some(basura));
+
+            assert!(
+                objetivo.is_none(),
+                "{basura:?} NO puede encender la palanca: mutaría cada petición"
+            );
+            let aviso = aviso.expect("un valor desconocido tiene que avisar");
+            assert!(
+                aviso.contains(basura),
+                "el aviso debe nombrar el valor: {aviso}"
+            );
+            assert!(
+                aviso.contains("APAGADA"),
+                "el aviso debe decir qué pasó: {aviso}"
+            );
+        }
     }
 }
 

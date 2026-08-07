@@ -155,6 +155,7 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `session` | Sesión resuelta por precedencia de cabeceras del request: `{source, key}`. Nunca `null` — la peor rama es un fallback honesto (`source: "unattributed"`), no una ausencia | Ver §4.6 para la tabla de precedencia completa y cómo estampar el header desde cada harness |
 | `skills` | Listado de skills declarado en el body: `{declared, listing_bytes, format}`, o `null`. Se paga en CADA petición, se invoque una skill o no | `null` = no se reconoció ningún listado, **nunca "cero skills"**. `format` dice qué forma se encontró y, de paso, de qué herramienta viene el tráfico sin fiarse del `User-Agent` — ver §4.8 |
 | `instructions` | Bloque de instrucciones del usuario (`CLAUDE.md`) declarado en el body: `{bytes, format}`, o `null`. Se paga en CADA petición. Medido: el 48% del peaje fijo de una sesión de Claude Code | `null` = no se reconoció ningún bloque, **nunca "el usuario no tiene instrucciones"** — Claude Code IGNORA `AGENTS.md`, así que ahí `null` es correcto. Ver §4.13 |
+| `effort_forced` | Nivel de esfuerzo que IMPUSO el proxy (palanca B), o `null` si no intervino — el default | Se lee JUNTO a `requested_effort`, nunca en su lugar: es lo que impide confundir un ahorro del cliente con una intervención del medidor. Ver §4.14 |
 | `prompt_bytes` | Bytes del body que MANDÓ EL CLIENTE, en su forma lógica | **No es wire** (en `/v1/codex/responses` y `/v1beta/*` se mide descomprimido), **no es lo que subió al proveedor** (con `cache_control_forced` el body reenviado es mayor) y **no es la suma del desglose**. Ver §4.10 antes de usarlo |
 | `response_bytes` | Bytes del CUERPO DE LA RESPUESTA que cruzaron el proxy. `null` si no llegó a haber respuesta | **Sin comprimir**, y por eso no es ancho de banda: el proxy descarta `Accept-Encoding` para poder leer el SSE. Ver §4.9 antes de compararlo con `prompt_bytes` |
 | `codex_quota` | Estado de la cuota de suscripción de Codex (OAuth de `chatgpt.com`), parseado de las doce cabeceras `x-codex-*` de la RESPUESTA del upstream: doce campos, todos opcionales. `null` si la petición no fue a Codex vía OAuth, o si el upstream falló antes de responder | Es el ÚNICO campo de esta fila que se lee de la respuesta y no del request ni del body. Cuota NUNCA son dólares: no alimenta ni puede alimentar `cost_estimate_usd` — ver §4.7 |
@@ -1056,6 +1057,64 @@ recorrido fusionaba una apertura sin cerrar con el bloque siguiente y publicaba
 
 ---
 
+### 4.14. `effort_forced`: la única fila donde el medidor confiesa
+
+`requested_effort` (§4) dice qué nivel de esfuerzo **pidió el cliente**.
+`effort_forced` dice cuál **impuso el proxy**, o `null` si no intervino — que es
+el caso por defecto, porque la palanca B arranca apagada.
+
+```json
+"requested_effort": "high",
+"effort_forced": "low"
+```
+
+Esa fila cuenta la historia entera: el cliente pidió una cosa, el proxy mandó
+otra, y **los `output_tokens` que se midan en esa fila son del segundo**.
+
+#### Por qué el campo tiene que existir
+
+Es la única defensa contra el peor fallo que este proyecto puede cometer:
+**medir un ahorro que causó el propio medidor y presentarlo como del cliente.**
+
+Sin este campo, dos filas con `output_tokens` distintos serían indistinguibles
+entre «el cliente cambió algo» y «el proxy mutó el body». Toda la telemetría
+anterior quedaría bajo sospecha en cuanto alguien encendiera la palanca una vez.
+
+`requested_effort` se lee **antes** de mutar, precisamente para que el par
+funcione. Los dos campos juntos, o ninguno.
+
+#### Por qué guarda un `String` y `cache_control_forced` un `bool`
+
+Porque aquí hay algo que declarar. La palanca A inyecta siempre el mismo valor
+fijo (`{"type": "ephemeral"}`) y basta con saber que ocurrió. La B impone un
+nivel que **el lector no puede deducir de la fila**: sin el valor, sabrías que
+te intervinieron pero no en qué dirección. Una fila que no es autocontenida
+obliga a ir a buscar la configuración del proxy de aquel momento, que es
+justamente lo que nadie va a hacer.
+
+#### `null` significa "el proxy no intervino"
+
+Y cubre cuatro casos que se distinguen entre sí mirando el resto de la fila:
+
+| Caso | Cómo se reconoce |
+|---|---|
+| La palanca está apagada (default) | Todas las filas con `null` |
+| El cliente ya pedía ese nivel | `requested_effort` == el nivel configurado |
+| `output_config` presente y no-objeto | El body no es el dialecto esperado |
+| Dialecto sin `effort` | `upstream` es `openai` o `gemini` |
+
+Los tres últimos no son fallos: son el proxy prefiriendo **no tocar** a romper
+el request. Ver `docs/optimizer-effort.md` §5.
+
+#### No cambia lo que ya medías
+
+`effort_forced` no altera ningún otro campo. `prompt_bytes` sigue siendo el body
+**original** —se calcula antes de mutar, como con `cache_control_forced`— y los
+`context_*_bytes` también. Lo único que cambia respecto a una fila sin palanca
+es que el body que subió al proveedor llevaba otro `effort`, y la fila lo dice.
+
+---
+
 ## 5. Límite de memoria: 200 filas, y se pierden al reiniciar
 
 `RECENT_CAPACITY = 200` (`src/telemetry/recent.rs`): el buffer es un
@@ -1109,6 +1168,7 @@ el historial completo, o algo más viejo que las últimas 200 peticiones, la
 |---|---|
 | `src/telemetry/recent.rs` | `RecentRequests`, `RecentRequest` — buffer FIFO acotado y proyección, sin axum |
 | `src/provider/skills.rs` | `detect_skills`, `detect_skills_in_body` — reconoce las tres formas medidas; un bloque sin entradas no cuenta (§4.8) |
+| `src/provider/anthropic.rs` | `aplicar_palancas`, `fuerza_effort` — las dos palancas del optimizador sobre el mismo body, con UNA sola serialización (§4.14) |
 | `src/provider/instructions.rs` | `detect_instructions`, `detect_instructions_in_body` — el bloque de `CLAUDE.md`, delimitado por su envoltorio y no por una cabecera (§4.13) |
 | `src/provider/block_scan.rs` | `primer_bloque_con` — el recorrido que comparten los dos detectores: un bloque sólo cuenta si trae su marca interna, y una mención no interrumpe la búsqueda |
 | `src/telemetry/codex_quota.rs` | `CodexQuota`, `CodexQuota::from_headers` — parseo y saneo de las doce cabeceras `x-codex-*`, sin ningún campo en USD (§4.7) |
@@ -1143,6 +1203,7 @@ GET /version → {
   "contract": 1,
   "endpoints": ["/health", "/stats", "/sessions", "/requests"],
   "fields": ["tool_names", "tool_search", "tools_flattened", "skills", "instructions",
+             "effort_forced",
              "response_bytes", "codex_quota", "session", "prepare_us"]
 }
 ```
