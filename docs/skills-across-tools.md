@@ -164,15 +164,16 @@ buena, la conclusión habría sido exactamente la contraria a la medida.
 ## 7. Invocar una skill: cuatro mecanismos, y dos que no existen
 
 Declarar una skill cuesta entre 138 B y 390 B por petición (§1). **Invocarla es
-otra cosa — y en dos de las cuatro herramientas ni siquiera es posible por la
-vía que ellas mismas anuncian.**
+otra cosa — y no siempre es posible por la vía que la propia herramienta
+anuncia:** Codex no tiene mecanismo, y Gemini solo declara el suyo en modo
+interactivo.
 
 | Herramienta | Mecanismo de invocación | Coste medido |
 |---|---|---|
 | **Claude Code** | Herramienta `Skill` dedicada | **2.998 B** |
 | **opencode** | Herramienta `skill` dedicada | **3.335 B** |
 | **Codex** | **Ninguna**: da un `file:` locator y el modelo lee el fichero | sin mecanismo propio |
-| **Gemini CLI** | Anuncia `activate_skill`… **que no declara** | **no invocable** |
+| **Gemini CLI** | Anuncia `activate_skill`; la declara en **interactivo**, no en `-p` | **depende del modo** |
 
 Misma skill en las dos que sí funcionan (`judgment-day`, 2.846 B en disco):
 
@@ -187,26 +188,56 @@ está en el envoltorio: opencode envuelve con `<skill_content name="…">` y
 repite el nombre como cabecera, ~470 B frente a los ~100 B de ruta de Claude
 Code. Un 11% más cara por la misma capacidad.
 
-### Gemini CLI: se paga el listado y no hay puerta
+### Gemini CLI: la puerta existe, pero solo en interactivo
+
+> **Corrección del 2026-08-08.** La versión anterior de esta sección decía
+> *"se paga el listado y no hay puerta"*, sin más. Era cierta **solo del modo
+> que se había probado**, y el propio texto lo declaraba en un aviso de
+> alcance. Ese aviso se cobró: medido el modo interactivo, la herramienta **sí
+> se declara**. Se corrige aquí en vez de reescribir el pasado, igual que la
+> retractación de `docs/optimizer-skills.md` §5.
 
 El `systemInstruction` de Gemini dice, literalmente:
 
 > *"To activate a skill and receive its detailed instructions, call the
 > `activate_skill` tool with the skill's name."*
 
-**`activate_skill` no está entre las herramientas declaradas.** Las once que
-llegan son `update_topic`, `list_directory`, `read_file`, `grep_search`,
-`glob`, `replace`, `write_file`, `web_fetch`, `google_web_search`,
-`enter_plan_mode` e `invoke_agent`. Verificado en dos capturas idénticas: la
-cadena `activate_skill` aparece **solo** dentro de `systemInstruction`, nunca
-en `tools`.
+Si esa herramienta llega o no **depende del modo**, y la diferencia es enorme:
 
-Consecuencia medida: en este modo se pagan **288 B por skill en cada petición**
-y el modelo no tiene forma de canjearlos.
+| | `gemini -p` (headless) | `gemini -i` (interactivo) |
+|---|---:|---:|
+| Cuerpo del agente | 82.217 / 83.315 B | 116.393 / 117.454 B |
+| Tools declaradas | **11** | **36** |
+| **`activate_skill` entre ellas** | **NO** (0/2) | **SÍ** (2/2) |
+| Entradas `<skill>` en el listado | 23 | 23 |
+| `activate_skill` en `systemInstruction` | 2 | 2 |
 
-> **Alcance de la afirmación.** Medido con `gemini -p` (no interactivo, un solo
-> turno). Si el modo interactivo declara la herramienta, está **sin medir** —
-> esta conclusión vale para el modo probado, no para todos.
+Dos sondas por modo, todas capturadas a coste cero (Gemini CLI 0.49.0,
+`gemini-3.1-pro-preview`). Las once de headless son `update_topic`,
+`list_directory`, `read_file`, `grep_search`, `glob`, `replace`, `write_file`,
+`web_fetch`, `google_web_search`, `enter_plan_mode` e `invoke_agent`.
+
+**El fallo es real, y es solo de headless.** En `gemini -p` el prompt manda
+llamar una herramienta que no viaja: se pagan los **288 B por skill** y el
+modelo no tiene forma de canjearlos. En interactivo la puerta está, así que ahí
+el listado sí compra algo.
+
+> **Lo que NO se pudo aislar.** El modo interactivo trae **25 tools más**, no
+> una: **20 son de MCP** y las otras cinco son `activate_skill`,
+> `run_shell_command`, `ask_user` y las dos de procesos en segundo plano.
+>
+> Las de MCP tienen explicación en el propio bundle —`if (this.interactive ||
+> this.acpMode) await this.mcpInitializationPromise`—, y las otras cuatro piden
+> a alguien al otro lado. Pero el registro de `activate_skill` cuelga del
+> descubrimiento de skills, no de ese flag, así que encaja en el grupo por
+> parecido, no por código leído.
+>
+> **La correlación con el modo está medida 2/2 y 2/2; el mecanismo exacto, no.**
+> Se dice en vez de rellenarlo con una explicación plausible, que es justo lo
+> que §5 documenta que sale caro.
+
+**El listado es idéntico en los dos modos** (23 entradas). El precio por skill
+de §1 no cambia; lo que cambia es si se puede canjear.
 
 ### Codex: no invoca, lee
 
@@ -224,9 +255,10 @@ Claude Code sería comparar dos cosas distintas.
 
 ## 8. Lo que queda sin medir
 
-- **`activate_skill` en el modo interactivo de Gemini.** Aquí se midió
-  `gemini -p`. Si el modo interactivo sí la declara, el veredicto de §7 cambia
-  para ese modo.
+- ~~**`activate_skill` en el modo interactivo de Gemini**~~ — medido el
+  2026-08-08: **sí la declara** (2/2 sondas), y el veredicto de §7 cambió. Queda
+  sin aislar POR QUÉ: el interactivo trae 25 tools más, no una.
+  ([#68](https://github.com/pichu2707/OxideGate/issues/68))
 - **El coste real de leer un `SKILL.md` en Codex**, que depende de cómo lo lea
   el modelo y no de un mecanismo de skills.
 - **Todas las cifras son de UNA instalación**: la de este equipo, con este

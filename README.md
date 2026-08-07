@@ -165,9 +165,11 @@ Y dos creencias extendidas, refutadas con grupo de control:
 > **Marcar una tool con `defer_loading` cuesta 21 bytes y no quita ninguno.**
 > El esquema viaja completo. La carga diferida ahorra **contexto**, no **cable**.
 
-> **Gemini CLI cobra 288 B por skill y no declara la herramienta para
-> canjearlos.** Su prompt manda llamar `activate_skill`; esa herramienta no
-> está entre las once que envía. Medido en `gemini -p`, dos capturas idénticas.
+> **Gemini CLI cobra 288 B por skill y, en `gemini -p`, no declara la
+> herramienta para canjearlos.** Su prompt manda llamar `activate_skill`; en
+> headless esa herramienta no está entre las once que envía. **En interactivo
+> sí**: llegan 36 tools y `activate_skill` es una de ellas. Dos sondas por modo.
+> El listado que se paga es el mismo; lo que cambia es si se puede canjear.
 
 > **`disable-model-invocation: true` hace que una skill cueste CERO bytes.** No
 > se lista, así que no se paga en ninguna petición. En esta máquina son 11 de
@@ -208,8 +210,8 @@ seguirla son lo mismo.
 | **Qué cubo cayó dentro del prefijo cacheado** | ✅ Campo `cache_by_section` — el único ESTIMADO del contrato, por eso va anidado y con su `method` versionado. Ver [§4.11](docs/telemetry-per-request.md) |
 | Coste de `gpt-5.5` y `gpt-5.6-sol` | ✅ Tarifados. Y el descuento de caché **no es uniforme dentro de OpenAI**: 0,5 en la familia 4o, 0,1 en la familia 5 |
 | Comparar el coste de skills entre herramientas | ✅ Medido en 4 clientes: **138 B/skill en Claude Code, 390 B en Codex** — ver [`docs/skills-across-tools.md`](docs/skills-across-tools.md) |
-| Invocar una skill en Gemini, opencode y Codex | ✅ Medido: opencode **3.335 B**; Codex **no tiene mecanismo** (lee el fichero); Gemini anuncia `activate_skill` y **no la declara** — ver [§7](docs/skills-across-tools.md) |
-| **`activate_skill` en el modo interactivo de Gemini** | ❌ Sin medir: aquí se probó `gemini -p` |
+| Invocar una skill en Gemini, opencode y Codex | ✅ Medido: opencode **3.335 B**; Codex **no tiene mecanismo** (lee el fichero); Gemini declara `activate_skill` en interactivo y **no en `-p`** — ver [§7](docs/skills-across-tools.md) |
+| **`activate_skill` en el modo interactivo de Gemini** | ✅ Medido: **sí la declara** (36 tools frente a 11 en `-p`), 2/2 sondas. El PORQUÉ sigue sin aislar — ver [§7](docs/skills-across-tools.md) |
 | Bytes de bajada | ✅ Campo `response_bytes` — **sin comprimir**, ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.9 |
 | Bytes de subida, en `GET /requests` | ✅ Campo `prompt_bytes` — **no es wire**: en Codex y Gemini se mide descomprimido, y con la Palanca A el body reenviado es mayor. Ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.10 |
 | **Gasto por sección** | ✅ `input_share_by_section`: qué fracción del input PAGADO es cada cubo, ponderada por caché. **Fracciones, nunca euros** — ver [§4.12](docs/telemetry-per-request.md) |

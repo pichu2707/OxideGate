@@ -282,8 +282,8 @@ Dos obstáculos que costaron un rato y conviene no reaprender:
 - ~~**El coste de invocar** en Gemini, opencode y Codex~~ — medido, [#28](https://github.com/pichu2707/OxideGate/issues/28)
   cerrado: opencode **3.335 B**; Codex no tiene mecanismo (entrega un `file:`
   locator y el modelo lee el fichero); Gemini anuncia `activate_skill` y **no la
-  declara** — pero eso está medido con `gemini -p`, y el modo interactivo sigue
-  sin comprobar ([#68](https://github.com/pichu2707/OxideGate/issues/68)). Ver
+  declara EN `gemini -p`** — en interactivo sí la declara, medido el 2026-08-08
+  ([#68](https://github.com/pichu2707/OxideGate/issues/68)). Ver
   `docs/skills-across-tools.md` §7.
 - ~~**Cuántos bytes son comandos** y cuántos skills en el listado~~ — **no es
   un hueco pendiente, es una pregunta cerrada en negativo.** Desde el cable es
