@@ -93,12 +93,21 @@ cosas distintas (ver `docs/telemetry-level-1.md`).
 
 ## 3. La invariante de privacidad (léase antes de exponer este endpoint)
 
-`RecentRequest` — el tipo que serializa cada fila — **no tiene** los campos
-`prompt_hash` ni `prompt_bytes`. No es un filtro en tiempo de ejecución que
-alguien pueda desactivar por error: es una garantía de compilación, porque el
-campo directamente no existe en el struct. `telemetry.jsonl` sí guarda
-`prompt_hash` por fila (para poder correlacionar redundancia offline), pero
-esa huella nunca llega a la API HTTP.
+`RecentRequest` — el tipo que serializa cada fila — **no tiene el campo
+`prompt_hash`**. No es un filtro en tiempo de ejecución que alguien pueda
+desactivar por error: es una garantía de compilación, porque el campo
+directamente no existe en el struct. `telemetry.jsonl` sí guarda `prompt_hash`
+por fila (para poder correlacionar redundancia offline), pero esa huella nunca
+llega a la API HTTP.
+
+> **`prompt_bytes` SÍ se publica**, desde #51 (§4.10). Hasta el 2026-08-08 esta
+> sección decía que tampoco existía, y era falso: el struct lo lleva y hay un
+> test que **exige** que la fila lo exponga. La invariante nunca fue "no salen
+> datos del prompt" — es **"no sale ninguna HUELLA del prompt"**, y un contador
+> de bytes no lo es: no permite reconstruir nada ni correlacionar dos peticiones
+> con el mismo contenido, que es justo lo que `prompt_hash` sí permite. La misma
+> distinción por la que los cinco `context_*_bytes` llevan publicándose desde el
+> principio.
 
 Esto mirroriza la misma invariante que ya documenta
 `docs/telemetry-by-model.md` para los agregados de `/stats` y que impone
@@ -232,9 +241,9 @@ campo con una afirmación de bytes-no-enviados.
 
 **Nunca se exponen nombres de herramienta individuales.** Solo la etiqueta
 del servidor y conteos agregados viajan por este endpoint — la misma
-invariante de privacidad del §3 (`prompt_hash`/`prompt_bytes` nunca se
-exponen) se extiende aquí: el nombre de una herramienta puntual, o un
-fragmento de su `input_schema`/`description`, tampoco sale por HTTP.
+invariante de privacidad del §3 (`prompt_hash` nunca se expone) se extiende
+aquí: el nombre de una herramienta puntual, o un fragmento de su
+`input_schema`/`description`, tampoco sale por HTTP.
 
 **`null` vs. `[]` son estados DISTINTOS, no intercambiables:**
 

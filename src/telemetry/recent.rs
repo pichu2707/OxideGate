@@ -249,9 +249,13 @@ pub struct RecentRequest {
 }
 
 impl From<&RequestMetric> for RecentRequest {
-    /// Copia campo a campo desde `RequestMetric`, excluyendo `prompt_hash` y
-    /// `prompt_bytes` a propósito (ver invariante de privacidad en el header
-    /// del módulo).
+    /// Copia campo a campo desde `RequestMetric`, excluyendo `prompt_hash` a
+    /// propósito (ver invariante de privacidad en el header del módulo).
+    ///
+    /// `prompt_bytes` SÍ se copia, desde #51. La invariante es sobre la
+    /// HUELLA, no sobre todo lo que empiece por `prompt_`: un contador de
+    /// bytes no identifica ningún prompt ni correlaciona dos peticiones con el
+    /// mismo contenido, que es justo lo que `prompt_hash` permite.
     fn from(m: &RequestMetric) -> Self {
         Self {
             timestamp: m.timestamp.clone(),
