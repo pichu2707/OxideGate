@@ -430,6 +430,36 @@ const MAX_TOOL_NAMES: usize = 64;
 /// no se acerca; uno de 1 MB sería una entrada hostil, no un caso de uso.
 const MAX_TOOL_NAME_LEN: usize = 128;
 
+/// Una invocación observada, con su servidor YA RESUELTO.
+///
+/// El servidor se resuelve **en el momento del escaneo** y no después, y esa
+/// decisión es lo único que hace fiable el cruce coste-vs-uso:
+///
+/// - **`mcp_tool_use` (conector MCP de Anthropic) trae el nombre DESNUDO** y
+///   su servidor en un campo hermano (`server_name`). Re-derivarlo luego con
+///   [`classify`] sobre el nombre daría `(native)` en el 100% de los casos:
+///   la invocación se acreditaría al cubo del agente y el servidor real
+///   aparecería sin usar.
+/// - **El nombre se acota a [`MAX_TOOL_NAME_LEN`] al guardarlo.** Si el
+///   servidor se dedujera del nombre ya recortado, un `mcp__<server>__<tool>`
+///   con un segmento de servidor largo se cortaría antes del segundo `__` y
+///   caería también en `(native)`. Aquí se clasifica ANTES de truncar.
+///
+/// Ambos fallos publicarían `unused` para un servidor en uso, que es el peor
+/// error que este dato puede provocar: el usuario borra una integración que
+/// funciona por consejo del medidor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCall {
+    /// Nombre tal como viajó, acotado a [`MAX_TOOL_NAME_LEN`] caracteres.
+    /// Es informativo: la atribución NO se deriva de él.
+    pub name: String,
+    /// Servidor propietario, resuelto al capturar. Mismo espacio de etiquetas
+    /// que [`ToolServerBytes::server`], así que el cruce compara like-for-like.
+    pub server: String,
+    /// Naturaleza del cubo, resuelta junto al servidor.
+    pub kind: ToolServerKind,
+}
+
 /// Invocaciones de herramienta observadas en la RESPUESTA del proveedor.
 ///
 /// Contrapartida de [`ToolServerBytes::tool_names`], que publica lo que el
@@ -453,18 +483,14 @@ const MAX_TOOL_NAME_LEN: usize = 128;
 ///    lo VISTO sin recortar. Es el mismo mecanismo por el que
 ///    `tool_names.len() < tools` delata el recorte en el lado declarado.
 ///
-/// Los nombres van CRUDOS y CON REPETICIONES, a propósito:
-/// - Crudos porque son el mismo string que viaja en `tools[]`, así que la
-///   atribución a servidor la deriva quien lea con [`classify`] o
-///   [`server_of`], sin que la fila fosilice la convención `mcp__` del día
-///   en que se escribió.
-/// - Con repeticiones porque cuántas veces se llamó a una herramienta es un
-///   dato real del cable, y deduplicar al escribir lo perdería para siempre.
+/// Cada entrada lleva su servidor ya resuelto (ver [`ToolCall`]) y las
+/// repeticiones se conservan: cuántas veces se llamó a una herramienta es un
+/// dato real del cable, y deduplicar al escribir lo perdería para siempre.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCalls {
     /// Herramientas de CLIENTE invocadas (`tool_use` y `mcp_tool_use`): las
     /// que el agente declara y se ejecutan por su cuenta, MCP incluidas.
-    pub invoked: Vec<String>,
+    pub invoked: Vec<ToolCall>,
     /// Herramientas de SERVIDOR invocadas (`server_tool_use`): `web_search`,
     /// `web_fetch`… Las ejecuta el proveedor, no el agente. Van aparte
     /// porque no salen de la configuración MCP del usuario y por tanto no
@@ -493,15 +519,27 @@ pub struct ToolCalls {
 }
 
 impl ToolCalls {
-    /// Registra una invocación de herramienta de cliente. El contador total
-    /// sube SIEMPRE; la lista solo mientras quede cupo, con las mismas dos
-    /// guardas ([`MAX_TOOL_NAMES`]/[`MAX_TOOL_NAME_LEN`]) que se aplican a
-    /// los nombres declarados. Un nombre que llega en la RESPUESTA es tan
-    /// poco fiable como uno que llega en la petición: ambos son texto de
-    /// fuera.
+    /// Registra una invocación de cliente cuyo servidor se deduce del NOMBRE
+    /// COMPLETO (convención `mcp__<server>__<tool>`), antes de truncarlo.
+    ///
+    /// El contador total sube SIEMPRE; la lista solo mientras quede cupo.
     pub fn push_invoked(&mut self, name: &str) {
+        let (kind, server) = classify(name);
+        self.push_invoked_de(name, server, kind);
+    }
+
+    /// Registra una invocación cuyo servidor viene DADO, no deducido del
+    /// nombre. Es el camino del conector MCP de Anthropic, donde el bloque
+    /// trae `server_name` aparte y el nombre no lleva prefijo alguno.
+    pub fn push_invoked_de(&mut self, name: &str, server: &str, kind: ToolServerKind) {
         self.invoked_total = self.invoked_total.saturating_add(1);
-        push_acotado(&mut self.invoked, name);
+        if self.invoked.len() < MAX_TOOL_NAMES {
+            self.invoked.push(ToolCall {
+                name: name.chars().take(MAX_TOOL_NAME_LEN).collect(),
+                server: server.chars().take(MAX_TOOL_NAME_LEN).collect(),
+                kind,
+            });
+        }
     }
 
     /// Ídem para herramientas de servidor. Cupo propio, no compartido: un
@@ -521,12 +559,10 @@ impl ToolCalls {
 
 /// Empuja `name` a `lista` respetando el cupo de entradas y el de longitud.
 ///
-/// Es el ÚNICO sitio donde se aplican los dos topes, y lo usan tanto los
-/// nombres declarados ([`group_tools_by_server`]) como los invocados
-/// ([`ToolCalls`]). Compartirlo no es estética: todo el valor del cruce
-/// declarado-vs-invocado es que ambos lados guarden el MISMO string, así que
-/// dos truncados que puedan divergir romperían la comparación por igualdad
-/// sin que ningún test lo notara.
+/// Lo comparten los nombres DECLARADOS ([`group_tools_by_server`]) y las
+/// herramientas de servidor invocadas. Compartirlo no es estética: el cruce
+/// declarado-vs-invocado compara strings por igualdad, así que dos truncados
+/// que puedan divergir lo romperían sin que ningún test lo notara.
 ///
 /// Trunca por CARACTERES, nunca por bytes: cortar UTF-8 a mitad de un punto
 /// de código haría panic, y este dato viene de fuera.

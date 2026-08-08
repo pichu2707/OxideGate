@@ -22,7 +22,7 @@
 use super::{
     array_field, fingerprint, measure_key, measure_other, model_and_stream_from_value, parse_body,
     split_history_and_last_turn, tools_overhead_bytes, ContextBreakdown, Incoming, Outgoing,
-    Provider, ToolCalls, Usage,
+    Provider, ToolCalls, ToolServerKind, Usage,
 };
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -272,13 +272,27 @@ fn registra_bloque(bloque: &Value, calls: &mut ToolCalls) {
     };
 
     match bloque.get("type").and_then(Value::as_str) {
-        // `mcp_tool_use` es el conector MCP server-side de Anthropic. Cuenta
-        // como invocacion de CLIENTE: sale de un servidor MCP que el usuario
-        // configuro, que es justo lo que el recomendador mide. Dejarlo fuera
-        // publicaria listas vacias en filas donde el modelo llamo decenas de
-        // veces, y el escape documentado —mirar el `upstream`— no salvaria
-        // el caso porque el upstream es `anthropic` igual.
-        Some("tool_use") | Some("mcp_tool_use") => calls.push_invoked(name),
+        // `tool_use`: el nombre SIGUE la convencion `mcp__<server>__<tool>`
+        // cuando viene de un MCP client-side, asi que el servidor se deduce
+        // de el.
+        Some("tool_use") => calls.push_invoked(name),
+
+        // `mcp_tool_use` es el conector MCP server-side de Anthropic, y su
+        // forma es DISTINTA: el nombre llega DESNUDO (`search_docs`) y el
+        // servidor viaja en un campo hermano. Pasarlo por la convencion de
+        // nombres lo atribuiria a `(native)` en el 100% de los casos, el
+        // servidor real apareceria sin usar, y el recomendador aconsejaria
+        // borrar justo el que se invoca en cada turno.
+        //
+        // Sin `server_name` legible no se inventa un servidor: cae a la
+        // deduccion por nombre, que al menos es honesta sobre no saberlo.
+        Some("mcp_tool_use") => match bloque.get("server_name").and_then(Value::as_str) {
+            Some(servidor) if !servidor.is_empty() => {
+                calls.push_invoked_de(name, servidor, ToolServerKind::Mcp)
+            }
+            _ => calls.push_invoked(name),
+        },
+
         Some("server_tool_use") => calls.push_server_invoked(name),
         _ => {}
     }
@@ -442,6 +456,13 @@ fn has_cache_control(value: &Value) -> bool {
 mod tests {
     use super::*;
     use super::super::{MAX_TOOL_NAME_LEN, MAX_TOOL_NAMES, NATIVE_TOOLS_LABEL, measure_value};
+
+    /// Solo los nombres de las invocaciones de cliente. La ATRIBUCIÓN a
+    /// servidor tiene sus propios tests: mezclarlas aquí haría que un fallo
+    /// de atribución se leyera como un fallo de captura.
+    fn nombres(calls: &ToolCalls) -> Vec<String> {
+        calls.invoked.iter().map(|c| c.name.clone()).collect()
+    }
 
     /// Anthropic manda el input en `message_start` y el output acumulado en
     /// `message_delta`. Extraer ambos eventos por separado debe dejar los
@@ -1266,7 +1287,8 @@ mod tests {
         let mut calls = ToolCalls::default();
         ANTHROPIC.extract_tool_use(&evento, &mut calls);
 
-        assert_eq!(calls.invoked, vec!["get_weather".to_string()]);
+        assert_eq!(
+            nombres(&calls), vec!["get_weather".to_string()]);
         assert!(calls.server_invoked.is_empty(), "no es de servidor");
     }
 
@@ -1315,7 +1337,7 @@ mod tests {
         ANTHROPIC.extract_tool_use(&cuerpo, &mut calls);
 
         assert_eq!(
-            calls.invoked,
+            nombres(&calls),
             vec![
                 "get_weather".to_string(),
                 "mcp__context7__get-docs".to_string()
@@ -1368,7 +1390,7 @@ mod tests {
         }
 
         assert_eq!(
-            calls.invoked,
+            nombres(&calls),
             vec!["Read".to_string()],
             "una invocación en el stream es UNA en la fila"
         );
@@ -1392,7 +1414,7 @@ mod tests {
         ANTHROPIC.extract_tool_use(&cuerpo, &mut calls);
 
         assert_eq!(
-            calls.invoked,
+            nombres(&calls),
             vec!["Read".to_string(), "Read".to_string(), "Grep".to_string()]
         );
     }
@@ -1439,7 +1461,7 @@ mod tests {
             &mut solo_largo,
         );
         assert_eq!(
-            solo_largo.invoked[0].chars().count(),
+            solo_largo.invoked[0].name.chars().count(),
             MAX_TOOL_NAME_LEN,
             "cupo de longitud, contado en CARACTERES (cortar bytes UTF-8 haría panic)"
         );
@@ -1489,7 +1511,7 @@ mod tests {
         let mut calls = ToolCalls::default();
         ANTHROPIC.extract_tool_use(&evento, &mut calls);
 
-        assert_eq!(calls.invoked, vec!["search_docs".to_string()]);
+        assert_eq!(nombres(&calls), vec!["search_docs".to_string()]);
         assert!(calls.server_invoked.is_empty(), "no es server_tool_use");
     }
 
@@ -1520,7 +1542,7 @@ mod tests {
         ANTHROPIC.extract_tool_use(&serde_json::json!({"type": "message_stop"}), &mut calls);
         assert!(calls.complete, "message_stop cierra el escaneo");
         assert_eq!(
-            calls.invoked,
+            nombres(&calls),
             vec!["Read".to_string()],
             "y no altera la lista"
         );
@@ -1568,5 +1590,85 @@ mod tests {
             calls.invoked_total > calls.invoked.len(),
             "la comparacion que hara el consumidor: total > publicados"
         );
+    }
+
+    /// REGRESIÓN CRÍTICA. El conector MCP manda el nombre DESNUDO y el
+    /// servidor en un campo hermano. Deducirlo del nombre lo mandaba a
+    /// `(native)`, el servidor real salía con cero invocaciones, y el
+    /// recomendador aconsejaba borrar justo el que se usa en cada turno.
+    #[test]
+    fn el_conector_mcp_se_atribuye_a_su_servidor_no_a_native() {
+        let evento = serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "mcp_tool_use",
+                "id": "mcptoolu_1",
+                "name": "search_docs",
+                "server_name": "remoto",
+                "input": {}
+            }
+        });
+
+        let mut calls = ToolCalls::default();
+        ANTHROPIC.extract_tool_use(&evento, &mut calls);
+
+        let llamada = &calls.invoked[0];
+        assert_eq!(llamada.name, "search_docs", "el nombre viaja desnudo");
+        assert_eq!(
+            llamada.server, "remoto",
+            "y el servidor sale de server_name, NO de deducirlo del nombre"
+        );
+        assert_eq!(llamada.kind, ToolServerKind::Mcp);
+    }
+
+    /// Sin `server_name` utilizable no se inventa un servidor: se cae a la
+    /// deducción por nombre, que al menos es honesta sobre no saberlo.
+    #[test]
+    fn sin_server_name_el_conector_cae_a_la_deduccion_por_nombre() {
+        for bloque in [
+            serde_json::json!({"type": "mcp_tool_use", "name": "algo"}),
+            serde_json::json!({"type": "mcp_tool_use", "name": "algo", "server_name": ""}),
+            serde_json::json!({"type": "mcp_tool_use", "name": "algo", "server_name": 42}),
+        ] {
+            let mut calls = ToolCalls::default();
+            ANTHROPIC.extract_tool_use(&serde_json::json!({"content_block": bloque}), &mut calls);
+            assert_eq!(
+                calls.invoked[0].kind,
+                ToolServerKind::Native,
+                "sin servidor legible, nativo — nunca un servidor inventado"
+            );
+        }
+    }
+
+    /// REGRESIÓN. El servidor se resuelve ANTES de truncar el nombre. Si se
+    /// dedujera del nombre ya recortado, un servidor de más de 128 caracteres
+    /// perdería su segundo `__` y caería en `(native)`, publicando `unused`
+    /// para un servidor en uso.
+    #[test]
+    fn el_servidor_se_resuelve_antes_de_truncar_el_nombre() {
+        let servidor_largo = "s".repeat(MAX_TOOL_NAME_LEN);
+        let nombre = format!("mcp__{servidor_largo}__una-herramienta");
+
+        let mut calls = ToolCalls::default();
+        ANTHROPIC.extract_tool_use(
+            &serde_json::json!({
+                "content_block": {"type": "tool_use", "id": "t1", "name": nombre}
+            }),
+            &mut calls,
+        );
+
+        let llamada = &calls.invoked[0];
+        assert_eq!(
+            llamada.name.chars().count(),
+            MAX_TOOL_NAME_LEN,
+            "el nombre sí se recorta"
+        );
+        assert_eq!(
+            llamada.kind,
+            ToolServerKind::Mcp,
+            "pero la atribución NO se hace sobre el recorte"
+        );
+        assert_eq!(llamada.server, servidor_largo);
     }
 }

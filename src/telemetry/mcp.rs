@@ -41,7 +41,7 @@
 //! "quitar de su configuración", así que se publican con sus números y con
 //! [`Verdict::NotApplicable`]. Recomendar quitar las herramientas nativas no
 //! sería una recomendación agresiva, sería una incoherente.
-use crate::provider::{ToolServerKind, classify};
+use crate::provider::ToolServerKind;
 use crate::telemetry::RequestMetric;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -59,6 +59,21 @@ use std::collections::HashMap;
 /// tarda días en acumularse en un uso normal y el consejo llegaría tarde para
 /// ser útil.
 pub const MIN_PETICIONES_CONCLUYENTES: u64 = 50;
+
+/// Tope de servidores distintos que este registro recuerda.
+///
+/// Las etiquetas vienen de nombres de herramienta que llegan en la RESPUESTA
+/// —texto de fuera— asi que sin tope un upstream que emitiera nombres
+/// `mcp__<uuid>__tool` variados haria crecer la memoria un acumulador por
+/// nombre distinto durante toda la vida del proceso.
+///
+/// Mismo criterio que sus hermanos: `SessionRegistry` corta en 10.000,
+/// `StatsRegistry` en 50.000 y `group_tools_by_server` en 32. Aqui basta con
+/// menos: una configuracion MCP real tiene decenas de servidores, no miles.
+/// Los rechazados se cuentan en [`McpSnapshot::servidores_omitidos`] para que
+/// el tope sea VISIBLE — un cupo silencioso convertiria un informe corto en
+/// uno que parece completo.
+pub const MAX_SERVIDORES: usize = 256;
 
 /// Por qué una petición no pudo usarse como prueba de no-uso.
 ///
@@ -96,8 +111,10 @@ pub enum Verdict {
         /// Peticiones que superaron los tres filtros y no trajeron ninguna
         /// invocación de este servidor.
         conclusive_requests: u64,
-        /// Bytes por petición que se dejarían de pagar al quitarlo.
-        bytes_per_request: u64,
+        /// Bytes que cuesta en cada petición donde viaja. Para el ahorro
+        /// total hay que ponderarlo con `declared_in_requests`, que va en la
+        /// fila: este número NO es un ahorro sobre todo el tráfico.
+        bytes_per_request_declared: u64,
     },
     /// Cero invocaciones, pero sin peticiones concluyentes suficientes.
     /// **No es lo mismo que `Unused`** y por eso no se colapsan: aquí la
@@ -121,12 +138,25 @@ pub struct McpServerRow {
     pub kind: ToolServerKind,
     /// Peticiones en las que este servidor viajó declarado en `tools[]`.
     pub declared_in_requests: u64,
-    /// Bytes por petición, promediados sobre `declared_in_requests`. Es lo
-    /// que se dejaría de pagar por petición si se quitara.
-    pub bytes_per_request: u64,
-    /// Herramientas que declaraba la ÚLTIMA vez que se vio. No se promedia:
-    /// una media de "número de herramientas" no significa nada, y lo que le
-    /// importa a quien lee es la configuración actual.
+    /// Bytes que cuesta este servidor **en las peticiones donde viaja**,
+    /// promediados sobre `declared_in_requests` — NO sobre todo el tráfico.
+    ///
+    /// La distinción importa para dimensionar el ahorro: un servidor
+    /// declarado en 20 de 1.000 peticiones cuesta esto en esas 20 y nada en
+    /// las otras 980. Multiplicar por el total exageraría la ganancia 50
+    /// veces. `declared_in_requests` va al lado justo para poder hacer la
+    /// cuenta correcta.
+    pub bytes_per_request_declared: u64,
+    /// Herramientas que declaraba la ÚLTIMA vez que se vio. Es un valor
+    /// PUNTUAL, no una media: promediar "número de herramientas" no
+    /// significa nada, y lo que le importa a quien lee es la configuración
+    /// actual.
+    ///
+    /// **Ojo al leerlo junto a `bytes_per_request_declared`**, que sí es una
+    /// media de toda la ventana: si la configuración cambió dentro de ella,
+    /// las dos cifras describen momentos distintos. Un servidor recortado de
+    /// 8 herramientas a 2 la semana pasada muestra `2` junto al coste medio
+    /// que incluye los días de 8.
     pub tools_declared: usize,
     /// Invocaciones de herramientas de este servidor en todo el histórico.
     pub invocations: u64,
@@ -148,12 +178,37 @@ pub struct McpSnapshot {
     /// Filas, ordenadas por bytes por petición descendente: lo más caro
     /// primero, que es el orden en el que interesa mirarlas.
     pub servers: Vec<McpServerRow>,
+    /// Servidores distintos que no se admitieron por [`MAX_SERVIDORES`].
+    /// Distinto de cero significa que **este informe está incompleto**: hay
+    /// servidores de los que no se sabe nada. Se publica en vez de recortar
+    /// en silencio, porque una lista corta que parece completa es peor que
+    /// una que avisa de que no lo está.
+    pub servidores_omitidos: u64,
+    /// Timestamp más antiguo que entró en este agregado, o `None` si está
+    /// vacío.
+    ///
+    /// **La ventana NO es "todo lo que existió".** `rehydrate` solo repone
+    /// los últimos `OXIDEGATE_HISTORY_DAYS` días (7 por defecto, y `0` la
+    /// desactiva), así que tras un reinicio este agregado empieza donde diga
+    /// este campo. Sin publicarlo, un operador con la ventana corta podría
+    /// leer un `unused` como si cubriera meses y borrar un servidor que usa
+    /// una vez por semana.
+    pub desde: Option<String>,
+    /// Servidores que se invocaron pero de los que no se vio ninguna
+    /// declaración, así que no tienen coste que cruzar.
+    ///
+    /// El caso típico es el desborde de `MAX_TOOL_SERVERS` en el lado
+    /// declarado: con más de 32 servidores en una petición, los que sobran se
+    /// pliegan en `(others)` y pierden su identidad, mientras sus
+    /// invocaciones sí conservan el nombre real. Sin este campo esos
+    /// servidores desaparecían del informe por completo — y son justo los del
+    /// usuario con la configuración más cara.
+    pub invocados_sin_declarar: Vec<String>,
 }
 
 /// Acumulador interno por servidor.
 #[derive(Debug, Default)]
 struct McpAccumulator {
-    kind: Option<ToolServerKind>,
     bytes_total: u64,
     declared_in_requests: u64,
     tools_declared: usize,
@@ -169,7 +224,18 @@ struct McpAccumulator {
 /// rehidrata del `telemetry.jsonl` al arrancar.
 #[derive(Debug, Default)]
 pub struct McpRegistry {
-    accumulators: HashMap<String, McpAccumulator>,
+    /// Keyeado por `(kind, servidor)` y NO solo por la etiqueta, igual que
+    /// `provider::group_tools_by_server`: un servidor MCP llamado
+    /// literalmente `(native)` sigue siendo `kind: Mcp` y no debe fusionarse
+    /// con el cubo nativo del agente. Fusionarlos duplicaba
+    /// `declared_in_requests` en una misma peticion —se llegaba al umbral con
+    /// la mitad— y hacia last-write-wins con el `kind` publicado.
+    accumulators: HashMap<(ToolServerKind, String), McpAccumulator>,
+    /// Servidores distintos que se dejaron de admitir por
+    /// [`MAX_SERVIDORES`]. Se publica para que el tope sea visible.
+    descartados_por_cupo: u64,
+    /// Timestamp más antiguo ingerido, para publicar la ventana real.
+    desde: Option<String>,
 }
 
 impl McpRegistry {
@@ -181,32 +247,60 @@ impl McpRegistry {
     /// permitiría que una misma petición contase como concluyente para uno e
     /// inconcluyente para otro, que no significa nada.
     pub fn ingest(&mut self, m: &RequestMetric) {
+        // La ventana real del agregado, para que un `unused` no se lea como
+        // si cubriera mas tiempo del que cubre.
+        match &self.desde {
+            Some(actual) if actual.as_str() <= m.timestamp.as_str() => {}
+            _ => self.desde = Some(m.timestamp.clone()),
+        }
+
+        // Las invocaciones se atribuyen SIEMPRE y ANTES que nada, aunque la
+        // fila no traiga desglose de coste y aunque no sea concluyente. Es la
+        // asimetria central de este modulo: la ausencia de prueba no es
+        // prueba de ausencia, pero la presencia SI es presencia.
+        //
+        // Antes se retornaba aqui cuando `tools_by_server` era `None`, y eso
+        // tiraba la prueba de uso: ese campo es `None` cuando el BODY no se
+        // pudo descomponer, mientras que `tool_calls` sale de un escaneo
+        // independiente de la RESPUESTA y seguia trayendo nombres reales.
+        if let Some(calls) = m.tool_calls.as_ref() {
+            for llamada in &calls.invoked {
+                // El servidor ya viene RESUELTO del escaneo (ver
+                // `provider::ToolCall`): aqui no se re-deriva del nombre,
+                // que es justo donde el conector MCP y los nombres
+                // truncados atribuian mal.
+                let clave = (llamada.kind, llamada.server.clone());
+                // El chequeo del cupo va ANTES del `get_mut` para no sostener
+                // un prestamo mutable mientras se consulta `len()`.
+                let hay_hueco = self.accumulators.len() < MAX_SERVIDORES;
+                match self.accumulators.get_mut(&clave) {
+                    Some(acc) => acc.invocations += 1,
+                    None if hay_hueco => {
+                        self.accumulators.entry(clave).or_default().invocations += 1;
+                    }
+                    // Cupo agotado: se cuenta el rechazo en vez de crecer sin
+                    // limite con etiquetas que vienen de fuera.
+                    None => self.descartados_por_cupo += 1,
+                }
+            }
+        }
+
         let Some(declarados) = m.tools_by_server.as_ref() else {
-            // Sin desglose de la petición no hay coste que atribuir, así que
-            // no hay cruce que hacer. No es un descarte: es que esta fila no
-            // habla de servidores en absoluto.
+            // Sin desglose no hay coste que atribuir. La fila ya aporto sus
+            // invocaciones arriba; aqui simplemente no hay nada que declarar.
             return;
         };
 
         let motivo = motivo_de_descarte(m);
 
-        // Las invocaciones se atribuyen ANTES de mirar si la fila es
-        // concluyente: ver una llamada prueba el uso incluso en un turno
-        // abortado. Es la asimetría central de este módulo — la ausencia de
-        // prueba no es prueba de ausencia, pero la presencia sí es presencia.
-        if let Some(calls) = m.tool_calls.as_ref() {
-            for nombre in &calls.invoked {
-                let (_, servidor) = classify(nombre);
-                self.accumulators
-                    .entry(servidor.to_string())
-                    .or_default()
-                    .invocations += 1;
-            }
-        }
-
         for fila in declarados {
-            let acc = self.accumulators.entry(fila.server.clone()).or_default();
-            acc.kind = Some(fila.kind);
+            let clave = (fila.kind, fila.server.clone());
+            if !self.accumulators.contains_key(&clave) && self.accumulators.len() >= MAX_SERVIDORES
+            {
+                self.descartados_por_cupo += 1;
+                continue;
+            }
+            let acc = self.accumulators.entry(clave).or_default();
             acc.bytes_total += fila.bytes as u64;
             acc.declared_in_requests += 1;
             acc.tools_declared = fila.tools;
@@ -226,14 +320,14 @@ impl McpRegistry {
             .accumulators
             .iter()
             .filter(|(_, acc)| acc.declared_in_requests > 0)
-            .map(|(server, acc)| {
+            .map(|((kind, server), acc)| {
                 let bytes_per_request = acc.bytes_total / acc.declared_in_requests;
-                let kind = acc.kind.unwrap_or(ToolServerKind::Mcp);
+                let kind = *kind;
                 McpServerRow {
                     server: server.clone(),
                     kind,
                     declared_in_requests: acc.declared_in_requests,
-                    bytes_per_request,
+                    bytes_per_request_declared: bytes_per_request,
                     tools_declared: acc.tools_declared,
                     invocations: acc.invocations,
                     conclusive_requests: acc.conclusive_requests,
@@ -252,14 +346,29 @@ impl McpRegistry {
         // Desempate por nombre para que la salida sea estable entre llamadas
         // (el HashMap no lo es) y los tests puedan afirmar sobre ella.
         servers.sort_by(|a, b| {
-            b.bytes_per_request
-                .cmp(&a.bytes_per_request)
+            b.bytes_per_request_declared
+                .cmp(&a.bytes_per_request_declared)
                 .then_with(|| a.server.cmp(&b.server))
         });
+
+        // Servidores que se invocaron pero nunca se vieron declarados: no
+        // tienen coste que cruzar, pero desaparecerian del informe si solo se
+        // filtrara por `declared_in_requests > 0`. Se nombran aparte.
+        let mut invocados_sin_declarar: Vec<String> = self
+            .accumulators
+            .iter()
+            .filter(|((_, _), acc)| acc.declared_in_requests == 0 && acc.invocations > 0)
+            .map(|((_, server), _)| server.clone())
+            .collect();
+        invocados_sin_declarar.sort();
+        invocados_sin_declarar.dedup();
 
         McpSnapshot {
             umbral: MIN_PETICIONES_CONCLUYENTES,
             servers,
+            desde: self.desde.clone(),
+            servidores_omitidos: self.descartados_por_cupo,
+            invocados_sin_declarar,
         }
     }
 }
@@ -280,9 +389,13 @@ fn motivo_de_descarte(m: &RequestMetric) -> Option<Motivo> {
     if !calls.complete {
         return Some(Motivo::Incompleta);
     }
-    if calls.invoked_total > calls.invoked.len()
-        || calls.server_invoked_total > calls.server_invoked.len()
-    {
+    // SOLO se mira el cupo de `invoked`. El de `server_invoked` (web_search,
+    // web_fetch) tiene su propia cuota independiente y no puede esconder una
+    // invocacion MCP: esas viven unicamente en `invoked`. Incluirlo
+    // descalificaba toda peticion de una sesion de investigacion con mas de
+    // 64 busquedas, y el endpoint no llegaba nunca al umbral — ademas de
+    // atribuir la causa al cupo equivocado en `descartes.truncadas`.
+    if calls.invoked_total > calls.invoked.len() {
         return Some(Motivo::Truncada);
     }
     None
@@ -309,7 +422,7 @@ fn veredicto(
     if conclusive_requests >= MIN_PETICIONES_CONCLUYENTES {
         Verdict::Unused {
             conclusive_requests,
-            bytes_per_request,
+            bytes_per_request_declared: bytes_per_request,
         }
     } else {
         Verdict::InsufficientData {
@@ -437,7 +550,7 @@ mod tests {
             ctx.verdict,
             Verdict::Unused {
                 conclusive_requests: MIN_PETICIONES_CONCLUYENTES,
-                bytes_per_request: 12_400,
+                bytes_per_request_declared: 12_400,
             },
             "declarado en todas, invocado en ninguna"
         );
@@ -619,7 +732,10 @@ mod tests {
             .find(|s| s.server == "(native)")
             .unwrap();
         assert_eq!(nativo.verdict, Verdict::NotApplicable);
-        assert_eq!(nativo.bytes_per_request, 5_000, "el coste sí se publica");
+        assert_eq!(
+            nativo.bytes_per_request_declared, 5_000,
+            "el coste sí se publica"
+        );
     }
 
     /// El orden es estable y por coste descendente: un `HashMap` no lo es, y
@@ -648,5 +764,164 @@ mod tests {
     fn el_umbral_se_publica_con_los_datos() {
         let snap = McpRegistry::default().snapshot();
         assert_eq!(snap.umbral, MIN_PETICIONES_CONCLUYENTES);
+    }
+
+    /// REGRESIÓN CRÍTICA. Una invocación observada cuenta AUNQUE la fila no
+    /// traiga desglose de coste. Antes se retornaba antes de atribuirla, así
+    /// que un body que no parsea tiraba la prueba de uso mientras las demás
+    /// peticiones acumulaban concluyentes: el servidor salía `unused`.
+    #[test]
+    fn una_invocacion_cuenta_aunque_la_fila_no_traiga_desglose() {
+        let mut reg = McpRegistry::default();
+
+        // Fila SIN `tools_by_server` pero CON invocación: el body no parseó,
+        // la respuesta sí trajo la llamada.
+        let mut sin_desglose = metrica_minima();
+        sin_desglose.tools_by_server = None;
+        sin_desglose.tool_calls = Some(invocando(&["mcp__context7__get-docs"]));
+        reg.ingest(&sin_desglose);
+
+        // Y ahora peticiones normales que sí declaran y no invocan.
+        for _ in 0..MIN_PETICIONES_CONCLUYENTES {
+            reg.ingest(&fila(
+                "context7",
+                ToolServerKind::Mcp,
+                12_400,
+                8,
+                Some(invocando(&[])),
+            ));
+        }
+
+        let snap = reg.snapshot();
+        let ctx = snap
+            .servers
+            .iter()
+            .find(|s| s.server == "context7")
+            .unwrap();
+        assert_eq!(
+            ctx.verdict,
+            Verdict::Used { invocations: 1 },
+            "la prueba de uso sobrevive aunque su fila no declarase coste"
+        );
+    }
+
+    /// REGRESIÓN. El mapa se keyea por `(kind, servidor)`. Con la clave solo
+    /// por etiqueta, un servidor MCP llamado literalmente `(native)` se
+    /// fusionaba con el cubo nativo: se llegaba al umbral con la mitad de
+    /// peticiones y el `kind` publicado era last-write-wins.
+    #[test]
+    fn un_servidor_mcp_llamado_native_no_se_fusiona_con_el_cubo_nativo() {
+        let mut reg = McpRegistry::default();
+        let mut m = metrica_minima();
+        m.tools_by_server = Some(vec![
+            ToolServerBytes {
+                server: "(native)".to_string(),
+                kind: ToolServerKind::Native,
+                tools: 5,
+                bytes: 1_000,
+                tool_names: Vec::new(),
+                deferred_tools: 0,
+            },
+            ToolServerBytes {
+                server: "(native)".to_string(),
+                kind: ToolServerKind::Mcp,
+                tools: 2,
+                bytes: 40,
+                tool_names: Vec::new(),
+                deferred_tools: 0,
+            },
+        ]);
+        m.tool_calls = Some(invocando(&[]));
+        reg.ingest(&m);
+
+        let snap = reg.snapshot();
+        let filas: Vec<_> = snap
+            .servers
+            .iter()
+            .filter(|s| s.server == "(native)")
+            .collect();
+
+        assert_eq!(filas.len(), 2, "dos cubos distintos, no uno fusionado");
+        for f in filas {
+            assert_eq!(
+                f.declared_in_requests, 1,
+                "una peticion cuenta UNA vez por cubo, no dos"
+            );
+        }
+    }
+
+    /// REGRESIÓN. El cupo de `server_invoked` (web_search, web_fetch) no
+    /// puede descalificar una fila: esas herramientas no salen de la config
+    /// MCP y su truncado no puede esconder ninguna invocación MCP. Incluirlo
+    /// dejaba el endpoint en `insufficient_data` para siempre en sesiones de
+    /// investigación.
+    #[test]
+    fn el_cupo_de_las_de_servidor_no_descalifica_la_fila() {
+        let mut reg = McpRegistry::default();
+        for _ in 0..MIN_PETICIONES_CONCLUYENTES {
+            let mut calls = invocando(&[]);
+            calls.server_invoked_total = 999; // muchas busquedas, lista recortada
+            reg.ingest(&fila(
+                "context7",
+                ToolServerKind::Mcp,
+                12_400,
+                8,
+                Some(calls),
+            ));
+        }
+
+        let snap = reg.snapshot();
+        let ctx = snap
+            .servers
+            .iter()
+            .find(|s| s.server == "context7")
+            .unwrap();
+        assert_eq!(ctx.descartes.truncadas, 0, "el cupo ajeno no descalifica");
+        assert_eq!(
+            ctx.conclusive_requests, MIN_PETICIONES_CONCLUYENTES,
+            "las peticiones siguen contando"
+        );
+    }
+
+    /// REGRESIÓN. El mapa no puede crecer sin límite con etiquetas que vienen
+    /// de la respuesta, y el recorte tiene que ser VISIBLE: una lista corta
+    /// que parece completa es peor que una que avisa.
+    #[test]
+    fn el_cupo_de_servidores_se_respeta_y_se_publica() {
+        let mut reg = McpRegistry::default();
+        for i in 0..MAX_SERVIDORES + 20 {
+            let mut m = metrica_minima();
+            m.tool_calls = Some(invocando(&[&format!("mcp__servidor{i}__t")]));
+            reg.ingest(&m);
+        }
+
+        let snap = reg.snapshot();
+        assert!(
+            snap.servidores_omitidos >= 20,
+            "los rechazados se cuentan: {}",
+            snap.servidores_omitidos
+        );
+    }
+
+    /// REGRESIÓN. Un servidor invocado del que nunca se vio la declaración
+    /// (típicamente por el desborde de `(others)`) no puede desaparecer del
+    /// informe sin más: se nombra aparte.
+    #[test]
+    fn los_invocados_sin_declarar_se_nombran_en_vez_de_desaparecer() {
+        let mut reg = McpRegistry::default();
+        let mut m = metrica_minima();
+        m.tool_calls = Some(invocando(&["mcp__linear__crear-issue"]));
+        reg.ingest(&m);
+
+        let snap = reg.snapshot();
+        assert!(
+            snap.servers.iter().all(|s| s.server != "linear"),
+            "sin declaraciones no tiene coste que cruzar"
+        );
+        assert_eq!(
+            snap.invocados_sin_declarar,
+            vec!["linear".to_string()],
+            "pero se nombra: si no, el usuario con mas servidores veria menos"
+        );
     }
 }

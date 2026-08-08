@@ -1271,12 +1271,15 @@ respuesta— así que solo la puede responder un punto que vea las dos.
 ```json
 {
   "umbral": 50,
+  "desde": "2026-08-01T09:12:03Z",
+  "servidores_omitidos": 0,
+  "invocados_sin_declarar": [],
   "servers": [
     {
       "server": "context7",
       "kind": "mcp",
       "declared_in_requests": 200,
-      "bytes_per_request": 12400,
+      "bytes_per_request_declared": 12400,
       "tools_declared": 8,
       "invocations": 0,
       "conclusive_requests": 187,
@@ -1284,7 +1287,7 @@ respuesta— así que solo la puede responder un punto que vea las dos.
       "verdict": {
         "type": "unused",
         "conclusive_requests": 187,
-        "bytes_per_request": 12400
+        "bytes_per_request_declared": 12400
       }
     }
   ]
@@ -1337,17 +1340,53 @@ aplicar el suyo. Está en 50 y no en 200 porque 200 tarda días en acumularse
 en un uso normal y el consejo llegaría tarde para ser útil; 3 sería ruido que
 cualquier sesión corta produce.
 
-### No admite `?since=`
+### La ventana: `desde`, y por qué no admite `?since=`
 
-A diferencia de `/stats`, y a propósito: la pregunta es sobre un HÁBITO, y un
-hábito se mide sobre todo lo acumulado. Acotar la ventana solo serviría para
-bajar artificialmente las peticiones concluyentes y convertir un `unused` en
-un `insufficient_data`. Si algún día hace falta, entra como parámetro nuevo y
-aditivo.
+**El agregado NO cubre "todo lo que existió".** Se rehidrata del
+`telemetry.jsonl` al arrancar —como `/stats` y `/sessions`, y por un motivo
+más fuerte: sin histórico arrancaría en blanco tras cada reinicio y no
+llegaría nunca al umbral— pero `rehydrate` solo repone los últimos
+`OXIDEGATE_HISTORY_DAYS` días (**7 por defecto**, y `0` desactiva la
+rehidratación).
 
-Se rehidrata del `telemetry.jsonl` al arrancar, como `/stats` y `/sessions`, y
-por un motivo más fuerte: sin histórico arrancaría en blanco tras cada
-reinicio y no llegaría nunca al umbral.
+Por eso el snapshot publica **`desde`**: el timestamp más antiguo que entró en
+el agregado. Sin ese campo, alguien con la ventana corta podría leer un
+`unused` como si cubriera meses y borrar un servidor que usa una vez por
+semana. Con `OXIDEGATE_HISTORY_DAYS=0` y un reinicio reciente, un `unused`
+puede apoyarse en minutos de tráfico — `desde` lo dice.
+
+No admite `?since=`, a diferencia de `/stats`: la pregunta es sobre un
+HÁBITO, y acotar más la ventana solo bajaría las peticiones concluyentes y
+convertiría un `unused` en un `insufficient_data`. Si hace falta, entra
+después como parámetro aditivo.
+
+### Dos campos más que evitan un informe engañoso
+
+- **`servidores_omitidos`**: servidores distintos que no se admitieron por el
+  tope de 256. Las etiquetas salen de nombres que llegan en la respuesta
+  —texto de fuera—, así que el registro tiene cupo como todos sus hermanos
+  (`SessionRegistry` corta en 10.000, `StatsRegistry` en 50.000). Distinto de
+  cero significa que **este informe está incompleto**.
+- **`invocados_sin_declarar`**: servidores que se invocaron pero de los que
+  nunca se vio la declaración, así que no hay coste que cruzar. El caso
+  típico es el desborde de `MAX_TOOL_SERVERS`: con más de 32 servidores en
+  una petición, los que sobran se pliegan en `(others)` y pierden su
+  identidad del lado declarado, mientras sus invocaciones sí conservan el
+  nombre real. Sin este campo desaparecían del informe — y son justo los del
+  usuario con la configuración más cara.
+
+### `bytes_per_request_declared` no es un ahorro sobre todo el tráfico
+
+El nombre lleva `_declared` porque promedia **solo sobre las peticiones en las
+que el servidor viajaba**, que es `declared_in_requests`. Un servidor
+declarado en 20 de 1.000 peticiones cuesta eso en esas 20 y nada en las otras
+980; multiplicar por el total exageraría la ganancia 50 veces. Los dos campos
+van juntos en la fila justo para poder hacer la cuenta correcta.
+
+Y ojo al leerlo junto a **`tools_declared`**, que es un valor PUNTUAL (el de
+la última vez que se vio) mientras el coste es una media de toda la ventana:
+si la configuración cambió dentro de ella, las dos cifras describen momentos
+distintos.
 
 ---
 
