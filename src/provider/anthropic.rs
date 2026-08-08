@@ -181,11 +181,29 @@ impl Provider for Anthropic {
             return;
         }
 
+        // `message_stop` es la marca de fin del dialecto SSE de Anthropic.
+        // Verla es la unica prueba de que la respuesta se escaneo entera: el
+        // `status` de la fila no sirve —se captura antes de que fluya el
+        // cuerpo— y sin esta senal un turno abortado a mitad seria
+        // indistinguible de uno completo sin invocaciones.
+        if value.get("type").and_then(Value::as_str) == Some("message_stop") {
+            calls.marca_completa();
+            return;
+        }
+
         if let Some(bloques) = value.get("content").and_then(Value::as_array) {
             for bloque in bloques {
                 registra_bloque(bloque, calls);
             }
+            // Un cuerpo no-streaming con `content` parseado ES la respuesta
+            // entera: si `finish()` llego a deserializarlo, no falto nada.
+            calls.marca_completa();
         }
+    }
+
+    /// Anthropic es el unico dialecto verificado en el cable hoy.
+    fn captura_invocaciones(&self) -> bool {
+        true
     }
 
     /// Desglosa el body de `/v1/messages`. Mapeo directo del dialecto:
@@ -254,7 +272,13 @@ fn registra_bloque(bloque: &Value, calls: &mut ToolCalls) {
     };
 
     match bloque.get("type").and_then(Value::as_str) {
-        Some("tool_use") => calls.push_invoked(name),
+        // `mcp_tool_use` es el conector MCP server-side de Anthropic. Cuenta
+        // como invocacion de CLIENTE: sale de un servidor MCP que el usuario
+        // configuro, que es justo lo que el recomendador mide. Dejarlo fuera
+        // publicaria listas vacias en filas donde el modelo llamo decenas de
+        // veces, y el escape documentado —mirar el `upstream`— no salvaria
+        // el caso porque el upstream es `anthropic` igual.
+        Some("tool_use") | Some("mcp_tool_use") => calls.push_invoked(name),
         Some("server_tool_use") => calls.push_server_invoked(name),
         _ => {}
     }
@@ -417,7 +441,7 @@ fn has_cache_control(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::{measure_value, MAX_TOOL_NAMES, MAX_TOOL_NAME_LEN, NATIVE_TOOLS_LABEL};
+    use super::super::{MAX_TOOL_NAME_LEN, MAX_TOOL_NAMES, NATIVE_TOOLS_LABEL, measure_value};
 
     /// Anthropic manda el input en `message_start` y el output acumulado en
     /// `message_delta`. Extraer ambos eventos por separado debe dejar los
@@ -1439,6 +1463,110 @@ mod tests {
             calls.server_invoked,
             vec!["web_search".to_string()],
             "la de servidor entra aunque la de cliente esté a tope"
+        );
+    }
+
+    /// REGRESIÓN. `mcp_tool_use` es el conector MCP server-side de Anthropic
+    /// y cuenta como invocación de CLIENTE: sale de un servidor que el
+    /// usuario configuró, justo lo que el recomendador mide. Descartarlo
+    /// publicaría listas vacías en filas con decenas de llamadas, y el
+    /// escape "mira el upstream" no salvaría el caso: el upstream es
+    /// `anthropic` igual.
+    #[test]
+    fn el_conector_mcp_tambien_cuenta_como_invocacion() {
+        let evento = serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "mcp_tool_use",
+                "id": "mcptoolu_1",
+                "name": "search_docs",
+                "server_name": "remoto",
+                "input": {}
+            }
+        });
+
+        let mut calls = ToolCalls::default();
+        ANTHROPIC.extract_tool_use(&evento, &mut calls);
+
+        assert_eq!(calls.invoked, vec!["search_docs".to_string()]);
+        assert!(calls.server_invoked.is_empty(), "no es server_tool_use");
+    }
+
+    /// REGRESIÓN. El `status` de la fila NO dice si la respuesta se escaneó
+    /// entera: se captura antes de que fluya el cuerpo, así que un turno
+    /// abortado sale con 200. `complete` es la única señal, y solo la pone
+    /// la marca de fin del dialecto.
+    #[test]
+    fn sin_message_stop_la_respuesta_queda_marcada_incompleta() {
+        let a_medias = [
+            serde_json::json!({"type": "message_start", "message": {"content": []}}),
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {"type": "tool_use", "id": "t1", "name": "Read"}
+            }),
+        ];
+
+        let mut calls = ToolCalls::default();
+        for evento in &a_medias {
+            ANTHROPIC.extract_tool_use(evento, &mut calls);
+        }
+        assert!(
+            !calls.complete,
+            "el turno se cortó: la lista es un prefijo, no un total"
+        );
+
+        ANTHROPIC.extract_tool_use(&serde_json::json!({"type": "message_stop"}), &mut calls);
+        assert!(calls.complete, "message_stop cierra el escaneo");
+        assert_eq!(
+            calls.invoked,
+            vec!["Read".to_string()],
+            "y no altera la lista"
+        );
+    }
+
+    /// Un cuerpo no-streaming que llegó a parsearse ES la respuesta entera.
+    #[test]
+    fn el_cuerpo_completo_se_marca_completo() {
+        let cuerpo = serde_json::json!({
+            "id": "msg_1",
+            "content": [{"type": "tool_use", "id": "t1", "name": "Read"}]
+        });
+
+        let mut calls = ToolCalls::default();
+        ANTHROPIC.extract_tool_use(&cuerpo, &mut calls);
+
+        assert!(calls.complete);
+    }
+
+    /// REGRESIÓN. El cupo recorta la LISTA pero nunca el contador, que es lo
+    /// que delata el recorte — igual que `tool_names.len() < tools` lo
+    /// delata en el lado declarado. Sin esto, una respuesta con 70 llamadas
+    /// publicaría 64 y sería indistinguible de una con exactamente 64.
+    #[test]
+    fn el_truncado_queda_a_la_vista_en_el_contador() {
+        let bloques: Vec<serde_json::Value> = (0..MAX_TOOL_NAMES + 6)
+            .map(|i| serde_json::json!({"type": "tool_use", "id": i, "name": "Read"}))
+            .collect();
+        let cuerpo = serde_json::json!({"content": bloques});
+
+        let mut calls = ToolCalls::default();
+        ANTHROPIC.extract_tool_use(&cuerpo, &mut calls);
+
+        assert_eq!(
+            calls.invoked.len(),
+            MAX_TOOL_NAMES,
+            "la lista sí se recorta"
+        );
+        assert_eq!(
+            calls.invoked_total,
+            MAX_TOOL_NAMES + 6,
+            "el contador NO: es lo que revela el recorte"
+        );
+        assert!(
+            calls.invoked_total > calls.invoked.len(),
+            "la comparacion que hara el consumidor: total > publicados"
         );
     }
 }

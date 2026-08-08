@@ -698,8 +698,7 @@ mod tests {
                 source: SessionSource::Unattributed,
                 key: "unattributed".to_string(),
             },
-            tools_invoked: Vec::new(),
-            server_tools_invoked: Vec::new(),
+            tool_calls: None,
         }
     }
 

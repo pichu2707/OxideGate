@@ -54,7 +54,7 @@
 //! tanto por `GET /requests` como al `telemetry.jsonl` en texto plano. Léase
 //! `docs/telemetry-per-request.md` §4.3 antes de exponer este endpoint fuera de
 //! localhost.
-use crate::provider::{InstructionsBlock, SkillsBlock, ToolSearchSignal, ToolServerBytes};
+use crate::provider::{InstructionsBlock, SkillsBlock, ToolCalls, ToolSearchSignal, ToolServerBytes};
 use crate::telemetry::logger::RequestMetric;
 use crate::telemetry::{CacheBySection, SectionShare, CodexQuota, SessionAttribution};
 use serde::Serialize;
@@ -217,26 +217,21 @@ pub struct RecentRequest {
     /// No compromete la invariante de privacidad del módulo: es una etiqueta
     /// de un enum documentado por el proveedor, no contenido de prompt.
     pub effort_forced: Option<String>,
-    /// Herramientas de CLIENTE invocadas en la respuesta, en orden y con
-    /// repeticiones. Contrapartida de los nombres DECLARADOS que ya viajan
-    /// dentro de `tools_by_server[].tool_names`: cruzar ambos sobre el
-    /// histórico es lo que permite decir "pagas por este servidor MCP y no
-    /// lo invocas".
+    /// Invocaciones de herramienta observadas en la respuesta. `None` = este
+    /// proveedor no tiene extractor (hoy solo lo tiene Anthropic); `Some` con
+    /// listas vacías = se escaneó y no hubo ninguna. Son afirmaciones
+    /// distintas y no deben fundirse.
     ///
     /// No compromete la invariante de privacidad del módulo: un nombre de
     /// herramienta es un identificador declarado por el propio cliente —el
     /// mismo string que ya se publica en `tool_names`—, no contenido de
     /// prompt. El `input` de la llamada, que SÍ lo sería, no se mide.
     ///
-    /// Vacío significa "no se reconoció ninguna invocación", nunca "no
-    /// invocó nada": solo Anthropic tiene extractor hoy.
+    /// Lleva dentro `complete` y los `*_total` para que el lector sepa si la
+    /// lista es un prefijo (turno abortado) o está recortada por el cupo.
+    /// Ver `telemetry::logger::RequestMetric::tool_calls`.
     #[serde(default)]
-    pub tools_invoked: Vec<String>,
-    /// Herramientas de SERVIDOR invocadas (`web_search`, `web_fetch`…).
-    /// Lista aparte: las ejecuta el proveedor y no salen de la configuración
-    /// MCP del usuario, así que no cuentan como uso de un servidor suyo.
-    #[serde(default)]
-    pub server_tools_invoked: Vec<String>,
+    pub tool_calls: Option<ToolCalls>,
     /// Bytes del body que MANDÓ EL CLIENTE, en su forma lógica. La mitad de
     /// subida que le faltaba a [`Self::response_bytes`].
     ///
@@ -332,8 +327,7 @@ impl From<&RequestMetric> for RecentRequest {
             skills: m.skills,
             instructions: m.instructions,
             effort_forced: m.effort_forced.clone(),
-            tools_invoked: m.tools_invoked.clone(),
-            server_tools_invoked: m.server_tools_invoked.clone(),
+            tool_calls: m.tool_calls.clone(),
             prompt_bytes: m.prompt_bytes,
             response_bytes: m.response_bytes,
             prepare_us: m.prepare_us,
@@ -441,8 +435,7 @@ mod tests {
                 source: SessionSource::Unattributed,
                 key: "unattributed".to_string(),
             },
-            tools_invoked: Vec::new(),
-            server_tools_invoked: Vec::new(),
+            tool_calls: None,
         }
     }
 
@@ -1026,16 +1019,15 @@ mod tests {
             "response_bytes",
             "route",
             "served_speed",
-            "server_tools_invoked",
             "session",
             "skills",
             "status",
             "stream",
             "timestamp",
+            "tool_calls",
             "tool_search",
             "tools_by_server",
             "tools_flattened",
-            "tools_invoked",
             "tools_overhead_bytes",
             "total_ms",
             "ttft_ms",

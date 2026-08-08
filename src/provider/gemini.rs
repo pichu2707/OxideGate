@@ -139,6 +139,12 @@ impl Provider for Gemini {
     /// concluir que un servidor no se usa.
     fn extract_tool_use(&self, _value: &Value, _calls: &mut ToolCalls) {}
 
+    /// Dialecto no capturado todavia: la fila publica `None`, no listas
+    /// vacias. Ver [`Provider::captura_invocaciones`].
+    fn captura_invocaciones(&self) -> bool {
+        false
+    }
+
     /// Desglosa el body de `generateContent`/`streamGenerateContent`.
     /// `systemInstruction` → `system_bytes`; `tools` → `tools_bytes`;
     /// `contents` → todo menos el último a `history_bytes`, el último a

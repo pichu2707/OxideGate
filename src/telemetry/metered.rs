@@ -194,6 +194,17 @@ impl UsageScanner {
     /// Cierre del stream: en no-streaming el `usage` vive en el JSON completo.
     fn finish(&mut self) {
         if self.is_stream {
+            // Un upstream que corta la conexion justo tras el ultimo
+            // `data: {...}` deja ese evento en `line_buf` sin su `\n`
+            // final, y hasta aqui se descartaba entero. Afectaba ya al
+            // `usage`; ahora ademas se perderia una invocacion, asi que se
+            // vacia el resto antes de cerrar. `scan_sse_line` ignora lo que
+            // no sea un `data:` valido, de modo que un remanente a medio
+            // JSON no hace nada — no puede corromper el acumulado.
+            if !self.line_buf.is_empty() {
+                let resto = std::mem::take(&mut self.line_buf);
+                self.scan_sse_line(&resto);
+            }
             return;
         }
         if let Ok(value) = serde_json::from_slice::<Value>(&self.full_body) {
@@ -369,8 +380,13 @@ impl MeteredBody {
             skills: self.base.skills,
             instructions: self.base.instructions,
             effort_forced: self.base.effort_forced.clone(),
-            tools_invoked: std::mem::take(&mut self.scanner.calls.invoked),
-            server_tools_invoked: std::mem::take(&mut self.scanner.calls.server_invoked),
+            // `None` si este proveedor no tiene extractor: publicar listas
+            // vacias ahi seria afirmar "no invoco nada", que es otra cosa.
+            tool_calls: self
+                .base
+                .provider
+                .captura_invocaciones()
+                .then(|| std::mem::take(&mut self.scanner.calls)),
             response_bytes: Some(self.response_bytes),
             codex_quota: self.base.codex_quota.clone(),
         });
@@ -557,5 +573,41 @@ mod tests {
 
         assert_eq!(scanner.calls.invoked, vec!["Read".to_string()]);
         assert_eq!(scanner.usage.output_tokens, Some(7));
+    }
+
+    /// REGRESIÓN. Un upstream que corta la conexión justo tras el último
+    /// `data: {...}`, sin el salto de línea final, dejaba ese evento entero
+    /// en `line_buf` y se descartaba en silencio. Afectaba ya al `usage`;
+    /// con las invocaciones además se perdía una llamada, así que `finish()`
+    /// vacía el resto antes de cerrar.
+    #[test]
+    fn el_ultimo_evento_sin_salto_de_linea_no_se_pierde() {
+        let mut scanner = UsageScanner::new(true, &ANTHROPIC);
+
+        scanner.feed(b"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"Read\"}}\n\n");
+        // Sin `\n` final: la conexión se corta aquí.
+        scanner.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":9}}");
+        scanner.finish();
+
+        assert_eq!(
+            scanner.usage.output_tokens,
+            Some(9),
+            "el usage del ultimo evento tambien se recupera"
+        );
+        assert_eq!(scanner.calls.invoked, vec!["Read".to_string()]);
+    }
+
+    /// Un remanente que no es un `data:` válido no puede corromper nada:
+    /// `scan_sse_line` lo ignora, así que drenar el buffer es seguro.
+    #[test]
+    fn un_remanente_a_medio_json_no_rompe_el_acumulado() {
+        let mut scanner = UsageScanner::new(true, &ANTHROPIC);
+
+        scanner.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":4}}\n\n");
+        scanner.feed(b"data: {\"type\":\"content_bl");
+        scanner.finish();
+
+        assert_eq!(scanner.usage.output_tokens, Some(4), "lo bueno sobrevive");
+        assert!(scanner.calls.invoked.is_empty(), "lo roto se ignora");
     }
 }

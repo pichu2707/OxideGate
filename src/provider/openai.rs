@@ -142,6 +142,12 @@ impl Provider for OpenAiChat {
     /// "el modelo no invocó nada".
     fn extract_tool_use(&self, _value: &Value, _calls: &mut ToolCalls) {}
 
+    /// Dialecto no capturado todavia: la fila publica `None`, no listas
+    /// vacias. Ver [`Provider::captura_invocaciones`].
+    fn captura_invocaciones(&self) -> bool {
+        false
+    }
+
     /// Desglosa el body de `/v1/chat/completions`. A diferencia de
     /// Anthropic, acá NO hay un campo `system` a nivel raíz: el prompt de
     /// sistema es un mensaje más, con `role: "system"` (o `"developer"`, el
@@ -319,6 +325,12 @@ impl Provider for OpenAiResponses {
     /// Listas vacías significan "no se reconoció ninguna invocación", nunca
     /// "el modelo no invocó nada".
     fn extract_tool_use(&self, _value: &Value, _calls: &mut ToolCalls) {}
+
+    /// Dialecto no capturado todavia: la fila publica `None`, no listas
+    /// vacias. Ver [`Provider::captura_invocaciones`].
+    fn captura_invocaciones(&self) -> bool {
+        false
+    }
 
     /// Desglosa el body de `/v1/responses`. `instructions` → `system_bytes`
     /// (es el equivalente del `system` de Anthropic en este dialecto);
@@ -548,6 +560,11 @@ impl Provider for OpenAiCodexResponses {
     /// dialecto, misma ausencia declarada.
     fn extract_tool_use(&self, value: &Value, calls: &mut ToolCalls) {
         OPENAI_RESPONSES.extract_tool_use(value, calls);
+    }
+
+    /// Delega, igual que el extractor: mismo dialecto, misma ausencia.
+    fn captura_invocaciones(&self) -> bool {
+        OPENAI_RESPONSES.captura_invocaciones()
     }
 
     /// DELEGA en [`OPENAI_RESPONSES::decompose`]: mismo dialecto exacto

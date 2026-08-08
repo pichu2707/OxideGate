@@ -115,7 +115,7 @@ Esto mirroriza la misma invariante que ya documenta
 haya o no autenticación de por medio.
 
 **Los NOMBRES de herramienta sí viajan; el CONTENIDO no.** `tool_names`
-(declaradas, §4.7) y `tools_invoked`/`server_tools_invoked` (invocadas, §4.15)
+(declaradas, §4.2) y `tool_calls` (invocadas, §4.15)
 publican identificadores de herramienta por HTTP. No son huellas de prompt —
 los eligió el cliente y ya se los declaró al proveedor en texto plano— pero
 describen qué integraciones tiene montadas quien usa el proxy, así que
@@ -168,8 +168,7 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `skills` | Listado de skills declarado en el body: `{declared, listing_bytes, format}`, o `null`. Se paga en CADA petición, se invoque una skill o no | `null` = no se reconoció ningún listado, **nunca "cero skills"**. `format` dice qué forma se encontró y, de paso, de qué herramienta viene el tráfico sin fiarse del `User-Agent` — ver §4.8 |
 | `instructions` | Bloque de instrucciones del usuario (`CLAUDE.md`) declarado en el body: `{bytes, format}`, o `null`. Se paga en CADA petición. Medido: el 48% del peaje fijo de una sesión de Claude Code | `null` = no se reconoció ningún bloque, **nunca "el usuario no tiene instrucciones"** — Claude Code IGNORA `AGENTS.md`, así que ahí `null` es correcto. Ver §4.13 |
 | `effort_forced` | Nivel de esfuerzo que IMPUSO el proxy (palanca B), o `null` si no intervino — el default | Se lee JUNTO a `requested_effort`, nunca en su lugar: es lo que impide confundir un ahorro del cliente con una intervención del medidor. Ver §4.14 |
-| `tools_invoked` | Herramientas de CLIENTE que el modelo INVOCÓ en esta respuesta, en orden y con repeticiones | Contrapartida de `tool_names` (declaradas). Cruzarlos sobre el histórico es lo que permite recomendar quitar un servidor MCP que se paga y no se usa. Vacío = no se reconoció ninguna, NUNCA "no invocó nada". Ver §4.15 |
-| `server_tools_invoked` | Herramientas de SERVIDOR invocadas (`web_search`, `web_fetch`) | Lista aparte: las ejecuta el proveedor, no salen de la config MCP del usuario. Ver §4.15 |
+| `tool_calls` | Invocaciones observadas en la RESPUESTA: `invoked` (cliente, MCP incluidas), `server_invoked` (`web_search`…), sus totales sin truncar, y `complete` | Contrapartida de `tool_names` (declaradas). `null` = este proveedor no tiene extractor, que NO es lo mismo que listas vacías. `complete: false` = la lista es un prefijo (turno abortado) y no sirve para concluir que un servidor no se usa. Ver §4.15 |
 | `prompt_bytes` | Bytes del body que MANDÓ EL CLIENTE, en su forma lógica | **No es wire** (en `/v1/codex/responses` y `/v1beta/*` se mide descomprimido), **no es lo que subió al proveedor** (con `cache_control_forced` el body reenviado es mayor) y **no es la suma del desglose**. Ver §4.10 antes de usarlo |
 | `response_bytes` | Bytes del CUERPO DE LA RESPUESTA que cruzaron el proxy. `null` si no llegó a haber respuesta | **Sin comprimir**, y por eso no es ancho de banda: el proxy descarta `Accept-Encoding` para poder leer el SSE. Ver §4.9 antes de compararlo con `prompt_bytes` |
 | `codex_quota` | Estado de la cuota de suscripción de Codex (OAuth de `chatgpt.com`), parseado de las doce cabeceras `x-codex-*` de la RESPUESTA del upstream: doce campos, todos opcionales. `null` si la petición no fue a Codex vía OAuth, o si el upstream falló antes de responder | Es el ÚNICO campo de esta fila que se lee de la respuesta y no del request ni del body. Cuota NUNCA son dólares: no alimenta ni puede alimentar `cost_estimate_usd` — ver §4.7 |
@@ -1131,14 +1130,19 @@ es que el body que subió al proveedor llevaba otro `effort`, y la fila lo dice.
 ### 4.15. `tools_invoked`: lo que el modelo USA, frente a lo que el cliente DECLARA
 
 Hasta este slice, el proxy sabía exactamente qué herramientas **se declaran**
-(`tools_by_server[].tool_names`, §4.7) y absolutamente nada de cuáles **se
+(`tools_by_server[].tool_names`, §4.2) y absolutamente nada de cuáles **se
 usan**. Es un hueco caro: `mcp-lean.json` es la palanca más grande del
 catálogo publicado —**−55.098 B por petición**— y no hay forma de recomendarla
 sin saber qué servidor sobra.
 
 ```json
-"tools_invoked": ["Read", "Read", "mcp__context7__get-docs"],
-"server_tools_invoked": ["web_search"]
+"tool_calls": {
+  "invoked": ["Read", "Read", "mcp__context7__get-docs"],
+  "server_invoked": ["web_search"],
+  "invoked_total": 3,
+  "server_invoked_total": 1,
+  "complete": true
+}
 ```
 
 Cruzar esos nombres con `tools_by_server` sobre el histórico es lo único que
@@ -1174,8 +1178,8 @@ respuesta completa. El proveedor cubre las dos formas en un solo método
 
 El escáner que ya leía el `usage` de cada evento (`UsageScanner`) parsea el
 JSON **una vez** y ahora se lo pasa a los dos extractores. No hay un segundo
-recorrido del stream, no se bufferiza la respuesta y no se retrasa un solo
-byte al cliente: la promesa de passthrough intacto se mantiene porque este
+recorrido del stream, este campo no bufferiza nada que el escáner de `usage`
+no bufferizara ya, y no se retrasa un solo byte al cliente: la promesa de passthrough intacto se mantiene porque este
 campo se lee del `Value` que ya existía.
 
 #### Por qué crudos y con repeticiones
@@ -1201,34 +1205,59 @@ sumarlas inflaría el «sí lo usas» de un servidor MCP con llamadas que no son
 suyas. Se pueden contrastar contra `usage.server_tool_use`, que Anthropic
 reporta por su cuenta.
 
-#### Vacío NO significa "no invocó nada"
+#### Tres formas de que la lista sea corta, y cómo distinguirlas
 
-Significa **«no se reconoció ninguna invocación»**, y hoy son cosas
-distintas por dos motivos:
+Una lista corta puede significar tres cosas muy distintas. **El recomendador
+tiene que separarlas o acabará aconsejando borrar servidores que sí se usan**,
+y por eso el campo lleva metadatos en vez de ser dos vectores pelados:
 
-1. **Solo Anthropic tiene extractor.** Gemini (`functionCall` dentro de
-   `candidates[].content.parts[]`) y OpenAI (`tool_calls`, o items
-   `function_call` en la Responses API) usan formas distintas que **no se han
-   capturado todavía contra tráfico real**. Mismo criterio que `instructions`
-   (§4.13), que publica un solo `format` por la misma razón: este proyecto no
-   publica lo que no vio en el cable.
-2. **Una fila de error nunca llega a tener respuesta que escanear.** Ahí el
-   `status` distingue el caso sin necesidad de otro campo.
+| Qué pasó | Cómo se ve en la fila |
+|---|---|
+| El modelo invocó poco — el caso honesto | `complete: true`, `invoked_total == invoked.len()` |
+| **Este proveedor no tiene extractor** | `tool_calls` es **`null`**, no un objeto con listas vacías |
+| **El escaneo se cortó** (turno abortado, stream roto) | `complete: false` — las listas son un PREFIJO |
+| **La lista se truncó** por el cupo | `invoked_total > invoked.len()` |
 
-Antes de concluir que un servidor no se usa, **mirar el `upstream` de la
-fila**. Es la misma disciplina que exige `served_speed`.
+**`null` no es lo mismo que listas vacías.** `null` dice "aquí no se midió";
+un objeto con `invoked: []` dice "se escaneó la respuesta entera y el modelo
+no invocó nada". Son afirmaciones distintas y la segunda es mucho más fuerte.
+Hoy solo Anthropic tiene extractor —Gemini y OpenAI usan formas distintas
+(`functionCall`, `tool_calls`, items `function_call`) que **no se han
+capturado contra tráfico real**— y las filas escritas antes de que el campo
+existiera también rehidratan como `null`. Fundir ambos casos en un vector
+vacío haría que cada una de esas filas contase como prueba de que un servidor
+no se usa.
+
+**`complete: false` no se puede deducir del `status`.** Es la trampa que
+parece obvia y no lo es: el `status` se captura de la respuesta del upstream
+**antes de que fluya un solo byte del cuerpo**, así que un turno que el
+cliente aborta a mitad de stream sale con `200` y una lista parcial. Los
+turnos abortados son comunes en flujos de agente. Una fila con
+`complete: false` sirve para **confirmar** que un servidor se usó (si aparece
+en ella), nunca para concluir que no se usó.
+
+**`mcp_tool_use` sí se captura**, y cuenta como invocación de cliente: el
+conector MCP server-side de Anthropic sale de un servidor que configuró el
+usuario, que es exactamente lo que el recomendador mide.
 
 #### Acotado igual que los nombres declarados
 
 64 entradas por lista y 128 caracteres por nombre, los mismos topes que
-`tool_names`, y por el mismo motivo: un nombre que llega en la respuesta es
-texto de fuera igual que uno de la petición, y estas filas viven además en el
-buffer de 200 de `/requests`. Los dos cupos son **independientes** — que un
-modelo agote el de cliente no puede silenciar la lista de servidor. El
-truncado cuenta CARACTERES, no bytes: cortar UTF-8 a mitad de un punto de
-código haría panic.
+`tool_names` y aplicados por **el mismo helper** (`provider::push_acotado`):
+compartirlo no es estética, es que todo el valor del cruce
+declarado-vs-invocado depende de que ambos lados guarden el MISMO string, y
+dos truncados que pudieran divergir romperían la comparación por igualdad sin
+que ningún test lo notara.
 
-**Aditivo**: `FIELDS` pasa de 13 a 15 y `CONTRACT_VERSION` sigue en 1.
+Y —igual que en el lado declarado— **el recorte queda a la vista**:
+`invoked_total` cuenta lo visto sin aplicar el cupo, así que
+`invoked_total > invoked.len()` delata el truncado. Es el mismo mecanismo por
+el que `tool_names.len() < tools` lo delata en `tools_by_server`. Los dos
+cupos son **independientes**: que un modelo agote el de cliente no puede
+silenciar la lista de servidor. El truncado cuenta CARACTERES, no bytes:
+cortar UTF-8 a mitad de un punto de código haría panic.
+
+**Aditivo**: `FIELDS` pasa de 13 a 14 (`tool_calls`) y `CONTRACT_VERSION` sigue en 1.
 
 ---
 

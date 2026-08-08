@@ -319,13 +319,21 @@ async fn send_and_meter(
                 skills: out.skills,
                 instructions: out.instructions,
                 effort_forced: out.effort_forced,
-                // Esta rama es el camino de ERROR: el upstream no llegó a
-                // responder, así que no hubo respuesta que escanear. Vacío
-                // acá es la ausencia honesta —"no hubo nada que mirar"—, no
-                // "el modelo no invocó herramientas": el `status` de la fila
-                // distingue los dos casos sin necesidad de otro campo.
-                tools_invoked: Vec::new(),
-                server_tools_invoked: Vec::new(),
+                // Camino de ERROR: el upstream no llegó a responder, así que
+                // no hubo respuesta que escanear. `None` es la ausencia
+                // honesta —"no hubo nada que mirar"—, distinta de un `Some`
+                // con listas vacías, que afirmaría haber escaneado y no haber
+                // encontrado nada.
+                //
+                // Una versión anterior de este comentario decía que el
+                // `status` de la fila bastaba para distinguir los dos casos.
+                // Es FALSO y conviene dejarlo dicho: `status` se captura de
+                // `resp.status()` antes de que fluya un byte del cuerpo, así
+                // que un turno abortado a mitad de stream sale con `200` y
+                // una lista parcial. Quien necesite saber si el escaneo llegó
+                // al final tiene que mirar `ToolCalls::complete`, que existe
+                // exactamente por eso.
+                tool_calls: None,
                 // No hubo respuesta que recorrer: `None` honesto, no un `0`
                 // que se leería como "el proveedor devolvió un cuerpo vacío".
                 response_bytes: None,
