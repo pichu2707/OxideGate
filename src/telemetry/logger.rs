@@ -336,6 +336,20 @@ pub struct RequestMetric {
     /// es la respuesta correcta. Ver `provider::instructions`.
     #[serde(default)]
     pub instructions: Option<InstructionsBlock>,
+    /// Nivel de esfuerzo que IMPUSO la palanca B del optimizador, o `null` si
+    /// el proxy no intervino — el caso por defecto, porque arranca apagada.
+    ///
+    /// **Se lee JUNTO a `requested_effort`, nunca en su lugar.** Ese campo
+    /// dice lo que pidió el cliente (leído antes de mutar); este, lo que subió
+    /// de verdad. Una fila con `requested_effort: "high"` y
+    /// `effort_forced: "low"` avisa de que sus `output_tokens` son del segundo:
+    /// sin este campo, un ahorro provocado por el propio medidor sería
+    /// indistinguible de uno del cliente, que es el peor fallo que este
+    /// proyecto puede cometer.
+    ///
+    /// Ver `docs/optimizer-effort.md` y `docs/telemetry-per-request.md` §4.14.
+    #[serde(default)]
+    pub effort_forced: Option<String>,
     /// Bytes del CUERPO DE LA RESPUESTA que cruzaron el proxy. `None` si no
     /// llegó a haber respuesta del upstream.
     ///
@@ -687,6 +701,7 @@ mod tests {
             tools_flattened: None,
             skills: None,
             instructions: None,
+            effort_forced: None,
             response_bytes: None,
             status: 200,
             ttft_ms: None,

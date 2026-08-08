@@ -85,11 +85,12 @@ impl Provider for Anthropic {
         let requested_effort = parsed.as_ref().and_then(requested_effort_of);
         let requested_speed = parsed.as_ref().and_then(requested_speed_of);
 
-        let (body, cache_control_forced) = if cfg.force_prompt_cache {
-            force_cache_control(incoming.body, parsed)
-        } else {
-            (incoming.body, false)
-        };
+        let (body, cache_control_forced, effort_forced) = aplicar_palancas(
+            incoming.body,
+            parsed,
+            cfg.force_prompt_cache,
+            cfg.force_effort.as_deref(),
+        );
 
         Outgoing {
             url: format!("{}/messages", cfg.target_anthropic_url),
@@ -104,6 +105,7 @@ impl Provider for Anthropic {
             context,
             skills,
             instructions,
+            effort_forced,
             tools_by_server: by_server,
             tools_overhead_bytes: overhead,
             requested_effort,
@@ -244,22 +246,105 @@ fn requested_speed_of(value: &Value) -> Option<String> {
 /// Toma `raw` (para poder devolverlo intacto sin reserializar cuando no hay
 /// mutación) y `parsed`, el `Value` que YA parseó `prepare` a partir de
 /// `raw`: esta función nunca vuelve a llamar a `serde_json::from_slice`.
-fn force_cache_control(raw: Vec<u8>, parsed: Option<Value>) -> (Vec<u8>, bool) {
+/// Aplica las palancas del optimizador sobre el body saliente y lo serializa
+/// **una sola vez**.
+///
+/// Existe porque las dos palancas mutan el MISMO body: encadenarlas por
+/// separado significaría serializar dos veces y, peor, que la segunda tuviera
+/// que volver a parsear lo que la primera acababa de escribir.
+///
+/// Con las dos apagadas —el default— devuelve `raw` **intacto**, sin pasar por
+/// una vuelta de reserializado. Es la invariante 3 del contrato de `prepare`:
+/// parsear no es reserializar, y un proxy que promete no tocar nada tiene que
+/// devolver los mismos bytes que recibió.
+///
+/// Si algo falla a mitad —el body no es un objeto, la serialización revienta—
+/// se reenvía `raw` y **no se declara ninguna intervención**: preferimos no
+/// mutar a romper el request, y sobre todo preferimos no decir que mutamos
+/// algo que no mutamos.
+fn aplicar_palancas(
+    raw: Vec<u8>,
+    parsed: Option<Value>,
+    force_cache: bool,
+    force_effort: Option<&str>,
+) -> (Vec<u8>, bool, Option<String>) {
+    if !force_cache && force_effort.is_none() {
+        return (raw, false, None);
+    }
+
     let Some(mut value) = parsed else {
-        return (raw, false);
+        return (raw, false, None);
     };
 
-    // Solo los objetos JSON son indexables por clave: inyectar en un array o
-    // escalar entraría en pánico. Además, si el cliente ya cachea, no tocamos.
-    if !value.is_object() || has_cache_control(&value) {
-        return (raw, false);
+    // Solo los objetos JSON son indexables por clave: mutar un array o un
+    // escalar entraría en pánico.
+    if !value.is_object() {
+        return (raw, false, None);
     }
 
-    value["cache_control"] = serde_json::json!({"type": "ephemeral"});
-    match serde_json::to_vec(&value) {
-        Ok(body) => (body, true),
-        Err(_) => (raw, false),
+    let cache = force_cache && inyecta_cache_control(&mut value);
+    let effort = force_effort.and_then(|objetivo| fuerza_effort(&mut value, objetivo));
+
+    if !cache && effort.is_none() {
+        return (raw, false, None);
     }
+
+    match serde_json::to_vec(&value) {
+        Ok(body) => (body, cache, effort),
+        Err(_) => (raw, false, None),
+    }
+}
+
+/// Palanca A sobre un `Value` ya parseado. `true` si mutó.
+///
+/// No hace falta pedir caché si el cliente YA gestiona el suyo: pisar sus
+/// breakpoints puede superar el máximo de 4 por request, que Anthropic
+/// responde con `400`.
+fn inyecta_cache_control(value: &mut Value) -> bool {
+    if has_cache_control(value) {
+        return false;
+    }
+    value["cache_control"] = serde_json::json!({"type": "ephemeral"});
+    true
+}
+
+/// Palanca B sobre un `Value` ya parseado. Devuelve el nivel impuesto, o
+/// `None` si no hubo intervención que declarar.
+///
+/// **Sobrescribe lo que el cliente pidió, a propósito.** Medido: Claude Code
+/// manda `{"effort": "high"}` explícito en cada petición, así que una palanca
+/// que solo actuara ante su ausencia no haría nada nunca. Lo que la hace
+/// honesta no es abstenerse, es que la fila publique las dos cosas:
+/// `requested_effort` (leído ANTES de mutar) y `effort_forced`.
+///
+/// Dos casos en los que no toca nada:
+///
+/// - **Ya está en el nivel pedido.** No hay intervención que declarar, y
+///   declararla sería mentir en la única dirección que importa.
+/// - **`output_config` existe y no es un objeto.** Entonces esto no es el
+///   dialecto que creemos, y meter una clave dentro rompería el request.
+fn fuerza_effort(value: &mut Value, objetivo: &str) -> Option<String> {
+    // Comparación insensible a mayúsculas: `objetivo` viene normalizado de
+    // `parse_force_effort`, pero lo que trae el cliente no pasa por ahí. Sin
+    // esto, un `"LOW"` del cliente contra un `low` configurado se reportaría
+    // como intervención cuando lo único que cambia es el casing — y una
+    // intervención declarada que no cambia nada es tan mentira como una real
+    // sin declarar.
+    if requested_effort_of(value).is_some_and(|actual| actual.eq_ignore_ascii_case(objetivo)) {
+        return None;
+    }
+    if value.get("output_config").is_some_and(|oc| !oc.is_object()) {
+        return None;
+    }
+
+    value
+        .as_object_mut()?
+        .entry("output_config")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+        .as_object_mut()?
+        .insert("effort".to_string(), Value::String(objetivo.to_string()));
+
+    Some(objetivo.to_string())
 }
 
 /// Detecta recursivamente si la clave `cache_control` aparece en cualquier
@@ -339,6 +424,12 @@ mod tests {
     /// Construye un `AppConfig` mínimo para los tests de `prepare`, sin pasar
     /// por `AppConfig::load()` (que lee variables de entorno del proceso).
     fn test_config(force_prompt_cache: bool) -> AppConfig {
+        config_con(force_prompt_cache, None)
+    }
+
+    /// Config de test con las DOS palancas gobernables, para poder afirmar
+    /// que no se pisan entre ellas.
+    fn config_con(force_prompt_cache: bool, force_effort: Option<&str>) -> AppConfig {
         AppConfig {
             local_port: 8080,
             bind_host: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
@@ -349,6 +440,8 @@ mod tests {
             target_codex_url: "https://chatgpt.com/backend-api/codex".to_string(),
             storage_dir: std::path::PathBuf::from("/tmp/oxidegate-test"),
             force_prompt_cache,
+            force_effort: force_effort.map(str::to_string),
+            force_effort_warning: None,
         }
     }
 
@@ -393,6 +486,193 @@ mod tests {
 
         assert!(!out.cache_control_forced);
         assert_eq!(out.body, original_body);
+    }
+
+    /// Palanca B: con el flag puesto, `effort` pasa a ser el configurado y la
+    /// fila declara a QUÉ se forzó — no un simple booleano.
+    #[test]
+    fn la_palanca_b_fuerza_el_effort_y_declara_a_que() {
+        let cfg = config_con(false, Some("low"));
+        let incoming = incoming_with_body(
+            r#"{"model":"claude-opus-4-8","output_config":{"effort":"high"},"messages":[]}"#,
+        );
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert_eq!(out.effort_forced.as_deref(), Some("low"));
+        let body: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(body["output_config"]["effort"], "low");
+    }
+
+    /// **La fila tiene que contar las DOS cosas.** `requested_effort` se lee
+    /// ANTES de mutar, así que sigue diciendo lo que pidió el cliente aunque
+    /// el proxy lo haya pisado. Sin esto, una medición sobre un body que el
+    /// propio medidor alteró no se distinguiría de una limpia.
+    #[test]
+    fn requested_effort_sigue_siendo_el_del_cliente_tras_forzar() {
+        let cfg = config_con(false, Some("low"));
+        let incoming = incoming_with_body(
+            r#"{"model":"claude-opus-4-8","output_config":{"effort":"high"},"messages":[]}"#,
+        );
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert_eq!(
+            out.requested_effort.as_deref(),
+            Some("high"),
+            "lo que pidió el cliente"
+        );
+        assert_eq!(
+            out.effort_forced.as_deref(),
+            Some("low"),
+            "lo que impuso el proxy"
+        );
+    }
+
+    /// Si el cliente YA pedía el nivel configurado, no hay intervención que
+    /// declarar: el body no se toca y la fila no miente diciendo que sí.
+    #[test]
+    fn no_declara_intervencion_si_el_cliente_ya_pedia_ese_nivel() {
+        let cfg = config_con(false, Some("low"));
+        let incoming = incoming_with_body(
+            r#"{"model":"claude-opus-4-8","output_config":{"effort":"low"},"messages":[]}"#,
+        );
+        let original = incoming.body.clone();
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert!(out.effort_forced.is_none());
+        assert_eq!(out.body, original, "sin mutación no hay reserializado");
+    }
+
+    /// Sin `output_config` en el body, forzar significa crearlo.
+    #[test]
+    fn crea_output_config_si_no_venia() {
+        let cfg = config_con(false, Some("xhigh"));
+        let incoming = incoming_with_body(r#"{"model":"claude-opus-4-8","messages":[]}"#);
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert_eq!(out.effort_forced.as_deref(), Some("xhigh"));
+        let body: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+    }
+
+    /// `output_config` presente pero NO objeto: no es el dialecto que creemos,
+    /// así que no se toca. Preferimos no mutar a romper el request — mismo
+    /// criterio que la palanca A con un body que no es objeto.
+    #[test]
+    fn un_output_config_que_no_es_objeto_no_se_toca() {
+        let cfg = config_con(false, Some("low"));
+        let incoming = incoming_with_body(
+            r#"{"model":"claude-opus-4-8","output_config":"raro","messages":[]}"#,
+        );
+        let original = incoming.body.clone();
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert!(out.effort_forced.is_none());
+        assert_eq!(out.body, original);
+    }
+
+    /// `output_config: null` es distinto de ausente y de no-objeto, y es un
+    /// valor que un cliente o un harness con un bug puede mandar
+    /// perfectamente. No debe petar ni mutar.
+    #[test]
+    fn un_output_config_nulo_no_se_toca_ni_peta() {
+        let cfg = config_con(false, Some("low"));
+        let incoming =
+            incoming_with_body(r#"{"model":"claude-opus-4-8","output_config":null,"messages":[]}"#);
+        let original = incoming.body.clone();
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert!(out.effort_forced.is_none());
+        assert_eq!(out.body, original);
+    }
+
+    /// El casing del cliente no es una intervención. Si pide `"LOW"` y la
+    /// palanca está en `low`, no hay nada que forzar: declararlo sería
+    /// reportar una intervención que no cambia el esfuerzo, solo la grafía.
+    #[test]
+    fn el_casing_del_cliente_no_cuenta_como_intervencion() {
+        let cfg = config_con(false, Some("low"));
+        let incoming = incoming_with_body(
+            r#"{"model":"claude-opus-4-8","output_config":{"effort":"LOW"},"messages":[]}"#,
+        );
+        let original = incoming.body.clone();
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert!(out.effort_forced.is_none());
+        assert_eq!(out.body, original, "sin intervención no hay reserializado");
+    }
+
+    /// Con la palanca B encendida y un body que NO es un objeto JSON, se
+    /// reenvía intacto. La guarda está compartida con la palanca A, pero un
+    /// test que solo la ejercita por un camino no prueba el otro.
+    #[test]
+    fn la_palanca_b_no_toca_un_body_que_no_es_objeto() {
+        let cfg = config_con(false, Some("low"));
+        for crudo in ["[1,2,3]", "\"no soy un objeto\"", "esto no es json"] {
+            let incoming = incoming_with_body(crudo);
+            let original = incoming.body.clone();
+
+            let out = ANTHROPIC.prepare(incoming, &cfg);
+
+            assert!(out.effort_forced.is_none(), "crudo: {crudo}");
+            assert_eq!(out.body, original, "crudo: {crudo}");
+        }
+    }
+
+    /// **La palanca sube tanto como baja, y hay que fijarlo.** Un comentario
+    /// afirmaba lo contrario y el código nunca lo cumplió; lo cazó una
+    /// revisión doble. El test existe para que la afirmación viva aquí y no
+    /// en una frase que nadie vuelve a comprobar.
+    #[test]
+    fn la_palanca_b_tambien_sube_el_nivel() {
+        let cfg = config_con(false, Some("max"));
+        let incoming = incoming_with_body(
+            r#"{"model":"claude-opus-4-8","output_config":{"effort":"low"},"messages":[]}"#,
+        );
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert_eq!(out.effort_forced.as_deref(), Some("max"));
+        let body: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(body["output_config"]["effort"], "max");
+    }
+
+    /// Las DOS palancas a la vez sobre el mismo body: se aplican ambas y el
+    /// body se serializa UNA sola vez. Que una encienda no puede tragarse a la
+    /// otra.
+    #[test]
+    fn las_dos_palancas_conviven_en_una_sola_serializacion() {
+        let cfg = config_con(true, Some("low"));
+        let incoming = incoming_with_body(
+            r#"{"model":"claude-opus-4-8","output_config":{"effort":"high"},"messages":[]}"#,
+        );
+
+        let out = ANTHROPIC.prepare(incoming, &cfg);
+
+        assert!(out.cache_control_forced, "palanca A");
+        assert_eq!(out.effort_forced.as_deref(), Some("low"), "palanca B");
+        let body: Value = serde_json::from_slice(&out.body).unwrap();
+        assert_eq!(body["cache_control"]["type"], "ephemeral");
+        assert_eq!(body["output_config"]["effort"], "low");
+    }
+
+    /// La palanca B no toca a los otros dialectos: `effort` es de Anthropic.
+    /// Lo guarda el propio tipo —OpenAI y Gemini devuelven `None`— pero se
+    /// afirma para que un cambio futuro tenga que romper un test.
+    #[test]
+    fn la_palanca_b_no_existe_fuera_de_anthropic() {
+        let out = ANTHROPIC.prepare(
+            incoming_with_body(r#"{"model":"x","messages":[]}"#),
+            &test_config(false),
+        );
+
+        assert!(out.effort_forced.is_none(), "apagada por defecto");
     }
 
     /// REGRESIÓN de bytes: con la palanca apagada (default), el body

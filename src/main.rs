@@ -681,6 +681,21 @@ async fn main() {
     if let Some(aviso) = &config.bind_host_warning {
         eprintln!("{aviso}");
     }
+    // Un typo en OXIDEGATE_FORCE_EFFORT deja la palanca apagada: se cuenta por
+    // el mismo motivo que el bind, porque creer que optimizas y no hacerlo es
+    // el fallo silencioso que este proxy existe para no cometer.
+    if let Some(aviso) = &config.force_effort_warning {
+        eprintln!("{aviso}");
+    }
+    // Y si SÍ está encendida se anuncia, porque a partir de aquí el proxy deja
+    // de ser un observador puro: muta cada petición a Anthropic.
+    if let Some(nivel) = &config.force_effort {
+        eprintln!(
+            "🔧 Palanca B ACTIVA: se fuerza output_config.effort={nivel} en las peticiones a \
+             Anthropic.\n   Las filas afectadas llevan effort_forced={nivel}; requested_effort \
+             sigue diciendo qué pidió el cliente."
+        );
+    }
     let state = AppState {
         config: Arc::new(config),
         http: reqwest::Client::new(),

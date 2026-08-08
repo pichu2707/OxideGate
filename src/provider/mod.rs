@@ -165,6 +165,26 @@ pub struct Outgoing {
     /// Code con un `AGENTS.md` en el proyecto, `None` es la respuesta CORRECTA
     /// porque esa herramienta no lo manda.
     pub instructions: Option<InstructionsBlock>,
+    /// Nivel de esfuerzo que IMPUSO el proxy (palanca B del optimizador,
+    /// `AppConfig::force_effort`), o `None` si no intervino — que es el caso
+    /// por defecto, porque la palanca arranca apagada.
+    ///
+    /// **Es el complemento honesto de [`Self::requested_effort`], y sin él
+    /// esa medición estaría contaminada.** `requested_effort` se lee ANTES de
+    /// mutar, así que sigue diciendo lo que pidió el cliente; este campo dice
+    /// lo que subió de verdad al proveedor. Una fila con
+    /// `requested_effort: "high"` y `effort_forced: "low"` cuenta la historia
+    /// entera: el cliente pidió una cosa, el proxy mandó otra, y los tokens de
+    /// salida que se midan en esa fila son del segundo, no del primero.
+    ///
+    /// Guarda un `String` y no un `bool` —a diferencia de
+    /// [`Self::cache_control_forced`]— porque aquí hay algo que declarar: la
+    /// palanca A inyecta siempre el mismo valor fijo (`{"type":"ephemeral"}`)
+    /// y basta con saber que ocurrió; la B impone un nivel que el lector no
+    /// puede deducir de la fila. Sin el valor, la fila no sería autocontenida.
+    ///
+    /// Dialecto de Anthropic únicamente: OpenAI y Gemini devuelven `None`.
+    pub effort_forced: Option<String>,
 }
 
 /// Acumulador de tokens medidos desde la respuesta del proveedor.

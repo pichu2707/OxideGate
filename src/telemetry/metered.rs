@@ -107,6 +107,10 @@ pub struct MetricBase {
     /// (`Outgoing::instructions`). Viaja intacto hasta
     /// `RequestMetric::instructions`. `None` = no se pudo ver.
     pub instructions: Option<InstructionsBlock>,
+    /// Nivel de esfuerzo impuesto por la palanca B (`Outgoing::effort_forced`).
+    /// Viaja intacto hasta `RequestMetric::effort_forced`. `None` = el proxy no
+    /// intervino.
+    pub effort_forced: Option<String>,
     /// Proveedor dueño del dialecto de esta respuesta: la extracción del
     /// `usage` se delega íntegramente en él, así este módulo no necesita
     /// saber nada de ningún proveedor concreto.
@@ -357,6 +361,7 @@ impl MeteredBody {
             tools_flattened: self.base.tools_flattened,
             skills: self.base.skills,
             instructions: self.base.instructions,
+            effort_forced: self.base.effort_forced.clone(),
             response_bytes: Some(self.response_bytes),
             codex_quota: self.base.codex_quota.clone(),
         });
@@ -436,6 +441,7 @@ mod tests {
             tools_flattened: None,
             skills: None,
             instructions: None,
+            effort_forced: None,
             provider: &ANTHROPIC,
             codex_quota: None,
         }

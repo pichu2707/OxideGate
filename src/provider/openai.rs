@@ -109,6 +109,7 @@ impl Provider for OpenAiChat {
             context,
             skills,
             instructions,
+            effort_forced: None,
             tools_by_server: by_server,
             tools_overhead_bytes: overhead,
             // `output_config.effort` y `speed` (raíz) son dialecto EXCLUSIVO
@@ -284,6 +285,7 @@ impl Provider for OpenAiResponses {
             context,
             skills,
             instructions,
+            effort_forced: None,
             tools_by_server: by_server,
             tools_overhead_bytes: overhead,
             // Ídem Chat Completions: `effort`/`speed` son dialecto exclusivo
@@ -506,6 +508,7 @@ impl Provider for OpenAiCodexResponses {
             context,
             skills,
             instructions,
+            effort_forced: None,
             tools_by_server: by_server,
             tools_overhead_bytes: overhead,
             // `effort`/`speed` son dialecto exclusivo de Anthropic.
@@ -971,6 +974,8 @@ mod tests {
             target_codex_url: "https://chatgpt.com/backend-api/codex".to_string(),
             storage_dir: std::path::PathBuf::from("/tmp/oxidegate-test"),
             force_prompt_cache: false,
+            force_effort: None,
+            force_effort_warning: None,
         }
     }
 
