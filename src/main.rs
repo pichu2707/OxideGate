@@ -63,6 +63,9 @@ RUTAS QUE SIRVE:
     GET  /stats      Agregado en vivo por (proveedor, modelo).
     GET  /sessions   Agregado por sesion: que costo cada sesion de trabajo.
     GET  /requests   Detalle de los últimos requests individuales.
+    GET  /mcp        Que cuesta cada servidor MCP y cuanto se usa: bytes por
+                     peticion cruzados con invocaciones reales. Dice cual
+                     sobra, con la evidencia que lo sostiene al lado.
     GET  /history    Desde cuando miden los agregados: ventana rehidratada al
                      arrancar desde telemetry.jsonl, cuantas filas entraron y
                      cual es la mas antigua. Se ajusta con
@@ -642,16 +645,19 @@ async fn main() {
         ruta.push("telemetry.jsonl");
         let stats = telemetry.stats();
         let sessions = telemetry.sessions();
+        let mcp = telemetry.mcp();
         let mut s = stats.write().expect("lock de stats envenenado al arrancar");
         let mut ses = sessions
             .write()
             .expect("lock de sessions envenenado al arrancar");
+        let mut m = mcp.write().expect("lock de mcp envenenado al arrancar");
         telemetry::rehydrate::rehydrate(
             &ruta,
             history_days,
             chrono::Utc::now(),
             &mut s,
             &mut ses,
+            &mut m,
         )
     };
     if rehydrated.rows > 0 {
@@ -761,6 +767,7 @@ async fn main() {
         // Detalle en vivo de los últimos requests individuales: qué request
         // puntual es atípico (outlier de coste/latencia).
         .route("/requests", get(middleware::requests::handle_requests))
+        .route("/mcp", get(middleware::mcp::handle_mcp))
         .with_state(Arc::new(state));
 
     let addr = SocketAddr::new(bind_host, port);
@@ -785,6 +792,7 @@ async fn main() {
     println!("🪪 Capacidades y versión del contrato en http://{addr}/version");
     println!("📊 Estadísticas en vivo por modelo en http://{addr}/stats");
     println!("🧾 Últimos requests en vivo en http://{addr}/requests");
+    println!("🔌 Coste vs uso por servidor MCP en http://{addr}/mcp");
     axum::serve(listener, app).await.unwrap();
 }
 

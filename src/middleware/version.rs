@@ -58,7 +58,8 @@ pub const CONTRACT_VERSION: u32 = 1;
 /// `/health` se lista igual que el resto: un consumidor que descubre el proxy
 /// por `/version` necesita saber que la ruta de liveness existe, y omitirla
 /// aquí reproduciría en pequeño el mismo agujero que esta ruta viene a tapar.
-pub const ENDPOINTS: [&str; 5] = ["/health", "/stats", "/sessions", "/requests", "/history"];
+pub const ENDPOINTS: [&str; 6] = ["/health", "/stats", "/sessions", "/requests",
+        "/mcp", "/history"];
 
 /// Campos que un consumidor puede necesitar sondear antes de dibujar una
 /// columna.

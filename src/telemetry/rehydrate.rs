@@ -48,6 +48,7 @@ use crate::telemetry::logger::RequestMetric;
 struct SoloTimestamp {
     timestamp: String,
 }
+use crate::telemetry::mcp::McpRegistry;
 use crate::telemetry::stats::{SessionRegistry, StatsRegistry};
 
 /// Días de histórico que se releen si `OXIDEGATE_HISTORY_DAYS` no dice otra
@@ -98,6 +99,7 @@ pub fn rehydrate(
     now: chrono::DateTime<chrono::Utc>,
     stats: &mut StatsRegistry,
     sessions: &mut SessionRegistry,
+    mcp: &mut McpRegistry,
 ) -> Rehydrated {
     let mut out = Rehydrated::default();
     if days == 0 {
@@ -146,6 +148,11 @@ pub fn rehydrate(
         }
         stats.ingest(&m);
         sessions.ingest(&m);
+        // El cruce MCP se rehidrata como los otros dos agregados, y por un
+        // motivo mas fuerte: exige 50 peticiones concluyentes antes de opinar,
+        // asi que sin histórico arrancaria en blanco tras cada reinicio y no
+        // llegaria nunca al umbral en un uso normal.
+        mcp.ingest(&m);
         out.rows += 1;
     }
     out
@@ -238,9 +245,13 @@ mod tests {
             fila("2026-07-30T10:00:00Z", "anthropic", "claude-opus-4-8", 100),
             fila("2026-07-31T10:00:00Z", "anthropic", "claude-opus-4-8", 200),
         ]);
-        let (mut s, mut ses) = (StatsRegistry::default(), SessionRegistry::default());
+        let (mut s, mut ses, mut mcp) = (
+            StatsRegistry::default(),
+            SessionRegistry::default(),
+            McpRegistry::default(),
+        );
 
-        let r = rehydrate(f.path(), 7, ahora(), &mut s, &mut ses);
+        let r = rehydrate(f.path(), 7, ahora(), &mut s, &mut ses, &mut mcp);
 
         assert_eq!(r.rows, 2);
         assert_eq!(r.skipped_old, 0);
@@ -259,9 +270,13 @@ mod tests {
             fila("2026-07-31T10:00:00Z", "anthropic", "m", 2),
             "{esto no es json".to_string(),
         ]);
-        let (mut s, mut ses) = (StatsRegistry::default(), SessionRegistry::default());
+        let (mut s, mut ses, mut mcp) = (
+            StatsRegistry::default(),
+            SessionRegistry::default(),
+            McpRegistry::default(),
+        );
 
-        let r = rehydrate(f.path(), 7, ahora(), &mut s, &mut ses);
+        let r = rehydrate(f.path(), 7, ahora(), &mut s, &mut ses, &mut mcp);
 
         assert_eq!(r.rows, 1);
         assert_eq!(r.skipped_old, 1);
@@ -276,9 +291,13 @@ mod tests {
             fila("2026-07-31T10:00:00Z", "anthropic", "m", 1),
             r#"{"timestamp":"2026-07-31T11:00:00Z","route":"/v1/mes"#.to_string(),
         ]);
-        let (mut s, mut ses) = (StatsRegistry::default(), SessionRegistry::default());
+        let (mut s, mut ses, mut mcp) = (
+            StatsRegistry::default(),
+            SessionRegistry::default(),
+            McpRegistry::default(),
+        );
 
-        let r = rehydrate(f.path(), 7, ahora(), &mut s, &mut ses);
+        let r = rehydrate(f.path(), 7, ahora(), &mut s, &mut ses, &mut mcp);
 
         assert_eq!(r.rows, 1);
         assert_eq!(r.skipped_bad, 1);
@@ -291,9 +310,13 @@ mod tests {
     fn una_fila_sin_los_campos_nuevos_se_rehidrata_igual() {
         let f = escribe(&[r#"{"timestamp":"2026-07-31T10:00:00Z","route":"/v1/messages","upstream":"anthropic","prompt_hash":"h","stream":false,"status":200,"total_ms":50.0}"#
             .to_string()]);
-        let (mut s, mut ses) = (StatsRegistry::default(), SessionRegistry::default());
+        let (mut s, mut ses, mut mcp) = (
+            StatsRegistry::default(),
+            SessionRegistry::default(),
+            McpRegistry::default(),
+        );
 
-        let r = rehydrate(f.path(), 7, ahora(), &mut s, &mut ses);
+        let r = rehydrate(f.path(), 7, ahora(), &mut s, &mut ses, &mut mcp);
 
         assert_eq!(r.rows, 1, "una fila vieja no puede quedarse fuera");
         assert_eq!(r.skipped_bad, 0);
@@ -310,9 +333,13 @@ mod tests {
     #[test]
     fn una_fila_con_tools_by_server_sin_tool_names_se_rehidrata_igual() {
         let f = escribe(&[r#"{"timestamp":"2026-07-31T10:00:00Z","route":"/v1/messages","upstream":"anthropic","prompt_hash":"h","stream":true,"status":200,"total_ms":10.0,"tools_by_server":[{"server":"(native)","kind":"native","tools":3,"bytes":100}]}"#.to_string()]);
-        let (mut s, mut ses) = (StatsRegistry::default(), SessionRegistry::default());
+        let (mut s, mut ses, mut mcp) = (
+            StatsRegistry::default(),
+            SessionRegistry::default(),
+            McpRegistry::default(),
+        );
 
-        let r = rehydrate(f.path(), 7, ahora(), &mut s, &mut ses);
+        let r = rehydrate(f.path(), 7, ahora(), &mut s, &mut ses, &mut mcp);
 
         assert_eq!(r.rows, 1, "sin tool_names ni deferred_tools debe entrar");
         assert_eq!(r.skipped_bad, 0);
@@ -328,9 +355,13 @@ mod tests {
             r#"{"timestamp":"2026-01-01T10:00:00Z","route":"/v1/m","upstream":"a"}"#.to_string(),
             fila("2026-07-31T10:00:00Z", "anthropic", "m", 1),
         ]);
-        let (mut s, mut ses) = (StatsRegistry::default(), SessionRegistry::default());
+        let (mut s, mut ses, mut mcp) = (
+            StatsRegistry::default(),
+            SessionRegistry::default(),
+            McpRegistry::default(),
+        );
 
-        let r = rehydrate(f.path(), 7, ahora(), &mut s, &mut ses);
+        let r = rehydrate(f.path(), 7, ahora(), &mut s, &mut ses, &mut mcp);
 
         assert_eq!(r.rows, 1);
         assert_eq!(r.skipped_old, 1, "la vieja cuenta como vieja");
@@ -342,9 +373,13 @@ mod tests {
     #[test]
     fn cero_dias_desactiva_la_rehidratacion() {
         let f = escribe(&[fila("2026-07-31T10:00:00Z", "anthropic", "m", 1)]);
-        let (mut s, mut ses) = (StatsRegistry::default(), SessionRegistry::default());
+        let (mut s, mut ses, mut mcp) = (
+            StatsRegistry::default(),
+            SessionRegistry::default(),
+            McpRegistry::default(),
+        );
 
-        let r = rehydrate(f.path(), 0, ahora(), &mut s, &mut ses);
+        let r = rehydrate(f.path(), 0, ahora(), &mut s, &mut ses, &mut mcp);
 
         assert_eq!(r, Rehydrated::default());
         assert!(s.snapshot(None).0.is_empty());
@@ -353,9 +388,20 @@ mod tests {
     /// Un primer arranque no tiene fichero, y eso no es un error.
     #[test]
     fn sin_fichero_no_es_un_error() {
-        let (mut s, mut ses) = (StatsRegistry::default(), SessionRegistry::default());
+        let (mut s, mut ses, mut mcp) = (
+            StatsRegistry::default(),
+            SessionRegistry::default(),
+            McpRegistry::default(),
+        );
 
-        let r = rehydrate(Path::new("/no/existe/telemetry.jsonl"), 7, ahora(), &mut s, &mut ses);
+        let r = rehydrate(
+            Path::new("/no/existe/telemetry.jsonl"),
+            7,
+            ahora(),
+            &mut s,
+            &mut ses,
+            &mut mcp,
+        );
 
         assert_eq!(r, Rehydrated::default());
     }

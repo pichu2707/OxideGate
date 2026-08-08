@@ -1259,6 +1259,96 @@ cortar UTF-8 a mitad de un punto de código haría panic.
 
 **Aditivo**: `FIELDS` pasa de 13 a 14 (`tool_calls`) y `CONTRACT_VERSION` sigue en 1.
 
+
+## 4.16. `GET /mcp`: qué cuesta cada servidor y cuánto se usa
+
+Los cuatro endpoints anteriores contestan sobre coste. Este contesta sobre
+**valor**: cruza los bytes que un servidor MCP cuesta con las veces que
+realmente se invoca, y es la única pregunta que necesita los dos lados del
+cable a la vez —los bytes viven en la petición, las invocaciones en la
+respuesta— así que solo la puede responder un punto que vea las dos.
+
+```json
+{
+  "umbral": 50,
+  "servers": [
+    {
+      "server": "context7",
+      "kind": "mcp",
+      "declared_in_requests": 200,
+      "bytes_per_request": 12400,
+      "tools_declared": 8,
+      "invocations": 0,
+      "conclusive_requests": 187,
+      "descartes": { "sin_extractor": 11, "incompletas": 2, "truncadas": 0 },
+      "verdict": {
+        "type": "unused",
+        "conclusive_requests": 187,
+        "bytes_per_request": 12400
+      }
+    }
+  ]
+}
+```
+
+Esa fila es la frase que motiva todo el campo `tool_calls` (§4.15): *pagas
+12.400 B por petición por `context7` y no has invocado ninguna de sus 8
+herramientas en 187 peticiones concluyentes*.
+
+### El veredicto viene con la evidencia, no en su lugar
+
+Recomendar quitar un servidor que sí se usa es el peor fallo posible aquí: el
+usuario pierde una integración que funciona **por consejo del medidor**. Por
+eso cada fila publica en qué se apoya, y una petición solo cuenta como prueba
+de NO-uso si supera los tres filtros:
+
+| Filtro | Qué descarta | Campo |
+|---|---|---|
+| Tiene extractor | `tool_calls: null` — el proveedor no mide, o la fila es anterior al campo | `descartes.sin_extractor` |
+| Se escaneó entera | `complete: false` — turno abortado, la lista es un prefijo | `descartes.incompletas` |
+| No está truncada | el cupo recortó, una llamada pudo quedar fuera | `descartes.truncadas` |
+
+Los tres se cuentan por separado, y no como un total, porque cada uno se
+arregla de forma distinta: `sin_extractor` con un extractor nuevo,
+`truncadas` subiendo el cupo, e `incompletas` no se arregla — es tráfico real
+que el usuario abortó.
+
+### La asimetría: ver una llamada prueba el uso; no verla no prueba el no-uso
+
+Una invocación observada en una fila **incompleta** cuenta igual hacia
+`invocations`. Solo el veredicto de NO-uso exige filas concluyentes. Si no
+fuera así, un turno abortado podría esconder la única prueba de que un
+servidor sí se usa, y el recomendador aconsejaría borrarlo.
+
+### Los cuatro veredictos
+
+| `type` | Significa |
+|---|---|
+| `used` | Se invocó al menos una vez. Nunca se recomienda quitarlo |
+| `unused` | Cero invocaciones sobre `umbral` peticiones concluyentes o más |
+| `insufficient_data` | Cero invocaciones, pero sin evidencia suficiente. **No es lo mismo que `unused`** — aquí la respuesta honesta es «todavía no lo sé» |
+| `not_applicable` | `(native)` o `(others)`: no es algo que el usuario pueda quitar de su configuración |
+
+### El umbral viaja en la respuesta
+
+`umbral` es un **juicio, no una medida**, y por eso se publica: quien no esté
+de acuerdo tiene `invocations`, `conclusive_requests` y los descartes para
+aplicar el suyo. Está en 50 y no en 200 porque 200 tarda días en acumularse
+en un uso normal y el consejo llegaría tarde para ser útil; 3 sería ruido que
+cualquier sesión corta produce.
+
+### No admite `?since=`
+
+A diferencia de `/stats`, y a propósito: la pregunta es sobre un HÁBITO, y un
+hábito se mide sobre todo lo acumulado. Acotar la ventana solo serviría para
+bajar artificialmente las peticiones concluyentes y convertir un `unused` en
+un `insufficient_data`. Si algún día hace falta, entra como parámetro nuevo y
+aditivo.
+
+Se rehidrata del `telemetry.jsonl` al arrancar, como `/stats` y `/sessions`, y
+por un motivo más fuerte: sin histórico arrancaría en blanco tras cada
+reinicio y no llegaría nunca al umbral.
+
 ---
 
 ## 5. Límite de memoria: 200 filas, y se pierden al reiniciar
