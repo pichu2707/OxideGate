@@ -433,11 +433,17 @@ impl Drop for MeteredBody {
 #[cfg(test)]
 mod tests {
     use super::{MeteredBody, MetricBase, UsageScanner};
-    use crate::provider::ANTHROPIC;
+    use crate::provider::{ANTHROPIC, ToolCalls};
     use crate::telemetry::{SessionAttribution, SessionSource, TelemetrySink};
     use bytes::Bytes;
     use futures_util::StreamExt;
     use std::time::Instant;
+
+    /// Solo los nombres, para no acoplar estos tests (que prueban el ESCÁNER)
+    /// a la forma de la atribución a servidor, que se prueba aparte.
+    fn nombres_de(calls: &ToolCalls) -> Vec<String> {
+        calls.invoked.iter().map(|c| c.name.clone()).collect()
+    }
 
     /// `MetricBase` mínima para ejercitar el recorrido del stream.
     fn base_de_prueba(stream: bool) -> MetricBase {
@@ -543,7 +549,7 @@ mod tests {
         scanner.finish();
 
         assert_eq!(
-            scanner.calls.invoked,
+            nombres_de(&scanner.calls),
             vec!["mcp__context7__get-docs".to_string()],
             "la de cliente, reensamblada desde dos chunks"
         );
@@ -571,7 +577,7 @@ mod tests {
         scanner.feed(br#""usage":{"output_tokens":7}}"#);
         scanner.finish();
 
-        assert_eq!(scanner.calls.invoked, vec!["Read".to_string()]);
+        assert_eq!(nombres_de(&scanner.calls), vec!["Read".to_string()]);
         assert_eq!(scanner.usage.output_tokens, Some(7));
     }
 
@@ -594,7 +600,7 @@ mod tests {
             Some(9),
             "el usage del ultimo evento tambien se recupera"
         );
-        assert_eq!(scanner.calls.invoked, vec!["Read".to_string()]);
+        assert_eq!(nombres_de(&scanner.calls), vec!["Read".to_string()]);
     }
 
     /// Un remanente que no es un `data:` válido no puede corromper nada:
