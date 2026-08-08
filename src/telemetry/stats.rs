@@ -698,6 +698,7 @@ mod tests {
                 source: SessionSource::Unattributed,
                 key: "unattributed".to_string(),
             },
+            tool_calls: None,
         }
     }
 

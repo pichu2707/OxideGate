@@ -8,7 +8,7 @@
 //! agregación y el detalle reciente en vivo sin tocar el JSONL. Así el I/O de
 //! log NUNCA se suma a la latencia que le devolvemos a gentle-ai.
 use crate::provider::{
-    ContextBreakdown, InstructionsBlock, SkillsBlock, ToolSearchSignal, ToolServerBytes,
+    ContextBreakdown, InstructionsBlock, SkillsBlock, ToolCalls, ToolSearchSignal, ToolServerBytes,
 };
 use crate::telemetry::{
     CacheBySection, SectionShare, CodexQuota, RecentRequests, SessionAttribution, SessionRegistry, StatsRegistry,
@@ -350,6 +350,28 @@ pub struct RequestMetric {
     /// Ver `docs/optimizer-effort.md` y `docs/telemetry-per-request.md` §4.14.
     #[serde(default)]
     pub effort_forced: Option<String>,
+    /// Invocaciones de herramienta observadas en la RESPUESTA
+    /// (`provider::ToolCalls`). **Contrapartida de `tool_names`**, que dice
+    /// lo que el cliente DECLARA: esto dice lo que el modelo USA. Cruzar los
+    /// dos sobre el histórico es lo único que permite afirmar "pagas 12.400 B
+    /// por este servidor MCP y no has invocado ninguna de sus herramientas",
+    /// la palanca más grande del catálogo (−55.098 B).
+    ///
+    /// **`None` significa "este proveedor no tiene extractor", y por eso NO
+    /// es un `Vec` vacío.** Hoy solo Anthropic lo tiene, y las filas
+    /// anteriores a que existiera el campo también rehidratan como `None`.
+    /// Un `Some` con listas vacías es una afirmación distinta y mucho más
+    /// fuerte: se escaneó la respuesta y el modelo no invocó nada. Fundir
+    /// ambas en un vector vacío haría que el recomendador contase como
+    /// "servidor sin usar" cada fila escrita antes del extractor.
+    ///
+    /// Antes de concluir que un servidor no se usa hay que mirar además dos
+    /// cosas dentro del bloque: `complete` (si vale `false`, las listas son
+    /// un prefijo — el turno se abortó) y `invoked_total` frente a
+    /// `invoked.len()` (si difieren, la lista está recortada por el cupo).
+    /// Ver `docs/telemetry-per-request.md` §4.15.
+    #[serde(default)]
+    pub tool_calls: Option<ToolCalls>,
     /// Bytes del CUERPO DE LA RESPUESTA que cruzaron el proxy. `None` si no
     /// llegó a haber respuesta del upstream.
     ///
@@ -702,6 +724,7 @@ mod tests {
             skills: None,
             instructions: None,
             effort_forced: None,
+            tool_calls: None,
             response_bytes: None,
             status: 200,
             ttft_ms: None,

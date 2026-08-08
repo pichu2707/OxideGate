@@ -18,12 +18,23 @@
 //! públicamente inofensivos.
 //!
 //! La misma invariante aplica al desglose de herramientas por servidor
-//! (`tools_by_server`): lo que se expone es la ETIQUETA del servidor
-//! (`(native)`, `claude_ai_Gmail`, `(others)`…) y un conteo de bytes/cantidad
-//! de herramientas, NUNCA el nombre individual de cada herramienta ni ningún
-//! fragmento del `input_schema`/`description` que la compone. Un nombre de
-//! servidor no es contenido de prompt: no filtra nada que el propio cliente
-//! no le haya declarado ya al proveedor en texto plano.
+//! (`tools_by_server`), pero la línea NO está donde estuvo. Se expone la
+//! etiqueta del servidor (`(native)`, `claude_ai_Gmail`, `(others)`…), el
+//! conteo de bytes/cantidad, **y los nombres individuales de herramienta**:
+//! `tool_names` (declaradas, dentro de cada fila de servidor) y
+//! [`RecentRequest::tools_invoked`] / [`RecentRequest::server_tools_invoked`]
+//! (invocadas). Lo que NUNCA sale es el CONTENIDO: ni un fragmento del
+//! `input_schema`/`description` que compone una herramienta, ni el `input`
+//! con el que se la llamó.
+//!
+//! Hasta que `tool_names` entró en el contrato (`/version` lo declara, y
+//! `oxidegate-lens` lo consume), este párrafo prometía que los nombres
+//! individuales NUNCA se publicaban. Dejó de ser cierto ahí y la frase se
+//! quedó — la clase de doc que no se nota hasta que alguien decide exponer
+//! `/requests` fuera de localhost confiando en ella. Un nombre de
+//! herramienta sigue sin ser contenido de prompt: lo eligió el cliente y ya
+//! se lo declaró al proveedor en texto plano. Pero es un identificador, y
+//! quien lea esta vista tiene que saber que viaja.
 //!
 //! Es PURO: no conoce axum ni ningún framework HTTP, solo `RequestMetric`. El
 //! handler que lo expone por HTTP vive en `middleware::requests`.
@@ -43,7 +54,7 @@
 //! tanto por `GET /requests` como al `telemetry.jsonl` en texto plano. Léase
 //! `docs/telemetry-per-request.md` §4.3 antes de exponer este endpoint fuera de
 //! localhost.
-use crate::provider::{InstructionsBlock, SkillsBlock, ToolSearchSignal, ToolServerBytes};
+use crate::provider::{InstructionsBlock, SkillsBlock, ToolCalls, ToolSearchSignal, ToolServerBytes};
 use crate::telemetry::logger::RequestMetric;
 use crate::telemetry::{CacheBySection, SectionShare, CodexQuota, SessionAttribution};
 use serde::Serialize;
@@ -206,6 +217,21 @@ pub struct RecentRequest {
     /// No compromete la invariante de privacidad del módulo: es una etiqueta
     /// de un enum documentado por el proveedor, no contenido de prompt.
     pub effort_forced: Option<String>,
+    /// Invocaciones de herramienta observadas en la respuesta. `None` = este
+    /// proveedor no tiene extractor (hoy solo lo tiene Anthropic); `Some` con
+    /// listas vacías = se escaneó y no hubo ninguna. Son afirmaciones
+    /// distintas y no deben fundirse.
+    ///
+    /// No compromete la invariante de privacidad del módulo: un nombre de
+    /// herramienta es un identificador declarado por el propio cliente —el
+    /// mismo string que ya se publica en `tool_names`—, no contenido de
+    /// prompt. El `input` de la llamada, que SÍ lo sería, no se mide.
+    ///
+    /// Lleva dentro `complete` y los `*_total` para que el lector sepa si la
+    /// lista es un prefijo (turno abortado) o está recortada por el cupo.
+    /// Ver `telemetry::logger::RequestMetric::tool_calls`.
+    #[serde(default)]
+    pub tool_calls: Option<ToolCalls>,
     /// Bytes del body que MANDÓ EL CLIENTE, en su forma lógica. La mitad de
     /// subida que le faltaba a [`Self::response_bytes`].
     ///
@@ -301,6 +327,7 @@ impl From<&RequestMetric> for RecentRequest {
             skills: m.skills,
             instructions: m.instructions,
             effort_forced: m.effort_forced.clone(),
+            tool_calls: m.tool_calls.clone(),
             prompt_bytes: m.prompt_bytes,
             response_bytes: m.response_bytes,
             prepare_us: m.prepare_us,
@@ -408,6 +435,7 @@ mod tests {
                 source: SessionSource::Unattributed,
                 key: "unattributed".to_string(),
             },
+            tool_calls: None,
         }
     }
 
@@ -996,6 +1024,7 @@ mod tests {
             "status",
             "stream",
             "timestamp",
+            "tool_calls",
             "tool_search",
             "tools_by_server",
             "tools_flattened",

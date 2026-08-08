@@ -430,6 +430,112 @@ const MAX_TOOL_NAMES: usize = 64;
 /// no se acerca; uno de 1 MB sería una entrada hostil, no un caso de uso.
 const MAX_TOOL_NAME_LEN: usize = 128;
 
+/// Invocaciones de herramienta observadas en la RESPUESTA del proveedor.
+///
+/// Contrapartida de [`ToolServerBytes::tool_names`], que publica lo que el
+/// cliente DECLARA. Este acumulador publica lo que el modelo USA — el dato
+/// que hace falta para decir "pagas por este servidor MCP y no lo invocas",
+/// y el único de los dos que no se puede leer de la petición.
+///
+/// # Por qué lleva metadatos y no solo dos listas
+///
+/// Una lista corta puede significar tres cosas MUY distintas, y quien lea
+/// tiene que poder separarlas o el recomendador aconsejará borrar servidores
+/// que sí se usan:
+///
+/// 1. **El modelo invocó poco.** El caso honesto.
+/// 2. **El escaneo se cortó**: el cliente abortó el turno o el stream se
+///    rompió. Lo dice [`Self::complete`]. NO se puede deducir del `status`
+///    de la fila: ese se captura ANTES de que fluya el cuerpo, así que un
+///    turno abortado a mitad sale con `200` igual que uno completo.
+/// 3. **La lista se truncó** por el cupo. Lo delatan
+///    [`Self::invoked_total`] / [`Self::server_invoked_total`], que cuentan
+///    lo VISTO sin recortar. Es el mismo mecanismo por el que
+///    `tool_names.len() < tools` delata el recorte en el lado declarado.
+///
+/// Los nombres van CRUDOS y CON REPETICIONES, a propósito:
+/// - Crudos porque son el mismo string que viaja en `tools[]`, así que la
+///   atribución a servidor la deriva quien lea con [`classify`] o
+///   [`server_of`], sin que la fila fosilice la convención `mcp__` del día
+///   en que se escribió.
+/// - Con repeticiones porque cuántas veces se llamó a una herramienta es un
+///   dato real del cable, y deduplicar al escribir lo perdería para siempre.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCalls {
+    /// Herramientas de CLIENTE invocadas (`tool_use` y `mcp_tool_use`): las
+    /// que el agente declara y se ejecutan por su cuenta, MCP incluidas.
+    pub invoked: Vec<String>,
+    /// Herramientas de SERVIDOR invocadas (`server_tool_use`): `web_search`,
+    /// `web_fetch`… Las ejecuta el proveedor, no el agente. Van aparte
+    /// porque no salen de la configuración MCP del usuario y por tanto no
+    /// entran en el recuento que alimenta al recomendador.
+    pub server_invoked: Vec<String>,
+    /// Invocaciones de cliente VISTAS, sin aplicar el cupo. Si es mayor que
+    /// `invoked.len()`, la lista está recortada — y hay que tratarla como un
+    /// mínimo, no como el total.
+    #[serde(default)]
+    pub invoked_total: usize,
+    /// Ídem para las de servidor.
+    #[serde(default)]
+    pub server_invoked_total: usize,
+    /// `true` si la respuesta se escaneó ENTERA (llegó su marca de fin).
+    ///
+    /// `false` significa que las listas son un PREFIJO: el cliente se
+    /// desconectó a media respuesta, el stream se rompió, o el cuerpo no
+    /// pudo parsearse. Una fila con `complete: false` **no sirve para
+    /// concluir que un servidor no se usa** — solo para confirmar que sí se
+    /// usó, si aparece en ella.
+    ///
+    /// Existe porque el `status` NO da esta información: se captura antes de
+    /// que fluya el cuerpo, así que un turno abortado a mitad publica `200`.
+    #[serde(default)]
+    pub complete: bool,
+}
+
+impl ToolCalls {
+    /// Registra una invocación de herramienta de cliente. El contador total
+    /// sube SIEMPRE; la lista solo mientras quede cupo, con las mismas dos
+    /// guardas ([`MAX_TOOL_NAMES`]/[`MAX_TOOL_NAME_LEN`]) que se aplican a
+    /// los nombres declarados. Un nombre que llega en la RESPUESTA es tan
+    /// poco fiable como uno que llega en la petición: ambos son texto de
+    /// fuera.
+    pub fn push_invoked(&mut self, name: &str) {
+        self.invoked_total = self.invoked_total.saturating_add(1);
+        push_acotado(&mut self.invoked, name);
+    }
+
+    /// Ídem para herramientas de servidor. Cupo propio, no compartido: un
+    /// modelo que agote el de una lista no debe poder silenciar la otra.
+    pub fn push_server_invoked(&mut self, name: &str) {
+        self.server_invoked_total = self.server_invoked_total.saturating_add(1);
+        push_acotado(&mut self.server_invoked, name);
+    }
+
+    /// Marca que la respuesta se escaneó entera. Lo llama el proveedor al
+    /// reconocer la marca de fin de SU dialecto: el escáner genérico no sabe
+    /// cuál es.
+    pub fn marca_completa(&mut self) {
+        self.complete = true;
+    }
+}
+
+/// Empuja `name` a `lista` respetando el cupo de entradas y el de longitud.
+///
+/// Es el ÚNICO sitio donde se aplican los dos topes, y lo usan tanto los
+/// nombres declarados ([`group_tools_by_server`]) como los invocados
+/// ([`ToolCalls`]). Compartirlo no es estética: todo el valor del cruce
+/// declarado-vs-invocado es que ambos lados guarden el MISMO string, así que
+/// dos truncados que puedan divergir romperían la comparación por igualdad
+/// sin que ningún test lo notara.
+///
+/// Trunca por CARACTERES, nunca por bytes: cortar UTF-8 a mitad de un punto
+/// de código haría panic, y este dato viene de fuera.
+fn push_acotado(lista: &mut Vec<String>, name: &str) {
+    if lista.len() < MAX_TOOL_NAMES {
+        lista.push(name.chars().take(MAX_TOOL_NAME_LEN).collect());
+    }
+}
+
 /// Naturaleza del cubo al que se atribuye una herramienta. Distingue por
 /// TIPO, no por una cadena mágica: un servidor MCP llamado literalmente
 /// `(native)` (o `(others)`) es un servidor MCP, no una herramienta nativa
@@ -487,7 +593,9 @@ pub struct ToolServerBytes {
     /// cruce contra la lista autoritativa lo hace quien la tiene (ver
     /// `tools_flattened` y `docs/telemetry-per-request.md` §4.2).
     ///
-    /// Acotada a [`MAX_TOOL_NAMES`] entradas de [`MAX_TOOL_NAME_LEN`] bytes.
+    /// Acotada a [`MAX_TOOL_NAMES`] entradas de [`MAX_TOOL_NAME_LEN`]
+    /// CARACTERES (no bytes: cortar UTF-8 a mitad de un punto de codigo haria
+    /// panic). Mismo helper que los nombres invocados, ver [`push_acotado`].
     /// Si `tool_names.len() < tools`, la lista está truncada y el conteo
     /// `tools` es el bueno.
     #[serde(default)]
@@ -703,10 +811,11 @@ pub fn group_tools_by_server<'a>(
         }
         // El conteo de arriba NO se acota; la lista de nombres sí. Así el
         // recorte queda a la vista comparando `tool_names.len()` con `tools`.
-        if entry.names.len() < MAX_TOOL_NAMES {
-            let recortado: String = name.chars().take(MAX_TOOL_NAME_LEN).collect();
-            entry.names.push(recortado);
-        }
+        // MISMO helper que usan los nombres INVOCADOS (`ToolCalls`). El
+        // cruce declarado-vs-invocado compara strings por igualdad, así que
+        // los dos lados tienen que truncar identicamente o una herramienta
+        // de nombre largo dejaría de casar consigo misma.
+        push_acotado(&mut entry.names, name);
     }
 
     let mut rows: Vec<ToolServerBytes> = totals
@@ -783,6 +892,37 @@ pub trait Provider: Send + Sync {
     /// contiene, en algún lado, el `usage` del proveedor. No hace nada si
     /// `value` no trae un `usage` reconocible para este proveedor.
     fn extract_usage(&self, value: &Value, usage: &mut Usage);
+
+    /// Acumula en `calls` las invocaciones de herramienta que aparezcan en
+    /// `value`, que es o un evento SSE ya reconstituido o el cuerpo entero
+    /// de una respuesta no-streaming — el mismo doble papel que
+    /// [`Provider::extract_usage`], y sobre el MISMO `Value` ya parseado:
+    /// este método no vuelve a recorrer el stream ni bufferiza nada.
+    ///
+    /// Semántica ACUMULATIVA, no "último gana": cada llamada añade a lo ya
+    /// visto. Es la diferencia con `extract_usage`, donde el proveedor
+    /// reporta totales que se sobrescriben; aquí cada evento trae una
+    /// invocación distinta y perder las anteriores vaciaría el dato.
+    ///
+    /// Sin implementación por defecto A PROPÓSITO, por el mismo motivo que
+    /// [`Provider::decompose`]: un `Default` vacío dejaría a un proveedor
+    /// nuevo publicando "no se invocó nada" —indistinguible de la verdad—
+    /// sin que nadie lo notara. Que no compile obliga a decidir.
+    fn extract_tool_use(&self, value: &Value, calls: &mut ToolCalls);
+
+    /// `true` si este proveedor implementa [`Provider::extract_tool_use`] de
+    /// verdad; `false` si su cuerpo esta vacio porque el dialecto no se ha
+    /// capturado todavia contra trafico real.
+    ///
+    /// Decide si la fila publica `Some(ToolCalls)` o `None`, y esa
+    /// distincion es el contrato: `None` dice "aqui no se midio", mientras
+    /// que un `Some` con listas vacias dice "se escaneo y no hubo ninguna".
+    /// Fundirlas haria que el recomendador contase como "servidor sin usar"
+    /// cada peticion servida por un proveedor sin extractor.
+    ///
+    /// Sin default, igual que `extract_tool_use`: un proveedor nuevo tiene
+    /// que declarar en que lado esta, no heredarlo.
+    fn captura_invocaciones(&self) -> bool;
 
     /// Descompone el body de la petición por componente (ver
     /// [`ContextBreakdown`]). `None` si el body no es un objeto JSON o el
