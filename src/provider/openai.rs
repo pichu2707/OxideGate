@@ -17,7 +17,7 @@ use super::{
     array_field, classify, fingerprint, maybe_decompress, measure_key, measure_other,
     measure_value, model_and_stream_from_value, parse_body, split_history_and_last_turn,
     tools_overhead_bytes, ContextBreakdown, Incoming, Outgoing, Provider, ToolSearchSignal,
-    ToolServerBytes, ToolServerKind, Usage,
+    ToolServerBytes, ToolServerKind, ToolCalls, Usage,
 };
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -132,6 +132,15 @@ impl Provider for OpenAiChat {
     fn extract_usage(&self, value: &Value, usage: &mut Usage) {
         extract_openai_usage(value, usage);
     }
+
+    /// OpenAI NO publica invocaciones en esta fila. Mismo criterio que en
+    /// Gemini: su dialecto las manda como `tool_calls` (Chat Completions) o
+    /// como items `function_call` (Responses API), formas distintas de la de
+    /// Anthropic que no se capturaron todavía contra tráfico real.
+    ///
+    /// Listas vacías significan "no se reconoció ninguna invocación", nunca
+    /// "el modelo no invocó nada".
+    fn extract_tool_use(&self, _value: &Value, _calls: &mut ToolCalls) {}
 
     /// Desglosa el body de `/v1/chat/completions`. A diferencia de
     /// Anthropic, acá NO hay un campo `system` a nivel raíz: el prompt de
@@ -301,6 +310,15 @@ impl Provider for OpenAiResponses {
     fn extract_usage(&self, value: &Value, usage: &mut Usage) {
         extract_openai_usage(value, usage);
     }
+
+    /// OpenAI NO publica invocaciones en esta fila. Mismo criterio que en
+    /// Gemini: su dialecto las manda como `tool_calls` (Chat Completions) o
+    /// como items `function_call` (Responses API), formas distintas de la de
+    /// Anthropic que no se capturaron todavía contra tráfico real.
+    ///
+    /// Listas vacías significan "no se reconoció ninguna invocación", nunca
+    /// "el modelo no invocó nada".
+    fn extract_tool_use(&self, _value: &Value, _calls: &mut ToolCalls) {}
 
     /// Desglosa el body de `/v1/responses`. `instructions` → `system_bytes`
     /// (es el equivalente del `system` de Anthropic en este dialecto);
@@ -524,6 +542,12 @@ impl Provider for OpenAiCodexResponses {
     /// `output_tokens`. Nunca se duplica el parseo del dialecto.
     fn extract_usage(&self, value: &Value, usage: &mut Usage) {
         OPENAI_RESPONSES.extract_usage(value, usage);
+    }
+
+    /// Delega en `OPENAI_RESPONSES`, igual que `extract_usage`: mismo
+    /// dialecto, misma ausencia declarada.
+    fn extract_tool_use(&self, value: &Value, calls: &mut ToolCalls) {
+        OPENAI_RESPONSES.extract_tool_use(value, calls);
     }
 
     /// DELEGA en [`OPENAI_RESPONSES::decompose`]: mismo dialecto exacto

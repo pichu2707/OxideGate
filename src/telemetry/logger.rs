@@ -350,6 +350,40 @@ pub struct RequestMetric {
     /// Ver `docs/optimizer-effort.md` y `docs/telemetry-per-request.md` §4.14.
     #[serde(default)]
     pub effort_forced: Option<String>,
+    /// Herramientas de CLIENTE que el modelo invocó en ESTA respuesta
+    /// (`tool_use`), en orden y con repeticiones.
+    ///
+    /// **Es la contrapartida de `tool_names`**, que dice lo que el cliente
+    /// DECLARA: este dice lo que el modelo USA. Cruzar los dos sobre el
+    /// histórico es lo único que permite afirmar "pagas 12.400 B por este
+    /// servidor MCP y no has invocado ninguna de sus herramientas", que es
+    /// la palanca más grande del catálogo (−55.098 B) y la única que ningún
+    /// otro punto de la cadena puede medir.
+    ///
+    /// Nombres CRUDOS: el mismo string que viaja en `tools[]`, así que la
+    /// atribución a servidor se deriva con `provider::classify` sin que la
+    /// fila fosilice la convención `mcp__` del día en que se escribió.
+    ///
+    /// Vacío significa **"no se reconoció ninguna invocación"**, nunca "el
+    /// modelo no invocó nada": hoy solo Anthropic tiene extractor, así que
+    /// una fila de otro `upstream` sale vacía por construcción. Mirar el
+    /// `upstream` antes de concluir que un servidor no se usa.
+    ///
+    /// Acotado igual que `tool_names` (64 entradas × 128 caracteres): un
+    /// nombre que llega en la respuesta es texto de fuera, igual que uno de
+    /// la petición.
+    #[serde(default)]
+    pub tools_invoked: Vec<String>,
+    /// Herramientas de SERVIDOR invocadas (`server_tool_use`: `web_search`,
+    /// `web_fetch`…). Lista aparte a propósito: las ejecuta el proveedor, no
+    /// el agente, y no salen de la configuración MCP del usuario. Sumarlas a
+    /// `tools_invoked` inflaría el "sí lo usas" de un servidor MCP con
+    /// llamadas que no son suyas.
+    ///
+    /// Contrastable contra `usage.server_tool_use`, que Anthropic reporta
+    /// por su cuenta con los conteos de búsquedas.
+    #[serde(default)]
+    pub server_tools_invoked: Vec<String>,
     /// Bytes del CUERPO DE LA RESPUESTA que cruzaron el proxy. `None` si no
     /// llegó a haber respuesta del upstream.
     ///
@@ -702,6 +736,8 @@ mod tests {
             skills: None,
             instructions: None,
             effort_forced: None,
+            tools_invoked: Vec::new(),
+            server_tools_invoked: Vec::new(),
             response_bytes: None,
             status: 200,
             ttft_ms: None,

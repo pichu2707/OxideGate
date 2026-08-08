@@ -22,7 +22,7 @@
 use super::{
     array_field, fingerprint, measure_key, measure_other, model_and_stream_from_value, parse_body,
     split_history_and_last_turn, tools_overhead_bytes, ContextBreakdown, Incoming, Outgoing,
-    Provider, Usage,
+    Provider, ToolCalls, Usage,
 };
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -159,6 +159,35 @@ impl Provider for Anthropic {
         }
     }
 
+    /// Lee las invocaciones del dialecto de Anthropic, que las publica en
+    /// DOS formas según el modo de la respuesta:
+    ///
+    /// - **Streaming**: un evento `content_block_start` por bloque, con el
+    ///   bloque colgando de `content_block` (singular). El `name` viaja
+    ///   ENTERO en ese evento; lo único troceado en `input_json_delta` es el
+    ///   `input`, que este campo no necesita.
+    /// - **No-streaming**: el cuerpo entero, con todos los bloques en el
+    ///   array `content` de la raíz.
+    ///
+    /// El `return` tras la rama de streaming NO es un atajo: garantiza que
+    /// un mismo `Value` no pueda contarse por los dos caminos. Hoy no puede
+    /// ocurrir —`message_start` anida su `content` (vacío) bajo `message`,
+    /// no en la raíz— pero un evento futuro que trajera ambas claves
+    /// duplicaría cada invocación en silencio, y una fila con el doble de
+    /// llamadas no tiene ninguna pinta de estar mal.
+    fn extract_tool_use(&self, value: &Value, calls: &mut ToolCalls) {
+        if let Some(block) = value.get("content_block") {
+            registra_bloque(block, calls);
+            return;
+        }
+
+        if let Some(bloques) = value.get("content").and_then(Value::as_array) {
+            for bloque in bloques {
+                registra_bloque(bloque, calls);
+            }
+        }
+    }
+
     /// Desglosa el body de `/v1/messages`. Mapeo directo del dialecto:
     /// `system` (string o array de bloques de contenido, ambos se miden
     /// igual con `serde_json::to_vec`) → `system_bytes`; `tools` →
@@ -204,6 +233,30 @@ impl Provider for Anthropic {
                 })
                 .collect(),
         )
+    }
+}
+
+/// Registra UN bloque de contenido en `calls` si es una invocación.
+///
+/// Discrimina por el `type` del bloque, no por la presencia de `name`: un
+/// bloque `text` no tiene `name` y se ignoraría igual, pero apoyarse en esa
+/// coincidencia dejaría que cualquier bloque futuro con `name` (uno de
+/// citación, uno de adjunto) entrara como si fuera una llamada.
+///
+/// Los dos tipos van a listas SEPARADAS porque miden cosas distintas:
+/// `tool_use` es una herramienta que el agente declaró y ejecuta él —lo que
+/// alimenta al recomendador de MCP—, mientras que `server_tool_use` la
+/// ejecuta el proveedor y no sale de la configuración del usuario. Sumarlas
+/// inflaría el "sí lo usas" de un servidor MCP con llamadas que no son suyas.
+fn registra_bloque(bloque: &Value, calls: &mut ToolCalls) {
+    let Some(name) = bloque.get("name").and_then(Value::as_str) else {
+        return;
+    };
+
+    match bloque.get("type").and_then(Value::as_str) {
+        Some("tool_use") => calls.push_invoked(name),
+        Some("server_tool_use") => calls.push_server_invoked(name),
+        _ => {}
     }
 }
 
@@ -364,7 +417,7 @@ fn has_cache_control(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::{measure_value, NATIVE_TOOLS_LABEL};
+    use super::super::{measure_value, MAX_TOOL_NAMES, MAX_TOOL_NAME_LEN, NATIVE_TOOLS_LABEL};
 
     /// Anthropic manda el input en `message_start` y el output acumulado en
     /// `message_delta`. Extraer ambos eventos por separado debe dejar los
@@ -1168,4 +1221,224 @@ mod tests {
         assert_eq!(usage_sin_speed.speed, None);
     }
 
+    /// La forma que hace posible todo el campo: en streaming el NOMBRE de la
+    /// herramienta viaja entero en `content_block_start`. Lo único troceado
+    /// entre eventos (`input_json_delta`) es el `input`, que no se mide.
+    /// Fixture calcada del ejemplo publicado en la documentación de
+    /// streaming de Anthropic.
+    #[test]
+    fn el_nombre_llega_entero_en_content_block_start() {
+        let evento = serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "tool_use",
+                "id": "toolu_01T1x1fJ34qAmk2tNTrN7Up6",
+                "name": "get_weather",
+                "input": {}
+            }
+        });
+
+        let mut calls = ToolCalls::default();
+        ANTHROPIC.extract_tool_use(&evento, &mut calls);
+
+        assert_eq!(calls.invoked, vec!["get_weather".to_string()]);
+        assert!(calls.server_invoked.is_empty(), "no es de servidor");
+    }
+
+    /// `server_tool_use` es un tipo de bloque DISTINTO (IDs `srvtoolu_`) y
+    /// va a su propia lista: lo ejecuta el proveedor, no el agente, así que
+    /// no cuenta como uso de un servidor MCP del usuario. Mezclarlas
+    /// inflaría el "sí lo usas" del recomendador con llamadas ajenas.
+    #[test]
+    fn las_de_servidor_van_a_su_propia_lista() {
+        let evento = serde_json::json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {
+                "type": "server_tool_use",
+                "id": "srvtoolu_014hJH82Qum7Td6UV8gDXThB",
+                "name": "web_search",
+                "input": {}
+            }
+        });
+
+        let mut calls = ToolCalls::default();
+        ANTHROPIC.extract_tool_use(&evento, &mut calls);
+
+        assert!(calls.invoked.is_empty(), "no es de cliente");
+        assert_eq!(calls.server_invoked, vec!["web_search".to_string()]);
+    }
+
+    /// No-streaming: el cuerpo entero trae los bloques en `content` de la
+    /// raíz. Mismo método, misma salida — el proveedor cubre las dos formas
+    /// igual que hace `extract_usage`.
+    #[test]
+    fn tambien_lee_el_cuerpo_completo_sin_streaming() {
+        let cuerpo = serde_json::json!({
+            "id": "msg_01",
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Miro el tiempo:"},
+                {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {}},
+                {"type": "tool_use", "id": "toolu_2", "name": "mcp__context7__get-docs", "input": {}}
+            ],
+            "stop_reason": "tool_use"
+        });
+
+        let mut calls = ToolCalls::default();
+        ANTHROPIC.extract_tool_use(&cuerpo, &mut calls);
+
+        assert_eq!(
+            calls.invoked,
+            vec![
+                "get_weather".to_string(),
+                "mcp__context7__get-docs".to_string()
+            ],
+            "el bloque de texto no cuenta; los dos tool_use sí, en orden"
+        );
+    }
+
+    /// REGRESIÓN DE DISEÑO. Un stream real empieza por `message_start`, que
+    /// trae un `content` (vacío) anidado bajo `message`. Si el extractor
+    /// mirase `content` en cualquier profundidad, o si no cortara tras la
+    /// rama de streaming, cada invocación podría contarse dos veces — y una
+    /// fila con el doble de llamadas no tiene ninguna pinta de estar mal.
+    #[test]
+    fn un_stream_completo_no_cuenta_dos_veces() {
+        let eventos = [
+            serde_json::json!({
+                "type": "message_start",
+                "message": {"id": "msg_01", "content": [], "role": "assistant"}
+            }),
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }),
+            serde_json::json!({
+                "type": "content_block_start",
+                "index": 1,
+                "content_block": {
+                    "type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}
+                }
+            }),
+            serde_json::json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": "{\"path\":"}
+            }),
+            serde_json::json!({"type": "content_block_stop", "index": 1}),
+            serde_json::json!({
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use"},
+                "usage": {"output_tokens": 89}
+            }),
+            serde_json::json!({"type": "message_stop"}),
+        ];
+
+        let mut calls = ToolCalls::default();
+        for evento in &eventos {
+            ANTHROPIC.extract_tool_use(evento, &mut calls);
+        }
+
+        assert_eq!(
+            calls.invoked,
+            vec!["Read".to_string()],
+            "una invocación en el stream es UNA en la fila"
+        );
+    }
+
+    /// Las repeticiones se preservan: cuántas veces se llamó a una
+    /// herramienta es un dato real del cable. Deduplicar al escribir lo
+    /// perdería para siempre, y el histórico es lo que consumirá el
+    /// recomendador.
+    #[test]
+    fn las_repeticiones_se_preservan() {
+        let cuerpo = serde_json::json!({
+            "content": [
+                {"type": "tool_use", "id": "a", "name": "Read", "input": {}},
+                {"type": "tool_use", "id": "b", "name": "Read", "input": {}},
+                {"type": "tool_use", "id": "c", "name": "Grep", "input": {}}
+            ]
+        });
+
+        let mut calls = ToolCalls::default();
+        ANTHROPIC.extract_tool_use(&cuerpo, &mut calls);
+
+        assert_eq!(
+            calls.invoked,
+            vec!["Read".to_string(), "Read".to_string(), "Grep".to_string()]
+        );
+    }
+
+    /// Discrimina por `type`, no por "tiene name". Un bloque futuro con
+    /// `name` que no sea una invocación no debe colarse en la cuenta.
+    #[test]
+    fn un_bloque_con_name_que_no_es_invocacion_no_cuenta() {
+        let cuerpo = serde_json::json!({
+            "content": [
+                {"type": "text", "text": "hola"},
+                {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_1", "name": "inventado"},
+                {"type": "thinking", "thinking": "", "signature": ""}
+            ]
+        });
+
+        let mut calls = ToolCalls::default();
+        ANTHROPIC.extract_tool_use(&cuerpo, &mut calls);
+
+        assert!(calls.invoked.is_empty());
+        assert!(calls.server_invoked.is_empty());
+    }
+
+    /// Mismas guardas que los nombres DECLARADOS: el nombre que llega en la
+    /// respuesta es texto de fuera igual que el de la petición, y estas
+    /// filas viven además en el buffer de 200 de `/requests`.
+    #[test]
+    fn las_guardas_de_tamano_valen_igual_en_la_respuesta() {
+        let largo = "z".repeat(MAX_TOOL_NAME_LEN * 4);
+        let mut bloques: Vec<serde_json::Value> = (0..MAX_TOOL_NAMES * 2)
+            .map(|i| serde_json::json!({"type": "tool_use", "id": i, "name": "Read"}))
+            .collect();
+        bloques.push(serde_json::json!({"type": "tool_use", "id": "x", "name": largo}));
+        let cuerpo = serde_json::json!({"content": bloques});
+
+        let mut calls = ToolCalls::default();
+        ANTHROPIC.extract_tool_use(&cuerpo, &mut calls);
+
+        assert_eq!(calls.invoked.len(), MAX_TOOL_NAMES, "cupo de entradas");
+
+        let mut solo_largo = ToolCalls::default();
+        ANTHROPIC.extract_tool_use(
+            &serde_json::json!({"content": [{"type": "tool_use", "name": "z".repeat(MAX_TOOL_NAME_LEN * 4)}]}),
+            &mut solo_largo,
+        );
+        assert_eq!(
+            solo_largo.invoked[0].chars().count(),
+            MAX_TOOL_NAME_LEN,
+            "cupo de longitud, contado en CARACTERES (cortar bytes UTF-8 haría panic)"
+        );
+    }
+
+    /// Los dos cupos son independientes: un modelo que agote el de una
+    /// lista no debe poder silenciar la otra.
+    #[test]
+    fn los_dos_cupos_no_se_comparten() {
+        let mut bloques: Vec<serde_json::Value> = (0..MAX_TOOL_NAMES + 10)
+            .map(|i| serde_json::json!({"type": "tool_use", "id": i, "name": "Read"}))
+            .collect();
+        bloques.push(serde_json::json!({"type": "server_tool_use", "name": "web_search"}));
+        let cuerpo = serde_json::json!({"content": bloques});
+
+        let mut calls = ToolCalls::default();
+        ANTHROPIC.extract_tool_use(&cuerpo, &mut calls);
+
+        assert_eq!(calls.invoked.len(), MAX_TOOL_NAMES);
+        assert_eq!(
+            calls.server_invoked,
+            vec!["web_search".to_string()],
+            "la de servidor entra aunque la de cliente esté a tope"
+        );
+    }
 }

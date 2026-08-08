@@ -319,6 +319,13 @@ async fn send_and_meter(
                 skills: out.skills,
                 instructions: out.instructions,
                 effort_forced: out.effort_forced,
+                // Esta rama es el camino de ERROR: el upstream no llegó a
+                // responder, así que no hubo respuesta que escanear. Vacío
+                // acá es la ausencia honesta —"no hubo nada que mirar"—, no
+                // "el modelo no invocó herramientas": el `status` de la fila
+                // distingue los dos casos sin necesidad de otro campo.
+                tools_invoked: Vec::new(),
+                server_tools_invoked: Vec::new(),
                 // No hubo respuesta que recorrer: `None` honesto, no un `0`
                 // que se leería como "el proveedor devolvió un cuerpo vacío".
                 response_bytes: None,

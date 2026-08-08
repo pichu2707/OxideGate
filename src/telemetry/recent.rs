@@ -18,12 +18,23 @@
 //! públicamente inofensivos.
 //!
 //! La misma invariante aplica al desglose de herramientas por servidor
-//! (`tools_by_server`): lo que se expone es la ETIQUETA del servidor
-//! (`(native)`, `claude_ai_Gmail`, `(others)`…) y un conteo de bytes/cantidad
-//! de herramientas, NUNCA el nombre individual de cada herramienta ni ningún
-//! fragmento del `input_schema`/`description` que la compone. Un nombre de
-//! servidor no es contenido de prompt: no filtra nada que el propio cliente
-//! no le haya declarado ya al proveedor en texto plano.
+//! (`tools_by_server`), pero la línea NO está donde estuvo. Se expone la
+//! etiqueta del servidor (`(native)`, `claude_ai_Gmail`, `(others)`…), el
+//! conteo de bytes/cantidad, **y los nombres individuales de herramienta**:
+//! `tool_names` (declaradas, dentro de cada fila de servidor) y
+//! [`RecentRequest::tools_invoked`] / [`RecentRequest::server_tools_invoked`]
+//! (invocadas). Lo que NUNCA sale es el CONTENIDO: ni un fragmento del
+//! `input_schema`/`description` que compone una herramienta, ni el `input`
+//! con el que se la llamó.
+//!
+//! Hasta que `tool_names` entró en el contrato (`/version` lo declara, y
+//! `oxidegate-lens` lo consume), este párrafo prometía que los nombres
+//! individuales NUNCA se publicaban. Dejó de ser cierto ahí y la frase se
+//! quedó — la clase de doc que no se nota hasta que alguien decide exponer
+//! `/requests` fuera de localhost confiando en ella. Un nombre de
+//! herramienta sigue sin ser contenido de prompt: lo eligió el cliente y ya
+//! se lo declaró al proveedor en texto plano. Pero es un identificador, y
+//! quien lea esta vista tiene que saber que viaja.
 //!
 //! Es PURO: no conoce axum ni ningún framework HTTP, solo `RequestMetric`. El
 //! handler que lo expone por HTTP vive en `middleware::requests`.
@@ -206,6 +217,26 @@ pub struct RecentRequest {
     /// No compromete la invariante de privacidad del módulo: es una etiqueta
     /// de un enum documentado por el proveedor, no contenido de prompt.
     pub effort_forced: Option<String>,
+    /// Herramientas de CLIENTE invocadas en la respuesta, en orden y con
+    /// repeticiones. Contrapartida de los nombres DECLARADOS que ya viajan
+    /// dentro de `tools_by_server[].tool_names`: cruzar ambos sobre el
+    /// histórico es lo que permite decir "pagas por este servidor MCP y no
+    /// lo invocas".
+    ///
+    /// No compromete la invariante de privacidad del módulo: un nombre de
+    /// herramienta es un identificador declarado por el propio cliente —el
+    /// mismo string que ya se publica en `tool_names`—, no contenido de
+    /// prompt. El `input` de la llamada, que SÍ lo sería, no se mide.
+    ///
+    /// Vacío significa "no se reconoció ninguna invocación", nunca "no
+    /// invocó nada": solo Anthropic tiene extractor hoy.
+    #[serde(default)]
+    pub tools_invoked: Vec<String>,
+    /// Herramientas de SERVIDOR invocadas (`web_search`, `web_fetch`…).
+    /// Lista aparte: las ejecuta el proveedor y no salen de la configuración
+    /// MCP del usuario, así que no cuentan como uso de un servidor suyo.
+    #[serde(default)]
+    pub server_tools_invoked: Vec<String>,
     /// Bytes del body que MANDÓ EL CLIENTE, en su forma lógica. La mitad de
     /// subida que le faltaba a [`Self::response_bytes`].
     ///
@@ -301,6 +332,8 @@ impl From<&RequestMetric> for RecentRequest {
             skills: m.skills,
             instructions: m.instructions,
             effort_forced: m.effort_forced.clone(),
+            tools_invoked: m.tools_invoked.clone(),
+            server_tools_invoked: m.server_tools_invoked.clone(),
             prompt_bytes: m.prompt_bytes,
             response_bytes: m.response_bytes,
             prepare_us: m.prepare_us,
@@ -408,6 +441,8 @@ mod tests {
                 source: SessionSource::Unattributed,
                 key: "unattributed".to_string(),
             },
+            tools_invoked: Vec::new(),
+            server_tools_invoked: Vec::new(),
         }
     }
 
@@ -991,6 +1026,7 @@ mod tests {
             "response_bytes",
             "route",
             "served_speed",
+            "server_tools_invoked",
             "session",
             "skills",
             "status",
@@ -999,6 +1035,7 @@ mod tests {
             "tool_search",
             "tools_by_server",
             "tools_flattened",
+            "tools_invoked",
             "tools_overhead_bytes",
             "total_ms",
             "ttft_ms",

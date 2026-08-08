@@ -10,7 +10,7 @@
 use super::{
     array_field, fingerprint, maybe_decompress, measure_key, measure_other, parse_body,
     split_history_and_last_turn, tools_overhead_bytes, ContextBreakdown, Incoming, Outgoing,
-    Provider, Usage,
+    Provider, ToolCalls, Usage,
 };
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -124,6 +124,20 @@ impl Provider for Gemini {
             usage.cache_read_tokens = Some(v);
         }
     }
+
+    /// Gemini NO publica invocaciones en esta fila, y es una ausencia
+    /// DECLARADA, no un olvido. Su dialecto las manda como `functionCall`
+    /// dentro de `candidates[].content.parts[]`, una forma distinta de la de
+    /// Anthropic — pero este proyecto solo publica lo que vio en el cable, y
+    /// esa forma no se capturó todavía contra tráfico real de Gemini. Ver el
+    /// mismo criterio en `instructions`, que publica un solo `format` por la
+    /// misma razón.
+    ///
+    /// Listas vacías aquí significan "no se reconoció ninguna invocación",
+    /// NUNCA "el modelo no invocó nada": son indistinguibles desde la fila, y
+    /// por eso el recomendador de MCP debe mirar el `upstream` antes de
+    /// concluir que un servidor no se usa.
+    fn extract_tool_use(&self, _value: &Value, _calls: &mut ToolCalls) {}
 
     /// Desglosa el body de `generateContent`/`streamGenerateContent`.
     /// `systemInstruction` → `system_bytes`; `tools` → `tools_bytes`;

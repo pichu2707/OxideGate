@@ -19,8 +19,8 @@
 //! el escáner de `usage` recién conoce al leer la respuesta — por eso viaja
 //! en `self.scanner.usage.speed`, no en `MetricBase`.
 use crate::provider::{
-    ContextBreakdown, InstructionsBlock, Provider, SkillsBlock, ToolSearchSignal, ToolServerBytes,
-    Usage,
+    ContextBreakdown, InstructionsBlock, Provider, SkillsBlock, ToolCalls, ToolSearchSignal,
+    ToolServerBytes, Usage,
 };
 use crate::telemetry::cache_attribution;
 use crate::telemetry::section_share;
@@ -137,6 +137,10 @@ struct UsageScanner {
     /// Proveedor al que se delega la extracción del `usage` de cada valor JSON.
     provider: &'static dyn Provider,
     usage: Usage,
+    /// Invocaciones de herramienta vistas en la respuesta. Se acumulan sobre
+    /// el MISMO `Value` que ya se parseó para el `usage`: ni un recorrido
+    /// extra del stream ni un byte bufferizado de más.
+    calls: ToolCalls,
 }
 
 impl UsageScanner {
@@ -147,6 +151,7 @@ impl UsageScanner {
             full_body: Vec::new(),
             provider,
             usage: Usage::default(),
+            calls: ToolCalls::default(),
         }
     }
 
@@ -182,6 +187,7 @@ impl UsageScanner {
         }
         if let Ok(value) = serde_json::from_str::<Value>(payload) {
             self.provider.extract_usage(&value, &mut self.usage);
+            self.provider.extract_tool_use(&value, &mut self.calls);
         }
     }
 
@@ -192,6 +198,7 @@ impl UsageScanner {
         }
         if let Ok(value) = serde_json::from_slice::<Value>(&self.full_body) {
             self.provider.extract_usage(&value, &mut self.usage);
+            self.provider.extract_tool_use(&value, &mut self.calls);
         }
     }
 }
@@ -362,6 +369,8 @@ impl MeteredBody {
             skills: self.base.skills,
             instructions: self.base.instructions,
             effort_forced: self.base.effort_forced.clone(),
+            tools_invoked: std::mem::take(&mut self.scanner.calls.invoked),
+            server_tools_invoked: std::mem::take(&mut self.scanner.calls.server_invoked),
             response_bytes: Some(self.response_bytes),
             codex_quota: self.base.codex_quota.clone(),
         });
@@ -497,6 +506,56 @@ mod tests {
         scanner.feed(b"ge\":{\"output_tokens\":7}}\n\n");
         scanner.finish();
 
+        assert_eq!(scanner.usage.output_tokens, Some(7));
+    }
+
+    /// El escáner recoge la invocación del MISMO evento SSE del que ya sacó
+    /// el `usage`, sin recorrer el stream dos veces — y lo hace sobre un
+    /// evento partido entre chunks, para probar que hereda el buffer de
+    /// línea existente en vez de traerse el suyo.
+    #[test]
+    fn el_escaner_recoge_invocaciones_del_mismo_stream() {
+        let mut scanner = UsageScanner::new(true, &ANTHROPIC);
+
+        scanner.feed(b"data: {\"type\":\"content_block_start\",\"index\":1,\"content_bl");
+        scanner.feed(b"ock\":{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"mcp__context7__get-docs\"}}\n\n");
+        scanner.feed(b"data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":");
+        scanner.feed(
+            b"{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_1\",\"name\":\"web_search\"}}\n\n",
+        );
+        scanner.feed(b"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":42}}\n\n");
+        scanner.finish();
+
+        assert_eq!(
+            scanner.calls.invoked,
+            vec!["mcp__context7__get-docs".to_string()],
+            "la de cliente, reensamblada desde dos chunks"
+        );
+        assert_eq!(
+            scanner.calls.server_invoked,
+            vec!["web_search".to_string()],
+            "la de servidor, en su lista"
+        );
+        assert_eq!(
+            scanner.usage.output_tokens,
+            Some(42),
+            "y el usage sigue saliendo del mismo recorrido"
+        );
+    }
+
+    /// El modo no-streaming pasa por `finish()`, no por `scan_sse_line`: el
+    /// cuerpo entero se parsea una vez al cerrar. Sin este test, una
+    /// implementación que solo cubriera SSE dejaría el campo vacío en todas
+    /// las respuestas no-streaming sin que ningún test lo notara.
+    #[test]
+    fn sin_streaming_las_invocaciones_salen_del_cuerpo_completo() {
+        let mut scanner = UsageScanner::new(false, &ANTHROPIC);
+
+        scanner.feed(br#"{"id":"msg_1","content":[{"type":"tool_use","id":"t1","name":"Read"}],"#);
+        scanner.feed(br#""usage":{"output_tokens":7}}"#);
+        scanner.finish();
+
+        assert_eq!(scanner.calls.invoked, vec!["Read".to_string()]);
         assert_eq!(scanner.usage.output_tokens, Some(7));
     }
 }

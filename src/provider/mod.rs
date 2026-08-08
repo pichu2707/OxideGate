@@ -430,6 +430,57 @@ const MAX_TOOL_NAMES: usize = 64;
 /// no se acerca; uno de 1 MB sería una entrada hostil, no un caso de uso.
 const MAX_TOOL_NAME_LEN: usize = 128;
 
+/// Invocaciones de herramienta observadas en la RESPUESTA del proveedor.
+///
+/// Contrapartida de [`ToolServerBytes::tool_names`], que publica lo que el
+/// cliente DECLARA. Este acumulador publica lo que el modelo USA — el dato
+/// que hace falta para decir "pagas por este servidor MCP y no lo invocas",
+/// y el único de los dos que no se puede leer de la petición.
+///
+/// Los nombres van CRUDOS y CON REPETICIONES, a propósito:
+/// - Crudos porque son el mismo string que viaja en `tools[]`, así que la
+///   atribución a servidor la deriva quien lea con [`classify`] o
+///   [`server_of`], sin que la fila fosilice la convención `mcp__` del día
+///   en que se escribió.
+/// - Con repeticiones porque cuántas veces se llamó a una herramienta es un
+///   dato real del cable, y deduplicar al escribir lo perdería para siempre.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolCalls {
+    /// Herramientas de CLIENTE invocadas (`tool_use`): las que el agente
+    /// declara en `tools[]` y ejecuta él mismo, MCP incluidas.
+    pub invoked: Vec<String>,
+    /// Herramientas de SERVIDOR invocadas (`server_tool_use`): `web_search`,
+    /// `web_fetch`… Las ejecuta el proveedor, no el agente. Van aparte
+    /// porque no salen de la configuración MCP del usuario y por tanto no
+    /// entran en el recuento que alimenta al recomendador.
+    pub server_invoked: Vec<String>,
+}
+
+impl ToolCalls {
+    /// Registra una invocación de herramienta de cliente, con las mismas dos
+    /// guardas que [`MAX_TOOL_NAMES`]/[`MAX_TOOL_NAME_LEN`] aplican a los
+    /// nombres declarados. Un nombre que llega en la RESPUESTA es tan poco
+    /// fiable como uno que llega en la petición: ambos son texto de fuera.
+    fn push_invoked(&mut self, name: &str) {
+        push_acotado(&mut self.invoked, name);
+    }
+
+    /// Ídem para herramientas de servidor. Cupo propio, no compartido: un
+    /// modelo que agote el de una lista no debe poder silenciar la otra.
+    fn push_server_invoked(&mut self, name: &str) {
+        push_acotado(&mut self.server_invoked, name);
+    }
+}
+
+/// Empuja `name` a `lista` respetando el cupo de entradas y el de longitud.
+/// Trunca por CARACTERES, nunca por bytes: cortar UTF-8 a mitad de un punto
+/// de código haría panic, y este dato viene de fuera.
+fn push_acotado(lista: &mut Vec<String>, name: &str) {
+    if lista.len() < MAX_TOOL_NAMES {
+        lista.push(name.chars().take(MAX_TOOL_NAME_LEN).collect());
+    }
+}
+
 /// Naturaleza del cubo al que se atribuye una herramienta. Distingue por
 /// TIPO, no por una cadena mágica: un servidor MCP llamado literalmente
 /// `(native)` (o `(others)`) es un servidor MCP, no una herramienta nativa
@@ -783,6 +834,23 @@ pub trait Provider: Send + Sync {
     /// contiene, en algún lado, el `usage` del proveedor. No hace nada si
     /// `value` no trae un `usage` reconocible para este proveedor.
     fn extract_usage(&self, value: &Value, usage: &mut Usage);
+
+    /// Acumula en `calls` las invocaciones de herramienta que aparezcan en
+    /// `value`, que es o un evento SSE ya reconstituido o el cuerpo entero
+    /// de una respuesta no-streaming — el mismo doble papel que
+    /// [`Provider::extract_usage`], y sobre el MISMO `Value` ya parseado:
+    /// este método no vuelve a recorrer el stream ni bufferiza nada.
+    ///
+    /// Semántica ACUMULATIVA, no "último gana": cada llamada añade a lo ya
+    /// visto. Es la diferencia con `extract_usage`, donde el proveedor
+    /// reporta totales que se sobrescriben; aquí cada evento trae una
+    /// invocación distinta y perder las anteriores vaciaría el dato.
+    ///
+    /// Sin implementación por defecto A PROPÓSITO, por el mismo motivo que
+    /// [`Provider::decompose`]: un `Default` vacío dejaría a un proveedor
+    /// nuevo publicando "no se invocó nada" —indistinguible de la verdad—
+    /// sin que nadie lo notara. Que no compile obliga a decidir.
+    fn extract_tool_use(&self, value: &Value, calls: &mut ToolCalls);
 
     /// Descompone el body de la petición por componente (ver
     /// [`ContextBreakdown`]). `None` si el body no es un objeto JSON o el

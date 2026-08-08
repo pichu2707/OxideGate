@@ -114,6 +114,18 @@ Esto mirroriza la misma invariante que ya documenta
 `src/middleware/stats.rs`: el proxy no expone huellas de prompt por HTTP,
 haya o no autenticación de por medio.
 
+**Los NOMBRES de herramienta sí viajan; el CONTENIDO no.** `tool_names`
+(declaradas, §4.7) y `tools_invoked`/`server_tools_invoked` (invocadas, §4.15)
+publican identificadores de herramienta por HTTP. No son huellas de prompt —
+los eligió el cliente y ya se los declaró al proveedor en texto plano— pero
+describen qué integraciones tiene montadas quien usa el proxy, así que
+conviene saberlo antes de exponer el endpoint. Lo que **nunca** sale es el
+contenido: ni un fragmento del `input_schema`/`description` que compone una
+herramienta, ni el `input` con el que se la invocó. El doc de módulo de
+`src/telemetry/recent.rs` afirmaba lo contrario —que los nombres individuales
+nunca se publicaban— desde que `tool_names` entró en el contrato; se corrigió
+junto con este slice.
+
 **Esta invariante cubre huellas de prompt, no el campo `client`.** El campo
 `client` (§4, §4.5) es un caso aparte: no es una huella de prompt, pero
 tampoco es un dato que el proxy calcule — es el `User-Agent` del cliente,
@@ -156,6 +168,8 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `skills` | Listado de skills declarado en el body: `{declared, listing_bytes, format}`, o `null`. Se paga en CADA petición, se invoque una skill o no | `null` = no se reconoció ningún listado, **nunca "cero skills"**. `format` dice qué forma se encontró y, de paso, de qué herramienta viene el tráfico sin fiarse del `User-Agent` — ver §4.8 |
 | `instructions` | Bloque de instrucciones del usuario (`CLAUDE.md`) declarado en el body: `{bytes, format}`, o `null`. Se paga en CADA petición. Medido: el 48% del peaje fijo de una sesión de Claude Code | `null` = no se reconoció ningún bloque, **nunca "el usuario no tiene instrucciones"** — Claude Code IGNORA `AGENTS.md`, así que ahí `null` es correcto. Ver §4.13 |
 | `effort_forced` | Nivel de esfuerzo que IMPUSO el proxy (palanca B), o `null` si no intervino — el default | Se lee JUNTO a `requested_effort`, nunca en su lugar: es lo que impide confundir un ahorro del cliente con una intervención del medidor. Ver §4.14 |
+| `tools_invoked` | Herramientas de CLIENTE que el modelo INVOCÓ en esta respuesta, en orden y con repeticiones | Contrapartida de `tool_names` (declaradas). Cruzarlos sobre el histórico es lo que permite recomendar quitar un servidor MCP que se paga y no se usa. Vacío = no se reconoció ninguna, NUNCA "no invocó nada". Ver §4.15 |
+| `server_tools_invoked` | Herramientas de SERVIDOR invocadas (`web_search`, `web_fetch`) | Lista aparte: las ejecuta el proveedor, no salen de la config MCP del usuario. Ver §4.15 |
 | `prompt_bytes` | Bytes del body que MANDÓ EL CLIENTE, en su forma lógica | **No es wire** (en `/v1/codex/responses` y `/v1beta/*` se mide descomprimido), **no es lo que subió al proveedor** (con `cache_control_forced` el body reenviado es mayor) y **no es la suma del desglose**. Ver §4.10 antes de usarlo |
 | `response_bytes` | Bytes del CUERPO DE LA RESPUESTA que cruzaron el proxy. `null` si no llegó a haber respuesta | **Sin comprimir**, y por eso no es ancho de banda: el proxy descarta `Accept-Encoding` para poder leer el SSE. Ver §4.9 antes de compararlo con `prompt_bytes` |
 | `codex_quota` | Estado de la cuota de suscripción de Codex (OAuth de `chatgpt.com`), parseado de las doce cabeceras `x-codex-*` de la RESPUESTA del upstream: doce campos, todos opcionales. `null` si la petición no fue a Codex vía OAuth, o si el upstream falló antes de responder | Es el ÚNICO campo de esta fila que se lee de la respuesta y no del request ni del body. Cuota NUNCA son dólares: no alimenta ni puede alimentar `cost_estimate_usd` — ver §4.7 |
@@ -1112,6 +1126,109 @@ el request. Ver `docs/optimizer-effort.md` §5.
 **original** —se calcula antes de mutar, como con `cache_control_forced`— y los
 `context_*_bytes` también. Lo único que cambia respecto a una fila sin palanca
 es que el body que subió al proveedor llevaba otro `effort`, y la fila lo dice.
+
+
+### 4.15. `tools_invoked`: lo que el modelo USA, frente a lo que el cliente DECLARA
+
+Hasta este slice, el proxy sabía exactamente qué herramientas **se declaran**
+(`tools_by_server[].tool_names`, §4.7) y absolutamente nada de cuáles **se
+usan**. Es un hueco caro: `mcp-lean.json` es la palanca más grande del
+catálogo publicado —**−55.098 B por petición**— y no hay forma de recomendarla
+sin saber qué servidor sobra.
+
+```json
+"tools_invoked": ["Read", "Read", "mcp__context7__get-docs"],
+"server_tools_invoked": ["web_search"]
+```
+
+Cruzar esos nombres con `tools_by_server` sobre el histórico es lo único que
+permite escribir la frase que justifica la palanca:
+
+> Pagas 12.400 B por petición por el servidor `context7` y no has invocado
+> ninguna de sus 8 herramientas en 200 peticiones.
+
+Nadie más puede escribirla. Hace falta tener los bytes por servidor y las
+invocaciones reales **en el mismo punto**, y ese punto es el proxy.
+
+#### El nombre llega entero; solo el argumento viaja troceado
+
+En streaming, cada bloque de contenido abre con un evento propio, y el de una
+invocación trae el nombre **completo**:
+
+```
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":
+       {"type":"tool_use","id":"toolu_01T1x…","name":"get_weather","input":{}}}
+```
+
+Lo que llega partido entre eventos `input_json_delta` es el `input` — y este
+campo **no lo mide**, ni lo necesita: para saber si un servidor MCP se usa
+basta con QUÉ se invocó, no con qué argumentos. Esa asimetría es la que hace
+que la captura no requiera reensamblar nada.
+
+En no-streaming la misma información está en el array `content` de la
+respuesta completa. El proveedor cubre las dos formas en un solo método
+(`Provider::extract_tool_use`), igual que ya hacía con el `usage`.
+
+#### No cuesta un recorrido más
+
+El escáner que ya leía el `usage` de cada evento (`UsageScanner`) parsea el
+JSON **una vez** y ahora se lo pasa a los dos extractores. No hay un segundo
+recorrido del stream, no se bufferiza la respuesta y no se retrasa un solo
+byte al cliente: la promesa de passthrough intacto se mantiene porque este
+campo se lee del `Value` que ya existía.
+
+#### Por qué crudos y con repeticiones
+
+Los nombres van **tal cual viajan en el cable**, sin agregar por servidor:
+
+- **Crudos** porque son el mismo string que aparece en `tools[]`, así que la
+  atribución a servidor la deriva quien lea (`provider::classify`). Publicar
+  un agregado `{server, calls}` fosilizaría la convención `mcp__<server>__<tool>`
+  del día en que se escribió: si mañana cambia, las filas viejas quedarían mal
+  agregadas para siempre, mientras que los nombres crudos seguirían siendo
+  reinterpretables.
+- **Con repeticiones** porque cuántas veces se llamó a una herramienta es un
+  dato real de la respuesta. Deduplicar al escribir lo perdería, y el
+  histórico es justo lo que consumirá el recomendador.
+
+#### Dos listas, no una
+
+`server_tools_invoked` recoge los bloques `server_tool_use` (`web_search`,
+`web_fetch`), que llegan con IDs `srvtoolu_` y los ejecuta el proveedor. Van
+aparte **a propósito**: no salen de la configuración MCP del usuario, así que
+sumarlas inflaría el «sí lo usas» de un servidor MCP con llamadas que no son
+suyas. Se pueden contrastar contra `usage.server_tool_use`, que Anthropic
+reporta por su cuenta.
+
+#### Vacío NO significa "no invocó nada"
+
+Significa **«no se reconoció ninguna invocación»**, y hoy son cosas
+distintas por dos motivos:
+
+1. **Solo Anthropic tiene extractor.** Gemini (`functionCall` dentro de
+   `candidates[].content.parts[]`) y OpenAI (`tool_calls`, o items
+   `function_call` en la Responses API) usan formas distintas que **no se han
+   capturado todavía contra tráfico real**. Mismo criterio que `instructions`
+   (§4.13), que publica un solo `format` por la misma razón: este proyecto no
+   publica lo que no vio en el cable.
+2. **Una fila de error nunca llega a tener respuesta que escanear.** Ahí el
+   `status` distingue el caso sin necesidad de otro campo.
+
+Antes de concluir que un servidor no se usa, **mirar el `upstream` de la
+fila**. Es la misma disciplina que exige `served_speed`.
+
+#### Acotado igual que los nombres declarados
+
+64 entradas por lista y 128 caracteres por nombre, los mismos topes que
+`tool_names`, y por el mismo motivo: un nombre que llega en la respuesta es
+texto de fuera igual que uno de la petición, y estas filas viven además en el
+buffer de 200 de `/requests`. Los dos cupos son **independientes** — que un
+modelo agote el de cliente no puede silenciar la lista de servidor. El
+truncado cuenta CARACTERES, no bytes: cortar UTF-8 a mitad de un punto de
+código haría panic.
+
+**Aditivo**: `FIELDS` pasa de 13 a 15 y `CONTRACT_VERSION` sigue en 1.
 
 ---
 
