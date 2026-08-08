@@ -1647,7 +1647,10 @@ mod tests {
     /// para un servidor en uso.
     #[test]
     fn el_servidor_se_resuelve_antes_de_truncar_el_nombre() {
-        let servidor_largo = "s".repeat(MAX_TOOL_NAME_LEN);
+        // EXCEDE el tope a proposito. La version anterior de este test
+        // usaba exactamente MAX_TOOL_NAME_LEN, justo el punto donde truncar
+        // es un no-op: pasaba sin comprobar nada de lo que su nombre promete.
+        let servidor_largo = "s".repeat(MAX_TOOL_NAME_LEN * 2);
         let nombre = format!("mcp__{servidor_largo}__una-herramienta");
 
         let mut calls = ToolCalls::default();
@@ -1667,9 +1670,13 @@ mod tests {
         assert_eq!(
             llamada.kind,
             ToolServerKind::Mcp,
-            "pero la atribución NO se hace sobre el recorte"
+            "pero la atribución NO se hace sobre el recorte del NOMBRE"
         );
-        assert_eq!(llamada.server, servidor_largo);
+        assert_eq!(
+            llamada.server,
+            crate::provider::etiqueta_servidor(&servidor_largo),
+            "y la etiqueta se acota con el MISMO helper que el lado declarado"
+        );
     }
 
     /// REGRESIÓN MEDIDA. La primera versión de `tool_calls` guardaba solo el

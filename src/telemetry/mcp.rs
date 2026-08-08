@@ -82,16 +82,16 @@ pub const MAX_SERVIDORES: usize = 256;
 /// `incompletas` no se arregla (es tráfico real abortado), y `truncadas`
 /// subiendo el cupo.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct Descartes {
+pub struct Discarded {
     /// El proveedor de esa fila no mide invocaciones (`tool_calls: null`), o
     /// la fila se escribió antes de que el campo existiera.
-    pub sin_extractor: u64,
+    pub no_extractor: u64,
     /// El escaneo no llegó al final: turno abortado o stream roto. La lista
     /// era un prefijo.
-    pub incompletas: u64,
+    pub incomplete: u64,
     /// La lista de invocaciones se recortó por el cupo, así que una llamada
     /// pudo quedarse fuera.
-    pub truncadas: u64,
+    pub truncated: u64,
 }
 
 /// Qué se puede afirmar de un servidor con la evidencia disponible.
@@ -163,7 +163,7 @@ pub struct McpServerRow {
     /// Peticiones que superaron los tres filtros de honestidad.
     pub conclusive_requests: u64,
     /// Por qué se descartaron las demás.
-    pub descartes: Descartes,
+    pub discarded: Discarded,
     /// Qué se puede afirmar con esta evidencia.
     pub verdict: Verdict,
 }
@@ -174,7 +174,7 @@ pub struct McpSnapshot {
     /// Peticiones concluyentes que exige un veredicto `unused`. Viaja en la
     /// respuesta a propósito: es un juicio, no una medida, y quien no esté de
     /// acuerdo tiene los conteos crudos para aplicar el suyo.
-    pub umbral: u64,
+    pub threshold: u64,
     /// Filas, ordenadas por bytes por petición descendente: lo más caro
     /// primero, que es el orden en el que interesa mirarlas.
     pub servers: Vec<McpServerRow>,
@@ -183,7 +183,7 @@ pub struct McpSnapshot {
     /// servidores de los que no se sabe nada. Se publica en vez de recortar
     /// en silencio, porque una lista corta que parece completa es peor que
     /// una que avisa de que no lo está.
-    pub servidores_omitidos: u64,
+    pub servers_omitted: u64,
     /// Timestamp más antiguo que entró en este agregado, o `None` si está
     /// vacío.
     ///
@@ -193,7 +193,7 @@ pub struct McpSnapshot {
     /// este campo. Sin publicarlo, un operador con la ventana corta podría
     /// leer un `unused` como si cubriera meses y borrar un servidor que usa
     /// una vez por semana.
-    pub desde: Option<String>,
+    pub since: Option<String>,
     /// Servidores que se invocaron pero de los que no se vio ninguna
     /// declaración, así que no tienen coste que cruzar.
     ///
@@ -203,7 +203,7 @@ pub struct McpSnapshot {
     /// invocaciones sí conservan el nombre real. Sin este campo esos
     /// servidores desaparecían del informe por completo — y son justo los del
     /// usuario con la configuración más cara.
-    pub invocados_sin_declarar: Vec<String>,
+    pub invoked_never_declared: Vec<String>,
 }
 
 /// Acumulador interno por servidor.
@@ -214,7 +214,7 @@ struct McpAccumulator {
     tools_declared: usize,
     invocations: u64,
     conclusive_requests: u64,
-    descartes: Descartes,
+    discarded: Discarded,
 }
 
 /// Registro en memoria del cruce coste-vs-uso por servidor MCP.
@@ -231,9 +231,17 @@ pub struct McpRegistry {
     /// `declared_in_requests` en una misma peticion —se llegaba al umbral con
     /// la mitad— y hacia last-write-wins con el `kind` publicado.
     accumulators: HashMap<(ToolServerKind, String), McpAccumulator>,
-    /// Servidores distintos que se dejaron de admitir por
-    /// [`MAX_SERVIDORES`]. Se publica para que el tope sea visible.
-    descartados_por_cupo: u64,
+    /// Etiquetas DISTINTAS que se dejaron de admitir por [`MAX_SERVIDORES`].
+    ///
+    /// Es un conjunto y no un contador porque el campo publicado promete
+    /// «servidores distintos»: contando ocurrencias, un solo servidor
+    /// invocado mil veces publicaba `servidores_omitidos: 1000` y el
+    /// operador leia que le faltaban mil servidores del informe.
+    ///
+    /// Acotado a [`MAX_SERVIDORES`] entradas: si el propio conjunto de
+    /// rechazados creciera sin limite, reintroduciria el agujero de memoria
+    /// que el cupo viene a cerrar.
+    descartados_por_cupo: std::collections::HashSet<(ToolServerKind, String)>,
     /// Timestamp más antiguo ingerido, para publicar la ventana real.
     desde: Option<String>,
 }
@@ -269,18 +277,32 @@ impl McpRegistry {
                 // `provider::ToolCall`): aqui no se re-deriva del nombre,
                 // que es justo donde el conector MCP y los nombres
                 // truncados atribuian mal.
-                let clave = (llamada.kind, llamada.server.clone());
                 // El chequeo del cupo va ANTES del `get_mut` para no sostener
                 // un prestamo mutable mientras se consulta `len()`.
                 let hay_hueco = self.accumulators.len() < MAX_SERVIDORES;
-                match self.accumulators.get_mut(&clave) {
+                // Busqueda SIN clonar: el `String` solo se materializa si de
+                // verdad hay que insertar. Con 64 invocaciones por respuesta
+                // y una entrada ya existente, clonar por llamada era pura
+                // basura de asignaciones en el camino caliente.
+                match self
+                    .accumulators
+                    .get_mut(&(llamada.kind, llamada.server.clone()))
+                {
                     Some(acc) => acc.invocations += 1,
                     None if hay_hueco => {
-                        self.accumulators.entry(clave).or_default().invocations += 1;
+                        self.accumulators
+                            .entry((llamada.kind, llamada.server.clone()))
+                            .or_default()
+                            .invocations += 1;
                     }
                     // Cupo agotado: se cuenta el rechazo en vez de crecer sin
                     // limite con etiquetas que vienen de fuera.
-                    None => self.descartados_por_cupo += 1,
+                    None => {
+                        if self.descartados_por_cupo.len() < MAX_SERVIDORES {
+                            self.descartados_por_cupo
+                                .insert((llamada.kind, llamada.server.clone()));
+                        }
+                    }
                 }
             }
         }
@@ -297,7 +319,9 @@ impl McpRegistry {
             let clave = (fila.kind, fila.server.clone());
             if !self.accumulators.contains_key(&clave) && self.accumulators.len() >= MAX_SERVIDORES
             {
-                self.descartados_por_cupo += 1;
+                if self.descartados_por_cupo.len() < MAX_SERVIDORES {
+                    self.descartados_por_cupo.insert(clave);
+                }
                 continue;
             }
             let acc = self.accumulators.entry(clave).or_default();
@@ -306,9 +330,9 @@ impl McpRegistry {
             acc.tools_declared = fila.tools;
 
             match motivo {
-                Some(Motivo::SinExtractor) => acc.descartes.sin_extractor += 1,
-                Some(Motivo::Incompleta) => acc.descartes.incompletas += 1,
-                Some(Motivo::Truncada) => acc.descartes.truncadas += 1,
+                Some(Motivo::SinExtractor) => acc.discarded.no_extractor += 1,
+                Some(Motivo::Incompleta) => acc.discarded.incomplete += 1,
+                Some(Motivo::Truncada) => acc.discarded.truncated += 1,
                 None => acc.conclusive_requests += 1,
             }
         }
@@ -331,7 +355,7 @@ impl McpRegistry {
                     tools_declared: acc.tools_declared,
                     invocations: acc.invocations,
                     conclusive_requests: acc.conclusive_requests,
-                    descartes: acc.descartes.clone(),
+                    discarded: acc.discarded.clone(),
                     verdict: veredicto(
                         kind,
                         acc.invocations,
@@ -354,21 +378,32 @@ impl McpRegistry {
         // Servidores que se invocaron pero nunca se vieron declarados: no
         // tienen coste que cruzar, pero desaparecerian del informe si solo se
         // filtrara por `declared_in_requests > 0`. Se nombran aparte.
-        let mut invocados_sin_declarar: Vec<String> = self
+        let mut invoked_never_declared: Vec<String> = self
             .accumulators
             .iter()
-            .filter(|((_, _), acc)| acc.declared_in_requests == 0 && acc.invocations > 0)
+            .filter(|((kind, _), acc)| {
+                // SOLO servidores MCP, el mismo filtro que aplica `veredicto`:
+                // `(native)` y `(others)` no son algo que el usuario pueda
+                // quitar, y la doc describe esta lista como «los del usuario
+                // con la configuracion mas cara». Sin este filtro, cualquier
+                // peticion cuyo body no se pudo descomponer metia `(native)`
+                // aqui — un cubo sintetico presentado como servidor.
+                *kind == ToolServerKind::Mcp && acc.declared_in_requests == 0 && acc.invocations > 0
+            })
             .map(|((_, server), _)| server.clone())
             .collect();
-        invocados_sin_declarar.sort();
-        invocados_sin_declarar.dedup();
+        invoked_never_declared.sort();
+        // Sin `dedup` por etiqueta: el filtro ya deja solo `Mcp`, asi que dos
+        // entradas con el mismo nombre serian el mismo servidor. Colapsar por
+        // etiqueta reintroduciria justo la fusion que la clave `(kind, server)`
+        // existe para evitar.
 
         McpSnapshot {
-            umbral: MIN_PETICIONES_CONCLUYENTES,
+            threshold: MIN_PETICIONES_CONCLUYENTES,
             servers,
-            desde: self.desde.clone(),
-            servidores_omitidos: self.descartados_por_cupo,
-            invocados_sin_declarar,
+            since: self.desde.clone(),
+            servers_omitted: self.descartados_por_cupo.len() as u64,
+            invoked_never_declared,
         }
     }
 }
@@ -394,7 +429,7 @@ fn motivo_de_descarte(m: &RequestMetric) -> Option<Motivo> {
     // invocacion MCP: esas viven unicamente en `invoked`. Incluirlo
     // descalificaba toda peticion de una sesion de investigacion con mas de
     // 64 busquedas, y el endpoint no llegaba nunca al umbral — ademas de
-    // atribuir la causa al cupo equivocado en `descartes.truncadas`.
+    // atribuir la causa al cupo equivocado en `discarded.truncated`.
     if calls.invoked_total > calls.invoked.len() {
         return Some(Motivo::Truncada);
     }
@@ -435,13 +470,13 @@ fn veredicto(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::{ToolCalls, ToolServerBytes};
+    use crate::provider::{MAX_TOOL_NAME_LEN, ToolCalls, ToolServerBytes};
     use crate::telemetry::{SessionAttribution, SessionSource};
 
     /// Métrica mínima válida. Los campos que este módulo NO mira se rellenan
     /// con valores neutros: lo único que importa aquí es `tools_by_server`
     /// (el coste declarado) y `tool_calls` (el uso observado).
-    fn metrica_minima() -> RequestMetric {
+    pub(super) fn metrica_minima() -> RequestMetric {
         RequestMetric {
             timestamp: "2026-08-08T10:00:00Z".to_string(),
             route: "/v1/messages".to_string(),
@@ -556,8 +591,8 @@ mod tests {
         );
         assert_eq!(ctx.invocations, 0);
         assert_eq!(
-            ctx.descartes,
-            Descartes::default(),
+            ctx.discarded,
+            Discarded::default(),
             "ninguna fila se descartó"
         );
     }
@@ -664,9 +699,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(ctx.conclusive_requests, 0, "ninguna prueba nada");
-        assert_eq!(ctx.descartes.sin_extractor, 1);
-        assert_eq!(ctx.descartes.incompletas, 1);
-        assert_eq!(ctx.descartes.truncadas, 1);
+        assert_eq!(ctx.discarded.no_extractor, 1);
+        assert_eq!(ctx.discarded.incomplete, 1);
+        assert_eq!(ctx.discarded.truncated, 1);
         assert_eq!(
             ctx.verdict,
             Verdict::InsufficientData {
@@ -763,7 +798,7 @@ mod tests {
     #[test]
     fn el_umbral_se_publica_con_los_datos() {
         let snap = McpRegistry::default().snapshot();
-        assert_eq!(snap.umbral, MIN_PETICIONES_CONCLUYENTES);
+        assert_eq!(snap.threshold, MIN_PETICIONES_CONCLUYENTES);
     }
 
     /// REGRESIÓN CRÍTICA. Una invocación observada cuenta AUNQUE la fila no
@@ -876,7 +911,7 @@ mod tests {
             .iter()
             .find(|s| s.server == "context7")
             .unwrap();
-        assert_eq!(ctx.descartes.truncadas, 0, "el cupo ajeno no descalifica");
+        assert_eq!(ctx.discarded.truncated, 0, "el cupo ajeno no descalifica");
         assert_eq!(
             ctx.conclusive_requests, MIN_PETICIONES_CONCLUYENTES,
             "las peticiones siguen contando"
@@ -896,10 +931,16 @@ mod tests {
         }
 
         let snap = reg.snapshot();
+        // Lo que de verdad hay que fijar es el TOPE. Afirmar solo que el
+        // contador no es cero dejaba pasar cualquier crecimiento sin limite,
+        // que es exactamente el fallo que el cupo viene a cerrar.
         assert!(
-            snap.servidores_omitidos >= 20,
-            "los rechazados se cuentan: {}",
-            snap.servidores_omitidos
+            snap.servers.len() + snap.invoked_never_declared.len() <= MAX_SERVIDORES,
+            "el mapa no puede exceder el cupo"
+        );
+        assert_eq!(
+            snap.servers_omitted, 20,
+            "y los 20 que sobraban se declaran como omitidos"
         );
     }
 
@@ -919,9 +960,93 @@ mod tests {
             "sin declaraciones no tiene coste que cruzar"
         );
         assert_eq!(
-            snap.invocados_sin_declarar,
+            snap.invoked_never_declared,
             vec!["linear".to_string()],
             "pero se nombra: si no, el usuario con mas servidores veria menos"
+        );
+    }
+
+    /// REGRESIÓN REPRODUCIDA. Un servidor cuya etiqueta excede el tope se
+    /// acotaba solo del lado invocado, partiéndolo en dos claves: el
+    /// recomendador publicaba `unused` con `invocations: 0` para un servidor
+    /// llamado en TODAS las peticiones. Medido antes del arreglo:
+    /// `Unused { conclusive_requests: 50, bytes_per_request_declared: 9000 }`.
+    #[test]
+    fn un_servidor_con_etiqueta_larga_no_se_parte_en_dos_claves() {
+        let servidor = "s".repeat(MAX_TOOL_NAME_LEN * 2);
+        let nombre = format!("mcp__{servidor}__foo");
+
+        let mut reg = McpRegistry::default();
+        for _ in 0..MIN_PETICIONES_CONCLUYENTES {
+            let mut m = metrica_minima();
+            m.tools_by_server = Some(vec![ToolServerBytes {
+                server: crate::provider::etiqueta_servidor(&servidor),
+                kind: ToolServerKind::Mcp,
+                tools: 1,
+                bytes: 9_000,
+                tool_names: Vec::new(),
+                deferred_tools: 0,
+            }]);
+            m.tool_calls = Some(invocando(&[&nombre]));
+            reg.ingest(&m);
+        }
+
+        let snap = reg.snapshot();
+        assert_eq!(snap.servers.len(), 1, "UNA clave, no dos");
+        assert_eq!(
+            snap.servers[0].invocations, MIN_PETICIONES_CONCLUYENTES,
+            "se invocó en todas"
+        );
+        assert!(
+            matches!(snap.servers[0].verdict, Verdict::Used { .. }),
+            "y por tanto NUNCA puede salir unused: {:?}",
+            snap.servers[0].verdict
+        );
+    }
+
+    /// REGRESIÓN. `servidores_omitidos` promete servidores DISTINTOS. Contando
+    /// ocurrencias, un solo servidor invocado mil veces publicaba `1000` y el
+    /// operador leía que le faltaban mil servidores del informe.
+    #[test]
+    fn los_omitidos_se_cuentan_distintos_no_por_ocurrencia() {
+        let mut reg = McpRegistry::default();
+        // Llenar el cupo.
+        for i in 0..MAX_SERVIDORES {
+            let mut m = metrica_minima();
+            m.tool_calls = Some(invocando(&[&format!("mcp__relleno{i}__t")]));
+            reg.ingest(&m);
+        }
+        // UN servidor de mas, invocado muchas veces.
+        for _ in 0..500 {
+            let mut m = metrica_minima();
+            m.tool_calls = Some(invocando(&["mcp__el-que-sobra__t"]));
+            reg.ingest(&m);
+        }
+
+        assert_eq!(
+            reg.snapshot().servers_omitted,
+            1,
+            "un servidor rechazado 500 veces sigue siendo UN servidor"
+        );
+    }
+
+    /// REGRESIÓN. `invocados_sin_declarar` se describe como servidores que el
+    /// usuario podría quitar. `(native)` no lo es, y se colaba en cuanto una
+    /// petición no traía desglose — el caso que el propio módulo modela en
+    /// `una_invocacion_cuenta_aunque_la_fila_no_traiga_desglose`.
+    #[test]
+    fn el_cubo_nativo_no_se_cuela_entre_los_invocados_sin_declarar() {
+        let mut reg = McpRegistry::default();
+        let mut m = metrica_minima();
+        m.tools_by_server = None; // body que no se pudo descomponer
+        m.tool_calls = Some(invocando(&["Read", "mcp__linear__crear"]));
+        reg.ingest(&m);
+
+        let snap = reg.snapshot();
+        assert_eq!(
+            snap.invoked_never_declared,
+            vec!["linear".to_string()],
+            "solo servidores MCP: `(native)` no es algo que se pueda quitar"
         );
     }
 }

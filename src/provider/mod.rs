@@ -428,7 +428,7 @@ const MAX_TOOL_NAMES: usize = 64;
 
 /// Tope de longitud de cada nombre publicado. Un nombre de herramienta real
 /// no se acerca; uno de 1 MB sería una entrada hostil, no un caso de uso.
-const MAX_TOOL_NAME_LEN: usize = 128;
+pub const MAX_TOOL_NAME_LEN: usize = 128;
 
 /// Una invocación observada, con su servidor YA RESUELTO.
 ///
@@ -581,7 +581,7 @@ impl ToolCalls {
         if self.invoked.len() < MAX_TOOL_NAMES {
             self.invoked.push(ToolCall {
                 name: name.chars().take(MAX_TOOL_NAME_LEN).collect(),
-                server: server.chars().take(MAX_TOOL_NAME_LEN).collect(),
+                server: etiqueta_servidor(server),
                 kind,
             });
         }
@@ -600,6 +600,24 @@ impl ToolCalls {
     pub fn marca_completa(&mut self) {
         self.complete = true;
     }
+}
+
+/// Acota la ETIQUETA de un servidor, y la acota IGUAL en los dos lados del
+/// cruce.
+///
+/// La simetría no es estética: el cruce declarado-vs-invocado compara estas
+/// etiquetas por igualdad. Truncar solo en un lado partía un servidor de más
+/// de [`MAX_TOOL_NAME_LEN`] caracteres en dos claves distintas —una con la
+/// etiqueta entera, otra recortada— y el recomendador publicaba `unused`
+/// para un servidor invocado en cada petición. Reproducido antes de este
+/// arreglo: 50 peticiones declarando E invocando daban
+/// `Unused { conclusive_requests: 50 }` con `invocations: 0`.
+///
+/// Dos servidores que solo difieran más allá del tope se fusionan, y es el
+/// mal menor deliberado: la alternativa —no acotar— deja entrar una etiqueta
+/// de un megabyte extraída de texto de fuera.
+pub fn etiqueta_servidor(server: &str) -> String {
+    server.chars().take(MAX_TOOL_NAME_LEN).collect()
 }
 
 /// Empuja `name` a `lista` respetando el cupo de entradas y el de longitud.
@@ -902,7 +920,10 @@ pub fn group_tools_by_server<'a>(
     let mut rows: Vec<ToolServerBytes> = totals
         .into_iter()
         .map(|((kind, server), acc)| ToolServerBytes {
-            server: server.to_string(),
+            // MISMO acotado que el lado invocado (`ToolCalls::push_invoked_de`).
+            // Si solo se acotara uno, un servidor largo se partiria en dos
+            // claves y el cruce lo daria por no usado.
+            server: etiqueta_servidor(server),
             kind,
             tools: acc.tools,
             bytes: acc.bytes,
