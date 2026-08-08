@@ -1671,4 +1671,46 @@ mod tests {
         );
         assert_eq!(llamada.server, servidor_largo);
     }
+
+    /// REGRESIÓN MEDIDA. La primera versión de `tool_calls` guardaba solo el
+    /// nombre. Cambiar la forma sin aceptar la vieja hacía que `serde`
+    /// fallara al parsear la fila ENTERA, y `rehydrate` la descartaba con sus
+    /// tokens, coste y latencia — verificado contra un `telemetry.jsonl` real
+    /// antes de este arreglo: «1 filas no se pudieron leer».
+    #[test]
+    fn una_fila_con_la_forma_vieja_de_invoked_sigue_entrando() {
+        let vieja: ToolCalls = serde_json::from_str(
+            r#"{"invoked":["mcp__context7__get-docs","Read"],
+                "server_invoked":[],"invoked_total":2,
+                "server_invoked_total":0,"complete":true}"#,
+        )
+        .expect("una fila de una build anterior tiene que entrar");
+
+        assert_eq!(vieja.invoked.len(), 2);
+        assert_eq!(vieja.invoked[0].name, "mcp__context7__get-docs");
+        assert_eq!(
+            vieja.invoked[0].server, "context7",
+            "el servidor se deriva del nombre, que es lo que hacia el consumidor de entonces"
+        );
+        assert_eq!(vieja.invoked[0].kind, ToolServerKind::Mcp);
+        assert_eq!(vieja.invoked[1].server, NATIVE_TOOLS_LABEL);
+    }
+
+    /// Y la forma actual, con el servidor ya resuelto, se lee tal cual — sin
+    /// volver a derivarlo del nombre.
+    #[test]
+    fn la_forma_actual_conserva_el_servidor_resuelto() {
+        let nueva: ToolCalls = serde_json::from_str(
+            r#"{"invoked":[{"name":"buscar","server":"conector-remoto","kind":"mcp"}],
+                "server_invoked":[],"invoked_total":1,
+                "server_invoked_total":0,"complete":true}"#,
+        )
+        .expect("la forma actual tiene que entrar");
+
+        assert_eq!(
+            nueva.invoked[0].server, "conector-remoto",
+            "NO se re-deriva de `buscar`, que daria (native)"
+        );
+        assert_eq!(nueva.invoked[0].kind, ToolServerKind::Mcp);
+    }
 }

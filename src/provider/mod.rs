@@ -448,7 +448,7 @@ const MAX_TOOL_NAME_LEN: usize = 128;
 /// Ambos fallos publicarían `unused` para un servidor en uso, que es el peor
 /// error que este dato puede provocar: el usuario borra una integración que
 /// funciona por consejo del medidor.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolCall {
     /// Nombre tal como viajó, acotado a [`MAX_TOOL_NAME_LEN`] caracteres.
     /// Es informativo: la atribución NO se deriva de él.
@@ -458,6 +458,51 @@ pub struct ToolCall {
     pub server: String,
     /// Naturaleza del cubo, resuelta junto al servidor.
     pub kind: ToolServerKind,
+}
+
+/// Deserialización TOLERANTE con las filas ya escritas.
+///
+/// La primera versión de este campo guardaba solo el nombre
+/// (`"invoked": ["Read", "mcp__x__y"]`). Cambiar la forma sin aceptar la
+/// anterior haría que `serde` fallara al parsear la fila ENTERA —no solo este
+/// campo— y `rehydrate` la contaría como ilegible, tirando sus tokens, coste
+/// y latencia junto al dato nuevo.
+///
+/// Es la misma disciplina que declara `RequestMetric`: los campos que una
+/// build anterior no escribía llevan `default`, y una fila vieja tiene que
+/// seguir entrando. Aquí no basta con `default` porque el campo SÍ está, con
+/// otra forma.
+///
+/// Al leer la forma vieja se deriva el servidor con [`classify`], que es
+/// exactamente lo que hacía el consumidor de entonces: no se inventa
+/// información que la fila no tenía, se reproduce la interpretación que ya
+/// se le daba.
+impl<'de> Deserialize<'de> for ToolCall {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Forma {
+            Actual {
+                name: String,
+                server: String,
+                kind: ToolServerKind,
+            },
+            /// Filas escritas antes de que la invocación llevara su servidor.
+            SoloNombre(String),
+        }
+
+        Ok(match Forma::deserialize(d)? {
+            Forma::Actual { name, server, kind } => ToolCall { name, server, kind },
+            Forma::SoloNombre(name) => {
+                let (kind, server) = classify(&name);
+                ToolCall {
+                    server: server.to_string(),
+                    kind,
+                    name,
+                }
+            }
+        })
+    }
 }
 
 /// Invocaciones de herramienta observadas en la RESPUESTA del proveedor.
