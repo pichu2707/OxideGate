@@ -320,6 +320,7 @@ async fn send_and_meter(
                 tools_flattened: out.tools_flattened,
                 skills: out.skills,
                 instructions: out.instructions,
+                hooks: out.hooks,
                 effort_forced: out.effort_forced,
                 // Camino de ERROR: el upstream no llegó a responder, así que
                 // no hubo respuesta que escanear. `None` es la ausencia
@@ -376,6 +377,7 @@ async fn send_and_meter(
         tools_flattened: out.tools_flattened,
         skills: out.skills,
         instructions: out.instructions,
+        hooks: out.hooks,
         effort_forced: out.effort_forced,
         provider: prov,
         // `resp` está vivo acá: `resp.status()` ya se leyó arriba (préstamo

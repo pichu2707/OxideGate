@@ -19,8 +19,8 @@
 //! el escáner de `usage` recién conoce al leer la respuesta — por eso viaja
 //! en `self.scanner.usage.speed`, no en `MetricBase`.
 use crate::provider::{
-    ContextBreakdown, InstructionsBlock, Provider, SkillsBlock, ToolCalls, ToolSearchSignal,
-    ToolServerBytes, Usage,
+    ContextBreakdown, HooksBlock, InstructionsBlock, Provider, SkillsBlock, ToolCalls,
+    ToolSearchSignal, ToolServerBytes, Usage,
 };
 use crate::telemetry::cache_attribution;
 use crate::telemetry::logger::{flatten_context_breakdown, tools_fields};
@@ -107,6 +107,9 @@ pub struct MetricBase {
     /// (`Outgoing::instructions`). Viaja intacto hasta
     /// `RequestMetric::instructions`. `None` = no se pudo ver.
     pub instructions: Option<InstructionsBlock>,
+    /// Salida de hooks vista en el body (`Outgoing::hooks`). Viaja intacta
+    /// hasta `RequestMetric::hooks`. `None` = no se reconocio el bloque.
+    pub hooks: Option<HooksBlock>,
     /// Nivel de esfuerzo impuesto por la palanca B (`Outgoing::effort_forced`).
     /// Viaja intacto hasta `RequestMetric::effort_forced`. `None` = el proxy no
     /// intervino.
@@ -379,6 +382,7 @@ impl MeteredBody {
             tools_flattened: self.base.tools_flattened,
             skills: self.base.skills,
             instructions: self.base.instructions,
+            hooks: self.base.hooks,
             effort_forced: self.base.effort_forced.clone(),
             // `None` si este proveedor no tiene extractor: publicar listas
             // vacias ahi seria afirmar "no invoco nada", que es otra cosa.
@@ -472,6 +476,7 @@ mod tests {
             tools_flattened: None,
             skills: None,
             instructions: None,
+            hooks: None,
             effort_forced: None,
             provider: &ANTHROPIC,
             codex_quota: None,

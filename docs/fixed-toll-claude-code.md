@@ -38,8 +38,15 @@ Para escala: el cuerpo completo de esa petición fue 183.861 B, de los cuales
 > ambos documentos. La cifra del campo es la reproducible por un tercero,
 > porque sus fronteras están en el propio body.
 >
-> Los otros dos bloques siguen **sin instrumentar**: la salida de hooks tiene su
-> propia marca y espera issue; el listado de skills se ve en `skills` (§4.8).
+> **Los tres bloques están ya instrumentados.** La salida de hooks tiene campo
+> propio desde el cierre de #64 —`hooks: {bytes, declared, format}`, ver
+> [`telemetry-per-request.md`](telemetry-per-request.md) §4.17— y el listado de
+> skills se ve en `skills` (§4.8).
+>
+> Aviso sobre esa última cifra: `skills.listing_bytes` **subestima** el listado
+> cuando alguna skill trae la descripción en varias líneas, porque el recorrido
+> se para en la primera continuación. Medido en −1.453 B (−8,9%) y −3 entradas
+> sobre una captura del 2026-08-09. Pendiente en el issue #84.
 
 ---
 

@@ -55,7 +55,7 @@
 //! `docs/telemetry-per-request.md` §4.3 antes de exponer este endpoint fuera de
 //! localhost.
 use crate::provider::{
-    InstructionsBlock, SkillsBlock, ToolCalls, ToolSearchSignal, ToolServerBytes,
+    HooksBlock, InstructionsBlock, SkillsBlock, ToolCalls, ToolSearchSignal, ToolServerBytes,
 };
 use crate::telemetry::logger::RequestMetric;
 use crate::telemetry::{CacheBySection, CodexQuota, SectionShare, SessionAttribution};
@@ -211,6 +211,9 @@ pub struct RecentRequest {
     /// una etiqueta de dialecto, **jamás una línea del contenido** del fichero
     /// —que es texto privado del usuario— ni una huella de él.
     pub instructions: Option<InstructionsBlock>,
+    /// Salida de los hooks de `SessionStart`: el 29% del peaje fijo. `None`
+    /// significa que no se reconocio el bloque, NUNCA que no haya hooks.
+    pub hooks: Option<HooksBlock>,
     /// Nivel de esfuerzo que IMPUSO la palanca B, o `null` si el proxy no
     /// intervino. Se lee junto a `requested_effort` (lo que pidió el cliente),
     /// nunca en su lugar: es lo que impide confundir un ahorro del cliente con
@@ -328,6 +331,7 @@ impl From<&RequestMetric> for RecentRequest {
             tools_flattened: m.tools_flattened,
             skills: m.skills,
             instructions: m.instructions,
+            hooks: m.hooks,
             effort_forced: m.effort_forced.clone(),
             tool_calls: m.tool_calls.clone(),
             prompt_bytes: m.prompt_bytes,
@@ -429,6 +433,7 @@ mod tests {
             tools_flattened: None,
             skills: None,
             instructions: None,
+            hooks: None,
             effort_forced: None,
             response_bytes: None,
             prepare_us: 42,
@@ -1019,6 +1024,7 @@ mod tests {
             "context_tools_bytes",
             "cost_estimate_usd",
             "effort_forced",
+            "hooks",
             "input_share_by_section",
             "input_tokens",
             "instructions",

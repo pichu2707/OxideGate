@@ -337,6 +337,10 @@ pub struct RequestMetric {
     /// es la respuesta correcta. Ver `provider::instructions`.
     #[serde(default)]
     pub instructions: Option<InstructionsBlock>,
+    /// Salida de los hooks de `SessionStart`, el 29% del peaje fijo. `None`
+    /// significa que no se reconocio el bloque, nunca que no haya hooks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<crate::provider::HooksBlock>,
     /// Nivel de esfuerzo que IMPUSO la palanca B del optimizador, o `null` si
     /// el proxy no intervino — el caso por defecto, porque arranca apagada.
     ///
@@ -742,6 +746,7 @@ mod tests {
             tools_flattened: None,
             skills: None,
             instructions: None,
+            hooks: None,
             effort_forced: None,
             tool_calls: None,
             response_bytes: None,

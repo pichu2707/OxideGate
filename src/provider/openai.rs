@@ -111,6 +111,8 @@ impl Provider for OpenAiChat {
             context,
             skills,
             instructions,
+            // Sin medir en este dialecto: ver `Outgoing::hooks`.
+            hooks: None,
             effort_forced: None,
             tools_by_server: by_server,
             tools_overhead_bytes: overhead,
@@ -308,6 +310,8 @@ impl Provider for OpenAiResponses {
             context,
             skills,
             instructions,
+            // Sin medir en este dialecto: ver `Outgoing::hooks`.
+            hooks: None,
             effort_forced: None,
             tools_by_server: by_server,
             tools_overhead_bytes: overhead,
@@ -552,6 +556,8 @@ impl Provider for OpenAiCodexResponses {
             context,
             skills,
             instructions,
+            // Sin medir en este dialecto: ver `Outgoing::hooks`.
+            hooks: None,
             effort_forced: None,
             tools_by_server: by_server,
             tools_overhead_bytes: overhead,
