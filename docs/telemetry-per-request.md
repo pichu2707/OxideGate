@@ -1023,7 +1023,7 @@ palanca se aplica.
 | Campo | Qué es |
 |---|---|
 | `bytes` | Bytes del bloque completo, envoltorio incluido. Se pagan en CADA petición |
-| `format` | `claude_md` \| `opencode_agents_md` — ver abajo |
+| `format` | `claude_md` \| `codex_agents_md` \| `opencode_agents_md` — ver abajo |
 
 #### El bloque se delimita por su ENVOLTORIO, nunca por una cabecera
 
@@ -1063,21 +1063,43 @@ correcto: **Claude Code ignora `AGENTS.md`** — `null` con ese fichero en el
 proyecto es la respuesta buena, no un fallo del detector. El mismo fichero,
 cuatro comportamientos (`docs/skills-across-tools.md` §6).
 
-#### Dos `format`, y cada uno con su captura detrás
+#### Tres `format`, y cada uno con su captura detrás
 
-| `format` | Herramienta | Envoltorio | Cierre |
-|---|---|---|---|
-| `claude_md` | Claude Code 2.1.220 | `<system-reminder>` con `# claudeMd` dentro | sí |
-| `opencode_agents_md` | opencode 1.18.15 | `Instructions from: <ruta absoluta>` | **no** |
+| `format` | Herramienta | Envoltorio | Cierre | Ruta |
+|---|---|---|---|---|
+| `claude_md` | Claude Code 2.1.220 | `<system-reminder>` con `# claudeMd` dentro | sí | — |
+| `codex_agents_md` | Codex 0.142.5 | cabecera + `<INSTRUCTIONS>`…`</INSTRUCTIONS>` | sí | **absoluta** |
+| `opencode_agents_md` | opencode 1.18.15 | `Instructions from: <ruta absoluta>` | **no** | **absoluta** |
 
 Cada dialecto entra **cuando tiene captura propia**, nunca desde una tabla. Y el
 motivo dejó de ser teórico: la marca que se documentaba para **Codex**
-—`--- project-doc ---`— **no existe** en 0.142.5. `grep` devuelve cero sobre una
-captura real. Una marca es una cadena literal, y las cadenas cambian.
+—`--- project-doc ---`— **no existe** en 0.142.5. `grep` devuelve cero sobre la
+captura real; la de verdad es `# AGENTS.md instructions for <ruta>`. La de
+opencode, en cambio, **sí sobrevivió** a diez versiones de deriva.
 
-Faltan **Codex** y **`pi`**, y `pi` además manda el cuerpo en zstd, así que sus
-cifras serán lógicas y habrá que decirlo. Ver #66 y
+Una de dos. Escribir ambos detectores desde la tabla habría dejado uno roto
+publicando `null` — y `null` es un valor legítimo en este campo, así que nadie
+lo habría notado.
+
+Falta **`pi`**, que además manda el cuerpo en zstd: sus cifras serán lógicas y
+habrá que decirlo. Ver #66 y
 [`banco-de-captura.md`](banco-de-captura.md) para el método.
+
+#### La cabecera de Codex va FUERA del envoltorio, y se cuenta
+
+```text
+# AGENTS.md instructions for /ruta/absoluta/proyecto
+
+<INSTRUCTIONS>
+…contenido del AGENTS.md…
+</INSTRUCTIONS>
+```
+
+Medir solo de `<INSTRUCTIONS>` a `</INSTRUCTIONS>` dejaría fuera la ruta, que
+son **116 de los 178 B** de envoltorio. El bloque se mide **desde la cabecera**.
+
+Y de nuevo: el «+159 B» que circulaba para Codex **no es una constante**, es
+`62 B + longitud de la ruta`.
 
 #### El envoltorio de opencode depende de DÓNDE tengas el proyecto
 

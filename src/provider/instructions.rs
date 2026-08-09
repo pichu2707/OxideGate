@@ -78,10 +78,30 @@ use super::block_scan::primer_bloque_con;
 /// para no inventar. Cada una entra cuando su captura exista.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
+// Las tres variantes acaban en `Md` y clippy sugiere quitar el sufijo. NO se
+// hace: estos nombres se serializan con `rename_all` y son VALORES PUBLICADOS
+// del campo `instructions.format` (`claude_md`, `codex_agents_md`,
+// `opencode_agents_md`), que consume `oxidegate-lens`. Renombrarlos por
+// ergonomía interna rompería el contrato de un consumidor externo — y el sufijo
+// no es ruido: nombra el fichero que cada harness inyecta.
+#[allow(clippy::enum_variant_names)]
 pub enum InstructionsFormat {
     /// Claude Code: `<system-reminder>` en `messages[0]` con la cabecera
     /// `# claudeMd` dentro. Medido: 33.716 B en una máquina real.
     ClaudeMd,
+    /// Codex: la cabecera `# AGENTS.md instructions for <ruta absoluta>`
+    /// seguida de un envoltorio `<INSTRUCTIONS>`…`</INSTRUCTIONS>`.
+    ///
+    /// Medido sobre captura real de **Codex 0.142.5** (2026-08-09): con un
+    /// `AGENTS.md` de 202 B el bloque son **380 B**, o sea **178 B de
+    /// envoltorio** — y **116 de esos 178 son la RUTA ABSOLUTA** del proyecto.
+    /// El «+159 B» que circulaba es en realidad `62 B + longitud de la ruta`.
+    ///
+    /// **La marca documentada para Codex no existe.** La tabla decía
+    /// `--- project-doc ---` dentro de `<INSTRUCTIONS>`; `grep` sobre la
+    /// captura devuelve cero. Es el caso que justifica la regla de #66: ningún
+    /// dialecto entra sin captura propia.
+    CodexAgentsMd,
     /// opencode: la marca `Instructions from: <ruta absoluta>` en el prompt de
     /// sistema, con el contenido pegado detrás.
     ///
@@ -154,7 +174,36 @@ const OPENCODE_FIN: &str = "Skills provide specialized instructions";
 /// tiene apertura. Ante un cuerpo donde los dos pudieran aparecer, gana el que
 /// se puede delimitar con certeza.
 pub fn detect_instructions(texto: &str) -> Option<InstructionsBlock> {
-    detect_claude_md(texto).or_else(|| detect_opencode(texto))
+    detect_claude_md(texto)
+        .or_else(|| detect_codex(texto))
+        .or_else(|| detect_opencode(texto))
+}
+
+/// Cabecera con la que Codex identifica el bloque. Va FUERA del envoltorio, y
+/// lleva el `# ` y el ` for ` a propósito: el prompt de sistema del propio
+/// Codex menciona «AGENTS.md instructions» sin ser el bloque —verificado en la
+/// captura: *«…take precedence over AGENTS.md instructions.»*—.
+const CODEX_CABECERA: &str = "# AGENTS.md instructions for ";
+const CODEX_ABRE: &str = "<INSTRUCTIONS>";
+const CODEX_CIERRA: &str = "</INSTRUCTIONS>";
+
+/// Codex: cabecera identificadora seguida del envoltorio `<INSTRUCTIONS>`.
+///
+/// Se mide **desde la cabecera**, no desde `<INSTRUCTIONS>`: la ruta absoluta
+/// vive ahí y son **116 de los 178 B de envoltorio** en la captura real.
+/// Cortar en el envoltorio dejaría fuera el 65% de lo que cuesta.
+///
+/// A diferencia de opencode, Codex **sí cierra** el bloque, así que la frontera
+/// final es real y no hay que adivinarla. Sin `</INSTRUCTIONS>` no es su forma
+/// y se devuelve `None` en vez de inventar un final.
+fn detect_codex(texto: &str) -> Option<InstructionsBlock> {
+    let inicio = texto.find(CODEX_CABECERA)?;
+    let abre = texto[inicio..].find(CODEX_ABRE)? + inicio;
+    let cierra = texto[abre..].find(CODEX_CIERRA)? + abre + CODEX_CIERRA.len();
+    Some(InstructionsBlock {
+        bytes: texto[inicio..cierra].len(),
+        format: InstructionsFormat::CodexAgentsMd,
+    })
 }
 
 /// opencode: `Instructions from: <ruta>` y el contenido pegado detrás, hasta
@@ -272,6 +321,70 @@ mod tests {
              además CONTRACT_VERSION en middleware::version y anótalo en \
              docs/telemetry-per-request.md §8"
         );
+    }
+
+    // --- Codex: cabecera + `<INSTRUCTIONS>`…`</INSTRUCTIONS>` ---
+
+    /// Reproduce la disposición REAL capturada de Codex 0.142.5: la cabecera
+    /// identificadora FUERA del envoltorio, y el contenido dentro.
+    fn parte_de_codex(contenido: &str) -> String {
+        format!(
+            "# AGENTS.md instructions for /home/quien/proyecto\n\n\
+             <INSTRUCTIONS>\n{contenido}\n</INSTRUCTIONS>"
+        )
+    }
+
+    #[test]
+    fn reconoce_el_bloque_de_codex() {
+        let texto = parte_de_codex("# Instrucciones\n\nResponde en una linea.");
+
+        let b = detect_instructions(&texto).expect("debe reconocer el bloque");
+
+        assert_eq!(b.format, InstructionsFormat::CodexAgentsMd);
+        assert_eq!(
+            b.bytes,
+            texto.len(),
+            "mide de la CABECERA al cierre: la cabecera también se paga"
+        );
+    }
+
+    /// La cabecera va FUERA del envoltorio, así que el bloque no puede medirse
+    /// solo de `<INSTRUCTIONS>` a `</INSTRUCTIONS>`: se dejaría fuera la ruta
+    /// absoluta, que en la captura real son 116 de los 178 B de envoltorio.
+    #[test]
+    fn la_cabecera_de_codex_entra_en_la_cuenta() {
+        let texto = parte_de_codex("x");
+        let solo_envoltorio = texto.find("<INSTRUCTIONS>").expect("hay envoltorio");
+
+        let b = detect_instructions(&texto).expect("reconoce");
+
+        assert!(
+            b.bytes > texto.len() - solo_envoltorio,
+            "sin la cabecera se perdería la ruta: {} vs {}",
+            b.bytes,
+            texto.len() - solo_envoltorio
+        );
+    }
+
+    /// **El prompt de sistema de Codex MENCIONA `AGENTS.md instructions`** sin
+    /// ser el bloque —verificado en la captura real: «…take precedence over
+    /// AGENTS.md instructions.»—. La marca lleva el `# ` y el ` for ` a
+    /// propósito para no morder ahí.
+    #[test]
+    fn la_mencion_del_prompt_de_sistema_no_abre_un_bloque() {
+        let texto = "Direct instructions take precedence over AGENTS.md instructions.\n\
+                     The contents of the AGENTS.md file at the root of the repo…";
+
+        assert!(detect_instructions(texto).is_none());
+    }
+
+    /// Sin cierre no hay bloque. Codex SÍ cierra —a diferencia de opencode—
+    /// así que un cuerpo sin `</INSTRUCTIONS>` no es su forma y no se adivina.
+    #[test]
+    fn sin_cierre_el_bloque_de_codex_no_se_adivina() {
+        let texto = "# AGENTS.md instructions for /x\n\n<INSTRUCTIONS>\ncontenido sin cerrar";
+
+        assert!(detect_instructions(texto).is_none());
     }
 
     // --- opencode: `Instructions from: <ruta>` ---
