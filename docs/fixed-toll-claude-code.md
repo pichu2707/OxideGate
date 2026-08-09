@@ -43,10 +43,11 @@ Para escala: el cuerpo completo de esa petición fue 183.861 B, de los cuales
 > [`telemetry-per-request.md`](telemetry-per-request.md) §4.17— y el listado de
 > skills se ve en `skills` (§4.8).
 >
-> Aviso sobre esa última cifra: `skills.listing_bytes` **subestima** el listado
-> cuando alguna skill trae la descripción en varias líneas, porque el recorrido
-> se para en la primera continuación. Medido en −1.453 B (−8,9%) y −3 entradas
-> sobre una captura del 2026-08-09. Pendiente en el issue #84.
+> Esa cifra de skills tuvo un sesgo hasta el cierre de #84: el recorrido se
+> paraba en la primera línea de continuación, así que una sola skill con la
+> descripción repartida en varias líneas se llevaba por delante las siguientes.
+> Publicaba 63 entradas de 66 y 14.902 B de 16.355 (−8,9%). Corregido: la
+> frontera pasa a ser la línea en blanco, que sí es estructura del listado.
 
 ---
 
