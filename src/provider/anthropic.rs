@@ -20,9 +20,9 @@
 //! [`Usage::speed`]): documentado por Anthropic pero no observado todavía en
 //! tráfico real de este proyecto.
 use super::{
-    array_field, fingerprint, measure_key, measure_other, model_and_stream_from_value, parse_body,
-    split_history_and_last_turn, tools_overhead_bytes, ContextBreakdown, Incoming, Outgoing,
-    Provider, ToolCalls, ToolServerKind, Usage,
+    ContextBreakdown, Incoming, Outgoing, Provider, ToolCalls, ToolServerKind, Usage, array_field,
+    fingerprint, measure_key, measure_other, model_and_stream_from_value, parse_body,
+    split_history_and_last_turn, tools_overhead_bytes,
 };
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -70,7 +70,9 @@ impl Provider for Anthropic {
             .map(model_and_stream_from_value)
             .unwrap_or((None, false));
         let context = parsed.as_ref().and_then(|v| self.decompose(v));
-        let skills = parsed.as_ref().and_then(crate::provider::skills::detect_skills_in_body);
+        let skills = parsed
+            .as_ref()
+            .and_then(crate::provider::skills::detect_skills_in_body);
         let instructions = parsed
             .as_ref()
             .and_then(crate::provider::instructions::detect_instructions_in_body);
@@ -148,10 +150,7 @@ impl Provider for Anthropic {
         if let Some(v) = u.get("cache_read_input_tokens").and_then(Value::as_u64) {
             usage.cache_read_tokens = Some(v);
         }
-        if let Some(v) = u
-            .get("cache_creation_input_tokens")
-            .and_then(Value::as_u64)
-        {
+        if let Some(v) = u.get("cache_creation_input_tokens").and_then(Value::as_u64) {
             usage.cache_write_tokens = Some(v);
         }
         if let Some(v) = u.get("speed").and_then(Value::as_str) {
@@ -231,7 +230,11 @@ impl Provider for Anthropic {
             history_bytes,
             last_turn_bytes,
             other_bytes,
-            measured_bytes: system_bytes + tools_bytes + history_bytes + last_turn_bytes + other_bytes,
+            measured_bytes: system_bytes
+                + tools_bytes
+                + history_bytes
+                + last_turn_bytes
+                + other_bytes,
             messages_count,
         })
     }
@@ -454,8 +457,8 @@ fn has_cache_control(value: &Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::{MAX_TOOL_NAME_LEN, MAX_TOOL_NAMES, NATIVE_TOOLS_LABEL, measure_value};
+    use super::*;
 
     /// Solo los nombres de las invocaciones de cliente. La ATRIBUCIÓN a
     /// servidor tiene sus propios tests: mezclarlas aquí haría que un fallo
@@ -799,9 +802,8 @@ mod tests {
     #[test]
     fn prepare_deja_tool_search_en_none() {
         let cfg = test_config(false);
-        let incoming = incoming_with_body(
-            r#"{"model":"claude-3-5-sonnet","system":"hola","messages":[]}"#,
-        );
+        let incoming =
+            incoming_with_body(r#"{"model":"claude-3-5-sonnet","system":"hola","messages":[]}"#);
 
         let out = ANTHROPIC.prepare(incoming, &cfg);
 
@@ -836,8 +838,14 @@ mod tests {
 
             let out = ANTHROPIC.prepare(incoming, &cfg);
 
-            assert!(!out.cache_control_forced, "body {body} no debe forzar caché");
-            assert_eq!(out.body, original_body, "body {body} debe reenviarse intacto");
+            assert!(
+                !out.cache_control_forced,
+                "body {body} no debe forzar caché"
+            );
+            assert_eq!(
+                out.body, original_body,
+                "body {body} debe reenviarse intacto"
+            );
             assert_eq!(out.context, None, "body {body} no debe producir desglose");
         }
     }
@@ -928,7 +936,11 @@ mod tests {
         );
         assert_eq!(
             bd.measured_bytes,
-            bd.system_bytes + bd.tools_bytes + bd.history_bytes + bd.last_turn_bytes + bd.other_bytes
+            bd.system_bytes
+                + bd.tools_bytes
+                + bd.history_bytes
+                + bd.last_turn_bytes
+                + bd.other_bytes
         );
     }
 
@@ -1104,7 +1116,10 @@ mod tests {
         assert_eq!(calendar.tools, 1);
         assert_eq!(calendar.bytes, expected_calendar);
 
-        assert_eq!(out.tools_overhead_bytes, expected_tools_bytes - expected_sum);
+        assert_eq!(
+            out.tools_overhead_bytes,
+            expected_tools_bytes - expected_sum
+        );
     }
 
     /// EXTREMO A EXTREMO por `prepare`: un body real con un servidor MCP
@@ -1183,7 +1198,8 @@ mod tests {
     #[test]
     fn prepare_tools_by_server_vacio_cuando_tools_es_vacio() {
         let cfg = test_config(false);
-        let incoming = incoming_with_body(r#"{"model":"claude-3-5-sonnet","tools":[],"messages":[]}"#);
+        let incoming =
+            incoming_with_body(r#"{"model":"claude-3-5-sonnet","tools":[],"messages":[]}"#);
 
         let out = ANTHROPIC.prepare(incoming, &cfg);
 
@@ -1218,9 +1234,8 @@ mod tests {
     #[test]
     fn prepare_effort_y_speed_none_cuando_ausentes() {
         let cfg = test_config(false);
-        let incoming = incoming_with_body(
-            r#"{"model":"claude-opus-4","output_config":{},"messages":[]}"#,
-        );
+        let incoming =
+            incoming_with_body(r#"{"model":"claude-opus-4","output_config":{},"messages":[]}"#);
 
         let out = ANTHROPIC.prepare(incoming, &cfg);
 

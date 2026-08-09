@@ -418,7 +418,6 @@ impl StatsRegistry {
     }
 }
 
-
 /// Tope de sesiones distintas que [`SessionRegistry`] trackea.
 ///
 /// `X-OxideGate-Session` es una cabecera **controlada por quien llama**: un
@@ -464,7 +463,11 @@ impl SessionAccumulator {
     /// hueco, no una fila de ceros.
     fn merge(&self, desde: Option<chrono::NaiveDate>) -> Option<SessionDay> {
         let mut out: Option<SessionDay> = None;
-        for (_, d) in self.days.iter().filter(|(x, _)| desde.is_none_or(|f| **x >= f)) {
+        for (_, d) in self
+            .days
+            .iter()
+            .filter(|(x, _)| desde.is_none_or(|f| **x >= f))
+        {
             let acc = out.get_or_insert_with(SessionDay::default);
             acc.requests += d.requests;
             acc.input_tokens += d.input_tokens;
@@ -580,7 +583,12 @@ mod tests {
     #[test]
     fn la_misma_key_con_distinto_source_no_se_fusiona() {
         let mut reg = SessionRegistry::default();
-        reg.ingest(&metric_de_sesion(SessionSource::Native, "claude-cli/1.0", 10, 0.1));
+        reg.ingest(&metric_de_sesion(
+            SessionSource::Native,
+            "claude-cli/1.0",
+            10,
+            0.1,
+        ));
         reg.ingest(&metric_de_sesion(
             SessionSource::Unattributed,
             "claude-cli/1.0",
@@ -591,8 +599,16 @@ mod tests {
         let filas = reg.snapshot(None).0;
 
         assert_eq!(filas.len(), 2, "son dos cubos distintos: {filas:?}");
-        assert!(filas.iter().any(|f| f.source == "native" && f.input_tokens == 10));
-        assert!(filas.iter().any(|f| f.source == "unattributed" && f.input_tokens == 20));
+        assert!(
+            filas
+                .iter()
+                .any(|f| f.source == "native" && f.input_tokens == 10)
+        );
+        assert!(
+            filas
+                .iter()
+                .any(|f| f.source == "unattributed" && f.input_tokens == 20)
+        );
     }
 
     /// Lo básico: varias peticiones de la misma sesión suman.
@@ -616,7 +632,12 @@ mod tests {
     #[test]
     fn la_fila_no_atribuida_se_declara_como_cubo_no_como_sesion() {
         let mut reg = SessionRegistry::default();
-        reg.ingest(&metric_de_sesion(SessionSource::Unattributed, "curl/8", 5, 0.0));
+        reg.ingest(&metric_de_sesion(
+            SessionSource::Unattributed,
+            "curl/8",
+            5,
+            0.0,
+        ));
 
         let f = &reg.snapshot(None).0[0];
 
@@ -952,9 +973,7 @@ mod tests {
         nuevo.timestamp = "2026-07-31T10:00:00Z".to_string();
         r.ingest(&nuevo);
 
-        let filas = r
-            .snapshot(chrono::NaiveDate::from_ymd_opt(2026, 7, 30))
-            .0;
+        let filas = r.snapshot(chrono::NaiveDate::from_ymd_opt(2026, 7, 30)).0;
 
         assert_eq!(filas.len(), 1);
         assert_eq!(filas[0].model, "modelo-nuevo");
@@ -977,5 +996,4 @@ mod tests {
         assert_eq!(f.distinct_prompts, 1, "una huella, vista dos veces");
         assert_eq!(f.requests, 2);
     }
-
 }

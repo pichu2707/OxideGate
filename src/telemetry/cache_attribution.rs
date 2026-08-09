@@ -55,7 +55,7 @@
 use serde::Serialize;
 
 use crate::provider::ContextBreakdown;
-use crate::telemetry::pricing::{cache_shape_for_upstream, CacheShape};
+use crate::telemetry::pricing::{CacheShape, cache_shape_for_upstream};
 
 /// Identificador del algoritmo, publicado dentro del propio objeto.
 ///
@@ -265,7 +265,16 @@ mod tests {
     #[test]
     fn upstream_desconocido_no_es_atribuible() {
         let c = breakdown();
-        assert!(attribute_cache("proveedor-que-no-existe", Some(&c), Some(100), Some(50), Some(0)).is_none());
+        assert!(
+            attribute_cache(
+                "proveedor-que-no-existe",
+                Some(&c),
+                Some(100),
+                Some(50),
+                Some(0)
+            )
+            .is_none()
+        );
     }
 
     /// `measured_bytes` a cero haría dividir por cero al convertir la fracción.
@@ -300,8 +309,14 @@ mod tests {
         let c = breakdown();
         let got = attribute_cache("anthropic", Some(&c), Some(400), Some(500), Some(100))
             .expect("atribuible");
-        assert_eq!(got.tools_cached_bytes, 400, "tools va primero y cabe entero");
-        assert_eq!(got.system_cached_bytes, 100, "system recibe el resto del prefijo");
+        assert_eq!(
+            got.tools_cached_bytes, 400,
+            "tools va primero y cabe entero"
+        );
+        assert_eq!(
+            got.system_cached_bytes, 100,
+            "system recibe el resto del prefijo"
+        );
         assert_eq!(got.history_cached_bytes, 0);
         assert_eq!(got.last_turn_cached_bytes, 0);
         assert_eq!(got.other_cached_bytes, 0);
@@ -333,7 +348,10 @@ mod tests {
         assert_eq!(got.tools_cached_bytes, 400);
         assert_eq!(got.system_cached_bytes, 100);
         assert_eq!(got.history_cached_bytes, 400);
-        assert_eq!(got.last_turn_cached_bytes, 0, "el turno nuevo NO puede estar cacheado");
+        assert_eq!(
+            got.last_turn_cached_bytes, 0,
+            "el turno nuevo NO puede estar cacheado"
+        );
         assert_eq!(got.other_cached_bytes, 0);
     }
 
@@ -348,7 +366,10 @@ mod tests {
             .expect("atribuible");
         assert_eq!(got.tools_cached_bytes, 400);
         assert_eq!(got.system_cached_bytes, 100);
-        assert_eq!(got.history_cached_bytes, 200, "el historial se corta por la mitad");
+        assert_eq!(
+            got.history_cached_bytes, 200,
+            "el historial se corta por la mitad"
+        );
         assert_eq!(got.last_turn_cached_bytes, 0);
     }
 
@@ -387,8 +408,12 @@ mod tests {
         let json = serde_json::to_value(got).expect("serializa");
 
         assert_eq!(json["method"], METHOD, "el método va DENTRO del objeto");
-        let claves: std::collections::BTreeSet<&str> =
-            json.as_object().expect("objeto").keys().map(String::as_str).collect();
+        let claves: std::collections::BTreeSet<&str> = json
+            .as_object()
+            .expect("objeto")
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
             claves,
             [

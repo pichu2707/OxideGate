@@ -8,9 +8,9 @@
 //! son dialecto exclusivo de Anthropic (`output_config.effort` y `speed` a
 //! nivel raíz) sin equivalente hoy en Gemini.
 use super::{
-    array_field, fingerprint, maybe_decompress, measure_key, measure_other, parse_body,
-    split_history_and_last_turn, tools_overhead_bytes, ContextBreakdown, Incoming, Outgoing,
-    Provider, ToolCalls, Usage,
+    ContextBreakdown, Incoming, Outgoing, Provider, ToolCalls, Usage, array_field, fingerprint,
+    maybe_decompress, measure_key, measure_other, parse_body, split_history_and_last_turn,
+    tools_overhead_bytes,
 };
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -50,7 +50,9 @@ impl Provider for Gemini {
         let logical = maybe_decompress(&incoming.body, incoming.content_encoding.as_deref());
         let parsed = parse_body(&logical);
         let context = parsed.as_ref().and_then(|v| self.decompose(v));
-        let skills = parsed.as_ref().and_then(crate::provider::skills::detect_skills_in_body);
+        let skills = parsed
+            .as_ref()
+            .and_then(crate::provider::skills::detect_skills_in_body);
         let instructions = parsed
             .as_ref()
             .and_then(crate::provider::instructions::detect_instructions_in_body);
@@ -167,7 +169,11 @@ impl Provider for Gemini {
             history_bytes,
             last_turn_bytes,
             other_bytes,
-            measured_bytes: system_bytes + tools_bytes + history_bytes + last_turn_bytes + other_bytes,
+            measured_bytes: system_bytes
+                + tools_bytes
+                + history_bytes
+                + last_turn_bytes
+                + other_bytes,
             messages_count,
         })
     }
@@ -196,7 +202,11 @@ impl Provider for Gemini {
         Some(
             tools
                 .iter()
-                .filter_map(|wrapper| wrapper.get("functionDeclarations").and_then(Value::as_array))
+                .filter_map(|wrapper| {
+                    wrapper
+                        .get("functionDeclarations")
+                        .and_then(Value::as_array)
+                })
                 .flatten()
                 .filter_map(|decl| {
                     let name = decl.get("name")?.as_str()?;
@@ -225,7 +235,7 @@ fn parse_gemini_path(path: &str) -> (Option<String>, bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{measure_value, NATIVE_TOOLS_LABEL};
+    use super::super::{NATIVE_TOOLS_LABEL, measure_value};
     use super::*;
 
     /// Gemini (`alt=sse`) manda `usageMetadata` con otros nombres de campo,
@@ -322,7 +332,11 @@ mod tests {
         assert_eq!(bd.last_turn_bytes, measure_value(&contents[2]));
         assert_eq!(
             bd.measured_bytes,
-            bd.system_bytes + bd.tools_bytes + bd.history_bytes + bd.last_turn_bytes + bd.other_bytes
+            bd.system_bytes
+                + bd.tools_bytes
+                + bd.history_bytes
+                + bd.last_turn_bytes
+                + bd.other_bytes
         );
     }
 
@@ -466,10 +480,7 @@ mod tests {
     fn prepare_prompt_hash_se_calcula_sobre_bytes_originales() {
         let cfg = test_config();
         let raw = r#"{"contents":[]}"#;
-        let incoming = incoming_with_body(
-            "/v1beta/models/gemini-1.5-flash:generateContent",
-            raw,
-        );
+        let incoming = incoming_with_body("/v1beta/models/gemini-1.5-flash:generateContent", raw);
         let expected_hash = fingerprint(raw.as_bytes());
 
         let out = GEMINI.prepare(incoming, &cfg);

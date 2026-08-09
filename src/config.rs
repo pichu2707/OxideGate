@@ -323,7 +323,10 @@ mod bind_host_tests {
         assert_eq!(host, IpAddr::V4(Ipv4Addr::LOCALHOST));
         let aviso = aviso.expect("un valor ilegible tiene que avisar");
         assert!(aviso.contains("0.0.0.O"), "el aviso debe citar el valor");
-        assert!(aviso.contains("127.0.0.1"), "y decir dónde bindeó de verdad");
+        assert!(
+            aviso.contains("127.0.0.1"),
+            "y decir dónde bindeó de verdad"
+        );
     }
 
     #[test]
@@ -342,7 +345,10 @@ mod bind_host_tests {
             IpAddr::V6(Ipv6Addr::UNSPECIFIED),
         ] {
             let aviso = exposure_warning(ip).unwrap_or_else(|| panic!("{ip} debe avisar"));
-            assert!(aviso.contains("/requests"), "{ip}: debe nombrar el endpoint");
+            assert!(
+                aviso.contains("/requests"),
+                "{ip}: debe nombrar el endpoint"
+            );
         }
     }
 }

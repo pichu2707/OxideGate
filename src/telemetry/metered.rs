@@ -23,9 +23,9 @@ use crate::provider::{
     ToolServerBytes, Usage,
 };
 use crate::telemetry::cache_attribution;
-use crate::telemetry::section_share;
 use crate::telemetry::logger::{flatten_context_breakdown, tools_fields};
 use crate::telemetry::pricing;
+use crate::telemetry::section_share;
 use crate::telemetry::{CodexQuota, RequestMetric, SessionAttribution, TelemetrySink};
 use bytes::Bytes;
 use futures_util::Stream;
@@ -503,10 +503,7 @@ mod tests {
         drop(body);
 
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-        let filas = recent
-            .read()
-            .unwrap_or_else(|p| p.into_inner())
-            .snapshot();
+        let filas = recent.read().unwrap_or_else(|p| p.into_inner()).snapshot();
         let fila = filas.last().expect("debe haber una fila");
 
         assert_eq!(

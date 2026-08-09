@@ -37,7 +37,13 @@ impl CacheAccounting {
     /// La `Separate` suma la caché al input; la `Subset` la descuenta del input
     /// y la recobra al multiplicador reducido, con clamp a cero ante datos
     /// inconsistentes (`cache_read > input`) para no dar un coste negativo.
-    fn input_cost_per_mtok(self, input: f64, cache_read: f64, cache_write: f64, price_in: f64) -> f64 {
+    fn input_cost_per_mtok(
+        self,
+        input: f64,
+        cache_read: f64,
+        cache_write: f64,
+        price_in: f64,
+    ) -> f64 {
         match self {
             CacheAccounting::Separate {
                 read_multiplier,
@@ -85,13 +91,25 @@ pub fn model_pricing(model: &str) -> Option<ModelPricing> {
             write_multiplier: ANTHROPIC_CACHE_WRITE_MULTIPLIER,
         };
         if m.contains("opus") {
-            return Some(ModelPricing { price_in: 15.0, price_out: 75.0, cache });
+            return Some(ModelPricing {
+                price_in: 15.0,
+                price_out: 75.0,
+                cache,
+            });
         }
         if m.contains("haiku") {
-            return Some(ModelPricing { price_in: 0.80, price_out: 4.0, cache });
+            return Some(ModelPricing {
+                price_in: 0.80,
+                price_out: 4.0,
+                cache,
+            });
         }
         if m.contains("sonnet") {
-            return Some(ModelPricing { price_in: 3.0, price_out: 15.0, cache });
+            return Some(ModelPricing {
+                price_in: 3.0,
+                price_out: 15.0,
+                cache,
+            });
         }
     }
 
@@ -111,20 +129,40 @@ pub fn model_pricing(model: &str) -> Option<ModelPricing> {
     // porque el emparejamiento es por subcadena y `gpt-5` los tragaría a los dos
     // con un precio cuatro veces menor.
     if m.contains("gpt-5.6-sol") || m.contains("gpt-5.5") {
-        return Some(ModelPricing { price_in: 5.0, price_out: 30.0, cache: openai_5_cache });
+        return Some(ModelPricing {
+            price_in: 5.0,
+            price_out: 30.0,
+            cache: openai_5_cache,
+        });
     }
     if m.contains("gpt-5") {
-        return Some(ModelPricing { price_in: 1.25, price_out: 10.0, cache: openai_5_cache });
+        return Some(ModelPricing {
+            price_in: 1.25,
+            price_out: 10.0,
+            cache: openai_5_cache,
+        });
     }
 
     if m.contains("gpt-4o-mini") {
-        return Some(ModelPricing { price_in: 0.15, price_out: 0.60, cache: openai_4o_cache });
+        return Some(ModelPricing {
+            price_in: 0.15,
+            price_out: 0.60,
+            cache: openai_4o_cache,
+        });
     }
     if m.contains("gpt-4o") {
-        return Some(ModelPricing { price_in: 2.50, price_out: 10.0, cache: openai_4o_cache });
+        return Some(ModelPricing {
+            price_in: 2.50,
+            price_out: 10.0,
+            cache: openai_4o_cache,
+        });
     }
     if m.contains("gpt-4-turbo") {
-        return Some(ModelPricing { price_in: 10.0, price_out: 30.0, cache: openai_4o_cache });
+        return Some(ModelPricing {
+            price_in: 10.0,
+            price_out: 30.0,
+            cache: openai_4o_cache,
+        });
     }
 
     // Google (Gemini): `cachedContentTokenCount` es subconjunto del input. El
@@ -135,17 +173,33 @@ pub fn model_pricing(model: &str) -> Option<ModelPricing> {
             read_multiplier: GEMINI_CACHE_READ_MULTIPLIER,
         };
         if m.contains("2.5-pro") {
-            return Some(ModelPricing { price_in: 1.25, price_out: 10.0, cache });
+            return Some(ModelPricing {
+                price_in: 1.25,
+                price_out: 10.0,
+                cache,
+            });
         }
         if m.contains("2.5-flash") {
-            return Some(ModelPricing { price_in: 0.30, price_out: 2.50, cache });
+            return Some(ModelPricing {
+                price_in: 0.30,
+                price_out: 2.50,
+                cache,
+            });
         }
         if m.contains("1.5-pro") || m.contains("pro") {
-            return Some(ModelPricing { price_in: 1.25, price_out: 5.0, cache });
+            return Some(ModelPricing {
+                price_in: 1.25,
+                price_out: 5.0,
+                cache,
+            });
         }
         // Familia flash (2.0-flash y genéricos): la opción barata por defecto.
         if m.contains("flash") {
-            return Some(ModelPricing { price_in: 0.10, price_out: 0.40, cache });
+            return Some(ModelPricing {
+                price_in: 0.10,
+                price_out: 0.40,
+                cache,
+            });
         }
     }
 
@@ -315,9 +369,12 @@ mod tests {
         .unwrap();
 
         // (1000 + 2000*0.1 + 300*1.25) * 3.0/1e6 + 500 * 15.0/1e6
-        let expected = (1000.0 + 2000.0 * 0.1 + 300.0 * 1.25) * 3.0 / 1_000_000.0
-            + 500.0 * 15.0 / 1_000_000.0;
-        assert!((cost - expected).abs() < EPS, "cost={cost} expected={expected}");
+        let expected =
+            (1000.0 + 2000.0 * 0.1 + 300.0 * 1.25) * 3.0 / 1_000_000.0 + 500.0 * 15.0 / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < EPS,
+            "cost={cost} expected={expected}"
+        );
     }
 
     /// Gemini contabiliza `cache_read` como SUBCONJUNTO del input: la
@@ -326,14 +383,22 @@ mod tests {
     #[test]
     fn gemini_cache_cost_is_subset_of_input() {
         // gemini-2.5-flash: price_in = 0.30, price_out = 2.50 USD/MTok.
-        let cost =
-            estimate_cost_usd(Some("gemini-2.5-flash"), Some(1000), Some(200), Some(400), None)
-                .unwrap();
+        let cost = estimate_cost_usd(
+            Some("gemini-2.5-flash"),
+            Some(1000),
+            Some(200),
+            Some(400),
+            None,
+        )
+        .unwrap();
 
         // (1000 - 400 + 400*0.25) * 0.30/1e6 + 200 * 2.50/1e6
-        let expected = (1000.0 - 400.0 + 400.0 * 0.25) * 0.30 / 1_000_000.0
-            + 200.0 * 2.50 / 1_000_000.0;
-        assert!((cost - expected).abs() < EPS, "cost={cost} expected={expected}");
+        let expected =
+            (1000.0 - 400.0 + 400.0 * 0.25) * 0.30 / 1_000_000.0 + 200.0 * 2.50 / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < EPS,
+            "cost={cost} expected={expected}"
+        );
     }
 
     /// OpenAI contabiliza `cache_read` como SUBCONJUNTO del input, igual que
@@ -341,13 +406,16 @@ mod tests {
     #[test]
     fn openai_cache_cost_is_subset_of_input() {
         // gpt-4o: price_in = 2.50, price_out = 10.0 USD/MTok.
-        let cost = estimate_cost_usd(Some("gpt-4o"), Some(1000), Some(200), Some(400), None)
-            .unwrap();
+        let cost =
+            estimate_cost_usd(Some("gpt-4o"), Some(1000), Some(200), Some(400), None).unwrap();
 
         // (1000 - 400 + 400*0.5) * 2.50/1e6 + 200 * 10.0/1e6
-        let expected = (1000.0 - 400.0 + 400.0 * 0.5) * 2.50 / 1_000_000.0
-            + 200.0 * 10.0 / 1_000_000.0;
-        assert!((cost - expected).abs() < EPS, "cost={cost} expected={expected}");
+        let expected =
+            (1000.0 - 400.0 + 400.0 * 0.5) * 2.50 / 1_000_000.0 + 200.0 * 10.0 / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < EPS,
+            "cost={cost} expected={expected}"
+        );
     }
 
     /// Retrocompatibilidad: sin datos de caché (`None`), el resultado debe
@@ -357,7 +425,10 @@ mod tests {
         let cost = estimate_cost_usd(Some("gpt-4o"), Some(1000), Some(500), None, None).unwrap();
 
         let expected = 1000.0 / 1_000_000.0 * 2.50 + 500.0 / 1_000_000.0 * 10.0;
-        assert!((cost - expected).abs() < EPS, "cost={cost} expected={expected}");
+        assert!(
+            (cost - expected).abs() < EPS,
+            "cost={cost} expected={expected}"
+        );
     }
 
     /// Garantía estructural del endurecimiento: cada familia declara su
@@ -386,12 +457,15 @@ mod tests {
     fn subset_cache_clamps_underflow_to_zero() {
         // cache_read (2000) > input (1000): la resta subyacente sería
         // negativa; el clamp debe evitarlo.
-        let cost = estimate_cost_usd(Some("gpt-4o"), Some(1000), Some(0), Some(2000), None)
-            .unwrap();
+        let cost =
+            estimate_cost_usd(Some("gpt-4o"), Some(1000), Some(0), Some(2000), None).unwrap();
 
         // billable_full_rate se clampa a 0.0: cost_in = 2000*0.5*2.50/1e6.
         let expected = 2000.0 * 0.5 * 2.50 / 1_000_000.0;
-        assert!((cost - expected).abs() < EPS, "cost={cost} expected={expected}");
+        assert!(
+            (cost - expected).abs() < EPS,
+            "cost={cost} expected={expected}"
+        );
         assert!(cost >= 0.0);
     }
 
@@ -472,10 +546,16 @@ mod tests {
             CacheAccounting::Separate { .. } => panic!("{modelo} deberia ser Subset"),
         };
         for m in ["gpt-5.5", "gpt-5.6-sol", "gpt-5"] {
-            assert!((mult(m) - 0.1).abs() < EPS, "{m}: la familia 5 lee cache al 0,1");
+            assert!(
+                (mult(m) - 0.1).abs() < EPS,
+                "{m}: la familia 5 lee cache al 0,1"
+            );
         }
         for m in ["gpt-4o", "gpt-4o-mini"] {
-            assert!((mult(m) - 0.5).abs() < EPS, "{m}: la familia 4o lee cache al 0,5");
+            assert!(
+                (mult(m) - 0.5).abs() < EPS,
+                "{m}: la familia 4o lee cache al 0,5"
+            );
         }
     }
 

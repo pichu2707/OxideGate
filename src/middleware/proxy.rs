@@ -17,7 +17,7 @@ use crate::telemetry::{
 use axum::{
     body::Body,
     extract::{Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::Response,
 };
 use std::sync::Arc;
@@ -156,7 +156,11 @@ pub async fn handle_gemini_route(state: State<Arc<AppState>>, req: Request) -> R
 /// [`Incoming`] con lo que cualquier proveedor pueda necesitar (body y,
 /// para rutas path-based como Gemini, path + query), y delega en el
 /// proveedor la construcción del request saliente antes de reenviar y medir.
-async fn run(prov: &'static dyn Provider, State(state): State<Arc<AppState>>, req: Request) -> Response {
+async fn run(
+    prov: &'static dyn Provider,
+    State(state): State<Arc<AppState>>,
+    req: Request,
+) -> Response {
     let start = Instant::now();
     let (parts, body) = req.into_parts();
 
@@ -231,9 +235,7 @@ async fn send_and_meter(
         // respuesta, nuestro escáner SSE leería bytes comprimidos y NO podría
         // extraer el `usage`. Pidiéndola sin comprimir la medimos en texto
         // plano; el cliente la recibe igual (sin `content-encoding`).
-        if name == header::HOST
-            || name == header::CONTENT_LENGTH
-            || name == header::ACCEPT_ENCODING
+        if name == header::HOST || name == header::CONTENT_LENGTH || name == header::ACCEPT_ENCODING
         {
             continue;
         }

@@ -76,7 +76,6 @@ impl SessionSource {
     }
 }
 
-
 /// Sesión resuelta para un request puntual: procedencia (`source`) y valor
 /// opaco (`key`), inseparables por construcción (ver doc del módulo).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

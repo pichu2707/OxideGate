@@ -222,8 +222,12 @@ mod tests {
 
         let v = serde_json::to_value(q).expect("serializa");
 
-        let claves: std::collections::BTreeSet<&str> =
-            v.as_object().expect("objeto").keys().map(String::as_str).collect();
+        let claves: std::collections::BTreeSet<&str> = v
+            .as_object()
+            .expect("objeto")
+            .keys()
+            .map(String::as_str)
+            .collect();
 
         assert_eq!(
             claves,
@@ -322,7 +326,11 @@ mod tests {
     #[test]
     fn valor_numerico_malformado_da_none_sin_panic() {
         let mut headers = HeaderMap::new();
-        insert(&mut headers, "x-codex-primary-used-percent", "no-es-un-numero");
+        insert(
+            &mut headers,
+            "x-codex-primary-used-percent",
+            "no-es-un-numero",
+        );
 
         let quota = CodexQuota::from_headers(&headers).expect("hay al menos una cabecera presente");
         assert_eq!(quota.primary_used_percent, None);

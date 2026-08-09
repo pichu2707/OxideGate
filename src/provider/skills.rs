@@ -134,12 +134,17 @@ fn detect_flat_list(texto: &str) -> Option<SkillsBlock> {
 /// Recorre TODAS las aperturas y se queda con la primera que contenga al menos
 /// un `<skill>`: las demás son menciones del bloque en el texto del usuario.
 fn detect_xml(texto: &str) -> Option<SkillsBlock> {
-    bloque_con_entradas(texto, "<available_skills>", "</available_skills>", "<skill>")
-        .map(|(bytes, n)| SkillsBlock {
-            declared: n,
-            listing_bytes: bytes,
-            format: SkillsFormat::AvailableSkillsXml,
-        })
+    bloque_con_entradas(
+        texto,
+        "<available_skills>",
+        "</available_skills>",
+        "<skill>",
+    )
+    .map(|(bytes, n)| SkillsBlock {
+        declared: n,
+        listing_bytes: bytes,
+        format: SkillsFormat::AvailableSkillsXml,
+    })
 }
 
 /// Bloque `<skills_instructions>` de Codex, con entradas `(file: <ruta>)`.
@@ -202,8 +207,12 @@ mod tests {
         })
         .expect("serializa");
 
-        let claves: std::collections::BTreeSet<&str> =
-            v.as_object().expect("objeto").keys().map(String::as_str).collect();
+        let claves: std::collections::BTreeSet<&str> = v
+            .as_object()
+            .expect("objeto")
+            .keys()
+            .map(String::as_str)
+            .collect();
 
         assert_eq!(
             claves,
@@ -228,7 +237,11 @@ mod tests {
 
         assert_eq!(b.declared, 2);
         assert_eq!(b.format, SkillsFormat::FlatList);
-        assert!(b.listing_bytes > 60, "bytes irrisorios: {}", b.listing_bytes);
+        assert!(
+            b.listing_bytes > 60,
+            "bytes irrisorios: {}",
+            b.listing_bytes
+        );
     }
 
     /// Gemini CLI y opencode comparten el XML `<available_skills>`.

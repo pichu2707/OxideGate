@@ -118,10 +118,7 @@ fn bind_error_message(port: u16, kind: std::io::ErrorKind, detail: &str) -> Stri
 /// para eliminar.
 enum ClientWiring {
     /// Se cablea exportando `var`. `needs_v1` decide si la base lleva `/v1`.
-    Env {
-        var: &'static str,
-        needs_v1: bool,
-    },
+    Env { var: &'static str, needs_v1: bool },
     /// Se cablea en un fichero: `run` no puede hacerlo, solo explicarlo.
     ConfigFile { hint: &'static str },
 }
@@ -425,7 +422,9 @@ async fn up_subcommand(port: u16, storage_dir: std::path::PathBuf) -> i32 {
     match estado {
         Ok(s) => s.code().unwrap_or(0),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("oxidegate up: no encuentro `oxidegate-monitor` junto a este binario ni en el PATH.");
+            eprintln!(
+                "oxidegate up: no encuentro `oxidegate-monitor` junto a este binario ni en el PATH."
+            );
             127
         }
         Err(e) => {

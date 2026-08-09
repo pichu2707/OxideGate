@@ -11,7 +11,8 @@ use crate::provider::{
     ContextBreakdown, InstructionsBlock, SkillsBlock, ToolCalls, ToolSearchSignal, ToolServerBytes,
 };
 use crate::telemetry::{
-    CacheBySection, SectionShare, CodexQuota, McpRegistry, RecentRequests, SessionAttribution, SessionRegistry, StatsRegistry,
+    CacheBySection, CodexQuota, McpRegistry, RecentRequests, SectionShare, SessionAttribution,
+    SessionRegistry, StatsRegistry,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -771,7 +772,8 @@ mod tests {
     /// confirmación no distingue el tráfico propio de una sonda cualquiera.
     #[test]
     fn banner_nombra_al_cliente_cuando_viene() {
-        let banner = first_request_banner(Some("claude-cli/2.0.1"), "anthropic", "/v1/messages", 200);
+        let banner =
+            first_request_banner(Some("claude-cli/2.0.1"), "anthropic", "/v1/messages", 200);
 
         assert!(
             banner.contains("claude-cli/2.0.1"),
@@ -800,7 +802,8 @@ mod tests {
     /// usuario sabe que "algo" pasó pero no si es lo que esperaba.
     #[test]
     fn banner_situa_la_peticion_con_upstream_ruta_y_status() {
-        let banner = first_request_banner(Some("opencode/1.0"), "openai", "/v1/chat/completions", 200);
+        let banner =
+            first_request_banner(Some("opencode/1.0"), "openai", "/v1/chat/completions", 200);
 
         assert!(banner.contains("openai"), "falta el upstream: {banner}");
         assert!(
@@ -814,7 +817,8 @@ mod tests {
     /// funciona sin decir dónde mirar deja al usuario en el mismo sitio.
     #[test]
     fn banner_apunta_al_monitor() {
-        let banner = first_request_banner(Some("claude-cli/2.0.1"), "anthropic", "/v1/messages", 200);
+        let banner =
+            first_request_banner(Some("claude-cli/2.0.1"), "anthropic", "/v1/messages", 200);
 
         assert!(
             banner.contains("oxidegate-monitor"),
@@ -827,7 +831,8 @@ mod tests {
     /// mostrar el código real para que un 401 no se lea como "todo bien".
     #[test]
     fn banner_con_status_de_error_muestra_el_codigo_real() {
-        let banner = first_request_banner(Some("claude-cli/2.0.1"), "anthropic", "/v1/messages", 401);
+        let banner =
+            first_request_banner(Some("claude-cli/2.0.1"), "anthropic", "/v1/messages", 401);
 
         assert!(banner.contains("401"), "oculta el status real: {banner}");
     }

@@ -7,10 +7,10 @@
 use crate::state::AppState;
 use crate::telemetry::StatsSnapshot;
 use axum::{
+    Json,
     extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use std::sync::Arc;
 
@@ -30,10 +30,11 @@ pub async fn handle_stats(
     State(state): State<Arc<AppState>>,
     Query(q): Query<crate::middleware::SinceQuery>,
 ) -> Response {
-    let desde = match crate::middleware::parse_since(q.since.as_deref(), chrono::Utc::now().date_naive()) {
-        Ok(d) => d,
-        Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
-    };
+    let desde =
+        match crate::middleware::parse_since(q.since.as_deref(), chrono::Utc::now().date_naive()) {
+            Ok(d) => d,
+            Err(e) => return (StatusCode::BAD_REQUEST, e).into_response(),
+        };
     let registry = state.telemetry.stats();
 
     // Read-lock BREVE: se toma, se construye el snapshot (todo síncrono) y se

@@ -94,7 +94,13 @@ mod tests {
     async fn publica_las_cinco_claves() {
         let v = body(HistoryState::default()).await;
 
-        for c in ["window_days", "rows", "oldest", "skipped_old", "skipped_bad"] {
+        for c in [
+            "window_days",
+            "rows",
+            "oldest",
+            "skipped_old",
+            "skipped_bad",
+        ] {
             assert!(v.get(c).is_some(), "falta `{c}`: {v}");
         }
     }
