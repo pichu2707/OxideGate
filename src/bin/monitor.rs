@@ -50,6 +50,18 @@
 //!   f         filtrar el panel de requests recientes al modelo seleccionado
 //!             con `↑`/`↓`; arranca APAGADO, porque el panel es un feed
 //!             global por defecto
+//!   PgUp/PgDn desplazar la PANTALLA ENTERA. Los paneles se pintan siempre a
+//!   Inicio    su tamaño completo sobre un lienzo más alto que el terminal, y
+//!   Fin       lo que se mueve es por dónde te asomas — ver [`ui`]. Repartir
+//!             un contenido de 63 líneas entre 33 dejaba el panel de requests
+//!             con 4 de las 12 que pide, enseñando UNA petición.
+//!
+//! La columna `hora` del panel de requests va en la ZONA HORARIA DE ESTA
+//! MÁQUINA, y el título del panel lleva la antigüedad de lo último que
+//! enseña (`· última hace 3h 47m`). Las dos cosas juntas resuelven el mismo
+//! problema: pintando UTC en crudo, un dato de hace treinta segundos y un
+//! panel congelado se ven IGUAL en cualquier zona que no sea UTC. Ver
+//! [`format_time`] y [`antiguedad_visible`].
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -2751,8 +2763,11 @@ fn indicador_de_scroll(scroll: u16, alto_contenido: u16, alto_ventana: u16) -> O
     if tope == 0 {
         return None;
     }
+    // Corto a propósito: el footer ya lleva diez teclas y en un terminal
+    // angosto lo que se recorta es justo la cola. `Inicio`/`Fin` quedan
+    // documentadas en la cabecera del módulo y en `docs/monitor-tui.md`.
     Some(format!(
-        "  ·  ↕ {}/{} lín. (PgUp/PgDn/Inicio/Fin)",
+        "  ·  ↕ {}/{} (PgUp/PgDn)",
         scroll + alto_ventana,
         alto_contenido
     ))
@@ -3230,11 +3245,27 @@ fn draw_requests_panel(lienzo: &mut Buffer, area: Rect, app: &App) {
         (None, true) => " · filtro (f) activo pero sin modelo seleccionado".to_string(),
         (None, false) => String::new(),
     };
+    // Los índices a pintar se calculan ANTES del título porque el título los
+    // necesita: la antigüedad que se anuncia tiene que ser la de las filas
+    // que se enseñan, no la del buffer entero (ver `antiguedad_visible`).
+    let visibles = visible_request_indices(&app.recent_requests, filter.as_ref());
+
+    // Antigüedad de lo último medido. Va en el título y no en una celda
+    // porque es una propiedad del PANEL entero, no de una fila: contesta
+    // "¿esto está pasando ahora?" antes de que te pongas a leer números.
+    let edad = antiguedad_visible(
+        &app.recent_requests,
+        &visibles,
+        chrono::Utc::now().timestamp(),
+    )
+    .map(|e| format!(" · última {e} "))
+    .unwrap_or_else(|| " ".to_string());
     let block = Block::default().borders(Borders::ALL).title(format!(
-        " requests recientes · vista:{} · {}{} ",
+        " requests recientes · vista:{} · {}{}{}",
         app.requests_view.label(),
         app.requests_status,
-        filter_label
+        filter_label,
+        edad
     ));
     let inner = block.inner(area);
     lienzo.pinta(block, area);
@@ -3262,7 +3293,7 @@ fn draw_requests_panel(lienzo: &mut Buffer, area: Rect, app: &App) {
         // el filtro (`f`) está puesto. `classify_outliers` se calculó sobre
         // el orden y el conjunto originales para que las estadísticas del
         // grupo no cambien — ver [`visible_request_indices`].
-        let mut indexed = visible_request_indices(&app.recent_requests, filter.as_ref());
+        let mut indexed = visibles.clone();
 
         // La tabla reserva su propia primera fila para el header.
         let capacity = (table_area.height - 1) as usize;
@@ -3869,18 +3900,79 @@ fn flattened_cell(r: &RequestRow) -> String {
     }
 }
 
-/// Extrae `HH:MM:SS` (UTC) de un timestamp RFC3339. Si el timestamp no
-/// parsea (dato corrupto o formato inesperado), devuelve el string crudo tal
-/// cual llegó: mejor mostrar el dato raro que ocultarlo con un placeholder
-/// engañoso.
+/// Extrae `HH:MM:SS` de un timestamp RFC3339, **en la zona horaria de esta
+/// máquina**.
+///
+/// El proxy sella en UTC y antes esta columna lo pintaba tal cual. En
+/// cualquier zona que no sea UTC eso hacía que un dato de hace treinta
+/// segundos se leyera con horas de retraso: en CEST (UTC+2), una petición
+/// recién medida salía como `20:06` con el reloj del usuario marcando
+/// `22:07`. **Un desfase de zona horaria y un panel congelado se ven
+/// exactamente igual**, y no había forma de distinguirlos desde la pantalla.
+///
+/// El monitor mira la máquina que tienes delante, así que la referencia es la
+/// hora de esa máquina. La conversión es real (`with_timezone`), no un
+/// recorte del string: un timestamp que ya venga con desplazamiento cae en el
+/// mismo instante que su equivalente en `Z`.
+///
+/// Convertir la hora NO basta por sí solo —`18:20` con el reloj en `22:07`
+/// sigue sin gritar que eso es de hace casi cuatro horas—, y por eso el panel
+/// enseña además la antigüedad explícita (ver [`antiguedad_visible`]).
+///
+/// Si el timestamp no parsea (dato corrupto o formato inesperado), devuelve
+/// el string crudo tal cual llegó: mejor mostrar el dato raro que ocultarlo
+/// con un placeholder engañoso.
 fn format_time(timestamp: &str) -> String {
     match chrono::DateTime::parse_from_rfc3339(timestamp) {
         Ok(dt) => dt
-            .with_timezone(&chrono::Utc)
+            .with_timezone(&chrono::Local)
             .format("%H:%M:%S")
             .to_string(),
         Err(_) => timestamp.to_string(),
     }
+}
+
+/// Cuánto hace de `timestamp` respecto de `ahora` (segundos epoch), en texto
+/// legible. `None` si el timestamp no parsea — no se inventa una antigüedad
+/// para un dato que no se entiende.
+///
+/// La escala cambia con la magnitud a propósito: `hace 45s` y `hace 3h 47m`
+/// responden a preguntas distintas, y `hace 13620s` no responde a ninguna.
+///
+/// Un timestamp del FUTURO (relojes desincronizados entre el proxy y el
+/// monitor) se trata como "ahora mismo", no como una antigüedad negativa ni
+/// como un número enorme por desbordamiento del `u64`.
+fn antiguedad(timestamp: &str, ahora: i64) -> Option<String> {
+    let t = chrono::DateTime::parse_from_rfc3339(timestamp)
+        .ok()?
+        .timestamp();
+    let segundos = (ahora - t).max(0);
+    Some(if segundos < 60 {
+        format!("hace {segundos}s")
+    } else if segundos < 3600 {
+        format!("hace {}m", segundos / 60)
+    } else {
+        format!("hace {}h {}m", segundos / 3600, (segundos % 3600) / 60)
+    })
+}
+
+/// Antigüedad de la petición más reciente de las que el panel PINTA.
+///
+/// Es la cifra que responde a la única pregunta que importa mirando un panel
+/// en vivo: **¿esto está pasando ahora?**. Sin ella, un buffer con datos de
+/// hace tres horas y un buffer al día se ven idénticos, y la conclusión
+/// natural —"se ha quedado pillado"— es la equivocada: el panel está
+/// diciendo la verdad, es el tráfico el que paró.
+///
+/// `visibles` son los índices ya filtrados y en orden de pintado (más
+/// reciente primero, ver [`visible_request_indices`]), así que la antigüedad
+/// sale del PRIMERO. Que siga al filtro no es un detalle: con `f` puesto en
+/// un modelo callado, la última petición del buffer puede ser de otro modelo
+/// y mucho más nueva que todo lo que se está enseñando. Un título que hablara
+/// del buffer entero describiría filas que no estás viendo — exactamente la
+/// clase de desajuste que este panel existe para eliminar.
+fn antiguedad_visible(rows: &[RequestRow], visibles: &[usize], ahora: i64) -> Option<String> {
+    antiguedad(&rows.get(*visibles.first()?)?.timestamp, ahora)
 }
 
 /// Máximo de caracteres para el nombre de modelo en la columna de la tabla,
@@ -7577,6 +7669,136 @@ mod tests {
     // Scroll global de la pantalla (lienzo + ventana)
     // -----------------------------------------------------------------
 
+    // -----------------------------------------------------------------
+    // Hora local y antigüedad de la última petición
+    // -----------------------------------------------------------------
+
+    /// El monitor mira la máquina que tienes delante, así que la hora es la
+    /// de esa máquina. Pintar UTC en crudo hacía que un dato de hace treinta
+    /// segundos se leyera con dos horas de retraso en CEST — indistinguible
+    /// de un panel congelado.
+    #[test]
+    fn format_time_pinta_en_la_zona_local_no_en_utc() {
+        // Instante fijo en UTC; el esperado se deriva de la zona de la
+        // máquina que corre el test, no de una constante: el test tiene que
+        // pasar igual en CEST, en UTC y en un CI en cualquier sitio.
+        let esperado = chrono::DateTime::parse_from_rfc3339("2024-06-01T16:20:09Z")
+            .unwrap()
+            .with_timezone(&chrono::Local)
+            .format("%H:%M:%S")
+            .to_string();
+
+        assert_eq!(format_time("2024-06-01T16:20:09Z"), esperado);
+    }
+
+    /// Un timestamp que ya viene con desplazamiento tiene que caer en el
+    /// mismo instante que su equivalente en Z: se convierte, no se recorta.
+    #[test]
+    fn format_time_convierte_en_vez_de_recortar_el_string() {
+        assert_eq!(
+            format_time("2024-06-01T18:20:09+02:00"),
+            format_time("2024-06-01T16:20:09Z"),
+            "el mismo instante tiene que pintarse igual venga como venga"
+        );
+    }
+
+    #[test]
+    fn format_time_devuelve_el_crudo_si_no_parsea() {
+        assert_eq!(format_time("no-es-una-fecha"), "no-es-una-fecha");
+    }
+
+    /// La antigüedad es lo que de verdad responde a "¿esto está vivo?".
+    /// Pasar la hora a local quita el desfase falso, pero `18:20` con el
+    /// reloj en `22:07` sigue sin gritar que eso es de hace casi cuatro
+    /// horas.
+    #[test]
+    fn la_antiguedad_se_lee_en_la_escala_que_toca() {
+        let base = chrono::DateTime::parse_from_rfc3339("2024-06-01T20:07:00Z")
+            .unwrap()
+            .timestamp();
+        let hace = |segundos: i64| {
+            let t = chrono::DateTime::from_timestamp(base - segundos, 0)
+                .unwrap()
+                .to_rfc3339();
+            antiguedad(&t, base)
+        };
+
+        assert_eq!(hace(0).as_deref(), Some("hace 0s"));
+        assert_eq!(hace(45).as_deref(), Some("hace 45s"));
+        assert_eq!(hace(90).as_deref(), Some("hace 1m"));
+        assert_eq!(hace(60 * 59).as_deref(), Some("hace 59m"));
+        assert_eq!(hace(60 * 60).as_deref(), Some("hace 1h 0m"));
+        // El caso real que disparó todo esto.
+        assert_eq!(hace(3 * 3600 + 47 * 60).as_deref(), Some("hace 3h 47m"));
+    }
+
+    /// Un timestamp del futuro (relojes desincronizados entre proxy y
+    /// monitor) NO se convierte en una antigüedad negativa ni en un número
+    /// enorme por desbordamiento: se dice que es de ahora.
+    #[test]
+    fn un_timestamp_del_futuro_no_produce_antiguedad_negativa() {
+        let base = chrono::DateTime::parse_from_rfc3339("2024-06-01T20:07:00Z")
+            .unwrap()
+            .timestamp();
+        let futuro = chrono::DateTime::from_timestamp(base + 300, 0)
+            .unwrap()
+            .to_rfc3339();
+        assert_eq!(antiguedad(&futuro, base).as_deref(), Some("hace 0s"));
+    }
+
+    #[test]
+    fn sin_timestamp_parseable_no_se_inventa_antiguedad() {
+        assert_eq!(antiguedad("no-es-una-fecha", 0), None);
+    }
+
+    /// La antigüedad sale de la fila más reciente de las que SE PINTAN, y
+    /// `visible_request_indices` las entrega con esa primero.
+    #[test]
+    fn la_antiguedad_sale_de_la_fila_mas_reciente_visible() {
+        let mut vieja = req_de("ollama", "llama3.2:3b");
+        vieja.timestamp = "2024-06-01T16:20:09Z".to_string();
+        let mut nueva = req_de("codex", "gpt-5.5");
+        nueva.timestamp = "2024-06-01T17:41:35Z".to_string();
+        let rows = vec![vieja, nueva];
+
+        let base = chrono::DateTime::parse_from_rfc3339("2024-06-01T20:07:00Z")
+            .unwrap()
+            .timestamp();
+
+        let todas = visible_request_indices(&rows, None);
+        assert_eq!(
+            antiguedad_visible(&rows, &todas, base).as_deref(),
+            Some("hace 2h 25m"),
+            "sin filtro manda la última del buffer"
+        );
+        assert_eq!(antiguedad_visible(&rows, &[], base), None);
+    }
+
+    /// EL DESAJUSTE QUE ESTO EVITA: con el filtro puesto en un modelo callado,
+    /// la última petición del buffer es de OTRO modelo y mucho más nueva que
+    /// todo lo que se enseña. Anunciar la del buffer describiría filas que no
+    /// estás viendo — el caso real que disparó este slice.
+    #[test]
+    fn con_filtro_la_antiguedad_habla_de_las_filas_enseñadas() {
+        let mut llama = req_de("ollama", "llama3.2:3b");
+        llama.timestamp = "2024-06-01T16:20:09Z".to_string();
+        let mut codex = req_de("codex", "gpt-5.5");
+        codex.timestamp = "2024-06-01T17:41:35Z".to_string();
+        let rows = vec![llama, codex];
+
+        let base = chrono::DateTime::parse_from_rfc3339("2024-06-01T20:07:00Z")
+            .unwrap()
+            .timestamp();
+
+        let key = ("ollama".to_string(), "llama3.2:3b".to_string());
+        let solo_llama = visible_request_indices(&rows, Some(&key));
+        assert_eq!(
+            antiguedad_visible(&rows, &solo_llama, base).as_deref(),
+            Some("hace 3h 46m"),
+            "con el filtro puesto manda la última de ESE modelo, no la del buffer"
+        );
+    }
+
     /// El header pinta DOS líneas de texto; con `Length(3)` los bordes se
     /// comían la segunda y el estado del poll no se veía nunca.
     #[test]
@@ -7634,16 +7856,8 @@ mod tests {
     #[test]
     fn con_desbordamiento_el_tope_es_lo_que_sobresale() {
         assert_eq!(tope_del_scroll(63, 33), 30);
-        assert!(
-            indicador_de_scroll(0, 63, 33)
-                .unwrap()
-                .contains("33/63 lín.")
-        );
-        assert!(
-            indicador_de_scroll(30, 63, 33)
-                .unwrap()
-                .contains("63/63 lín.")
-        );
+        assert!(indicador_de_scroll(0, 63, 33).unwrap().contains("33/63 ("));
+        assert!(indicador_de_scroll(30, 63, 33).unwrap().contains("63/63 ("));
     }
 
     /// El clamp vive en el dibujado: pulsar `Fin` pide un salto enorme y la
