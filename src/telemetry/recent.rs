@@ -54,9 +54,11 @@
 //! tanto por `GET /requests` como al `telemetry.jsonl` en texto plano. Léase
 //! `docs/telemetry-per-request.md` §4.3 antes de exponer este endpoint fuera de
 //! localhost.
-use crate::provider::{InstructionsBlock, SkillsBlock, ToolCalls, ToolSearchSignal, ToolServerBytes};
+use crate::provider::{
+    InstructionsBlock, SkillsBlock, ToolCalls, ToolSearchSignal, ToolServerBytes,
+};
 use crate::telemetry::logger::RequestMetric;
-use crate::telemetry::{CacheBySection, SectionShare, CodexQuota, SessionAttribution};
+use crate::telemetry::{CacheBySection, CodexQuota, SectionShare, SessionAttribution};
 use serde::Serialize;
 use std::collections::VecDeque;
 
@@ -674,7 +676,10 @@ mod tests {
         assert_eq!(parsed["codex_quota"]["secondary_window_minutes"], 10080);
         assert_eq!(parsed["codex_quota"]["primary_reset_after_seconds"], 1800);
         assert_eq!(parsed["codex_quota"]["primary_reset_at"], 1_732_000_000i64);
-        assert_eq!(parsed["codex_quota"]["secondary_reset_at"], 1_732_600_000i64);
+        assert_eq!(
+            parsed["codex_quota"]["secondary_reset_at"],
+            1_732_600_000i64
+        );
         assert_eq!(parsed["codex_quota"]["credits_has_credits"], false);
         assert_eq!(parsed["codex_quota"]["credits_unlimited"], false);
     }
@@ -830,7 +835,10 @@ mod tests {
         let mut recent = RecentRequests::default();
         recent.ingest(&m);
         let row = &recent.snapshot()[0];
-        assert_eq!(row.tool_search, m.tool_search, "la proyección copia el campo");
+        assert_eq!(
+            row.tool_search, m.tool_search,
+            "la proyección copia el campo"
+        );
 
         let json = serde_json::to_string(row).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -850,7 +858,11 @@ mod tests {
         let mut recent = RecentRequests::default();
         recent.ingest(&m);
         let row = &recent.snapshot()[0];
-        assert_eq!(row.tools_flattened, Some(true), "la proyección copia el campo");
+        assert_eq!(
+            row.tools_flattened,
+            Some(true),
+            "la proyección copia el campo"
+        );
 
         let json = serde_json::to_string(row).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();

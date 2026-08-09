@@ -6,8 +6,8 @@
 //! plugin de OpenCode la usa para decidir en caliente si redirige tráfico de
 //! Codex hacia acá antes de tocar nada más pesado.
 use axum::{
-    response::{IntoResponse, Response},
     Json,
+    response::{IntoResponse, Response},
 };
 use serde_json::json;
 
@@ -21,7 +21,7 @@ pub async fn handle_health() -> Response {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::{header, StatusCode};
+    use axum::http::{StatusCode, header};
 
     #[tokio::test]
     async fn handle_health_responde_200_con_status_ok() {

@@ -29,7 +29,7 @@
 //!   BENCH_REPEATS    repeticiones por tamaño (default 3)
 //!   GEMINI_MODEL     modelo Gemini (default gemini-2.0-flash)
 //!   OPENAI_MODEL     modelo OpenAI (default gpt-4o-mini)
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::env;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -77,8 +77,8 @@ async fn main() {
             let prompt = build_prompt(size, run);
 
             if let Some(key) = &gemini_key {
-                let model = env::var("GEMINI_MODEL")
-                    .unwrap_or_else(|_| "gemini-2.0-flash".to_string());
+                let model =
+                    env::var("GEMINI_MODEL").unwrap_or_else(|_| "gemini-2.0-flash".to_string());
                 if let Err(e) = fire_gemini(&client, &base, key, &model, &prompt).await {
                     eprintln!("  gemini size={size} run={run}: {e}");
                 } else {
@@ -86,8 +86,7 @@ async fn main() {
                 }
             }
             if let Some(key) = &openai_key {
-                let model =
-                    env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+                let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
                 if let Err(e) = fire_openai(&client, &base, key, &model, &prompt).await {
                     eprintln!("  openai size={size} run={run}: {e}");
                 } else {
@@ -130,8 +129,7 @@ async fn fire_gemini(
     model: &str,
     prompt: &str,
 ) -> Result<(), String> {
-    let url =
-        format!("{base}/v1beta/models/{model}:streamGenerateContent?alt=sse&key={key}");
+    let url = format!("{base}/v1beta/models/{model}:streamGenerateContent?alt=sse&key={key}");
     // `thinkingBudget: 0` desactiva el "thinking" (modelos 2.5+). Sin esto, con
     // un output chico el modelo gasta todo el presupuesto pensando y devuelve un
     // cuerpo VACÍO (sin usage) — contaminaría la barrida de tamaño de input.
@@ -212,8 +210,7 @@ fn report(path: &PathBuf, skip: usize) {
         let group: Vec<&Value> = rows
             .iter()
             .filter(|r| {
-                r["upstream"].as_str() == Some(up)
-                    && r["prompt_bytes"].as_u64() == Some(*pb as u64)
+                r["upstream"].as_str() == Some(up) && r["prompt_bytes"].as_u64() == Some(*pb as u64)
             })
             .collect();
         let n = group.len();

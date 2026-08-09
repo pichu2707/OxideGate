@@ -1,0 +1,61 @@
+name: CI
+
+# Se verifica en los PR y tambien en los push a `main`. Solo con PR
+# bastaria para el flujo normal, pero `main` recibe merge commits y un
+# merge limpio de dos ramas verdes puede dar un arbol rojo: cada rama se
+# verifico contra un `main` anterior, no contra la otra.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Un push nuevo cancela la ejecucion anterior de la misma rama. El unico
+# veredicto que importa es el del ultimo commit; seguir gastando minutos
+# en un estado que ya nadie va a mergear no informa de nada.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # `fmt` va en su propio job a proposito. Encadenado antes de los tests
+  # seria fail-fast: un salto de linea mal puesto ocultaria un test roto,
+  # y habria que arreglar el formato para descubrir el fallo de verdad.
+  # Separado, cada PR recibe los dos veredictos a la vez.
+  #
+  # No necesita cache: rustfmt parsea, no compila.
+  formato:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - run: cargo fmt --check
+
+  # clippy y tests comparten job porque comparten compilacion: separarlos
+  # duplicaria el build entero para ganar un matiz de diagnostico que el
+  # log ya da igual de claro.
+  verificacion:
+    name: clippy + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `-D warnings` convierte cada aviso en error. El repo ya esta en
+      # cero, y ese es justo el momento de poner el liston: mantenerlo en
+      # cero es gratis, volver a cero desde cincuenta no lo es.
+      - run: cargo clippy --all-targets -- -D warnings
+
+      - run: cargo test

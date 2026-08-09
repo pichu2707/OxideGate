@@ -45,7 +45,9 @@
 //!             (uso de cuota); INDEPENDIENTE de `p`/`c`/`s`
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -184,7 +186,11 @@ fn resolve_requests_url(stats_url: &str) -> String {
 /// misma. Separarla así permite testear las tres ramas de precedencia sin
 /// mutar `std::env` (que es estado global del proceso y correría en carrera
 /// con otros tests ejecutados en paralelo).
-fn resolve_requests_url_inner(stats_url: &str, requests_url_env: Option<String>, port_env: Option<String>) -> String {
+fn resolve_requests_url_inner(
+    stats_url: &str,
+    requests_url_env: Option<String>,
+    port_env: Option<String>,
+) -> String {
     if let Some(url) = requests_url_env {
         return url;
     }
@@ -224,7 +230,10 @@ fn run_once(url: &str, requests_url: &str) {
             println!("(sin filas todavía en {url} — el proxy está arriba pero sin tráfico)");
         }
         Ok(rows) => {
-            println!("{:<10} {:<20} {:>6} {:>8} {:>9} {:>10} {:>8}", "PROVEEDOR", "MODELO", "REQ", "tok/s", "TTFT ms", "coste $", "err%");
+            println!(
+                "{:<10} {:<20} {:>6} {:>8} {:>9} {:>10} {:>8}",
+                "PROVEEDOR", "MODELO", "REQ", "tok/s", "TTFT ms", "coste $", "err%"
+            );
             for r in &rows {
                 println!(
                     "{:<10} {:<20} {:>6} {:>8.1} {:>9.1} {:>10.4} {:>7.1}%",
@@ -270,7 +279,9 @@ fn run_once(url: &str, requests_url: &str) {
             print_sessions_table(url);
         }
         Err(e) => {
-            println!("/requests no disponible en {requests_url} ({e}) — puede ser una build del proxy anterior a este endpoint");
+            println!(
+                "/requests no disponible en {requests_url} ({e}) — puede ser una build del proxy anterior a este endpoint"
+            );
         }
     }
 }
@@ -486,7 +497,6 @@ struct RequestRow {
     /// del panel de cuota (tecla `u`, ver [`find_quota_source_row`]).
     codex_quota: Option<CodexQuotaRow>,
 }
-
 
 /// Fila de `GET /sessions`: espejo local y liviano de `SessionStatsRow`.
 ///
@@ -718,7 +728,10 @@ struct CodexQuotaRow {
 
 /// Hace el GET a `/requests` y parsea el array de filas (orden cronológico,
 /// más viejo primero — igual que lo entrega el buffer del proxy).
-fn fetch_requests(client: &reqwest::blocking::Client, url: &str) -> Result<Vec<RequestRow>, String> {
+fn fetch_requests(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<Vec<RequestRow>, String> {
     let resp = client.get(url).send().map_err(|e| e.to_string())?;
     if !resp.status().is_success() {
         return Err(format!("status {}", resp.status()));
@@ -856,11 +869,7 @@ fn generation_throughput(output_tokens: u64, total_ms: f64, ttft_ms: f64) -> Opt
         return None;
     }
     let value = output_tokens as f64 / (gen_ms / 1000.0);
-    if value.is_finite() {
-        Some(value)
-    } else {
-        None
-    }
+    if value.is_finite() { Some(value) } else { None }
 }
 
 /// Total de tokens de "prompt" (contexto enviado al proveedor) de una fila,
@@ -930,11 +939,7 @@ fn bytes_per_token(row: &RequestRow) -> Option<f64> {
 fn gen_ms_of(r: &RequestRow) -> Option<f64> {
     let ttft = r.ttft_ms?;
     let gen_ms = r.total_ms - ttft;
-    if gen_ms > 0.0 {
-        Some(gen_ms)
-    } else {
-        None
-    }
+    if gen_ms > 0.0 { Some(gen_ms) } else { None }
 }
 
 /// Clasifica cada fila de `rows` respecto a la distribución de su mismo
@@ -955,7 +960,10 @@ fn classify_outliers(rows: &[RequestRow]) -> Vec<Vec<OutlierKind>> {
     // sus pares del mismo proveedor+modelo, nunca contra el resto.
     let mut groups: HashMap<(String, Option<String>), Vec<usize>> = HashMap::new();
     for (i, r) in rows.iter().enumerate() {
-        groups.entry((r.upstream.clone(), r.model.clone())).or_default().push(i);
+        groups
+            .entry((r.upstream.clone(), r.model.clone()))
+            .or_default()
+            .push(i);
     }
 
     for indices in groups.values() {
@@ -1013,8 +1021,12 @@ fn classify_truncation(rows: &[RequestRow], indices: &[usize], result: &mut [Vec
     // token_total -> [(índice de fila, bytes medidos), ...]
     let mut by_token: HashMap<u64, Vec<(usize, usize)>> = HashMap::new();
     for &i in indices {
-        let Some(tokens) = prompt_tokens_total(&rows[i]) else { continue };
-        let Some(bytes) = rows[i].context_measured_bytes else { continue };
+        let Some(tokens) = prompt_tokens_total(&rows[i]) else {
+            continue;
+        };
+        let Some(bytes) = rows[i].context_measured_bytes else {
+            continue;
+        };
         by_token.entry(tokens).or_default().push((i, bytes));
     }
 
@@ -1026,8 +1038,16 @@ fn classify_truncation(rows: &[RequestRow], indices: &[usize], result: &mut [Vec
             continue;
         }
 
-        let min_bytes = samples.iter().map(|(_, b)| *b).min().expect("samples no está vacío (len >= 2)");
-        let max_bytes = samples.iter().map(|(_, b)| *b).max().expect("samples no está vacío (len >= 2)");
+        let min_bytes = samples
+            .iter()
+            .map(|(_, b)| *b)
+            .min()
+            .expect("samples no está vacío (len >= 2)");
+        let max_bytes = samples
+            .iter()
+            .map(|(_, b)| *b)
+            .max()
+            .expect("samples no está vacío (len >= 2)");
         if max_bytes == 0 {
             continue;
         }
@@ -1046,7 +1066,11 @@ fn classify_truncation(rows: &[RequestRow], indices: &[usize], result: &mut [Vec
 /// media. Filas sin `ttft_ms` se excluyen de la media Y no pueden flaggearse
 /// (no hay dato con qué compararlas).
 fn classify_slow_ttft(rows: &[RequestRow], indices: &[usize], result: &mut [Vec<OutlierKind>]) {
-    let values: Vec<f64> = indices.iter().filter_map(|&i| rows[i].ttft_ms).filter(|v| v.is_finite()).collect();
+    let values: Vec<f64> = indices
+        .iter()
+        .filter_map(|&i| rows[i].ttft_ms)
+        .filter(|v| v.is_finite())
+        .collect();
 
     if values.len() < MIN_GROUP_SAMPLE {
         return;
@@ -1076,7 +1100,11 @@ fn classify_slow_ttft(rows: &[RequestRow], indices: &[usize], result: &mut [Vec<
 /// de la media. Filas sin throughput calculable (ver
 /// [`generation_throughput`]) se excluyen de la media Y no pueden
 /// flaggearse.
-fn classify_slow_generation(rows: &[RequestRow], indices: &[usize], result: &mut [Vec<OutlierKind>]) {
+fn classify_slow_generation(
+    rows: &[RequestRow],
+    indices: &[usize],
+    result: &mut [Vec<OutlierKind>],
+) {
     let samples: Vec<(usize, f64)> = indices
         .iter()
         .filter_map(|&i| {
@@ -1117,7 +1145,10 @@ fn classify_cache_miss(rows: &[RequestRow], indices: &[usize], result: &mut [Vec
             continue;
         }
 
-        let hits = others.iter().filter(|&&j| rows[j].cache_read_tokens.is_some_and(|v| v > 0)).count();
+        let hits = others
+            .iter()
+            .filter(|&&j| rows[j].cache_read_tokens.is_some_and(|v| v > 0))
+            .count();
         let hit_ratio = hits as f64 / others.len() as f64;
         let this_is_miss = rows[i].cache_read_tokens.is_none_or(|v| v == 0);
 
@@ -1227,12 +1258,20 @@ struct WindowDelta {
 /// proxy entre el baseline y el poll actual podría hacerlos retroceder; en
 /// ese caso el delta cae a 0 en vez de underflow-ear) y deriva las tasas de
 /// la ventana con las funciones puras de arriba.
-fn compute_window_delta(baseline: &RawCounters, current: &RawCounters, elapsed_secs: f64) -> WindowDelta {
+fn compute_window_delta(
+    baseline: &RawCounters,
+    current: &RawCounters,
+    elapsed_secs: f64,
+) -> WindowDelta {
     let d_requests = current.requests.saturating_sub(baseline.requests);
     let d_output_tokens = current.output_tokens.saturating_sub(baseline.output_tokens);
     let d_input_tokens = current.input_tokens.saturating_sub(baseline.input_tokens);
-    let d_cache_read = current.cache_read_tokens.saturating_sub(baseline.cache_read_tokens);
-    let d_cache_write = current.cache_write_tokens.saturating_sub(baseline.cache_write_tokens);
+    let d_cache_read = current
+        .cache_read_tokens
+        .saturating_sub(baseline.cache_read_tokens);
+    let d_cache_write = current
+        .cache_write_tokens
+        .saturating_sub(baseline.cache_write_tokens);
     let d_cost_usd = (current.cost_usd - baseline.cost_usd).max(0.0);
     let d_ttft_sum = (current.ttft_ms_sum - baseline.ttft_ms_sum).max(0.0);
     let d_ttft_count = current.ttft_ms_count.saturating_sub(baseline.ttft_ms_count);
@@ -1265,7 +1304,9 @@ fn compute_window_delta(baseline: &RawCounters, current: &RawCounters, elapsed_s
 /// "sin dato en absoluto". Se sigue buscando hacia atrás hasta encontrar una
 /// fila con datos reales, o se agota el buffer y se devuelve `None`.
 fn find_tools_source_row(rows: &[RequestRow]) -> Option<&RequestRow> {
-    rows.iter().rev().find(|r| r.tools_by_server.as_ref().is_some_and(|v| !v.is_empty()))
+    rows.iter()
+        .rev()
+        .find(|r| r.tools_by_server.as_ref().is_some_and(|v| !v.is_empty()))
 }
 
 /// Fila de un servidor ya combinada con su delta contra el baseline (o sin
@@ -1322,11 +1363,15 @@ struct ServerDiffRow {
 /// pesaba se lista primero — es la fila que más le importa al usuario) y, en
 /// empate, por nombre de servidor (para que el orden sea determinístico
 /// entre corridas).
-fn diff_against_baseline(current: &[ToolServerRow], baseline: Option<&BTreeMap<String, usize>>) -> Vec<ServerDiffRow> {
+fn diff_against_baseline(
+    current: &[ToolServerRow],
+    baseline: Option<&BTreeMap<String, usize>>,
+) -> Vec<ServerDiffRow> {
     let mut result: Vec<ServerDiffRow> = current
         .iter()
         .map(|row| {
-            let delta = baseline.map(|b| row.bytes as i64 - *b.get(&row.server).unwrap_or(&0) as i64);
+            let delta =
+                baseline.map(|b| row.bytes as i64 - *b.get(&row.server).unwrap_or(&0) as i64);
             ServerDiffRow {
                 server: row.server.clone(),
                 kind: row.kind.clone(),
@@ -1339,8 +1384,10 @@ fn diff_against_baseline(current: &[ToolServerRow], baseline: Option<&BTreeMap<S
         .collect();
 
     if let Some(baseline) = baseline {
-        let mut disappeared: Vec<(&String, &usize)> =
-            baseline.iter().filter(|(name, _)| !current.iter().any(|r| &r.server == *name)).collect();
+        let mut disappeared: Vec<(&String, &usize)> = baseline
+            .iter()
+            .filter(|(name, _)| !current.iter().any(|r| &r.server == *name))
+            .collect();
         disappeared.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
 
         for (name, bytes) in disappeared {
@@ -1450,7 +1497,11 @@ const QUOTA_BAR_WIDTH: usize = 14;
 fn quota_bar(percent: u64) -> String {
     let clamped = percent.min(100) as usize;
     let filled = clamped * QUOTA_BAR_WIDTH / 100;
-    format!("{}{}", "█".repeat(filled), "·".repeat(QUOTA_BAR_WIDTH - filled))
+    format!(
+        "{}{}",
+        "█".repeat(filled),
+        "·".repeat(QUOTA_BAR_WIDTH - filled)
+    )
 }
 
 /// Segundos restantes hasta el reset de la ventana primaria, con la
@@ -1472,7 +1523,9 @@ fn quota_reset_remaining(quota: &CodexQuotaRow, source_timestamp: &str, now: i64
         return reset_at.checked_sub(now);
     }
     let after = quota.primary_reset_after_seconds?;
-    let base = chrono::DateTime::parse_from_rfc3339(source_timestamp).ok()?.timestamp();
+    let base = chrono::DateTime::parse_from_rfc3339(source_timestamp)
+        .ok()?
+        .timestamp();
     base.checked_add(after as i64)?.checked_sub(now)
 }
 
@@ -1482,7 +1535,9 @@ fn quota_reset_remaining(quota: &CodexQuotaRow, source_timestamp: &str, now: i64
 /// inminente, nunca un contador negativo). `None` ⇒ `"—"`, sin countdown
 /// fabricado.
 fn format_reset_countdown(remaining: Option<i64>) -> String {
-    let Some(remaining) = remaining else { return "—".to_string() };
+    let Some(remaining) = remaining else {
+        return "—".to_string();
+    };
     if remaining <= 0 {
         return "resetea ahora".to_string();
     }
@@ -1520,8 +1575,14 @@ fn quota_lines(quota: &CodexQuotaRow, source_timestamp: &str, now: i64) -> Vec<S
 
     match quota.primary_used_percent {
         Some(pct) => {
-            let window = quota.primary_window_minutes.map(|m| format!("{m}m")).unwrap_or_else(|| "—".to_string());
-            lines.push(format!("primaria: {} {pct}% · ventana {window}", quota_bar(pct)));
+            let window = quota
+                .primary_window_minutes
+                .map(|m| format!("{m}m"))
+                .unwrap_or_else(|| "—".to_string());
+            lines.push(format!(
+                "primaria: {} {pct}% · ventana {window}",
+                quota_bar(pct)
+            ));
         }
         None => lines.push("primaria: —".to_string()),
     }
@@ -1529,20 +1590,33 @@ fn quota_lines(quota: &CodexQuotaRow, source_timestamp: &str, now: i64) -> Vec<S
     if quota.secondary_window_minutes.is_some_and(|m| m > 0) {
         match quota.secondary_used_percent {
             Some(pct) => {
-                let window = quota.secondary_window_minutes.map(|m| format!("{m}m")).unwrap_or_else(|| "—".to_string());
-                lines.push(format!("secundaria: {} {pct}% · ventana {window}", quota_bar(pct)));
+                let window = quota
+                    .secondary_window_minutes
+                    .map(|m| format!("{m}m"))
+                    .unwrap_or_else(|| "—".to_string());
+                lines.push(format!(
+                    "secundaria: {} {pct}% · ventana {window}",
+                    quota_bar(pct)
+                ));
             }
             None => lines.push("secundaria: —".to_string()),
         }
     }
 
-    lines.push(format_reset_countdown(quota_reset_remaining(quota, source_timestamp, now)));
+    lines.push(format_reset_countdown(quota_reset_remaining(
+        quota,
+        source_timestamp,
+        now,
+    )));
 
     if quota.credits_has_credits == Some(true) {
         if quota.credits_unlimited == Some(true) {
             lines.push("créditos: ilimitados".to_string());
         } else {
-            lines.push(format!("créditos: {}", quota.credits_balance.as_deref().unwrap_or("—")));
+            lines.push(format!(
+                "créditos: {}",
+                quota.credits_balance.as_deref().unwrap_or("—")
+            ));
         }
     }
 
@@ -1804,7 +1878,11 @@ impl App {
     /// de dejar cifras viejas que parecerían actuales.
     fn poll_sessions(&mut self, client: &reqwest::blocking::Client) {
         let url = self.sessions_url.clone();
-        match client.get(&url).send().and_then(|r| r.json::<SessionsPayload>()) {
+        match client
+            .get(&url)
+            .send()
+            .and_then(|r| r.json::<SessionsPayload>())
+        {
             Ok(p) => self.sessions = p,
             Err(_) => self.sessions = SessionsPayload::default(),
         }
@@ -1860,11 +1938,20 @@ impl App {
             by_key.insert(key_of(r), RawCounters::from_row(r));
         }
 
-        let tools_by_server = find_tools_source_row(&self.recent_requests).and_then(|r| r.tools_by_server.as_ref()).map(
-            |servers| servers.iter().map(|s| (s.server.clone(), s.bytes)).collect::<BTreeMap<_, _>>(),
-        );
+        let tools_by_server = find_tools_source_row(&self.recent_requests)
+            .and_then(|r| r.tools_by_server.as_ref())
+            .map(|servers| {
+                servers
+                    .iter()
+                    .map(|s| (s.server.clone(), s.bytes))
+                    .collect::<BTreeMap<_, _>>()
+            });
 
-        self.baseline = Some(Baseline { at: Instant::now(), by_key, tools_by_server });
+        self.baseline = Some(Baseline {
+            at: Instant::now(),
+            by_key,
+            tools_by_server,
+        });
     }
 
     fn reset_baseline(&mut self) {
@@ -1912,7 +1999,11 @@ impl App {
 // Loop principal
 // ---------------------------------------------------------------------------
 
-fn run_app(terminal: &mut Terminal<CrosstermBackend<Stdout>>, url: &str, requests_url: &str) -> io::Result<()> {
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    url: &str,
+    requests_url: &str,
+) -> io::Result<()> {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
@@ -2001,7 +2092,10 @@ fn ui(f: &mut Frame, app: &App) {
     }
     constraints.push(Constraint::Length(1)); // footer
 
-    let chunks = Layout::default().direction(Direction::Vertical).constraints(constraints).split(area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(area);
 
     draw_header(f, chunks[0], app);
     draw_table(f, chunks[1], app);
@@ -2036,7 +2130,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 
     let text = vec![
         Line::from(vec![
-            Span::styled("OxideGate · monitor en vivo", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "OxideGate · monitor en vivo",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::raw(&app.url),
         ]),
@@ -2047,12 +2144,23 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         ]),
     ];
 
-    f.render_widget(Paragraph::new(text).block(Block::default().borders(Borders::ALL)), area);
+    f.render_widget(
+        Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
+        area,
+    );
 }
 
 fn draw_table(f: &mut Frame, area: Rect, app: &App) {
-    let header = Row::new(vec!["MODELO", "REQ", "tok/s", "TTFT ms", "cache-hit", "coste $", "redun%"])
-        .style(Style::default().add_modifier(Modifier::BOLD));
+    let header = Row::new(vec![
+        "MODELO",
+        "REQ",
+        "tok/s",
+        "TTFT ms",
+        "cache-hit",
+        "coste $",
+        "redun%",
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
 
     let rows: Vec<Row> = app
         .latest
@@ -2087,15 +2195,19 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App) {
         Constraint::Percentage(12),
     ];
 
-    let table = Table::new(rows, widths)
-        .header(header)
-        .block(Block::default().borders(Borders::ALL).title(" modelos (total acumulado) "));
+    let table = Table::new(rows, widths).header(header).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" modelos (total acumulado) "),
+    );
 
     f.render_widget(table, area);
 }
 
 fn draw_before_after(f: &mut Frame, area: Rect, app: &App) {
-    let block = Block::default().borders(Borders::ALL).title(" ANTES/DESPUÉS (ventana desde baseline) ");
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" ANTES/DESPUÉS (ventana desde baseline) ");
 
     let text = match (app.selected_row(), app.selected_delta()) {
         (Some(row), Some(d)) => vec![
@@ -2112,7 +2224,9 @@ fn draw_before_after(f: &mut Frame, area: Rect, app: &App) {
                 d.error_rate * 100.0
             )),
         ],
-        (Some(_), None) => vec![Line::from("sin baseline (o el modelo no existía al marcarlo) — pulse 'b'")],
+        (Some(_), None) => vec![Line::from(
+            "sin baseline (o el modelo no existía al marcarlo) — pulse 'b'",
+        )],
         (None, _) => vec![Line::from("sin modelo seleccionado todavía")],
     };
 
@@ -2247,7 +2361,8 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
         // invertimos para mostrar MÁS NUEVO ARRIBA, que es como se lee un
         // panel de "últimos eventos". `classify_outliers` se calculó sobre
         // el orden original para que las estadísticas del grupo no cambien.
-        let mut indexed: Vec<(usize, &RequestRow)> = app.recent_requests.iter().enumerate().collect();
+        let mut indexed: Vec<(usize, &RequestRow)> =
+            app.recent_requests.iter().enumerate().collect();
         indexed.reverse();
 
         // La tabla reserva su propia primera fila para el header.
@@ -2308,7 +2423,9 @@ fn draw_tools_panel(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let Some(source) = find_tools_source_row(&app.recent_requests) else {
-        let block = Block::default().borders(Borders::ALL).title(" tools por servidor ");
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" tools por servidor ");
         let inner = block.inner(area);
         f.render_widget(block, area);
         if inner.height > 0 && inner.width > 0 {
@@ -2334,14 +2451,31 @@ fn draw_tools_panel(f: &mut Frame, area: Rect, app: &App) {
     // `find_tools_source_row` garantiza `Some` no vacío: este `expect` nunca
     // debería fallar, pero preferimos documentarlo explícitamente en vez de
     // un `unwrap()` mudo.
-    let servers = source.tools_by_server.as_ref().expect("find_tools_source_row garantiza tools_by_server Some no vacío");
-    let baseline_map = app.baseline.as_ref().and_then(|b| b.tools_by_server.as_ref());
+    let servers = source
+        .tools_by_server
+        .as_ref()
+        .expect("find_tools_source_row garantiza tools_by_server Some no vacío");
+    let baseline_map = app
+        .baseline
+        .as_ref()
+        .and_then(|b| b.tools_by_server.as_ref());
     let diffs = diff_against_baseline(servers, baseline_map);
 
-    let header = Row::new(vec!["servidor", "kind", "tools", "deferred", "bytes", "% tools", "Δ baseline"])
-        .style(Style::default().add_modifier(Modifier::BOLD));
+    let header = Row::new(vec![
+        "servidor",
+        "kind",
+        "tools",
+        "deferred",
+        "bytes",
+        "% tools",
+        "Δ baseline",
+    ])
+    .style(Style::default().add_modifier(Modifier::BOLD));
 
-    let mut rows: Vec<Row> = diffs.iter().map(|d| Row::new(tools_row_cells(d, source.context_tools_bytes))).collect();
+    let mut rows: Vec<Row> = diffs
+        .iter()
+        .map(|d| Row::new(tools_row_cells(d, source.context_tools_bytes)))
+        .collect();
 
     // Separador visual antes de las filas de resumen: distingue "detalle por
     // servidor" de "totales de la petición completa".
@@ -2408,7 +2542,9 @@ fn draw_quota_panel(f: &mut Frame, area: Rect, app: &App) {
     }
 
     let Some(source) = find_quota_source_row(&app.recent_requests) else {
-        let block = Block::default().borders(Borders::ALL).title(" cuota codex ");
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" cuota codex ");
         let inner = block.inner(area);
         f.render_widget(block, area);
         if inner.height > 0 && inner.width > 0 {
@@ -2423,9 +2559,15 @@ fn draw_quota_panel(f: &mut Frame, area: Rect, app: &App) {
     // `find_quota_source_row` garantiza `codex_quota` Some: este `expect`
     // nunca debería fallar, pero preferimos documentarlo explícitamente en
     // vez de un `unwrap()` mudo.
-    let quota = source.codex_quota.as_ref().expect("find_quota_source_row garantiza codex_quota Some");
+    let quota = source
+        .codex_quota
+        .as_ref()
+        .expect("find_quota_source_row garantiza codex_quota Some");
     let now = chrono::Utc::now().timestamp();
-    let lines: Vec<Line> = quota_lines(quota, &source.timestamp, now).into_iter().map(Line::from).collect();
+    let lines: Vec<Line> = quota_lines(quota, &source.timestamp, now)
+        .into_iter()
+        .map(Line::from)
+        .collect();
 
     let block = Block::default().borders(Borders::ALL).title(format!(
         " cuota codex · fuente {} {} ",
@@ -2441,19 +2583,34 @@ fn requests_table_header<'a>(view: RequestsView) -> Row<'a> {
     let labels: Vec<&'a str> = match view {
         RequestsView::Latency => {
             vec![
-                "hora", "modelo", "st", "status", "in", "out", "c_rd", "c_wr", "ttft_ms", "gen_ms", "tok/s", "effort", "spd_req",
-                "spd_got", "usd", "outlier",
+                "hora", "modelo", "st", "status", "in", "out", "c_rd", "c_wr", "ttft_ms", "gen_ms",
+                "tok/s", "effort", "spd_req", "spd_got", "usd", "outlier",
             ]
         }
         RequestsView::Context => {
             vec![
-                "hora", "modelo", "msgs", "tools", "history", "system", "last_turn", "other", "total", "tax%", "B/tok", "prep_us",
-                "cliente", "tsearch", "flat", "outlier",
+                "hora",
+                "modelo",
+                "msgs",
+                "tools",
+                "history",
+                "system",
+                "last_turn",
+                "other",
+                "total",
+                "tax%",
+                "B/tok",
+                "prep_us",
+                "cliente",
+                "tsearch",
+                "flat",
+                "outlier",
             ]
         }
         RequestsView::Cache => {
             vec![
-                "hora", "modelo", "total", "cch%", "tools%", "hist%", "lt$", "$tools", "$hist", "$lt", "outlier",
+                "hora", "modelo", "total", "cch%", "tools%", "hist%", "lt$", "$tools", "$hist",
+                "$lt", "outlier",
             ]
         }
     };
@@ -2673,7 +2830,10 @@ fn flattened_cell(r: &RequestRow) -> String {
 /// engañoso.
 fn format_time(timestamp: &str) -> String {
     match chrono::DateTime::parse_from_rfc3339(timestamp) {
-        Ok(dt) => dt.with_timezone(&chrono::Utc).format("%H:%M:%S").to_string(),
+        Ok(dt) => dt
+            .with_timezone(&chrono::Utc)
+            .format("%H:%M:%S")
+            .to_string(),
         Err(_) => timestamp.to_string(),
     }
 }
@@ -2690,7 +2850,10 @@ fn truncate_model(model: Option<&str>) -> String {
         None => "-".to_string(),
         Some(m) if m.chars().count() <= MODEL_DISPLAY_MAX => m.to_string(),
         Some(m) => {
-            let head: String = m.chars().take(MODEL_DISPLAY_MAX.saturating_sub(1)).collect();
+            let head: String = m
+                .chars()
+                .take(MODEL_DISPLAY_MAX.saturating_sub(1))
+                .collect();
             format!("{head}…")
         }
     }
@@ -2712,7 +2875,10 @@ fn truncate_client(client: Option<&str>) -> String {
         None => "-".to_string(),
         Some(c) if c.chars().count() <= CLIENT_DISPLAY_MAX => c.to_string(),
         Some(c) => {
-            let head: String = c.chars().take(CLIENT_DISPLAY_MAX.saturating_sub(1)).collect();
+            let head: String = c
+                .chars()
+                .take(CLIENT_DISPLAY_MAX.saturating_sub(1))
+                .collect();
             format!("{head}…")
         }
     }
@@ -2746,7 +2912,10 @@ fn opt_str_short(v: Option<&str>) -> String {
         None => "-".to_string(),
         Some(s) if s.chars().count() <= SPEED_DISPLAY_MAX => s.to_string(),
         Some(s) => {
-            let head: String = s.chars().take(SPEED_DISPLAY_MAX.saturating_sub(1)).collect();
+            let head: String = s
+                .chars()
+                .take(SPEED_DISPLAY_MAX.saturating_sub(1))
+                .collect();
             format!("{head}…")
         }
     }
@@ -2834,7 +3003,11 @@ fn marker_text(kinds: &[OutlierKind]) -> String {
     if kinds.is_empty() {
         "-".to_string()
     } else {
-        kinds.iter().map(|k| k.marker()).collect::<Vec<_>>().join("+")
+        kinds
+            .iter()
+            .map(|k| k.marker())
+            .collect::<Vec<_>>()
+            .join("+")
     }
 }
 
@@ -2853,8 +3026,22 @@ fn print_requests_table(rows: &[RequestRow]) {
 
     println!(
         "{:<10} {:<16} {:>2} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>7} {:>7} {:>8} {:>8} {:>8} {:<14}",
-        "HORA", "MODELO", "st", "status", "in", "out", "c_rd", "c_wr", "ttft_ms", "gen_ms", "tok/s", "effort", "spd_req", "spd_got",
-        "usd", "outlier"
+        "HORA",
+        "MODELO",
+        "st",
+        "status",
+        "in",
+        "out",
+        "c_rd",
+        "c_wr",
+        "ttft_ms",
+        "gen_ms",
+        "tok/s",
+        "effort",
+        "spd_req",
+        "spd_got",
+        "usd",
+        "outlier"
     );
     for (i, r) in rows.iter().enumerate().rev() {
         let cells = requests_row_cells(RequestsView::Latency, r);
@@ -2898,8 +3085,22 @@ fn print_context_table(rows: &[RequestRow]) {
 
     println!(
         "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<18} {:<7} {:<5} {:<14}",
-        "HORA", "MODELO", "msgs", "tools", "history", "system", "last_turn", "other", "total", "tax%", "B/tok", "prep_us", "cliente",
-        "tsearch", "flat", "outlier"
+        "HORA",
+        "MODELO",
+        "msgs",
+        "tools",
+        "history",
+        "system",
+        "last_turn",
+        "other",
+        "total",
+        "tax%",
+        "B/tok",
+        "prep_us",
+        "cliente",
+        "tsearch",
+        "flat",
+        "outlier"
     );
     for (i, r) in rows.iter().enumerate().rev() {
         let cells = requests_row_cells(RequestsView::Context, r);
@@ -2932,9 +3133,7 @@ fn print_context_table(rows: &[RequestRow]) {
     println!(
         "nota: B/tok = total_bytes / prompt_tokens_total (denominador según dialecto, ver docs/monitor-tui.md §7.3.1); TRUNC = mismo total de tokens que otra fila con bodies que difieren >= 5% (tope de contexto probado, no estadística)"
     );
-    println!(
-        "nota: cliente = User-Agent crudo (truncado, ver docs/telemetry-per-request.md)"
-    );
+    println!("nota: cliente = User-Agent crudo (truncado, ver docs/telemetry-per-request.md)");
     println!(
         "nota: tsearch = carga diferida de tools (dialecto Responses/Codex): eager = sin diferido este turno; lazy:N = cargó N tools vía tool_search; - = no aplica (ver docs/telemetry-per-request.md §4.3)"
     );
@@ -2954,14 +3153,23 @@ fn print_tools_table(rows: &[RequestRow]) {
     println!("--- vista: tools por servidor ---");
 
     let Some(source) = find_tools_source_row(rows) else {
-        println!("(sin desglose de tools disponible: proxy anterior a este slice, o ninguna fila declara tools)");
+        println!(
+            "(sin desglose de tools disponible: proxy anterior a este slice, o ninguna fila declara tools)"
+        );
         return;
     };
 
-    println!("fuente: {} · modelo {}", format_time(&source.timestamp), source.model.as_deref().unwrap_or("-"));
+    println!(
+        "fuente: {} · modelo {}",
+        format_time(&source.timestamp),
+        source.model.as_deref().unwrap_or("-")
+    );
 
     // `find_tools_source_row` garantiza `Some` no vacío.
-    let servers = source.tools_by_server.as_ref().expect("find_tools_source_row garantiza tools_by_server Some no vacío");
+    let servers = source
+        .tools_by_server
+        .as_ref()
+        .expect("find_tools_source_row garantiza tools_by_server Some no vacío");
     let diffs = diff_against_baseline(servers, None);
 
     println!(
@@ -2975,7 +3183,10 @@ fn print_tools_table(rows: &[RequestRow]) {
             cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6]
         );
     }
-    println!("{:-<26} {:-<7} {:-<6} {:-<9} {:-<10} {:-<9} {:-<12}", "", "", "", "", "", "", "");
+    println!(
+        "{:-<26} {:-<7} {:-<6} {:-<9} {:-<10} {:-<9} {:-<12}",
+        "", "", "", "", "", "", ""
+    );
     println!(
         "{:<26} {:<7} {:>6} {:>9} {:>10} {:>9} {:>12}",
         "overhead",
@@ -3012,13 +3223,22 @@ fn print_quota_table(rows: &[RequestRow]) {
     println!("--- vista: cuota codex ---");
 
     let Some(source) = find_quota_source_row(rows) else {
-        println!("(sin datos de cuota: ninguna petición reciente usó el backend de Codex, o el proxy es anterior a la captura de cuota)");
+        println!(
+            "(sin datos de cuota: ninguna petición reciente usó el backend de Codex, o el proxy es anterior a la captura de cuota)"
+        );
         return;
     };
 
     // `find_quota_source_row` garantiza `codex_quota` Some.
-    let quota = source.codex_quota.as_ref().expect("find_quota_source_row garantiza codex_quota Some");
-    println!("fuente: {} · modelo {}", format_time(&source.timestamp), source.model.as_deref().unwrap_or("-"));
+    let quota = source
+        .codex_quota
+        .as_ref()
+        .expect("find_quota_source_row garantiza codex_quota Some");
+    println!(
+        "fuente: {} · modelo {}",
+        format_time(&source.timestamp),
+        source.model.as_deref().unwrap_or("-")
+    );
     let now = chrono::Utc::now().timestamp();
     for line in quota_lines(quota, &source.timestamp, now) {
         println!("{line}");
@@ -3034,7 +3254,11 @@ fn print_sessions_table(stats_url: &str) {
     println!("--- vista: gasto por sesión ---");
     let url = resolve_sessions_url(stats_url);
     let client = reqwest::blocking::Client::new();
-    match client.get(&url).send().and_then(|r| r.json::<SessionsPayload>()) {
+    match client
+        .get(&url)
+        .send()
+        .and_then(|r| r.json::<SessionsPayload>())
+    {
         Ok(p) => {
             for line in session_lines(&p.sessions, p.saturated) {
                 println!("{line}");
@@ -3043,7 +3267,9 @@ fn print_sessions_table(stats_url: &str) {
                 "nota: [sin atribuir] = cubo de fallback por User-Agent, NO una sesión — agrupa todas las no atribuidas de ese harness (ver docs/telemetry-by-session.md)"
             );
         }
-        Err(e) => println!("(/sessions no disponible en {url} ({e}) — puede ser una build del proxy anterior a este endpoint)"),
+        Err(e) => println!(
+            "(/sessions no disponible en {url} ({e}) — puede ser una build del proxy anterior a este endpoint)"
+        ),
     }
 }
 
@@ -3211,7 +3437,13 @@ mod tests {
         assert_eq!(window_error_rate(0, 0), 0.0);
     }
 
-    fn raw(requests: u64, output_tokens: u64, ttft_sum: f64, ttft_count: u64, cost: f64) -> RawCounters {
+    fn raw(
+        requests: u64,
+        output_tokens: u64,
+        ttft_sum: f64,
+        ttft_count: u64,
+        cost: f64,
+    ) -> RawCounters {
         RawCounters {
             requests,
             input_tokens: 0,
@@ -3259,7 +3491,11 @@ mod tests {
 
     #[test]
     fn resolve_url_usa_flag_si_esta_presente() {
-        let args = vec!["monitor".to_string(), "--url".to_string(), "http://x:1/stats".to_string()];
+        let args = vec![
+            "monitor".to_string(),
+            "--url".to_string(),
+            "http://x:1/stats".to_string(),
+        ];
         assert_eq!(resolve_url(&args), "http://x:1/stats");
     }
 
@@ -3271,13 +3507,20 @@ mod tests {
     fn resolve_requests_url_deriva_del_stats_url_del_flag_override() {
         // Caso `--url http://x:1/stats`: la URL de /requests se deriva
         // reemplazando el sufijo /stats por /requests.
-        assert_eq!(resolve_requests_url_inner("http://x:1/stats", None, None), "http://x:1/requests");
+        assert_eq!(
+            resolve_requests_url_inner("http://x:1/stats", None, None),
+            "http://x:1/requests"
+        );
     }
 
     #[test]
     fn resolve_requests_url_usa_env_override_si_esta_presente() {
         assert_eq!(
-            resolve_requests_url_inner("http://x:1/stats", Some("http://y:2/requests".to_string()), None),
+            resolve_requests_url_inner(
+                "http://x:1/stats",
+                Some("http://y:2/requests".to_string()),
+                None
+            ),
             "http://y:2/requests"
         );
     }
@@ -3287,14 +3530,21 @@ mod tests {
         // El override explícito tiene prioridad sobre la derivación por
         // sustitución, incluso si esta última sería válida.
         assert_eq!(
-            resolve_requests_url_inner("http://x:1/stats", Some("http://z:3/requests".to_string()), Some("9999".to_string())),
+            resolve_requests_url_inner(
+                "http://x:1/stats",
+                Some("http://z:3/requests".to_string()),
+                Some("9999".to_string())
+            ),
             "http://z:3/requests"
         );
     }
 
     #[test]
     fn resolve_requests_url_fallback_si_stats_url_no_termina_en_stats() {
-        assert_eq!(resolve_requests_url_inner("http://x:1/weird", None, None), "http://127.0.0.1:8080/requests");
+        assert_eq!(
+            resolve_requests_url_inner("http://x:1/weird", None, None),
+            "http://127.0.0.1:8080/requests"
+        );
     }
 
     #[test]
@@ -3371,9 +3621,33 @@ mod tests {
         // chica, el desvío estándar no es confiable: no debe flaggearse
         // SlowTtft (ni ningún otro estadístico), solo Error si lo hubiera.
         let rows = vec![
-            req("anthropic", "claude-opus-4", 200, Some(10.0), 100.0, Some(50), Some(10)),
-            req("anthropic", "claude-opus-4", 200, Some(10.0), 100.0, Some(50), Some(10)),
-            req("anthropic", "claude-opus-4", 200, Some(1000.0), 1100.0, Some(50), Some(10)),
+            req(
+                "anthropic",
+                "claude-opus-4",
+                200,
+                Some(10.0),
+                100.0,
+                Some(50),
+                Some(10),
+            ),
+            req(
+                "anthropic",
+                "claude-opus-4",
+                200,
+                Some(10.0),
+                100.0,
+                Some(50),
+                Some(10),
+            ),
+            req(
+                "anthropic",
+                "claude-opus-4",
+                200,
+                Some(1000.0),
+                1100.0,
+                Some(50),
+                Some(10),
+            ),
         ];
 
         let result = classify_outliers(&rows);
@@ -3386,7 +3660,17 @@ mod tests {
         // 5 filas con TTFT idéntico: stddev=0, no hay variación real que
         // reportar como outlier.
         let rows: Vec<RequestRow> = (0..5)
-            .map(|_| req("anthropic", "claude-opus-4", 200, Some(100.0), 200.0, Some(50), Some(10)))
+            .map(|_| {
+                req(
+                    "anthropic",
+                    "claude-opus-4",
+                    200,
+                    Some(100.0),
+                    200.0,
+                    Some(50),
+                    Some(10),
+                )
+            })
             .collect();
 
         let result = classify_outliers(&rows);
@@ -3398,13 +3682,36 @@ mod tests {
     fn classify_outliers_detecta_ttft_lento_a_2_sigma() {
         // ttft = [10,10,10,10,10,100]; mean=25, stddev≈33.54,
         // threshold=mean+2*stddev≈92.08. Solo la fila de 100 debe flaggearse.
-        let mut rows: Vec<RequestRow> =
-            (0..5).map(|_| req("anthropic", "claude-opus-4", 200, Some(10.0), 200.0, Some(50), Some(10))).collect();
-        rows.push(req("anthropic", "claude-opus-4", 200, Some(100.0), 300.0, Some(50), Some(10)));
+        let mut rows: Vec<RequestRow> = (0..5)
+            .map(|_| {
+                req(
+                    "anthropic",
+                    "claude-opus-4",
+                    200,
+                    Some(10.0),
+                    200.0,
+                    Some(50),
+                    Some(10),
+                )
+            })
+            .collect();
+        rows.push(req(
+            "anthropic",
+            "claude-opus-4",
+            200,
+            Some(100.0),
+            300.0,
+            Some(50),
+            Some(10),
+        ));
 
         let result = classify_outliers(&rows);
 
-        assert!(result[0..5].iter().all(|k| !k.contains(&OutlierKind::SlowTtft)));
+        assert!(
+            result[0..5]
+                .iter()
+                .all(|k| !k.contains(&OutlierKind::SlowTtft))
+        );
         assert!(result[5].contains(&OutlierKind::SlowTtft));
     }
 
@@ -3413,13 +3720,36 @@ mod tests {
         // 4 filas con cache-hit real (cache_read_tokens > 0) + 1 fila sin
         // cache-hit: la mitad+ de las OTRAS filas del grupo tienen hit, así
         // que la fila sin hit debe flaggearse CacheMiss. Las cacheadas no.
-        let mut rows: Vec<RequestRow> =
-            (0..4).map(|_| req("anthropic", "claude-opus-4", 200, Some(50.0), 200.0, Some(50), Some(500))).collect();
-        rows.push(req("anthropic", "claude-opus-4", 200, Some(50.0), 200.0, Some(50), None));
+        let mut rows: Vec<RequestRow> = (0..4)
+            .map(|_| {
+                req(
+                    "anthropic",
+                    "claude-opus-4",
+                    200,
+                    Some(50.0),
+                    200.0,
+                    Some(50),
+                    Some(500),
+                )
+            })
+            .collect();
+        rows.push(req(
+            "anthropic",
+            "claude-opus-4",
+            200,
+            Some(50.0),
+            200.0,
+            Some(50),
+            None,
+        ));
 
         let result = classify_outliers(&rows);
 
-        assert!(result[0..4].iter().all(|k| !k.contains(&OutlierKind::CacheMiss)));
+        assert!(
+            result[0..4]
+                .iter()
+                .all(|k| !k.contains(&OutlierKind::CacheMiss))
+        );
         assert!(result[4].contains(&OutlierKind::CacheMiss));
     }
 
@@ -3428,9 +3758,28 @@ mod tests {
         // total_ms == ttft_ms => gen_ms == 0: el throughput no es calculable
         // para esta fila y debe EXCLUIRSE de la métrica, no tratarse como
         // lenta, aunque el resto del grupo tenga throughput normal.
-        let mut rows: Vec<RequestRow> =
-            (0..4).map(|_| req("anthropic", "claude-opus-4", 200, Some(50.0), 550.0, Some(500), Some(10))).collect();
-        rows.push(req("anthropic", "claude-opus-4", 200, Some(100.0), 100.0, Some(500), Some(10)));
+        let mut rows: Vec<RequestRow> = (0..4)
+            .map(|_| {
+                req(
+                    "anthropic",
+                    "claude-opus-4",
+                    200,
+                    Some(50.0),
+                    550.0,
+                    Some(500),
+                    Some(10),
+                )
+            })
+            .collect();
+        rows.push(req(
+            "anthropic",
+            "claude-opus-4",
+            200,
+            Some(100.0),
+            100.0,
+            Some(500),
+            Some(10),
+        ));
 
         let result = classify_outliers(&rows);
 
@@ -3439,7 +3788,15 @@ mod tests {
 
     #[test]
     fn classify_outliers_error_se_flaggea_incluso_con_una_sola_fila() {
-        let rows = vec![req("anthropic", "claude-opus-4", 500, Some(10.0), 100.0, Some(50), Some(10))];
+        let rows = vec![req(
+            "anthropic",
+            "claude-opus-4",
+            500,
+            Some(10.0),
+            100.0,
+            Some(50),
+            Some(10),
+        )];
 
         let result = classify_outliers(&rows);
 
@@ -3450,9 +3807,28 @@ mod tests {
     fn classify_outliers_nan_en_ttft_no_panickea_y_se_excluye_de_la_media() {
         // Una fila con NaN no debería ni flaggearse a sí misma como
         // SlowTtft, ni contaminar la media/stddev usada para las demás.
-        let mut rows: Vec<RequestRow> =
-            (0..4).map(|_| req("anthropic", "claude-opus-4", 200, Some(10.0), 200.0, Some(50), Some(10))).collect();
-        rows.push(req("anthropic", "claude-opus-4", 200, Some(f64::NAN), 200.0, Some(50), Some(10)));
+        let mut rows: Vec<RequestRow> = (0..4)
+            .map(|_| {
+                req(
+                    "anthropic",
+                    "claude-opus-4",
+                    200,
+                    Some(10.0),
+                    200.0,
+                    Some(50),
+                    Some(10),
+                )
+            })
+            .collect();
+        rows.push(req(
+            "anthropic",
+            "claude-opus-4",
+            200,
+            Some(f64::NAN),
+            200.0,
+            Some(50),
+            Some(10),
+        ));
 
         let result = classify_outliers(&rows);
 
@@ -3463,9 +3839,28 @@ mod tests {
 
     #[test]
     fn classify_outliers_none_en_ttft_se_excluye_sin_flaggear() {
-        let mut rows: Vec<RequestRow> =
-            (0..4).map(|_| req("anthropic", "claude-opus-4", 200, Some(10.0), 200.0, Some(50), Some(10))).collect();
-        rows.push(req("anthropic", "claude-opus-4", 200, None, 200.0, Some(50), Some(10)));
+        let mut rows: Vec<RequestRow> = (0..4)
+            .map(|_| {
+                req(
+                    "anthropic",
+                    "claude-opus-4",
+                    200,
+                    Some(10.0),
+                    200.0,
+                    Some(50),
+                    Some(10),
+                )
+            })
+            .collect();
+        rows.push(req(
+            "anthropic",
+            "claude-opus-4",
+            200,
+            None,
+            200.0,
+            Some(50),
+            Some(10),
+        ));
 
         let result = classify_outliers(&rows);
 
@@ -3490,7 +3885,15 @@ mod tests {
         cache_write_tokens: Option<u64>,
         context_measured_bytes: Option<usize>,
     ) -> RequestRow {
-        let mut r = req(upstream, model, 200, Some(10.0), 100.0, Some(50), cache_read_tokens);
+        let mut r = req(
+            upstream,
+            model,
+            200,
+            Some(10.0),
+            100.0,
+            Some(50),
+            cache_read_tokens,
+        );
         r.input_tokens = input_tokens;
         r.cache_write_tokens = cache_write_tokens;
         r.context_measured_bytes = context_measured_bytes;
@@ -3501,7 +3904,14 @@ mod tests {
     fn prompt_tokens_total_anthropic_suma_cache_read_y_write() {
         // Caso real: cache-hit grande, input_tokens irrisorio. Sumar la
         // caché es OBLIGATORIO o el denominador queda absurdo.
-        let r = req_prompt("anthropic", "claude-opus-4", Some(2), Some(124_733), Some(1_355), Some(224_653));
+        let r = req_prompt(
+            "anthropic",
+            "claude-opus-4",
+            Some(2),
+            Some(124_733),
+            Some(1_355),
+            Some(224_653),
+        );
         assert_eq!(prompt_tokens_total(&r), Some(2 + 124_733 + 1_355));
     }
 
@@ -3509,13 +3919,27 @@ mod tests {
     fn prompt_tokens_total_no_anthropic_ignora_cache_read_por_ser_subconjunto() {
         // OpenAI/Gemini: cache_read ya es SUBCONJUNTO de input_tokens.
         // Sumarlo encima sería doble conteo.
-        let r = req_prompt("openai", "gpt-4o", Some(1000), Some(400), None, Some(50_000));
+        let r = req_prompt(
+            "openai",
+            "gpt-4o",
+            Some(1000),
+            Some(400),
+            None,
+            Some(50_000),
+        );
         assert_eq!(prompt_tokens_total(&r), Some(1000));
     }
 
     #[test]
     fn prompt_tokens_total_none_si_falta_input_tokens() {
-        let r = req_prompt("anthropic", "claude-opus-4", None, Some(100), Some(0), Some(1_000));
+        let r = req_prompt(
+            "anthropic",
+            "claude-opus-4",
+            None,
+            Some(100),
+            Some(0),
+            Some(1_000),
+        );
         assert_eq!(prompt_tokens_total(&r), None);
     }
 
@@ -3525,23 +3949,43 @@ mod tests {
         // gritaría "truncamiento" en el request MÁS SANO posible (cache-hit
         // grande, 200 OK). La suma da ~1.8, el valor real observado para
         // Anthropic con caché — MUY por debajo de un input_tokens-only.
-        let r = req_prompt("anthropic", "claude-opus-4", Some(2), Some(124_733), Some(1_355), Some(224_653));
+        let r = req_prompt(
+            "anthropic",
+            "claude-opus-4",
+            Some(2),
+            Some(124_733),
+            Some(1_355),
+            Some(224_653),
+        );
         let b = bytes_per_token(&r).expect("debe calcularse con todos los datos presentes");
         let expected = 224_653.0 / (2.0 + 124_733.0 + 1_355.0);
         assert!((b - expected).abs() < 1e-6, "b={b} expected={expected}");
-        assert!((b - 1.8).abs() < 0.05, "b={b} debe rondar ~1.8, no 112_326 (input_tokens solo)");
+        assert!(
+            (b - 1.8).abs() < 0.05,
+            "b={b} debe rondar ~1.8, no 112_326 (input_tokens solo)"
+        );
     }
 
     #[test]
     fn bytes_per_token_openai_con_cache_read_no_dobla_el_conteo() {
         let r = req_prompt("openai", "gpt-4o", Some(1000), Some(400), None, Some(2_700));
         let b = bytes_per_token(&r).expect("debe calcularse");
-        assert!((b - 2.7).abs() < 1e-9, "b={b} debe usar input_tokens=1000 solo, no 1000+400");
+        assert!(
+            (b - 2.7).abs() < 1e-9,
+            "b={b} debe usar input_tokens=1000 solo, no 1000+400"
+        );
     }
 
     #[test]
     fn bytes_per_token_none_si_falta_input_tokens() {
-        let r = req_prompt("anthropic", "claude-opus-4", None, Some(10), Some(0), Some(1_000));
+        let r = req_prompt(
+            "anthropic",
+            "claude-opus-4",
+            None,
+            Some(10),
+            Some(0),
+            Some(1_000),
+        );
         assert_eq!(bytes_per_token(&r), None);
     }
 
@@ -3563,8 +4007,22 @@ mod tests {
         // distinto (18.955 B vs. 28.806 B). El proveedor truncó el prompt en
         // silencio y devolvió 200 OK igual.
         let rows = vec![
-            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(18_955)),
-            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(28_806)),
+            req_prompt(
+                "openai",
+                "llama3.2:3b",
+                Some(4095),
+                None,
+                None,
+                Some(18_955),
+            ),
+            req_prompt(
+                "openai",
+                "llama3.2:3b",
+                Some(4095),
+                None,
+                None,
+                Some(28_806),
+            ),
         ];
 
         let result = classify_outliers(&rows);
@@ -3589,8 +4047,22 @@ mod tests {
         // 7.8% de este par SÍ cruza el piso y nunca debe volver a pasar
         // desapercibido.
         let rows = vec![
-            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(77_579)),
-            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(84_161)),
+            req_prompt(
+                "openai",
+                "llama3.2:3b",
+                Some(4095),
+                None,
+                None,
+                Some(77_579),
+            ),
+            req_prompt(
+                "openai",
+                "llama3.2:3b",
+                Some(4095),
+                None,
+                None,
+                Some(84_161),
+            ),
         ];
 
         let result = classify_outliers(&rows);
@@ -3630,8 +4102,22 @@ mod tests {
         // FRACCIONAL correctamente lo descarta: 600/200000 = 0.3%, muy por
         // debajo de TRUNCATION_BYTES_DELTA (5%).
         let rows = vec![
-            req_prompt("openai", "llama3.2:3b", Some(65_000), None, None, Some(199_400)),
-            req_prompt("openai", "llama3.2:3b", Some(65_000), None, None, Some(200_000)),
+            req_prompt(
+                "openai",
+                "llama3.2:3b",
+                Some(65_000),
+                None,
+                None,
+                Some(199_400),
+            ),
+            req_prompt(
+                "openai",
+                "llama3.2:3b",
+                Some(65_000),
+                None,
+                None,
+                Some(200_000),
+            ),
         ];
 
         let result = classify_outliers(&rows);
@@ -3649,8 +4135,22 @@ mod tests {
         // cuando en realidad es exactamente lo esperado — el falso positivo
         // que un detector naïve `bytes/tokens > umbral` NO podría evitar.
         let rows = vec![
-            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(20_000)),
-            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(20_150)), // +0.75%
+            req_prompt(
+                "openai",
+                "llama3.2:3b",
+                Some(4095),
+                None,
+                None,
+                Some(20_000),
+            ),
+            req_prompt(
+                "openai",
+                "llama3.2:3b",
+                Some(4095),
+                None,
+                None,
+                Some(20_150),
+            ), // +0.75%
         ];
 
         let result = classify_outliers(&rows);
@@ -3666,7 +4166,14 @@ mod tests {
         // del grupo con ese total de tokens (prompt_tokens_total suma la
         // caché), classify_truncation ni siquiera encuentra un par con el
         // que comparar — no flaggea.
-        let rows = vec![req_prompt("anthropic", "claude-opus-4", Some(2), Some(124_733), Some(1_355), Some(224_653))];
+        let rows = vec![req_prompt(
+            "anthropic",
+            "claude-opus-4",
+            Some(2),
+            Some(124_733),
+            Some(1_355),
+            Some(224_653),
+        )];
 
         let result = classify_outliers(&rows);
 
@@ -3681,8 +4188,22 @@ mod tests {
         // estas dos filas caerían en grupos de tokens DISTINTOS y el
         // detector nunca las compararía entre sí.
         let rows = vec![
-            req_prompt("openai", "gpt-4o", Some(1000), Some(400), None, Some(10_000)),
-            req_prompt("openai", "gpt-4o", Some(1000), Some(400), None, Some(15_000)),
+            req_prompt(
+                "openai",
+                "gpt-4o",
+                Some(1000),
+                Some(400),
+                None,
+                Some(10_000),
+            ),
+            req_prompt(
+                "openai",
+                "gpt-4o",
+                Some(1000),
+                Some(400),
+                None,
+                Some(15_000),
+            ),
         ];
 
         let result = classify_outliers(&rows);
@@ -3695,7 +4216,14 @@ mod tests {
     fn classify_truncation_filas_sin_input_tokens_se_excluyen_sin_panic() {
         let rows = vec![
             req_prompt("openai", "llama3.2:3b", None, None, None, Some(18_955)),
-            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(28_806)),
+            req_prompt(
+                "openai",
+                "llama3.2:3b",
+                Some(4095),
+                None,
+                None,
+                Some(28_806),
+            ),
         ];
 
         let result = classify_outliers(&rows);
@@ -3710,7 +4238,14 @@ mod tests {
         // grande que necesita exactamente ese input_tokens. El doc de
         // OutlierKind::Truncated es explícito: hacen falta >= 2 muestras
         // para EXCLUIR la coincidencia.
-        let rows = vec![req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(77_783))];
+        let rows = vec![req_prompt(
+            "openai",
+            "llama3.2:3b",
+            Some(4095),
+            None,
+            None,
+            Some(77_783),
+        )];
 
         let result = classify_outliers(&rows);
 
@@ -3742,7 +4277,15 @@ mod tests {
     /// eager) quedaba sin atribución en el panel.
     #[test]
     fn requests_row_cells_context_surface_client() {
-        let mut r = req("anthropic", "claude-opus-4", 200, Some(10.0), 100.0, Some(50), Some(10));
+        let mut r = req(
+            "anthropic",
+            "claude-opus-4",
+            200,
+            Some(10.0),
+            100.0,
+            Some(50),
+            Some(10),
+        );
         r.client = Some("claude-cli/2.1.207 (external, sdk-cli)".to_string());
 
         let cells = requests_row_cells(RequestsView::Context, &r);
@@ -3755,7 +4298,15 @@ mod tests {
     /// `User-Agent` es un dato ausente, no una categoría.
     #[test]
     fn requests_row_cells_context_client_none_es_guion() {
-        let mut r = req("anthropic", "claude-opus-4", 200, Some(10.0), 100.0, Some(50), Some(10));
+        let mut r = req(
+            "anthropic",
+            "claude-opus-4",
+            200,
+            Some(10.0),
+            100.0,
+            Some(50),
+            Some(10),
+        );
         r.client = None;
 
         let cells = requests_row_cells(RequestsView::Context, &r);
@@ -3775,7 +4326,15 @@ mod tests {
     /// eager-vs-lazy: `used: true` con `deferred_loaded: 3` ⇒ `"lazy:3"`.
     #[test]
     fn requests_row_cells_context_tsearch_lazy() {
-        let mut r = req("codex", "gpt-5.5", 200, Some(10.0), 100.0, Some(50), Some(10));
+        let mut r = req(
+            "codex",
+            "gpt-5.5",
+            200,
+            Some(10.0),
+            100.0,
+            Some(50),
+            Some(10),
+        );
         r.tool_search = Some(ToolSearchRow {
             used: true,
             deferred_loaded: 3,
@@ -3790,7 +4349,15 @@ mod tests {
     /// ⇒ `"eager"` — EAGER confirmado, no ausencia de dato.
     #[test]
     fn tsearch_cell_eager_cuando_used_false() {
-        let mut r = req("codex", "gpt-5.5", 200, Some(10.0), 100.0, Some(50), Some(10));
+        let mut r = req(
+            "codex",
+            "gpt-5.5",
+            200,
+            Some(10.0),
+            100.0,
+            Some(50),
+            Some(10),
+        );
         r.tool_search = Some(ToolSearchRow {
             used: false,
             deferred_loaded: 0,
@@ -3804,7 +4371,15 @@ mod tests {
     /// ninguna tool.
     #[test]
     fn tsearch_cell_lazy_cero_no_es_eager() {
-        let mut r = req("codex", "gpt-5.5", 200, Some(10.0), 100.0, Some(50), Some(10));
+        let mut r = req(
+            "codex",
+            "gpt-5.5",
+            200,
+            Some(10.0),
+            100.0,
+            Some(50),
+            Some(10),
+        );
         r.tool_search = Some(ToolSearchRow {
             used: true,
             deferred_loaded: 0,
@@ -3817,7 +4392,15 @@ mod tests {
     /// nunca string vacío ni un valor inventado.
     #[test]
     fn tsearch_cell_none_es_guion() {
-        let mut r = req("anthropic", "claude-opus-4", 200, Some(10.0), 100.0, Some(50), Some(10));
+        let mut r = req(
+            "anthropic",
+            "claude-opus-4",
+            200,
+            Some(10.0),
+            100.0,
+            Some(50),
+            Some(10),
+        );
         r.tool_search = None;
 
         assert_eq!(tsearch_cell(&r), "-");
@@ -3828,7 +4411,15 @@ mod tests {
     /// ⇒ `"yes"`.
     #[test]
     fn requests_row_cells_context_flat_yes() {
-        let mut r = req("codex", "gpt-5.5", 200, Some(10.0), 100.0, Some(50), Some(10));
+        let mut r = req(
+            "codex",
+            "gpt-5.5",
+            200,
+            Some(10.0),
+            100.0,
+            Some(50),
+            Some(10),
+        );
         r.tools_flattened = Some(true);
 
         let cells = requests_row_cells(RequestsView::Context, &r);
@@ -3840,7 +4431,15 @@ mod tests {
     /// (no aplica / proxy viejo) ⇒ `"-"`. Nunca string vacío.
     #[test]
     fn flattened_cell_no_y_guion() {
-        let mut r = req("codex", "gpt-5.5", 200, Some(10.0), 100.0, Some(50), Some(10));
+        let mut r = req(
+            "codex",
+            "gpt-5.5",
+            200,
+            Some(10.0),
+            100.0,
+            Some(50),
+            Some(10),
+        );
         r.tools_flattened = Some(false);
         assert_eq!(flattened_cell(&r), "no");
         r.tools_flattened = None;
@@ -3946,8 +4545,22 @@ mod tests {
         // Truncated debe convivir con otro OutlierKind en la misma fila
         // (acá, Error) sin pisarlo ni excluirlo.
         let mut rows = vec![
-            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(18_955)),
-            req_prompt("openai", "llama3.2:3b", Some(4095), None, None, Some(28_806)),
+            req_prompt(
+                "openai",
+                "llama3.2:3b",
+                Some(4095),
+                None,
+                None,
+                Some(18_955),
+            ),
+            req_prompt(
+                "openai",
+                "llama3.2:3b",
+                Some(4095),
+                None,
+                None,
+                Some(28_806),
+            ),
         ];
         rows[0].status = 500;
 
@@ -4027,8 +4640,20 @@ mod tests {
     /// la tabla en silencio: `ratatui` no se queja, simplemente pinta mal.
     #[test]
     fn las_tres_vistas_tienen_cabecera_anchos_y_celdas_del_mismo_ancho() {
-        let r = req("anthropic", "claude-opus-4-8", 200, Some(500.0), 1200.0, Some(80), Some(1000));
-        for vista in [RequestsView::Latency, RequestsView::Context, RequestsView::Cache] {
+        let r = req(
+            "anthropic",
+            "claude-opus-4-8",
+            200,
+            Some(500.0),
+            1200.0,
+            Some(80),
+            Some(1000),
+        );
+        for vista in [
+            RequestsView::Latency,
+            RequestsView::Context,
+            RequestsView::Cache,
+        ] {
             let anchos = requests_table_widths(vista).len();
             let celdas = requests_row_cells(vista, &r).len();
             // Los anchos incluyen la columna `outlier`, que el llamador
@@ -4046,7 +4671,15 @@ mod tests {
     /// es una afirmación distinta de "no se sabe".
     #[test]
     fn la_vista_cache_marca_ausente_cuando_el_proxy_no_atribuyo() {
-        let mut r = req("anthropic", "claude-opus-4-8", 200, Some(500.0), 1200.0, Some(80), Some(1000));
+        let mut r = req(
+            "anthropic",
+            "claude-opus-4-8",
+            200,
+            Some(500.0),
+            1200.0,
+            Some(80),
+            Some(1000),
+        );
         r.cache_by_section = None;
 
         let celdas = requests_row_cells(RequestsView::Cache, &r);
@@ -4131,7 +4764,8 @@ mod tests {
             "prepare_us": 850
         }"#;
 
-        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar un payload con todos los campos");
+        let row: RequestRow =
+            serde_json::from_str(json).expect("debe deserializar un payload con todos los campos");
 
         assert_eq!(row.context_system_bytes, Some(281));
         assert_eq!(row.context_tools_bytes, Some(159_123));
@@ -4176,7 +4810,8 @@ mod tests {
             "total_ms": 100.0
         }"#;
 
-        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar aunque falten los campos nuevos");
+        let row: RequestRow =
+            serde_json::from_str(json).expect("debe deserializar aunque falten los campos nuevos");
 
         assert_eq!(row.context_system_bytes, None);
         assert_eq!(row.context_tools_bytes, None);
@@ -4229,7 +4864,8 @@ mod tests {
             "prepare_us": 12
         }"#;
 
-        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar con context_* en null explícito");
+        let row: RequestRow =
+            serde_json::from_str(json).expect("debe deserializar con context_* en null explícito");
 
         assert_eq!(row.context_system_bytes, None);
         assert_eq!(row.context_tax_ratio, None);
@@ -4265,7 +4901,8 @@ mod tests {
             "tools_overhead_bytes": 77
         }"#;
 
-        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar con tools_by_server presente");
+        let row: RequestRow =
+            serde_json::from_str(json).expect("debe deserializar con tools_by_server presente");
 
         let servers = row.tools_by_server.expect("debe traer el desglose");
         assert_eq!(servers.len(), 2);
@@ -4310,14 +4947,29 @@ mod tests {
             "tools_overhead_bytes": 77
         }"#;
 
-        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar con deferred_tools presente");
+        let row: RequestRow =
+            serde_json::from_str(json).expect("debe deserializar con deferred_tools presente");
 
         let servers = row.tools_by_server.expect("debe traer el desglose");
-        let gmail = servers.iter().find(|s| s.server == "claude_ai_Gmail").expect("Gmail presente");
-        assert_eq!(gmail.deferred_tools, Some(3), "servidor totalmente diferido: deferred_tools == tools");
+        let gmail = servers
+            .iter()
+            .find(|s| s.server == "claude_ai_Gmail")
+            .expect("Gmail presente");
+        assert_eq!(
+            gmail.deferred_tools,
+            Some(3),
+            "servidor totalmente diferido: deferred_tools == tools"
+        );
 
-        let calendar = servers.iter().find(|s| s.server == "claude_ai_Google_Calendar").expect("Calendar presente");
-        assert_eq!(calendar.deferred_tools, Some(0), "servidor NADA diferido: sus bytes son reales y desconectables");
+        let calendar = servers
+            .iter()
+            .find(|s| s.server == "claude_ai_Google_Calendar")
+            .expect("Calendar presente");
+        assert_eq!(
+            calendar.deferred_tools,
+            Some(0),
+            "servidor NADA diferido: sus bytes son reales y desconectables"
+        );
     }
 
     #[test]
@@ -4343,7 +4995,8 @@ mod tests {
             "total_ms": 100.0
         }"#;
 
-        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar sin los campos de tools");
+        let row: RequestRow =
+            serde_json::from_str(json).expect("debe deserializar sin los campos de tools");
 
         assert_eq!(row.tools_by_server, None);
         assert_eq!(row.tools_overhead_bytes, None);
@@ -4355,20 +5008,46 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn tool_row(server: &str, kind: &str, tools: usize, bytes: usize) -> ToolServerRow {
-        ToolServerRow { server: server.to_string(), kind: kind.to_string(), tools, bytes, deferred_tools: Some(0) }
+        ToolServerRow {
+            server: server.to_string(),
+            kind: kind.to_string(),
+            tools,
+            bytes,
+            deferred_tools: Some(0),
+        }
     }
 
     /// Variante de [`tool_row`] que además fija `deferred_tools`, para los
     /// tests que necesitan un servidor con diferido parcial o total (no solo
     /// el `Some(0)` por defecto de la variante simple).
-    fn tool_row_deferred(server: &str, kind: &str, tools: usize, bytes: usize, deferred_tools: usize) -> ToolServerRow {
-        ToolServerRow { server: server.to_string(), kind: kind.to_string(), tools, bytes, deferred_tools: Some(deferred_tools) }
+    fn tool_row_deferred(
+        server: &str,
+        kind: &str,
+        tools: usize,
+        bytes: usize,
+        deferred_tools: usize,
+    ) -> ToolServerRow {
+        ToolServerRow {
+            server: server.to_string(),
+            kind: kind.to_string(),
+            tools,
+            bytes,
+            deferred_tools: Some(deferred_tools),
+        }
     }
 
     /// Variante de `req` (arriba) que además permite fijar `tools_by_server`,
     /// para los tests de [`find_tools_source_row`].
     fn req_with_tools(timestamp: &str, tools_by_server: Option<Vec<ToolServerRow>>) -> RequestRow {
-        let mut r = req("anthropic", "claude-opus-4", 200, Some(10.0), 100.0, Some(50), Some(10));
+        let mut r = req(
+            "anthropic",
+            "claude-opus-4",
+            200,
+            Some(10.0),
+            100.0,
+            Some(50),
+            Some(10),
+        );
         r.timestamp = timestamp.to_string();
         r.tools_by_server = tools_by_server;
         r
@@ -4376,7 +5055,10 @@ mod tests {
 
     #[test]
     fn find_tools_source_row_ninguna_fila_califica_devuelve_none() {
-        let rows = vec![req_with_tools("t1", None), req_with_tools("t2", Some(vec![]))];
+        let rows = vec![
+            req_with_tools("t1", None),
+            req_with_tools("t2", Some(vec![])),
+        ];
         assert!(find_tools_source_row(&rows).is_none());
     }
 
@@ -4407,7 +5089,10 @@ mod tests {
 
     #[test]
     fn diff_against_baseline_sin_baseline_todos_los_deltas_son_none() {
-        let current = vec![tool_row("(native)", "native", 29, 86_168), tool_row("claude_ai_Gmail", "mcp", 13, 24_321)];
+        let current = vec![
+            tool_row("(native)", "native", 29, 86_168),
+            tool_row("claude_ai_Gmail", "mcp", 13, 24_321),
+        ];
 
         let diffs = diff_against_baseline(&current, None);
 
@@ -4424,8 +5109,10 @@ mod tests {
 
         let diffs = diff_against_baseline(&current, Some(&baseline));
 
-        let disappeared =
-            diffs.iter().find(|d| d.server == "claude_ai_Google_Calendar").expect("debe seguir apareciendo como fila");
+        let disappeared = diffs
+            .iter()
+            .find(|d| d.server == "claude_ai_Google_Calendar")
+            .expect("debe seguir apareciendo como fila");
         assert_eq!(disappeared.bytes, 0);
         assert_eq!(disappeared.tools, 0);
         assert_eq!(disappeared.kind, "-");
@@ -4434,13 +5121,19 @@ mod tests {
 
     #[test]
     fn diff_against_baseline_servidor_nuevo_tiene_delta_positivo_completo() {
-        let current = vec![tool_row("(native)", "native", 29, 86_168), tool_row("plugin_engram_engram", "mcp", 18, 17_737)];
+        let current = vec![
+            tool_row("(native)", "native", 29, 86_168),
+            tool_row("plugin_engram_engram", "mcp", 18, 17_737),
+        ];
         let mut baseline = BTreeMap::new();
         baseline.insert("(native)".to_string(), 86_168usize);
 
         let diffs = diff_against_baseline(&current, Some(&baseline));
 
-        let new_server = diffs.iter().find(|d| d.server == "plugin_engram_engram").expect("debe estar presente");
+        let new_server = diffs
+            .iter()
+            .find(|d| d.server == "plugin_engram_engram")
+            .expect("debe estar presente");
         assert_eq!(new_server.delta, Some(17_737));
     }
 
@@ -4460,7 +5153,10 @@ mod tests {
         // `current` llega bytes DESC (orden real del proxy): la función NO
         // debe reordenarlo. Los servidores desaparecidos van DESPUÉS, y entre
         // ELLOS se ordenan por bytes de baseline DESCENDENTE.
-        let current = vec![tool_row("(native)", "native", 29, 86_168), tool_row("claude_ai_Gmail", "mcp", 13, 24_321)];
+        let current = vec![
+            tool_row("(native)", "native", 29, 86_168),
+            tool_row("claude_ai_Gmail", "mcp", 13, 24_321),
+        ];
         let mut baseline = BTreeMap::new();
         baseline.insert("(native)".to_string(), 86_168usize);
         baseline.insert("claude_ai_Gmail".to_string(), 24_321usize);
@@ -4470,7 +5166,15 @@ mod tests {
         let diffs = diff_against_baseline(&current, Some(&baseline));
 
         let names: Vec<&str> = diffs.iter().map(|d| d.server.as_str()).collect();
-        assert_eq!(names, vec!["(native)", "claude_ai_Gmail", "claude_ai_Google_Calendar", "claude_ai_Google_Drive"]);
+        assert_eq!(
+            names,
+            vec![
+                "(native)",
+                "claude_ai_Gmail",
+                "claude_ai_Google_Calendar",
+                "claude_ai_Google_Drive"
+            ]
+        );
     }
 
     #[test]
@@ -4505,15 +5209,28 @@ mod tests {
 
         let diffs = diff_against_baseline(&current, None);
 
-        let gmail = diffs.iter().find(|d| d.server == "claude_ai_Gmail").unwrap();
+        let gmail = diffs
+            .iter()
+            .find(|d| d.server == "claude_ai_Gmail")
+            .unwrap();
         assert_eq!(gmail.deferred_tools, Some(3));
         assert_eq!(deferred_cell(gmail), "3/3", "totalmente diferido");
 
-        let calendar = diffs.iter().find(|d| d.server == "claude_ai_Google_Calendar").unwrap();
+        let calendar = diffs
+            .iter()
+            .find(|d| d.server == "claude_ai_Google_Calendar")
+            .unwrap();
         assert_eq!(calendar.deferred_tools, Some(0));
-        assert_eq!(deferred_cell(calendar), "0/4", "nada diferido: bytes reales y desconectables");
+        assert_eq!(
+            deferred_cell(calendar),
+            "0/4",
+            "nada diferido: bytes reales y desconectables"
+        );
 
-        let drive = diffs.iter().find(|d| d.server == "claude_ai_Google_Drive").unwrap();
+        let drive = diffs
+            .iter()
+            .find(|d| d.server == "claude_ai_Google_Drive")
+            .unwrap();
         assert_eq!(deferred_cell(drive), "2/5", "diferido parcial");
     }
 
@@ -4528,7 +5245,10 @@ mod tests {
 
         let diffs = diff_against_baseline(&current, Some(&baseline));
 
-        let disappeared = diffs.iter().find(|d| d.server == "claude_ai_Gmail").unwrap();
+        let disappeared = diffs
+            .iter()
+            .find(|d| d.server == "claude_ai_Gmail")
+            .unwrap();
         assert_eq!(deferred_cell(disappeared), "-");
     }
 
@@ -4672,12 +5392,21 @@ mod tests {
     #[test]
     fn mark_baseline_toma_foto_de_tools_by_server_de_la_fila_fuente() {
         let mut app = App::new("http://x".to_string());
-        app.recent_requests = vec![req_with_tools("t1", Some(vec![tool_row("(native)", "native", 29, 86_168)]))];
+        app.recent_requests = vec![req_with_tools(
+            "t1",
+            Some(vec![tool_row("(native)", "native", 29, 86_168)]),
+        )];
 
         app.mark_baseline();
 
-        let baseline = app.baseline.as_ref().expect("mark_baseline debe crear un baseline");
-        let tools_baseline = baseline.tools_by_server.as_ref().expect("debe tomar la foto de tools_by_server");
+        let baseline = app
+            .baseline
+            .as_ref()
+            .expect("mark_baseline debe crear un baseline");
+        let tools_baseline = baseline
+            .tools_by_server
+            .as_ref()
+            .expect("debe tomar la foto de tools_by_server");
         assert_eq!(tools_baseline.get("(native)"), Some(&86_168));
     }
 
@@ -4687,7 +5416,10 @@ mod tests {
         // recent_requests vacío: no hay fila fuente que fotografiar.
         app.mark_baseline();
 
-        let baseline = app.baseline.as_ref().expect("mark_baseline debe crear un baseline igual");
+        let baseline = app
+            .baseline
+            .as_ref()
+            .expect("mark_baseline debe crear un baseline igual");
         assert!(baseline.tools_by_server.is_none());
     }
 
@@ -4726,8 +5458,11 @@ mod tests {
 
     #[test]
     fn find_quota_source_row_elige_la_fila_mas_reciente_con_dato() {
-        let rows =
-            vec![req_with_quota("t1", Some(full_quota())), req_with_quota("t2", None), req_with_quota("t3", Some(full_quota()))];
+        let rows = vec![
+            req_with_quota("t1", Some(full_quota())),
+            req_with_quota("t2", None),
+            req_with_quota("t3", Some(full_quota())),
+        ];
 
         let source = find_quota_source_row(&rows).expect("t3 califica como fuente");
         assert_eq!(source.timestamp, "t3");
@@ -4743,7 +5478,10 @@ mod tests {
     fn find_quota_source_row_salta_filas_none_mas_nuevas_y_usa_la_ultima_con_dato() {
         // t2 es la fila MÁS RECIENTE pero no trae cuota (tráfico no-Codex
         // intercalado): la fuente debe seguir siendo t1.
-        let rows = vec![req_with_quota("t1", Some(full_quota())), req_with_quota("t2", None)];
+        let rows = vec![
+            req_with_quota("t1", Some(full_quota())),
+            req_with_quota("t2", None),
+        ];
 
         let source = find_quota_source_row(&rows).expect("t1 califica como fuente");
         assert_eq!(source.timestamp, "t1");
@@ -4811,7 +5549,9 @@ mod tests {
         quota.primary_reset_at = None;
         quota.primary_reset_after_seconds = Some(3_600);
         let timestamp = "2024-01-01T00:00:00Z";
-        let base = chrono::DateTime::parse_from_rfc3339(timestamp).unwrap().timestamp();
+        let base = chrono::DateTime::parse_from_rfc3339(timestamp)
+            .unwrap()
+            .timestamp();
         let remaining = quota_reset_remaining(&quota, timestamp, base + 1_000);
         assert_eq!(remaining, Some(3_600 - 1_000));
     }
@@ -4821,7 +5561,10 @@ mod tests {
         let mut quota = full_quota();
         quota.primary_reset_at = None;
         quota.primary_reset_after_seconds = None;
-        assert_eq!(quota_reset_remaining(&quota, "2024-01-01T00:00:00Z", 0), None);
+        assert_eq!(
+            quota_reset_remaining(&quota, "2024-01-01T00:00:00Z", 0),
+            None
+        );
     }
 
     /// Regresión: un `reset_at` cercano a `i64::MIN` (cabecera `x-codex-*`
@@ -4831,10 +5574,16 @@ mod tests {
     fn quota_reset_remaining_no_desborda_con_reset_at_extremo() {
         let mut quota = full_quota();
         quota.primary_reset_at = Some(i64::MIN);
-        assert_eq!(quota_reset_remaining(&quota, "2024-01-01T00:00:00Z", 1_750_000_000), None);
+        assert_eq!(
+            quota_reset_remaining(&quota, "2024-01-01T00:00:00Z", 1_750_000_000),
+            None
+        );
 
         quota.primary_reset_at = Some(i64::MAX);
-        assert_eq!(quota_reset_remaining(&quota, "2024-01-01T00:00:00Z", -1), None);
+        assert_eq!(
+            quota_reset_remaining(&quota, "2024-01-01T00:00:00Z", -1),
+            None
+        );
     }
 
     #[test]
@@ -4919,7 +5668,8 @@ mod tests {
             }
         }"#;
 
-        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar con codex_quota presente");
+        let row: RequestRow =
+            serde_json::from_str(json).expect("debe deserializar con codex_quota presente");
         let quota = row.codex_quota.expect("debe traer la cuota");
         assert_eq!(quota.plan_type.as_deref(), Some("plus"));
         assert_eq!(quota.primary_used_percent, Some(4));
@@ -4943,7 +5693,8 @@ mod tests {
             "total_ms": 100.0
         }"#;
 
-        let row: RequestRow = serde_json::from_str(json).expect("debe deserializar sin codex_quota");
+        let row: RequestRow =
+            serde_json::from_str(json).expect("debe deserializar sin codex_quota");
         assert_eq!(row.codex_quota, None);
     }
 

@@ -40,7 +40,7 @@ use serde::Serialize;
 
 use crate::provider::ContextBreakdown;
 use crate::telemetry::cache_attribution::CacheBySection;
-use crate::telemetry::pricing::{model_pricing, CacheAccounting};
+use crate::telemetry::pricing::{CacheAccounting, model_pricing};
 
 /// Identificador del algoritmo, publicado dentro del propio objeto.
 ///
@@ -99,7 +99,9 @@ pub fn attribute_share(
     // pondera bytes ya presentes en el prompt, y la escritura de caché no es
     // una sección — es un cargo aparte sobre el mismo contenido.
     let m = match pricing.cache {
-        CacheAccounting::Separate { read_multiplier, .. } => read_multiplier,
+        CacheAccounting::Separate {
+            read_multiplier, ..
+        } => read_multiplier,
         CacheAccounting::Subset { read_multiplier } => read_multiplier,
     };
 
@@ -210,7 +212,11 @@ mod tests {
     /// Las cinco fracciones suman 1. Si no sumaran, no serían un reparto.
     #[test]
     fn las_cinco_fracciones_suman_uno() {
-        for c in [cache(0, 0, 0, 0), cache(400, 100, 200, 0), cache(400, 100, 400, 80)] {
+        for c in [
+            cache(0, 0, 0, 0),
+            cache(400, 100, 200, 0),
+            cache(400, 100, 400, 80),
+        ] {
             let s = attribute_share(Some("claude-opus-4-8"), Some(&contexto()), Some(&c))
                 .expect("repartible");
             let suma = s.tools_share

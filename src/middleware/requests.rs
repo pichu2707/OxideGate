@@ -7,9 +7,9 @@
 use crate::state::AppState;
 use crate::telemetry::RecentRequest;
 use axum::{
+    Json,
     extract::State,
     response::{IntoResponse, Response},
-    Json,
 };
 use std::sync::Arc;
 

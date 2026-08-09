@@ -17,15 +17,15 @@ pub mod skills;
 use crate::config::AppConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 pub use anthropic::ANTHROPIC;
 pub use gemini::GEMINI;
 pub use instructions::InstructionsBlock;
-pub use skills::SkillsBlock;
 pub use openai::{OPENAI_CHAT, OPENAI_CODEX_RESPONSES, OPENAI_RESPONSES};
+pub use skills::SkillsBlock;
 
 /// Lo que el proxy sabe del request entrante, antes de saber a qué proveedor
 /// pertenece.
@@ -799,9 +799,7 @@ pub struct ToolSearchSignal {
 pub fn classify(tool_name: &str) -> (ToolServerKind, &str) {
     let mut segments = tool_name.splitn(3, "__");
     match (segments.next(), segments.next(), segments.next()) {
-        (Some("mcp"), Some(server), Some(_)) if !server.is_empty() => {
-            (ToolServerKind::Mcp, server)
-        }
+        (Some("mcp"), Some(server), Some(_)) if !server.is_empty() => (ToolServerKind::Mcp, server),
         _ => (ToolServerKind::Native, NATIVE_TOOLS_LABEL),
     }
 }
@@ -1200,8 +1198,14 @@ pub fn maybe_decompress(body: &[u8], encoding: Option<&str>) -> Vec<u8> {
 /// `(None, false)` directamente sin invocar esta función.
 pub(crate) fn model_and_stream_from_value(value: &Value) -> (Option<String>, bool) {
     (
-        value.get("model").and_then(|m| m.as_str()).map(str::to_string),
-        value.get("stream").and_then(|s| s.as_bool()).unwrap_or(false),
+        value
+            .get("model")
+            .and_then(|m| m.as_str())
+            .map(str::to_string),
+        value
+            .get("stream")
+            .and_then(|s| s.as_bool())
+            .unwrap_or(false),
     )
 }
 
@@ -1231,14 +1235,25 @@ mod tests {
         })
         .expect("serializa");
 
-        let claves: std::collections::BTreeSet<&str> =
-            v.as_object().expect("objeto").keys().map(String::as_str).collect();
+        let claves: std::collections::BTreeSet<&str> = v
+            .as_object()
+            .expect("objeto")
+            .keys()
+            .map(String::as_str)
+            .collect();
 
         assert_eq!(
             claves,
-            ["bytes", "deferred_tools", "kind", "server", "tool_names", "tools"]
-                .into_iter()
-                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "bytes",
+                "deferred_tools",
+                "kind",
+                "server",
+                "tool_names",
+                "tools"
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
             "cambió la forma de tools_by_server. Si es ADITIVO, actualiza esta \
              lista. Si RENOMBRA, QUITA o cambia el tipo de una clave, sube además \
              CONTRACT_VERSION en middleware::version y anótalo en \
@@ -1258,8 +1273,12 @@ mod tests {
         })
         .expect("serializa");
 
-        let claves: std::collections::BTreeSet<&str> =
-            v.as_object().expect("objeto").keys().map(String::as_str).collect();
+        let claves: std::collections::BTreeSet<&str> = v
+            .as_object()
+            .expect("objeto")
+            .keys()
+            .map(String::as_str)
+            .collect();
 
         assert_eq!(
             claves,
@@ -1345,10 +1364,7 @@ mod tests {
         let (history, last, count) = split_history_and_last_turn(items.iter());
         assert_eq!(count, 3);
         assert_eq!(last, measure_value(&items[2]));
-        assert_eq!(
-            history,
-            measure_value(&items[0]) + measure_value(&items[1])
-        );
+        assert_eq!(history, measure_value(&items[0]) + measure_value(&items[1]));
     }
 
     /// `array_field` sobre una clave ausente o de otro tipo devuelve slice
@@ -1422,7 +1438,10 @@ mod tests {
             classify("mcp__claude_ai_Gmail__search_threads"),
             (ToolServerKind::Mcp, "claude_ai_Gmail")
         );
-        assert_eq!(classify("Read"), (ToolServerKind::Native, NATIVE_TOOLS_LABEL));
+        assert_eq!(
+            classify("Read"),
+            (ToolServerKind::Native, NATIVE_TOOLS_LABEL)
+        );
         // Un servidor MCP llamado literalmente "(native)" es Mcp, NUNCA Native.
         assert_eq!(
             classify("mcp__(native)__thing"),
@@ -1476,7 +1495,12 @@ mod tests {
         // servidor literal "(others)" de arriba.
         let names: Vec<String> = (0..31).map(|i| format!("mcp__srv{i:02}__tool")).collect();
         let values: Vec<Value> = (0..31).map(|i| serde_json::json!({"n": i})).collect();
-        entries.extend(names.iter().zip(values.iter()).map(|(n, v)| (n.as_str(), v)));
+        entries.extend(
+            names
+                .iter()
+                .zip(values.iter())
+                .map(|(n, v)| (n.as_str(), v)),
+        );
 
         // Servidor 33.°, distinto de todos los anteriores: cupo ya agotado
         // (32 trackeados), así que desborda genuinamente a `Others`.
@@ -1565,7 +1589,10 @@ mod tests {
         let srv = &rows[0];
         assert_eq!(srv.server, "srv");
         assert_eq!(srv.tools, 3);
-        assert_eq!(srv.deferred_tools, 3, "totalmente diferido: deferred_tools == tools");
+        assert_eq!(
+            srv.deferred_tools, 3,
+            "totalmente diferido: deferred_tools == tools"
+        );
     }
 
     /// Ninguna tool del servidor trae `defer_loading` (ni siquiera la clave
@@ -1588,7 +1615,10 @@ mod tests {
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].tools, 2);
-        assert_eq!(rows[0].deferred_tools, 0, "nada diferido: bytes reales y desconectables");
+        assert_eq!(
+            rows[0].deferred_tools, 0,
+            "nada diferido: bytes reales y desconectables"
+        );
     }
 
     /// EL CASO QUE MOTIVA EL CAMPO: un body con DOS servidores MCP donde uno
@@ -1614,11 +1644,20 @@ mod tests {
 
         let rows = group_tools_by_server(entries.into_iter());
 
-        let server_a = rows.iter().find(|r| r.server == "servidor_a").expect("servidor_a presente");
+        let server_a = rows
+            .iter()
+            .find(|r| r.server == "servidor_a")
+            .expect("servidor_a presente");
         assert_eq!(server_a.tools, 2);
-        assert_eq!(server_a.deferred_tools, 2, "servidor_a: totalmente diferido");
+        assert_eq!(
+            server_a.deferred_tools, 2,
+            "servidor_a: totalmente diferido"
+        );
 
-        let server_b = rows.iter().find(|r| r.server == "servidor_b").expect("servidor_b presente");
+        let server_b = rows
+            .iter()
+            .find(|r| r.server == "servidor_b")
+            .expect("servidor_b presente");
         assert_eq!(server_b.tools, 1);
         assert_eq!(
             server_b.deferred_tools, 0,
@@ -1644,7 +1683,10 @@ mod tests {
         let entries = vec![("engram_mem_search", &a), ("delegation_list", &b)];
 
         let rows = group_tools_by_server(entries.into_iter());
-        let nativa = rows.iter().find(|r| r.tools == 2).expect("ambas son nativas al aplanarse");
+        let nativa = rows
+            .iter()
+            .find(|r| r.tools == 2)
+            .expect("ambas son nativas al aplanarse");
 
         assert!(
             nativa.tool_names.contains(&"engram_mem_search".to_string()),
@@ -1667,10 +1709,19 @@ mod tests {
         let entries = vec![("mcp__engram__mem_search", &a), ("apply_patch", &b)];
 
         let rows = group_tools_by_server(entries.into_iter());
-        let engram = rows.iter().find(|r| r.server == "engram").expect("fila de engram");
-        let nativa = rows.iter().find(|r| r.kind == ToolServerKind::Native).expect("fila nativa");
+        let engram = rows
+            .iter()
+            .find(|r| r.server == "engram")
+            .expect("fila de engram");
+        let nativa = rows
+            .iter()
+            .find(|r| r.kind == ToolServerKind::Native)
+            .expect("fila nativa");
 
-        assert_eq!(engram.tool_names, vec!["mcp__engram__mem_search".to_string()]);
+        assert_eq!(
+            engram.tool_names,
+            vec!["mcp__engram__mem_search".to_string()]
+        );
         assert_eq!(nativa.tool_names, vec!["apply_patch".to_string()]);
     }
 
@@ -1732,8 +1783,14 @@ mod tests {
 
         assert_eq!(rows_sin.len(), 1);
         assert_eq!(rows_con.len(), 1);
-        assert_eq!(rows_sin[0].deferred_tools, 0, "sin la marca: deferred_tools debe dar 0");
-        assert_eq!(rows_con[0].deferred_tools, 1, "con la marca: deferred_tools debe dar 1");
+        assert_eq!(
+            rows_sin[0].deferred_tools, 0,
+            "sin la marca: deferred_tools debe dar 0"
+        );
+        assert_eq!(
+            rows_con[0].deferred_tools, 1,
+            "con la marca: deferred_tools debe dar 1"
+        );
 
         let bytes_sin = rows_sin[0].bytes;
         let bytes_con = rows_con[0].bytes;
@@ -1863,9 +1920,10 @@ mod tests {
     fn maybe_decompress_gzip_recupera_bytes_originales() {
         use std::io::Write;
         let original = br#"{"model":"gpt-5","input":"hola"}"#;
-        let mut encoder =
-            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder.write_all(original).expect("gzip comprime el fixture");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(original)
+            .expect("gzip comprime el fixture");
         let comprimido = encoder.finish().expect("gzip cierra el stream");
 
         let recuperado = maybe_decompress(&comprimido, Some("gzip"));

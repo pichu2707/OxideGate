@@ -4,7 +4,11 @@
 //! array y el monitor lo deserializa como tal, así que convertirlo en objeto
 //! rompería a todo consumidor existente. Un endpoint hermano es aditivo, y
 //! una build anterior simplemente devuelve 404.
-use axum::{Json, extract::State, response::{IntoResponse, Response}};
+use axum::{
+    Json,
+    extract::State,
+    response::{IntoResponse, Response},
+};
 use std::sync::Arc;
 
 use crate::state::AppState;
@@ -21,13 +25,11 @@ pub async fn handle_sessions(
     // Mismo contrato de `?since=` que `/stats`: fecha o días, y 400 si no se
     // entiende. Las dos rutas tienen que comportarse igual o el parámetro deja
     // de ser aprendible.
-    let desde = match crate::middleware::parse_since(
-        q.since.as_deref(),
-        chrono::Utc::now().date_naive(),
-    ) {
-        Ok(d) => d,
-        Err(e) => return (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
-    };
+    let desde =
+        match crate::middleware::parse_since(q.since.as_deref(), chrono::Utc::now().date_naive()) {
+            Ok(d) => d,
+            Err(e) => return (axum::http::StatusCode::BAD_REQUEST, e).into_response(),
+        };
     let registry = state.telemetry.sessions();
 
     // Read-lock BREVE, sin `.await` dentro: se toma, se construye el snapshot

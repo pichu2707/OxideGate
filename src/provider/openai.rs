@@ -14,10 +14,10 @@
 //! (`output_config.effort` y `speed` a nivel raíz), así que acá quedan
 //! siempre en `None` a propósito (ver la nota en cada `prepare`).
 use super::{
-    array_field, classify, fingerprint, maybe_decompress, measure_key, measure_other,
-    measure_value, model_and_stream_from_value, parse_body, split_history_and_last_turn,
-    tools_overhead_bytes, ContextBreakdown, Incoming, Outgoing, Provider, ToolSearchSignal,
-    ToolServerBytes, ToolServerKind, ToolCalls, Usage,
+    ContextBreakdown, Incoming, Outgoing, Provider, ToolCalls, ToolSearchSignal, ToolServerBytes,
+    ToolServerKind, Usage, array_field, classify, fingerprint, maybe_decompress, measure_key,
+    measure_other, measure_value, model_and_stream_from_value, parse_body,
+    split_history_and_last_turn, tools_overhead_bytes,
 };
 use crate::config::AppConfig;
 use serde_json::Value;
@@ -75,7 +75,9 @@ impl Provider for OpenAiChat {
             .map(model_and_stream_from_value)
             .unwrap_or((None, false));
         let context = parsed.as_ref().and_then(|v| self.decompose(v));
-        let skills = parsed.as_ref().and_then(crate::provider::skills::detect_skills_in_body);
+        let skills = parsed
+            .as_ref()
+            .and_then(crate::provider::skills::detect_skills_in_body);
         let instructions = parsed
             .as_ref()
             .and_then(crate::provider::instructions::detect_instructions_in_body);
@@ -192,7 +194,11 @@ impl Provider for OpenAiChat {
             history_bytes,
             last_turn_bytes,
             other_bytes,
-            measured_bytes: system_bytes + tools_bytes + history_bytes + last_turn_bytes + other_bytes,
+            measured_bytes: system_bytes
+                + tools_bytes
+                + history_bytes
+                + last_turn_bytes
+                + other_bytes,
             messages_count,
         })
     }
@@ -268,7 +274,9 @@ impl Provider for OpenAiResponses {
             .map(model_and_stream_from_value)
             .unwrap_or((None, false));
         let context = parsed.as_ref().and_then(|v| self.decompose(v));
-        let skills = parsed.as_ref().and_then(crate::provider::skills::detect_skills_in_body);
+        let skills = parsed
+            .as_ref()
+            .and_then(crate::provider::skills::detect_skills_in_body);
         let instructions = parsed
             .as_ref()
             .and_then(crate::provider::instructions::detect_instructions_in_body);
@@ -365,7 +373,11 @@ impl Provider for OpenAiResponses {
             history_bytes,
             last_turn_bytes,
             other_bytes,
-            measured_bytes: system_bytes + tools_bytes + history_bytes + last_turn_bytes + other_bytes,
+            measured_bytes: system_bytes
+                + tools_bytes
+                + history_bytes
+                + last_turn_bytes
+                + other_bytes,
             messages_count,
         })
     }
@@ -506,7 +518,9 @@ impl Provider for OpenAiCodexResponses {
             .map(model_and_stream_from_value)
             .unwrap_or((None, false));
         let context = parsed.as_ref().and_then(|v| self.decompose(v));
-        let skills = parsed.as_ref().and_then(crate::provider::skills::detect_skills_in_body);
+        let skills = parsed
+            .as_ref()
+            .and_then(crate::provider::skills::detect_skills_in_body);
         let instructions = parsed
             .as_ref()
             .and_then(crate::provider::instructions::detect_instructions_in_body);
@@ -690,7 +704,10 @@ fn extract_openai_usage(value: &Value, usage: &mut Usage) {
     let details = u
         .get("prompt_tokens_details")
         .or_else(|| u.get("input_tokens_details"));
-    if let Some(v) = details.and_then(|d| d.get("cached_tokens")).and_then(Value::as_u64) {
+    if let Some(v) = details
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+    {
         usage.cache_read_tokens = Some(v);
     }
     if let Some(v) = details
@@ -703,8 +720,8 @@ fn extract_openai_usage(value: &Value, usage: &mut Usage) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::NATIVE_TOOLS_LABEL;
+    use super::*;
 
     /// OpenAI (con include_usage) manda el `usage` en el chunk final, con
     /// `prompt_tokens`/`completion_tokens` y `choices` vacío.
@@ -844,7 +861,11 @@ mod tests {
         assert_eq!(bd.last_turn_bytes, measure_value(&messages[3]));
         assert_eq!(
             bd.measured_bytes,
-            bd.system_bytes + bd.tools_bytes + bd.history_bytes + bd.last_turn_bytes + bd.other_bytes
+            bd.system_bytes
+                + bd.tools_bytes
+                + bd.history_bytes
+                + bd.last_turn_bytes
+                + bd.other_bytes
         );
     }
 
@@ -939,7 +960,11 @@ mod tests {
         assert_eq!(bd.last_turn_bytes, measure_value(&body["input"]));
         assert_eq!(
             bd.measured_bytes,
-            bd.system_bytes + bd.tools_bytes + bd.history_bytes + bd.last_turn_bytes + bd.other_bytes
+            bd.system_bytes
+                + bd.tools_bytes
+                + bd.history_bytes
+                + bd.last_turn_bytes
+                + bd.other_bytes
         );
     }
 
@@ -980,7 +1005,11 @@ mod tests {
         assert_eq!(bd.last_turn_bytes, measure_value(&input[2]));
         assert_eq!(
             bd.measured_bytes,
-            bd.system_bytes + bd.tools_bytes + bd.history_bytes + bd.last_turn_bytes + bd.other_bytes
+            bd.system_bytes
+                + bd.tools_bytes
+                + bd.history_bytes
+                + bd.last_turn_bytes
+                + bd.other_bytes
         );
     }
 
@@ -1138,9 +1167,7 @@ mod tests {
     #[test]
     fn responses_prepare_nunca_muta_body() {
         let cfg = test_config();
-        let incoming = incoming_with_body(
-            r#"{"model":"gpt-4o","stream":true,"input":"hola"}"#,
-        );
+        let incoming = incoming_with_body(r#"{"model":"gpt-4o","stream":true,"input":"hola"}"#);
         let original_body = incoming.body.clone();
 
         let out = OPENAI_RESPONSES.prepare(incoming, &cfg);
@@ -1407,10 +1434,9 @@ mod tests {
     /// `None` del trait (contrato de "no aplica"), aun con `input` presente.
     #[test]
     fn chat_tool_search_es_none() {
-        let body: Value = serde_json::from_str(
-            r#"{"model": "gpt-4o", "input": [{"type": "tool_search_call"}]}"#,
-        )
-        .unwrap();
+        let body: Value =
+            serde_json::from_str(r#"{"model": "gpt-4o", "input": [{"type": "tool_search_call"}]}"#)
+                .unwrap();
 
         assert_eq!(OPENAI_CHAT.tool_search(&body), None);
     }
@@ -1508,8 +1534,7 @@ mod tests {
     /// afirmación de "verificable" ni de "aplanado".
     #[test]
     fn responses_tools_flattened_none_sin_tools() {
-        let body: Value =
-            serde_json::from_str(r#"{"model": "gpt-5.5", "input": "hola"}"#).unwrap();
+        let body: Value = serde_json::from_str(r#"{"model": "gpt-5.5", "input": "hola"}"#).unwrap();
 
         assert_eq!(OPENAI_RESPONSES.tools_flattened(&body), None);
     }
@@ -1518,8 +1543,7 @@ mod tests {
     /// se puede decir si el `(native)` estaría o no verificado.
     #[test]
     fn responses_tools_flattened_none_tools_vacio() {
-        let body: Value =
-            serde_json::from_str(r#"{"model": "gpt-5.5", "tools": []}"#).unwrap();
+        let body: Value = serde_json::from_str(r#"{"model": "gpt-5.5", "tools": []}"#).unwrap();
 
         assert_eq!(OPENAI_RESPONSES.tools_flattened(&body), None);
     }
@@ -1633,7 +1657,10 @@ mod tests {
 
         let out = OPENAI_CODEX_RESPONSES.prepare(incoming, &cfg);
 
-        assert!(out.context.is_some(), "el body zstd debe medirse, no quedar en None");
+        assert!(
+            out.context.is_some(),
+            "el body zstd debe medirse, no quedar en None"
+        );
         assert!(
             !out.tools_by_server.is_empty(),
             "las tools del body zstd deben desglosarse por servidor"
