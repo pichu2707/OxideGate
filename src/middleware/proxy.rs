@@ -310,6 +310,9 @@ async fn send_and_meter(
                 tools_by_server,
                 tools_overhead_bytes,
                 prepare_us,
+                // El upstream nunca contesto, asi que no hubo respuesta que
+                // escanear. Es un cero MEDIDO, no un hueco.
+                scan_us: 0,
                 requested_effort: out.requested_effort,
                 requested_speed: out.requested_speed,
                 served_speed: None,

@@ -412,6 +412,19 @@ pub struct RequestMetric {
     /// optimiza acá a propósito (ver informe del cambio).
     #[serde(default)]
     pub prepare_us: u64,
+    /// Microsegundos dentro del ESCANEO de la respuesta: la otra mitad del
+    /// overhead propio del proxy.
+    ///
+    /// `prepare_us` cubre el lado de la PETICIÓN; esto cubre el de la
+    /// RESPUESTA —el recorrido SSE que corre por cada chunk—, que no lo medía
+    /// nadie. Los dos juntos son el tiempo de CPU que cuesta observar, y son
+    /// lo que permite AUDITAR la premisa del proyecto en vez de creérsela.
+    ///
+    /// NO es `Option`: el escaneo siempre ocurre. Un cero es un cero MEDIDO
+    /// —una respuesta sin un solo chunk, o un upstream que nunca contestó— no
+    /// un dato ausente. `default` es para las filas ya escritas sin él.
+    #[serde(default)]
+    pub scan_us: u64,
 
     // --- Cuota de suscripción de Codex (ver `telemetry::codex_quota`) ---
     /// Estado de la cuota de suscripción de Codex, parseado de las doce
@@ -767,6 +780,7 @@ mod tests {
             tools_by_server: None,
             tools_overhead_bytes: None,
             prepare_us: 0,
+            scan_us: 0,
             codex_quota: None,
             session,
         }

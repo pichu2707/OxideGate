@@ -945,6 +945,7 @@ mod tests {
             effort_forced: None,
             response_bytes: None,
             prepare_us: 0,
+            scan_us: 0,
             codex_quota: None,
             session: SessionAttribution {
                 source: SessionSource::Unattributed,

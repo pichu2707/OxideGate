@@ -160,6 +160,7 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `context_messages_count` | Cantidad de mensajes del historial completo (incluyendo el último) | Sube con la conversación; útil para correlacionar contra `context_history_bytes` |
 | `context_tax_ratio` | `(context_system_bytes + context_tools_bytes + context_history_bytes) / context_measured_bytes` | Cercano a `1.0` (100%) ⇒ casi todo el body de esta petición es contexto YA enviado antes, no turno nuevo — la "tasa" que se paga por repetir contexto en cada request |
 | `prepare_us` | Microsegundos que el proxy pasó dentro de `Provider::prepare` (parseo del body + `decompose` + mutación opcional, p. ej. inyectar `cache_control`) | Ver la nota sobre qué NO incluye, más abajo |
+| `scan_us` | Microsegundos que el proxy pasó ESCANEANDO la respuesta (recorrido SSE por cada chunk, más el cierre). La otra mitad del overhead propio | Los dos juntos son el tiempo de CPU que cuesta observar — ver la nota de abajo |
 | `tools_by_server` | Desglose de `context_tools_bytes` por servidor MCP declarante: `[{server, kind, tools, bytes, deferred_tools, tool_names}, …]`, ordenado por `bytes` descendente | `null` si el body no parseó como objeto (o build anterior a este campo); `[]` si SÍ parseó pero no declaraba `tools` — son estados DISTINTOS, ver §4.2. `deferred_tools` (por elemento) es la fuente de verdad POR SERVIDOR de cuánto está diferido, ver §4.2 |
 | `tools_overhead_bytes` | Bytes de `tools` no atribuidos a ningún servidor (brackets/comas del array, wrapper de Gemini, herramientas huérfanas) | `null` en los mismos casos que `tools_by_server` es `null`; `sum(tools_by_server[].bytes) + tools_overhead_bytes == context_tools_bytes` siempre que ambos sean no-nulos |
 | `tool_search` | Señal de carga diferida de herramientas del dialecto Responses/Codex: `{used, deferred_loaded}`, o `null`. `used: false` ⇒ EAGER confirmado este turno; `used: true` ⇒ LAZY (el cliente cargó tools a mitad de sesión) | `null` en Anthropic/Gemini/OpenAI-Chat (no aplica) o si el body no parseó. Es el diferenciador eager-vs-lazy por cliente que `tools_by_server` NO puede dar — ver §4.3 |
@@ -204,6 +205,24 @@ nada por su cuenta: solo expone en vivo lo que `RequestMetric` ya mide.
   leer el body completo desde el socket del cliente, ni el round-trip al
   proveedor upstream. Es el overhead propio de OxideGate en esa fase
   puntual, no la latencia total de la petición — para eso está `total_ms`.
+- **`scan_us` mide la OTRA fase propia: el escaneo de la respuesta.** El
+  recorrido SSE corre por cada chunk buscando el `usage`, y hasta que existió
+  este campo no lo medía nadie. Con solo `prepare_us` no se podía afirmar que
+  observar saliera barato, únicamente suponerlo.
+
+  Medido en una petición en streaming real: **`prepare_us` 259 µs contra
+  `scan_us` 3.534 µs**. El escaneo cuesta unas **13 veces más** que la
+  preparación — la mitad que sí se medía era la barata.
+
+  `prepare_us + scan_us` es el tiempo de CPU que cuesta observar. Sobre esa
+  misma petición: **0,15% de `total_ms`**. La premisa del proyecto se sostiene,
+  pero ahora es un hecho auditable y no una creencia.
+
+  NO son `Option`: el escaneo siempre ocurre. Un cero es un cero MEDIDO —una
+  respuesta sin chunks, o un upstream que nunca contestó— no un dato ausente.
+  Y el número **incluye su propio coste de medición** (dos `Instant::now()` por
+  chunk): decenas de nanosegundos frente a un parseo de JSON, irrelevante para
+  lo que se decide con él, pero se dice en vez de fingir que medir es gratis.
 
 Ver `docs/monitor-tui.md` §7.3 para cómo el monitor presenta estos campos en
 la vista `Context` del panel de requests recientes.

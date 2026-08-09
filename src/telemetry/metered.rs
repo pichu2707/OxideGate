@@ -241,6 +241,19 @@ pub struct MeteredBody {
     /// honesta del TAMAÑO DEL CONTENIDO, no del ancho de banda que se habría
     /// consumido sin el medidor delante.
     response_bytes: usize,
+    /// Microsegundos acumulados DENTRO del escáner de la respuesta.
+    ///
+    /// Es la otra mitad del overhead propio del proxy: `prepare_us` mide el
+    /// lado de la PETICIÓN, esto mide el de la RESPUESTA — el recorrido SSE
+    /// que corre por cada chunk. Sin este número no se puede afirmar que
+    /// observar salga barato, solo suponerlo, y todo el proyecto se apoya en
+    /// esa afirmación.
+    ///
+    /// Se cronometra con dos `Instant::now()` por chunk, así que **el número
+    /// incluye su propio coste de medición**. Son decenas de nanosegundos
+    /// frente a un parseo de JSON: irrelevante para lo que se decide con él,
+    /// pero se dice en vez de fingir que la medición es gratis.
+    scan_us: u64,
     /// Guarda para no emitir la métrica dos veces (fin de stream + Drop).
     emitted: bool,
 }
@@ -266,6 +279,7 @@ impl MeteredBody {
             ttft_ms: None,
             scanner: UsageScanner::new(is_stream, provider),
             response_bytes: 0,
+            scan_us: 0,
             emitted: false,
         }
     }
@@ -276,7 +290,13 @@ impl MeteredBody {
             return;
         }
         self.emitted = true;
+        // `finish` cierra el escaneo (última línea parcial, no-streaming), así
+        // que su tiempo es escaneo igual que el de cada chunk.
+        let cierre = Instant::now();
         self.scanner.finish();
+        self.scan_us = self
+            .scan_us
+            .saturating_add(cierre.elapsed().as_micros() as u64);
 
         let total_ms = self.start.elapsed().as_secs_f64() * 1000.0;
         let cost_estimate_usd = pricing::estimate_cost_usd(
@@ -375,6 +395,7 @@ impl MeteredBody {
             tools_by_server,
             tools_overhead_bytes,
             prepare_us: self.base.prepare_us,
+            scan_us: self.scan_us,
             requested_effort: self.base.requested_effort.clone(),
             requested_speed: self.base.requested_speed.clone(),
             served_speed: self.scanner.usage.speed.clone(),
@@ -410,7 +431,11 @@ impl Stream for MeteredBody {
                     this.ttft_ms = Some(this.start.elapsed().as_secs_f64() * 1000.0);
                 }
                 this.response_bytes += bytes.len();
+                let escaneo = Instant::now();
                 this.scanner.feed(&bytes);
+                this.scan_us = this
+                    .scan_us
+                    .saturating_add(escaneo.elapsed().as_micros() as u64);
                 Poll::Ready(Some(Ok(bytes)))
             }
             Poll::Ready(Some(Err(e))) => {
@@ -485,6 +510,78 @@ mod tests {
 
     /// Los bytes de bajada se acumulan a lo largo de TODOS los chunks, no solo
     /// del primero ni del último. Un contador que se reasigne en vez de sumar
+    /// EL HUECO QUE CIERRA ESTE CAMPO. `prepare_us` mide el lado de la
+    /// PETICIÓN; el escaneo de la RESPUESTA corre por cada chunk y no lo medía
+    /// nadie. Sin él no se puede afirmar que observar salga barato — solo
+    /// suponerlo.
+    #[tokio::test]
+    async fn scan_us_mide_el_escaneo_de_la_respuesta() {
+        let dir = std::env::temp_dir().join(format!("oxi-scan-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir de prueba");
+        let sink = TelemetrySink::spawn(dir.clone());
+        let recent = sink.recent();
+
+        // Eventos SSE de verdad: el escáner los parsea, que es el trabajo que
+        // este campo viene a contar.
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = (0..40)
+            .map(|i| {
+                Ok(Bytes::from(format!(
+                    "event: content_block_delta\ndata: {{\"type\":\"content_block_delta\",\"index\":{i},\"delta\":{{\"type\":\"text_delta\",\"text\":\"hola\"}}}}\n\n"
+                )))
+            })
+            .collect();
+        let mut body = MeteredBody::new(
+            futures_util::stream::iter(chunks),
+            sink,
+            base_de_prueba(true),
+            Instant::now(),
+        );
+        while body.next().await.is_some() {}
+        drop(body);
+
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let filas = recent.read().unwrap_or_else(|p| p.into_inner()).snapshot();
+        let fila = filas.last().expect("debe haber una fila");
+
+        // No se afirma un umbral: en una maquina rapida 40 chunks pueden
+        // escanearse en menos de 1 us y el campo saldria 0 legitimamente. Lo
+        // que se afirma es que el campo EXISTE y se puebla — que era el hueco.
+        assert!(
+            fila.scan_us < 1_000_000,
+            "un escaneo de 40 chunks no puede tardar un segundo: {}",
+            fila.scan_us
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Una respuesta sin un solo chunk no escanea nada, y el campo lo dice con
+    /// un cero MEDIDO. Es la diferencia con `None`: aquí sí sabemos que no
+    /// hubo trabajo, no es que no hayamos podido verlo.
+    #[tokio::test]
+    async fn sin_chunks_el_escaneo_es_cero_medido_no_ausente() {
+        let dir = std::env::temp_dir().join(format!("oxi-scan0-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir de prueba");
+        let sink = TelemetrySink::spawn(dir.clone());
+        let recent = sink.recent();
+
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = Vec::new();
+        let mut body = MeteredBody::new(
+            futures_util::stream::iter(chunks),
+            sink,
+            base_de_prueba(true),
+            Instant::now(),
+        );
+        while body.next().await.is_some() {}
+        drop(body);
+
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let filas = recent.read().unwrap_or_else(|p| p.into_inner()).snapshot();
+        let fila = filas.last().expect("debe haber una fila");
+
+        assert_eq!(fila.scan_us, 0, "cero MEDIDO, no ausente");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// daría el tamaño del último chunk y parecería plausible.
     #[tokio::test]
     async fn response_bytes_suma_todos_los_chunks() {

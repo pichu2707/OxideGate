@@ -265,6 +265,25 @@ memoria alineados a potencias de 2.
 `tax%` se muestra como `-` (nunca `0.0`) cuando `context_tax_ratio` es
 `None` — mismo criterio de "ausente ≠ cero" que el resto del panel.
 
+#### `scan_us` y `prox%`: el medidor midiéndose
+
+`prep_us` mide el lado de la PETICIÓN. `scan_us` mide el de la RESPUESTA —el
+recorrido SSE que corre por cada chunk—, y hasta que existió no lo medía nadie.
+
+Van juntas a propósito: son las dos mitades del mismo número. Separarlas en
+vistas distintas invitaría a leer una como si fuera el total, y sería leerla
+justo al revés — medido en una petición en streaming real, **`prep_us` 259 µs
+contra `scan_us` 3.534 µs**: el escaneo cuesta unas 13 veces más, y era la
+mitad invisible.
+
+`prox%` es `(prep_us + scan_us) / total_ms`: qué fracción del reloj se llevó el
+propio medidor. En esa misma petición, **0,15%**.
+
+Exige las DOS mitades. Con una sola se marca ausente en vez de publicar un
+porcentaje calculado sobre la mitad del overhead — «el medidor cuesta un 0,1%»
+sacado de la mitad barata es exactamente la clase de número tranquilizador y
+falso que este panel no debe dar.
+
 ### 7.3.1. `B/tok` y el denominador dependiente del dialecto
 
 `B/tok` divide `context_measured_bytes` (bytes del body, ver §7.3) por
