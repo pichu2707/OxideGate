@@ -614,7 +614,8 @@ El monitor es la forma de comprobar que una optimización sirve:
 4. Observe el panel **Δ desde baseline**: el `cache-hit` subiendo, el coste/token
    bajando, los `tok/s` — el "después" limpio, sin que el "antes" lo diluya.
 
-Teclas: `q` salir · `b` baseline · `r` reset · ↑/↓ elegir modelo ·
+Teclas: `q` salir · `b` baseline · `r` reset · ↑/↓ elegir modelo (la tabla
+scrollea) ·
 `p` panel por petición · `c` cambiar de vista (latencia / contexto).
 `cargo run --bin oxidegate-monitor -- --once` da la foto en texto plano (headless).
 
