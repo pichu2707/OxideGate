@@ -111,7 +111,7 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
 | `q` / `Esc` | Salir |
 | `b` | Marcar baseline (para el panel ANTES/DESPUÉS) |
 | `r` | Resetear baseline |
-| `↑` / `↓` | Elegir el modelo (fila resaltada, afecta el panel ANTES/DESPUÉS y los sparklines) |
+| `↑` / `↓` | Elegir el modelo (fila resaltada, afecta el panel ANTES/DESPUÉS y los sparklines). La tabla **scrollea**: la selección arrastra el viewport y las primeras filas SALEN de la vista en vez de quedarse ancladas arriba. Bajando a la 4ª posición con dos filas visibles se ven la 3ª y la 4ª, no la 1ª y la 2ª. El título dice la posición (`4/12`) y la fila lleva `▶` además del fondo, que se pierde en un terminal sin color |
 | `p` | Mostrar/ocultar el panel de requests recientes (ver §7) |
 | `c` | Ciclar la vista de columnas del panel de requests recientes — `Latency` → `Context` → `Cache` → `Toll` → `Latency` (ver §7.1). **No-op si el panel está oculto**: no cambia nada mientras `p` lo tenga escondido |
 | `s` | Mostrar/ocultar el panel de tools por servidor (ver §8). **INDEPENDIENTE** de `p`/`c`: ninguna de las tres teclas afecta el estado de las otras |
@@ -126,7 +126,13 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
    hace 12s" o "sin baseline — pulse 'b'").
 2. **Tabla principal**, una fila por `(upstream, model)`, TOTAL acumulado
    desde que el proxy arrancó: `MODELO | REQ | tok/s | TTFT ms | cache-hit |
-   coste $ | redun%`. Fila seleccionada resaltada.
+   coste $ | redun%`. Fila seleccionada resaltada con `▶` y fondo.
+
+   La tabla tiene **viewport propio**: es la única sección elástica del
+   layout (`Constraint::Min(5)`), así que con los paneles abiertos se queda
+   en pocas filas y el resto se alcanza scrolleando. Antes se dibujaba sin
+   estado y se recortaba al área: `↑`/`↓` seguían moviendo la selección, pero
+   a partir de la última fila visible se pintaba FUERA de la pantalla.
 3. **Panel ANTES/DESPUÉS**: delta de ventana del modelo seleccionado desde
    el baseline (ver §3). Si no hay baseline, muestra el aviso para marcarlo.
 4. **Sparklines**: throughput (tok/s) y TTFT (ms) del modelo seleccionado a
