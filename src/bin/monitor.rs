@@ -2133,19 +2133,78 @@ fn draw_sparklines(f: &mut Frame, area: Rect, app: &App) {
 
     let throughput_data: Vec<u64> = history.throughput.iter().copied().collect();
     let ttft_data: Vec<u64> = history.ttft.iter().copied().collect();
+    let throughput_scale = sparkline_visible_scale(&throughput_data);
+    let ttft_scale = sparkline_visible_scale(&ttft_data);
 
     let throughput_sparkline = Sparkline::default()
-        .block(Block::default().borders(Borders::ALL).title(" tok/s (histórico) "))
-        .data(&throughput_data)
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " tok/s (histórico · rango {}..{}) ",
+            throughput_scale.min, throughput_scale.max
+        )))
+        .data(&throughput_scale.data)
+        .max(throughput_scale.render_max)
         .style(Style::default().fg(Color::Green));
 
     let ttft_sparkline = Sparkline::default()
-        .block(Block::default().borders(Borders::ALL).title(" TTFT ms (histórico) "))
-        .data(&ttft_data)
+        .block(Block::default().borders(Borders::ALL).title(format!(
+            " TTFT ms (histórico · rango {}..{}) ",
+            ttft_scale.min, ttft_scale.max
+        )))
+        .data(&ttft_scale.data)
+        .max(ttft_scale.render_max)
         .style(Style::default().fg(Color::Yellow));
 
     f.render_widget(throughput_sparkline, chunks[0]);
     f.render_widget(ttft_sparkline, chunks[1]);
+}
+
+struct SparklineScale {
+    data: Vec<u64>,
+    render_max: u64,
+    min: u64,
+    max: u64,
+}
+
+/// Convierte una serie absoluta en una serie visible para sparkline.
+///
+/// Ratatui dibuja el sparkline desde cero. Eso funciona cuando el cero tiene
+/// significado visual, pero falla para métricas que viven siempre en una banda
+/// alta: `980, 990, 1000` se ve como una pared llena, aunque haya forma real.
+/// Para que el panel muestre QUÉ HACE la señal, desplazamos la serie al mínimo
+/// observado y renderizamos el rango local con un 25% de aire superior. El
+/// título conserva el rango absoluto para no mentir sobre la magnitud real.
+fn sparkline_visible_scale(data: &[u64]) -> SparklineScale {
+    let min = data.iter().copied().min().unwrap_or(0);
+    let max = data.iter().copied().max().unwrap_or(0);
+
+    if data.is_empty() || max == 0 {
+        return SparklineScale {
+            data: vec![0; data.len()],
+            render_max: 1,
+            min,
+            max,
+        };
+    }
+
+    if min == max {
+        return SparklineScale {
+            data: vec![1; data.len()],
+            render_max: 2,
+            min,
+            max,
+        };
+    }
+
+    let shifted: Vec<u64> = data.iter().map(|v| v.saturating_sub(min)).collect();
+    let range = max.saturating_sub(min);
+    let render_max = range.saturating_add((range / 4).max(1));
+
+    SparklineScale {
+        data: shifted,
+        render_max,
+        min,
+        max,
+    }
 }
 
 /// Panel de requests recientes, más nuevo arriba (ver comentario de
@@ -3073,6 +3132,52 @@ mod tests {
     fn window_throughput_cero_si_elapsed_no_positivo() {
         assert_eq!(window_throughput(100, 0.0), 0.0);
         assert_eq!(window_throughput(100, -1.0), 0.0);
+    }
+
+    #[test]
+    fn sparkline_visible_scale_desplaza_al_minimo_para_ver_la_forma() {
+        // Este es el bug real: con escala 0..1000, una serie 980..1000 se ve
+        // como pared llena. El render debe usar el rango local 0..20 y dejar
+        // el rango absoluto solo como etiqueta.
+        let scale = sparkline_visible_scale(&[980, 1_000, 990]);
+
+        assert_eq!(scale.data, vec![0, 20, 10]);
+        assert_eq!(scale.render_max, 25);
+        assert_eq!((scale.min, scale.max), (980, 1_000));
+    }
+
+    #[test]
+    fn sparkline_visible_scale_no_devuelve_cero_para_series_vacias_o_planas() {
+        // `Sparkline::max(0)` no aporta escala útil. Incluso sin datos o con
+        // ceros mantenemos una escala mínima honesta y estable.
+        let empty = sparkline_visible_scale(&[]);
+        assert_eq!(empty.data, Vec::<u64>::new());
+        assert_eq!(empty.render_max, 1);
+
+        let zeroes = sparkline_visible_scale(&[0, 0, 0]);
+        assert_eq!(zeroes.data, vec![0, 0, 0]);
+        assert_eq!(zeroes.render_max, 1);
+    }
+
+    #[test]
+    fn sparkline_visible_scale_dibuja_series_constantes_sin_pared_llena() {
+        // Si todo vale lo mismo no hay "forma" que enseñar, pero tampoco debe
+        // llenarse toda la caja. Una línea a media altura comunica estabilidad.
+        let scale = sparkline_visible_scale(&[42, 42, 42]);
+
+        assert_eq!(scale.data, vec![1, 1, 1]);
+        assert_eq!(scale.render_max, 2);
+        assert_eq!((scale.min, scale.max), (42, 42));
+    }
+
+    #[test]
+    fn sparkline_visible_scale_suma_un_minimo_para_rangos_chicos() {
+        // En rangos 1..3, un 25% entero sería 0. El margen mínimo evita volver
+        // al mismo problema de saturación por redondeo.
+        let scale = sparkline_visible_scale(&[7, 8]);
+
+        assert_eq!(scale.data, vec![0, 1]);
+        assert_eq!(scale.render_max, 2);
     }
 
     #[test]
