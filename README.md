@@ -615,7 +615,7 @@ El monitor es la forma de comprobar que una optimización sirve:
    bajando, los `tok/s` — el "después" limpio, sin que el "antes" lo diluya.
 
 Teclas: `q` salir · `b` baseline · `r` reset · ↑/↓ elegir modelo (la tabla
-scrollea) ·
+scrollea) · `f` filtrar el panel por el modelo seleccionado ·
 `p` panel por petición · `c` cambiar de vista (latencia / contexto).
 `cargo run --bin oxidegate-monitor -- --once` da la foto en texto plano (headless).
 
