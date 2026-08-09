@@ -472,6 +472,11 @@ struct RequestRow {
     /// medición que nadie hizo: este proyecto prefiere un hueco honesto a un
     /// cero falso.
     prepare_us: Option<u64>,
+    /// Microsegundos dentro del ESCANEO de la respuesta: la otra mitad del
+    /// overhead propio del proxy. Mismo contrato `None` que
+    /// [`Self::prepare_us`] y por el mismo motivo — un proxy anterior a este
+    /// campo no lo manda, y eso es ausencia real, no un cero.
+    scan_us: Option<u64>,
 
     /// Desglose de `context_tools_bytes` por servidor MCP declarante (ver
     /// [`ToolServerRow`] y `provider::ToolServerBytes` del lado del proxy).
@@ -2678,6 +2683,8 @@ fn requests_table_labels<'a>(view: RequestsView) -> Vec<&'a str> {
                 "tax%",
                 "B/tok",
                 "prep_us",
+                "scan_us",
+                "prox%",
                 "cliente",
                 "tsearch",
                 "flat",
@@ -2736,6 +2743,8 @@ fn requests_table_widths(view: RequestsView) -> Vec<Constraint> {
             Constraint::Length(6),
             Constraint::Length(7),
             Constraint::Length(8),
+            Constraint::Length(8),
+            Constraint::Length(6),
             Constraint::Length(18),
             Constraint::Length(7),
             Constraint::Length(5),
@@ -2859,6 +2868,27 @@ fn toll_row_cells(r: &RequestRow) -> Vec<String> {
     ]
 }
 
+/// Celda `prox%`: qué fracción del reloj de la petición se llevó el PROPIO
+/// medidor — `(prepare_us + scan_us) / total_ms`.
+///
+/// Es el número que hace auditable la premisa del proyecto. Todo OxideGate se
+/// apoya en que observar sale casi gratis; mientras esa cifra no exista, eso es
+/// una creencia y no un dato.
+///
+/// Exige las DOS mitades. Con una sola no se publica un porcentaje a medias:
+/// se marca ausente, porque «el medidor cuesta un 0,1%» calculado sobre la
+/// mitad del overhead es exactamente la clase de número tranquilizador y falso
+/// que este panel no debe dar.
+fn proxy_share_cell(r: &RequestRow) -> String {
+    match (r.prepare_us, r.scan_us) {
+        (Some(prep), Some(scan)) if r.total_ms > 0.0 => {
+            let propio_ms = (prep + scan) as f64 / 1000.0;
+            format!("{:.2}", (propio_ms / r.total_ms) * 100.0)
+        }
+        _ => "-".to_string(),
+    }
+}
+
 /// Conteo con el mismo guion de dato ausente que [`opt_bytes`]. Un conteo
 /// ausente NO es un cero: «no sé cuántos hooks» y «cero hooks» son cosas
 /// distintas, y la segunda significa que ese bloque no cuesta nada.
@@ -2945,6 +2975,8 @@ fn requests_row_cells(view: RequestsView, r: &RequestRow) -> Vec<String> {
             opt_tax_ratio(r.context_tax_ratio),
             opt_fixed(bytes_per_token(r), 1),
             opt_u64(r.prepare_us),
+            opt_u64(r.scan_us),
+            proxy_share_cell(r),
             truncate_client(r.client.as_deref()),
             tsearch_cell(r),
             flattened_cell(r),
@@ -3290,7 +3322,7 @@ fn print_context_table(rows: &[RequestRow]) {
     let outliers = classify_outliers(rows);
 
     println!(
-        "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<18} {:<7} {:<5} {:<14}",
+        "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:>8} {:>6} {:<18} {:<7} {:<5} {:<14}",
         "HORA",
         "MODELO",
         "msgs",
@@ -3303,6 +3335,8 @@ fn print_context_table(rows: &[RequestRow]) {
         "tax%",
         "B/tok",
         "prep_us",
+        "scan_us",
+        "prox%",
         "cliente",
         "tsearch",
         "flat",
@@ -3311,7 +3345,7 @@ fn print_context_table(rows: &[RequestRow]) {
     for (i, r) in rows.iter().enumerate().rev() {
         let cells = requests_row_cells(RequestsView::Context, r);
         println!(
-            "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:<18} {:<7} {:<5} {:<14}",
+            "{:<10} {:<16} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9} {:>6} {:>6} {:>8} {:>8} {:>6} {:<18} {:<7} {:<5} {:<14}",
             cells[0],
             cells[1],
             cells[2],
@@ -3327,6 +3361,8 @@ fn print_context_table(rows: &[RequestRow]) {
             cells[12],
             cells[13],
             cells[14],
+            cells[15],
+            cells[16],
             marker_text(&outliers[i]),
         );
     }
@@ -3810,6 +3846,7 @@ mod tests {
             cache_by_section: None,
             input_share_by_section: None,
             prepare_us: Some(850),
+            scan_us: Some(150),
             tools_by_server: None,
             tools_overhead_bytes: None,
             tool_search: None,
@@ -4500,7 +4537,7 @@ mod tests {
 
         let cells = requests_row_cells(RequestsView::Context, &r);
 
-        assert_eq!(cells[12], "claude-cli/2.1.20…");
+        assert_eq!(cells[14], "claude-cli/2.1.20…");
     }
 
     /// `client: None` debe leerse como `-`, NUNCA como string vacío ni como
@@ -4521,7 +4558,7 @@ mod tests {
 
         let cells = requests_row_cells(RequestsView::Context, &r);
 
-        assert_eq!(cells[12], "-");
+        assert_eq!(cells[14], "-");
     }
 
     /// `truncate_client` no debe truncar un `User-Agent` que ya entra en
@@ -4552,7 +4589,7 @@ mod tests {
 
         let cells = requests_row_cells(RequestsView::Context, &r);
 
-        assert_eq!(cells[13], "lazy:3");
+        assert_eq!(cells[15], "lazy:3");
     }
 
     /// `used: false` (petición Responses/Codex medida sin diferido este turno)
@@ -4634,7 +4671,7 @@ mod tests {
 
         let cells = requests_row_cells(RequestsView::Context, &r);
 
-        assert_eq!(cells[14], "yes");
+        assert_eq!(cells[16], "yes");
     }
 
     /// `Some(false)` (hay tools `mcp__`, `(native)` de fiar) ⇒ `"no"`; `None`

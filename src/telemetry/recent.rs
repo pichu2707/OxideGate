@@ -265,6 +265,12 @@ pub struct RecentRequest {
     /// (parseo, `decompose` y mutación opcional del body). No incluye la
     /// lectura del body del socket ni el round-trip upstream.
     pub prepare_us: u64,
+    /// Microsegundos dentro del ESCANEO de la respuesta: la otra mitad del
+    /// overhead propio del proxy, la que `prepare_us` explícitamente NO cubre.
+    ///
+    /// NO es `Option`, igual que su hermano y por el mismo motivo: el escaneo
+    /// siempre ocurre. Un cero es un cero MEDIDO, no un dato ausente.
+    pub scan_us: u64,
     /// Estado de la cuota de suscripción de Codex (ver
     /// `telemetry::logger::RequestMetric::codex_quota` para el contrato
     /// completo). `None` para tráfico sin cabeceras `x-codex-*` (Anthropic,
@@ -337,6 +343,7 @@ impl From<&RequestMetric> for RecentRequest {
             prompt_bytes: m.prompt_bytes,
             response_bytes: m.response_bytes,
             prepare_us: m.prepare_us,
+            scan_us: m.scan_us,
             codex_quota: m.codex_quota.clone(),
             session: m.session.clone(),
         }
@@ -437,6 +444,7 @@ mod tests {
             effort_forced: None,
             response_bytes: None,
             prepare_us: 42,
+            scan_us: 7,
             codex_quota: None,
             session: SessionAttribution {
                 source: SessionSource::Unattributed,
@@ -1036,6 +1044,7 @@ mod tests {
             "requested_speed",
             "response_bytes",
             "route",
+            "scan_us",
             "served_speed",
             "session",
             "skills",

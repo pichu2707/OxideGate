@@ -82,7 +82,7 @@ pub const ENDPOINTS: [&str; 6] = [
 /// Un test (`telemetry::recent`) comprueba que cada entrada de aquí aparece de
 /// verdad en el JSON de `/requests`: esta lista no puede anunciar una
 /// capacidad que el proxy no tenga.
-pub const FIELDS: [&str; 15] = [
+pub const FIELDS: [&str; 16] = [
     "cache_by_section",
     "input_share_by_section",
     "prompt_bytes",
@@ -98,6 +98,7 @@ pub const FIELDS: [&str; 15] = [
     "codex_quota",
     "session",
     "prepare_us",
+    "scan_us",
 ];
 
 /// Payload de `/version`. Función pura para poder afirmar sobre ella en tests
