@@ -7,3 +7,7 @@ presentations/
 
 # Metadata del tooling de agentes (hash + fecha; se regenera sola)
 .atl/
+
+# Cuerpos capturados por `cargo run --example captura`. Llevan el CLAUDE.md,
+# el AGENTS.md y la configuracion de quien los capture: NUNCA se versionan.
+/capturas/
