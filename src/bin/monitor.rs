@@ -37,7 +37,8 @@
 //!   ↑ / ↓     elegir modelo en la tabla de agregados
 //!   p         mostrar/ocultar el panel de requests recientes (outliers)
 //!   c         ciclar la vista de columnas del panel de requests
-//!             (Latency ⇄ Context); no-op si el panel está oculto (`p`)
+//!             (Latency → Context → Cache → Toll); no-op si el panel está
+//!             oculto (`p`)
 //!   s         mostrar/ocultar el panel de "tools por servidor" (desglose
 //!             de bytes de herramientas MCP, con delta contra el baseline
 //!             marcado con `b`); INDEPENDIENTE de `p`/`c`
@@ -263,14 +264,20 @@ fn run_once(url: &str, requests_url: &str) {
         }
         Ok(rows) => {
             // `--once` es el modo para pegar resultados en texto plano en
-            // una conversación: imprime AMBAS vistas (Latency y Context),
-            // no una sola, cada una con su propio header — el usuario no
-            // tiene forma de "apretar `c`" en un snapshot que ya salió.
+            // una conversación: imprime VARIAS vistas (Latency, Context y
+            // Toll), no una sola, cada una con su propio header — el usuario
+            // no tiene forma de "apretar `c`" en un snapshot que ya salió.
+            //
+            // `Cache` sigue sin salir acá, y es una asimetría heredada, no una
+            // decisión: el mismo argumento le aplica igual.
             println!("--- vista: latency ---");
             print_requests_table(&rows);
             println!();
             println!("--- vista: context ---");
             print_context_table(&rows);
+            println!();
+            println!("--- vista: toll ---");
+            print_toll_table(&rows);
             println!();
             print_tools_table(&rows);
             println!();
@@ -427,6 +434,19 @@ struct RequestRow {
     context_measured_bytes: Option<usize>,
     context_messages_count: Option<usize>,
     context_tax_ratio: Option<f64>,
+    /// Bytes del cuerpo de la petición. Denominador del porcentaje de peaje
+    /// en la vista `Toll`: es lo que de verdad se paga, no solo lo medido.
+    prompt_bytes: Option<usize>,
+    /// Los tres bloques del PEAJE FIJO, lo que se paga antes de escribir una
+    /// palabra y en CADA petición de la sesión.
+    ///
+    /// Mismo contrato `None` que el resto de espejos: «no se pudo ver», nunca
+    /// cero. La vista `Toll` los pinta con el guion de dato ausente, porque un
+    /// `0` ahí se leería como «este bloque es gratis» — que es justo la
+    /// conclusión contraria a la correcta.
+    instructions: Option<InstructionsRow>,
+    hooks: Option<HooksRow>,
+    skills: Option<SkillsRow>,
     /// Qué cubo cayó dentro del prefijo cacheado, ESTIMADO por el proxy
     /// (espejo de `RecentRequest::cache_by_section`).
     ///
@@ -599,6 +619,35 @@ fn session_lines(rows: &[SessionRow], saturated: bool) -> Vec<String> {
         out.push(format!("… y {} sesiones más", rows.len() - 6));
     }
     out
+}
+
+/// Bloque de instrucciones del usuario: espejo de
+/// `provider::instructions::InstructionsBlock`.
+///
+/// `format` NO se deserializa: hoy solo hay una variante y la vista no
+/// ramifica por dialecto. Cuando haya más de una, entra aquí — antes no.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct InstructionsRow {
+    bytes: usize,
+}
+
+/// Salida de los hooks de `SessionStart`: espejo de
+/// `provider::hooks::HooksBlock`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct HooksRow {
+    bytes: usize,
+    /// Marcas `hook success:` contadas. Se pinta al lado de los bytes porque
+    /// «19 kB en 3 hooks» acciona y «19 kB» no: dice si el peaje viene de uno
+    /// caro o de muchos baratos.
+    declared: usize,
+}
+
+/// Listado de skills declaradas: espejo de `provider::skills::SkillsBlock`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct SkillsRow {
+    listing_bytes: usize,
+    /// Entradas del listado. Mismo motivo que en [`HooksRow::declared`].
+    declared: usize,
 }
 
 /// Bytes de cada sección que cayeron dentro del prefijo cacheado: espejo de
@@ -1678,6 +1727,20 @@ enum RequestsView {
     /// una columna que solo se mira cuando algo va mal no sirve si no está
     /// siempre visible.
     Cache,
+    /// Columnas del PEAJE FIJO: los tres bloques que el harness inyecta antes
+    /// de que el usuario escriba nada —`instructions` (48%), `hooks` (29%) y
+    /// `skills` (23%)— con su total y qué fracción de lo pagado son.
+    ///
+    /// **Vive aparte de `Context` por la misma clase de motivo que `Cache`,
+    /// no por falta de sitio** — aunque también la hubiera: `Context` ya son
+    /// 164 columnas.
+    ///
+    /// Las columnas de `Context` PARTICIONAN el prompt: `tools`, `history`,
+    /// `system`, `last_turn` y `other` suman el total. Estas no. Son una
+    /// ATRIBUCIÓN dentro de esos mismos cubos, así que ponerlas en la misma
+    /// tabla invitaría a sumarlas al total y contar los bytes dos veces. La
+    /// separación de vistas es lo que impide esa lectura.
+    Toll,
 }
 
 impl RequestsView {
@@ -1687,7 +1750,8 @@ impl RequestsView {
         match self {
             RequestsView::Latency => RequestsView::Context,
             RequestsView::Context => RequestsView::Cache,
-            RequestsView::Cache => RequestsView::Latency,
+            RequestsView::Cache => RequestsView::Toll,
+            RequestsView::Toll => RequestsView::Latency,
         }
     }
 
@@ -1698,6 +1762,7 @@ impl RequestsView {
             RequestsView::Latency => "latency",
             RequestsView::Context => "context",
             RequestsView::Cache => "cache",
+            RequestsView::Toll => "toll",
         }
     }
 }
@@ -2580,7 +2645,19 @@ fn draw_quota_panel(f: &mut Frame, area: Rect, app: &App) {
 /// Header de columnas del panel/tabla de requests, según la vista activa.
 /// Ver [`RequestsView`] para el contrato de qué columnas trae cada una.
 fn requests_table_header<'a>(view: RequestsView) -> Row<'a> {
-    let labels: Vec<&'a str> = match view {
+    Row::new(requests_table_labels(view)).style(Style::default().add_modifier(Modifier::BOLD))
+}
+
+/// Etiquetas de columna de una vista, separadas de [`requests_table_header`]
+/// para que un test pueda CONTARLAS.
+///
+/// `ratatui::Row` no expone cuántas celdas lleva, así que mientras las
+/// etiquetas vivieran dentro del constructor el guardián de alineación solo
+/// podía comparar anchos contra celdas — y la cabecera, que es la tercera
+/// pieza que tiene que cuadrar, quedaba sin comprobar pese a que el nombre del
+/// test la nombraba.
+fn requests_table_labels<'a>(view: RequestsView) -> Vec<&'a str> {
+    match view {
         RequestsView::Latency => {
             vec![
                 "hora", "modelo", "st", "status", "in", "out", "c_rd", "c_wr", "ttft_ms", "gen_ms",
@@ -2613,8 +2690,13 @@ fn requests_table_header<'a>(view: RequestsView) -> Row<'a> {
                 "$lt", "outlier",
             ]
         }
-    };
-    Row::new(labels).style(Style::default().add_modifier(Modifier::BOLD))
+        RequestsView::Toll => {
+            vec![
+                "hora", "modelo", "instr", "hooks", "nh", "skills", "nsk", "peaje", "%prom",
+                "outlier",
+            ]
+        }
+    }
 }
 
 /// Anchos de columna del panel/tabla de requests, según la vista activa.
@@ -2672,6 +2754,20 @@ fn requests_table_widths(view: RequestsView) -> Vec<Constraint> {
             Constraint::Length(15),
             Constraint::Length(14),
         ],
+        // 89 columnas + separadores. Deliberadamente estrecha: cabe donde
+        // `Context` (164) no cabe, que es parte del motivo de que exista.
+        RequestsView::Toll => vec![
+            Constraint::Length(9),
+            Constraint::Length(16),
+            Constraint::Length(9),
+            Constraint::Length(9),
+            Constraint::Length(4),
+            Constraint::Length(9),
+            Constraint::Length(4),
+            Constraint::Length(9),
+            Constraint::Length(6),
+            Constraint::Length(14),
+        ],
     }
 }
 
@@ -2701,6 +2797,75 @@ fn share_cell(v: Option<f64>) -> String {
 ///
 /// Se calcula aparte de [`requests_row_cells`] solo por longitud; la vista
 /// sigue siendo una rama más de ese `match`.
+/// Celdas de la vista `Toll`: los tres bloques del peaje fijo de una fila.
+///
+/// Dos reglas gobiernan esta función, y las dos son sobre honestidad, no sobre
+/// formato:
+///
+/// **1. `null` no es cero.** Los tres campos son `Option`, y `None` significa
+/// «no se pudo ver». Pintar un `0` diría que ese bloque es gratis — la
+/// conclusión contraria a la correcta, y el error que documenta
+/// `docs/telemetry-level-1.md`.
+///
+/// **2. Un total al que le falta un bloque es una COTA INFERIOR.** Se marca con
+/// `≥` en vez de presentarse como el peaje. Un número que parece completo y no
+/// lo está aconseja peor que no dar ninguno: quien lo lea decidirá si un plugin
+/// vale su peaje con una cifra corta sin saberlo.
+///
+/// Y lo que esta vista NO hace: sumar bytes al contexto. Estos bytes ya los
+/// cuentan las columnas `context_*`; aquí se ATRIBUYEN a quién los inyecta. Por
+/// eso el porcentaje es sobre `prompt_bytes` —qué fracción de lo pagado es
+/// peaje— y no un total nuevo que invitaría a contarlo dos veces.
+fn toll_row_cells(r: &RequestRow) -> Vec<String> {
+    let instr = r.instructions.as_ref().map(|i| i.bytes);
+    let hooks = r.hooks.as_ref().map(|h| h.bytes);
+    let skills = r.skills.as_ref().map(|s| s.listing_bytes);
+
+    let presentes: Vec<usize> = [instr, hooks, skills].into_iter().flatten().collect();
+    let completo = presentes.len() == 3;
+    let total: Option<usize> = if presentes.is_empty() {
+        None
+    } else {
+        Some(presentes.iter().sum())
+    };
+
+    let celda_total = match total {
+        // El `≥` es la diferencia entre «esto es el peaje» y «esto es lo que
+        // he podido ver del peaje».
+        Some(t) if completo => format_bytes(t),
+        Some(t) => format!("≥{}", format_bytes(t)),
+        None => "-".to_string(),
+    };
+
+    let celda_pct = match (total, r.prompt_bytes) {
+        (Some(t), Some(p)) if p > 0 => format!("{:.1}", (t as f64 / p as f64) * 100.0),
+        // Sin denominador no hay fracción. No se sustituye por el total ni por
+        // un cero: se declara que no se puede calcular.
+        _ => "-".to_string(),
+    };
+
+    vec![
+        format_time(&r.timestamp),
+        truncate_model(r.model.as_deref()),
+        opt_bytes(instr),
+        opt_bytes(hooks),
+        opt_count(r.hooks.as_ref().map(|h| h.declared)),
+        opt_bytes(skills),
+        opt_count(r.skills.as_ref().map(|s| s.declared)),
+        celda_total,
+        celda_pct,
+        // Sin marcador de outlier: lo agrega el llamador, que lo calcula una
+        // sola vez por fila y es común a las cuatro vistas.
+    ]
+}
+
+/// Conteo con el mismo guion de dato ausente que [`opt_bytes`]. Un conteo
+/// ausente NO es un cero: «no sé cuántos hooks» y «cero hooks» son cosas
+/// distintas, y la segunda significa que ese bloque no cuesta nada.
+fn opt_count(v: Option<usize>) -> String {
+    v.map(|n| n.to_string()).unwrap_or_else(|| "-".to_string())
+}
+
 fn cache_row_cells(r: &RequestRow) -> Vec<String> {
     let Some(c) = r.cache_by_section.as_ref() else {
         // Sin atribución no se rellena con ceros: se marca ausente en cada
@@ -2785,6 +2950,7 @@ fn requests_row_cells(view: RequestsView, r: &RequestRow) -> Vec<String> {
             flattened_cell(r),
         ],
         RequestsView::Cache => cache_row_cells(r),
+        RequestsView::Toll => toll_row_cells(r),
     }
 }
 
@@ -3080,6 +3246,46 @@ fn print_requests_table(rows: &[RequestRow]) {
 /// [`requests_row_cells`] para que esta vista en texto plano y la vista
 /// `Context` de la TUI (`draw_requests_panel`) nunca diverjan en qué dato
 /// muestra cada columna.
+/// Vista `Toll` en texto plano para `--once`.
+///
+/// Existe por el mismo motivo que [`print_context_table`], escrito en el
+/// comentario de `--once`: **quien lee un snapshot ya impreso no puede apretar
+/// `c`**. Y este es justo el número que se pega en una conversación para
+/// decidir si un plugin vale su peaje, que es la pregunta que motivó la vista.
+fn print_toll_table(rows: &[RequestRow]) {
+    let outliers = classify_outliers(rows);
+
+    println!(
+        "{:<10} {:<16} {:>9} {:>9} {:>4} {:>9} {:>4} {:>10} {:>6} {:<14}",
+        "HORA", "MODELO", "instr", "hooks", "nh", "skills", "nsk", "peaje", "%prom", "outlier"
+    );
+    for (i, r) in rows.iter().enumerate().rev() {
+        let cells = requests_row_cells(RequestsView::Toll, r);
+        println!(
+            "{:<10} {:<16} {:>9} {:>9} {:>4} {:>9} {:>4} {:>10} {:>6} {:<14}",
+            cells[0],
+            cells[1],
+            cells[2],
+            cells[3],
+            cells[4],
+            cells[5],
+            cells[6],
+            cells[7],
+            cells[8],
+            marker_text(&outliers[i])
+        );
+    }
+    println!(
+        "nota: peaje fijo = lo que el harness inyecta ANTES de que escribas nada, en CADA petición (instructions 48% · hooks 29% · skills 23%)"
+    );
+    println!(
+        "nota: `-` significa NO SE PUDO VER, nunca cero. `≥` en peaje = falta algún bloque, así que es una cota inferior, no el total"
+    );
+    println!(
+        "nota: estos bytes YA los cuentan las columnas de la vista context; aquí se atribuyen a quién los inyecta — no se suman aparte (ver docs/monitor-tui.md §7.3.3)"
+    );
+}
+
 fn print_context_table(rows: &[RequestRow]) {
     let outliers = classify_outliers(rows);
 
@@ -3597,6 +3803,10 @@ mod tests {
             context_measured_bytes: Some(163_527),
             context_messages_count: Some(12),
             context_tax_ratio: Some(0.9994),
+            prompt_bytes: Some(100_000),
+            instructions: None,
+            hooks: None,
+            skills: None,
             cache_by_section: None,
             input_share_by_section: None,
             prepare_us: Some(850),
@@ -4625,21 +4835,137 @@ mod tests {
     // RequestsView — enum total, ciclado con `c`
     // -----------------------------------------------------------------
 
-    /// El ciclo cubre las TRES variantes y vuelve al inicio. Que cierre el
+    /// El ciclo cubre las CUATRO variantes y vuelve al inicio. Que cierre el
     /// bucle es la parte que importa: una vista alcanzable pero de la que no
     /// se pueda salir sin reiniciar sería peor que no tenerla.
     #[test]
-    fn requests_view_next_cicla_entre_las_tres_variantes() {
+    fn requests_view_next_cicla_entre_las_cuatro_variantes() {
         assert_eq!(RequestsView::Latency.next(), RequestsView::Context);
         assert_eq!(RequestsView::Context.next(), RequestsView::Cache);
-        assert_eq!(RequestsView::Cache.next(), RequestsView::Latency);
+        assert_eq!(RequestsView::Cache.next(), RequestsView::Toll);
+        assert_eq!(RequestsView::Toll.next(), RequestsView::Latency);
+    }
+
+    // --- Vista Toll: el peaje fijo por petición ---
+
+    /// Fila con los tres bloques del peaje puestos.
+    fn req_con_peaje(
+        instr: Option<usize>,
+        hooks: Option<usize>,
+        skills: Option<usize>,
+    ) -> RequestRow {
+        let mut r = req(
+            "anthropic",
+            "claude-opus-4-1",
+            200,
+            Some(50.0),
+            100.0,
+            None,
+            None,
+        );
+        r.prompt_bytes = Some(100_000);
+        r.instructions = instr.map(|bytes| InstructionsRow { bytes });
+        r.hooks = hooks.map(|bytes| HooksRow { bytes, declared: 3 });
+        r.skills = skills.map(|listing_bytes| SkillsRow {
+            listing_bytes,
+            declared: 66,
+        });
+        r
+    }
+
+    /// El caso normal: los tres bloques presentes, el total es su suma y el
+    /// porcentaje se calcula sobre `prompt_bytes` — lo que de verdad se paga.
+    #[test]
+    fn el_peaje_suma_los_tres_bloques_y_los_situa_sobre_lo_pagado() {
+        let celdas = toll_row_cells(&req_con_peaje(Some(30_000), Some(12_000), Some(8_000)));
+
+        // hora, modelo, instr, hooks, nh, skills, nsk, peaje, %prom, outlier
+        assert_eq!(celdas[7], format_bytes(50_000), "el total son los tres");
+        assert_eq!(celdas[8], "50.0", "50.000 de 100.000 pagados");
+        assert_eq!(celdas[4], "3", "hooks declarados");
+        assert_eq!(celdas[6], "66", "skills declaradas");
+    }
+
+    /// **`null` NO es cero.** Un bloque que no se pudo ver se pinta con el
+    /// guion de dato ausente, nunca con un `0` que se leería como "gratis".
+    #[test]
+    fn un_bloque_ausente_se_marca_no_se_pinta_como_cero() {
+        let celdas = toll_row_cells(&req_con_peaje(Some(30_000), None, Some(8_000)));
+
+        assert_eq!(celdas[3], "-", "hooks ausente");
+        assert_eq!(celdas[4], "-", "y su conteo tampoco se inventa");
+    }
+
+    /// Y si falta alguno, el total es una COTA INFERIOR, no el peaje. Se
+    /// marca, porque un número que parece completo y no lo es aconseja peor
+    /// que no dar ninguno.
+    #[test]
+    fn con_un_bloque_ausente_el_total_se_declara_incompleto() {
+        let completo = toll_row_cells(&req_con_peaje(Some(30_000), Some(12_000), Some(8_000)));
+        let parcial = toll_row_cells(&req_con_peaje(Some(30_000), None, Some(8_000)));
+
+        assert!(!completo[7].starts_with('≥'), "completo no lleva marca");
+        assert!(
+            parcial[7].starts_with('≥'),
+            "un total al que le falta un bloque tiene que decirlo: {}",
+            parcial[7]
+        );
+    }
+
+    /// Sin ningún bloque no hay peaje que enseñar: todo ausente, y el total
+    /// tampoco se convierte en un cero.
+    #[test]
+    fn sin_ningun_bloque_no_se_fabrica_un_total() {
+        let celdas = toll_row_cells(&req_con_peaje(None, None, None));
+
+        assert_eq!(celdas[7], "-", "sin una sola muestra no hay total");
+        assert_eq!(celdas[8], "-", "ni porcentaje");
+    }
+
+    /// Sin `prompt_bytes` no hay denominador. El total sigue valiendo; el
+    /// porcentaje no se inventa.
+    #[test]
+    fn sin_prompt_bytes_hay_total_pero_no_porcentaje() {
+        let mut r = req_con_peaje(Some(30_000), Some(12_000), Some(8_000));
+        r.prompt_bytes = None;
+
+        let celdas = toll_row_cells(&r);
+
+        assert_eq!(celdas[7], format_bytes(50_000));
+        assert_eq!(celdas[8], "-");
+    }
+
+    /// Recorre TODAS las vistas siguiendo el ciclo de [`RequestsView::next`].
+    ///
+    /// La lista no se escribe a mano a propósito. Antes sí, con las tres
+    /// variantes cableadas, y eso convertía al guardián de abajo en un
+    /// guardián que no guarda: al añadir `Toll` habría seguido en verde sin
+    /// mirarla. Aquí la enumeración sale de `next()`, que es un `match`
+    /// exhaustivo y el compilador obliga a cubrir cada variante nueva.
+    ///
+    /// Y de paso comprueba algo que ninguna lista a mano puede: una vista
+    /// fuera del ciclo sería inalcanzable desde el teclado, que es un fallo por
+    /// sí mismo. Si existe y no está aquí, es que no se puede llegar a ella.
+    fn todas_las_vistas() -> Vec<RequestsView> {
+        let mut vistas = vec![RequestsView::default()];
+        loop {
+            let siguiente = vistas[vistas.len() - 1].next();
+            if siguiente == vistas[0] {
+                return vistas;
+            }
+            assert!(
+                !vistas.contains(&siguiente),
+                "el ciclo de vistas no vuelve al inicio: {siguiente:?} repetida"
+            );
+            vistas.push(siguiente);
+        }
     }
 
     /// Cabecera, anchos y celdas tienen que medir lo mismo EN CADA VISTA.
     /// Sin esto, agregar una columna a una sola de las tres piezas desalinea
     /// la tabla en silencio: `ratatui` no se queja, simplemente pinta mal.
     #[test]
-    fn las_tres_vistas_tienen_cabecera_anchos_y_celdas_del_mismo_ancho() {
+    fn todas_las_vistas_tienen_cabecera_anchos_y_celdas_del_mismo_ancho() {
         let r = req(
             "anthropic",
             "claude-opus-4-8",
@@ -4649,13 +4975,16 @@ mod tests {
             Some(80),
             Some(1000),
         );
-        for vista in [
-            RequestsView::Latency,
-            RequestsView::Context,
-            RequestsView::Cache,
-        ] {
+        let vistas = todas_las_vistas();
+        assert!(vistas.len() >= 4, "el ciclo tiene que cubrirlas todas");
+        for vista in vistas {
             let anchos = requests_table_widths(vista).len();
             let celdas = requests_row_cells(vista, &r).len();
+            let etiquetas = requests_table_labels(vista).len();
+            assert_eq!(
+                etiquetas, anchos,
+                "{vista:?}: {etiquetas} etiquetas contra {anchos} anchos"
+            );
             // Los anchos incluyen la columna `outlier`, que el llamador
             // agrega aparte; por eso las celdas son una menos.
             assert_eq!(
@@ -4725,6 +5054,9 @@ mod tests {
 
         app.cycle_requests_view();
         assert_eq!(app.requests_view, RequestsView::Cache);
+
+        app.cycle_requests_view();
+        assert_eq!(app.requests_view, RequestsView::Toll);
 
         app.cycle_requests_view();
         assert_eq!(app.requests_view, RequestsView::Latency);
