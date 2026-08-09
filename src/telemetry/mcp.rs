@@ -369,10 +369,17 @@ impl McpRegistry {
         // Lo más caro primero: es el orden en el que se mira una lista así.
         // Desempate por nombre para que la salida sea estable entre llamadas
         // (el HashMap no lo es) y los tests puedan afirmar sobre ella.
+        //
+        // Y por `kind` al final, igual que `group_tools_by_server`: la clave de
+        // `accumulators` es `(kind, server)`, así que un servidor MCP homónimo
+        // de `(native)` convive con el cubo nativo genuino. Si además empatan
+        // en bytes, sin este tercer criterio el orden lo decide el `HashMap` —
+        // estable dentro de un proceso, no entre reinicios.
         servers.sort_by(|a, b| {
             b.bytes_per_request_declared
                 .cmp(&a.bytes_per_request_declared)
                 .then_with(|| a.server.cmp(&b.server))
+                .then_with(|| a.kind.cmp(&b.kind))
         });
 
         // Servidores que se invocaron pero nunca se vieron declarados: no
@@ -771,6 +778,41 @@ mod tests {
             nativo.bytes_per_request_declared, 5_000,
             "el coste sí se publica"
         );
+    }
+
+    /// El desempate llega hasta `kind`, como en `group_tools_by_server`.
+    ///
+    /// Un servidor MCP homónimo de `(native)` y el cubo nativo genuino son
+    /// filas distintas —la clave es `(kind, server)`, justo para eso— pero si
+    /// empatan en bytes y comparten etiqueta, ordenar solo por bytes y nombre
+    /// deja el orden en manos del `HashMap`: estable dentro de un proceso, no
+    /// entre reinicios (el seed de SipHash cambia). El dato no sufre; la
+    /// promesa de salida estable, sí.
+    #[test]
+    fn el_orden_desempata_por_kind_cuando_bytes_y_etiqueta_coinciden() {
+        let mut anterior: Option<Vec<ToolServerKind>> = None;
+
+        // Se repite porque el sintoma es no determinista por construccion: una
+        // sola pasada podria acertar por casualidad.
+        for _ in 0..8 {
+            let mut reg = McpRegistry::default();
+            reg.ingest(&fila("(native)", ToolServerKind::Mcp, 5_000, 1, None));
+            reg.ingest(&fila("(native)", ToolServerKind::Native, 5_000, 1, None));
+
+            let orden: Vec<ToolServerKind> = reg
+                .snapshot()
+                .servers
+                .iter()
+                .filter(|s| s.server == "(native)")
+                .map(|s| s.kind)
+                .collect();
+
+            assert_eq!(orden.len(), 2, "las dos filas siguen siendo distintas");
+            if let Some(previo) = &anterior {
+                assert_eq!(&orden, previo, "el orden tiene que ser el mismo siempre");
+            }
+            anterior = Some(orden);
+        }
     }
 
     /// El orden es estable y por coste descendente: un `HashMap` no lo es, y
