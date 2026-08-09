@@ -11,7 +11,7 @@ use crate::provider::{
     ContextBreakdown, InstructionsBlock, SkillsBlock, ToolCalls, ToolSearchSignal, ToolServerBytes,
 };
 use crate::telemetry::{
-    CacheBySection, SectionShare, CodexQuota, RecentRequests, SessionAttribution, SessionRegistry, StatsRegistry,
+    CacheBySection, SectionShare, CodexQuota, McpRegistry, RecentRequests, SessionAttribution, SessionRegistry, StatsRegistry,
 };
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -535,6 +535,9 @@ pub struct TelemetrySink {
     recent: Arc<RwLock<RecentRequests>>,
     /// Agregación por sesión, alimentada en la misma task de drenaje.
     sessions: Arc<RwLock<SessionRegistry>>,
+    /// Cruce coste-vs-uso por servidor MCP, alimentado por el mismo drenaje
+    /// y expuesto por `GET /mcp`. Ver `telemetry::mcp`.
+    mcp: Arc<RwLock<McpRegistry>>,
 }
 
 /// Línea de confirmación que se imprime UNA sola vez, la primera vez que el
@@ -581,6 +584,8 @@ impl TelemetrySink {
         let recent_writer = Arc::clone(&recent);
         let sessions = Arc::new(RwLock::new(SessionRegistry::default()));
         let sessions_writer = Arc::clone(&sessions);
+        let mcp = Arc::new(RwLock::new(McpRegistry::default()));
+        let mcp_writer = Arc::clone(&mcp);
 
         let mut path = storage_dir;
         path.push("telemetry.jsonl");
@@ -650,6 +655,13 @@ impl TelemetrySink {
                     sessions.ingest(&metric);
                 }
 
+                {
+                    let mut mcp = mcp_writer
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    mcp.ingest(&metric);
+                }
+
                 if let Ok(mut line) = serde_json::to_string(&metric) {
                     line.push('\n');
                     if let Err(e) = file.write_all(line.as_bytes()).await {
@@ -664,6 +676,7 @@ impl TelemetrySink {
             stats,
             recent,
             sessions,
+            mcp,
         }
     }
 
@@ -688,6 +701,11 @@ impl TelemetrySink {
     /// Handle compartido de la agregación por sesión, para `GET /sessions`.
     pub fn sessions(&self) -> Arc<RwLock<SessionRegistry>> {
         Arc::clone(&self.sessions)
+    }
+
+    /// Handle compartido del cruce coste-vs-uso por servidor MCP.
+    pub fn mcp(&self) -> Arc<RwLock<McpRegistry>> {
+        Arc::clone(&self.mcp)
     }
 }
 

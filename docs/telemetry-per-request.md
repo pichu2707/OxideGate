@@ -1137,13 +1137,44 @@ sin saber qué servidor sobra.
 
 ```json
 "tool_calls": {
-  "invoked": ["Read", "Read", "mcp__context7__get-docs"],
+  "invoked": [
+    { "name": "Read",                    "server": "(native)", "kind": "native" },
+    { "name": "mcp__context7__get-docs", "server": "context7", "kind": "mcp"    },
+    { "name": "buscar",                  "server": "remoto",   "kind": "mcp"    }
+  ],
   "server_invoked": ["web_search"],
   "invoked_total": 3,
   "server_invoked_total": 1,
   "complete": true
 }
 ```
+
+**Cada invocación lleva su servidor RESUELTO, no solo el nombre.** Es lo único
+que hace fiable el cruce, porque hay dos casos donde el nombre no basta:
+
+- El **conector MCP de Anthropic** (`mcp_tool_use`) manda el nombre desnudo
+  —`buscar` en el ejemplo— y el servidor en un campo hermano. Deducirlo del
+  nombre lo mandaría a `(native)` el 100% de las veces, y el servidor real
+  aparecería sin usar.
+- El nombre se **acota a 128 caracteres** al guardarlo. Deducir el servidor del
+  nombre ya recortado partiría un `mcp__<server-largo>__<tool>` antes de su
+  segundo `__`.
+
+Ambos fallos publicarían `unused` para un servidor en uso, que es el peor
+error que este dato puede provocar.
+
+> **Cambio de forma respecto a la primera versión de este campo.** `invoked`
+> empezó siendo un array de strings. Ninguna release lo publicó así —entró en
+> `main` después de la v0.12.0 y se corrigió antes de la siguiente— así que
+> `CONTRACT_VERSION` sigue en 1: no hay ningún consumidor que pudiera haberse
+> escrito contra la forma vieja desde una versión publicada.
+>
+> Aun así, las filas ya escritas en `telemetry.jsonl` con la forma antigua
+> **siguen entrando**: `ToolCall` acepta las dos al deserializar y, al leer un
+> string suelto, deriva el servidor con `provider::classify` — que es
+> exactamente lo que hacía el consumidor de entonces. Sin esa tolerancia,
+> `serde` fallaba al parsear la fila ENTERA y la rehidratación perdía también
+> sus tokens, coste y latencia.
 
 Cruzar esos nombres con `tools_by_server` sobre el histórico es lo único que
 permite escribir la frase que justifica la palanca:
@@ -1257,7 +1288,139 @@ cupos son **independientes**: que un modelo agote el de cliente no puede
 silenciar la lista de servidor. El truncado cuenta CARACTERES, no bytes:
 cortar UTF-8 a mitad de un punto de código haría panic.
 
-**Aditivo**: `FIELDS` pasa de 13 a 14 (`tool_calls`) y `CONTRACT_VERSION` sigue en 1.
+**Aditivo respecto a lo publicado**: `FIELDS` pasa de 13 a 14 (`tool_calls`) y
+`CONTRACT_VERSION` sigue en 1. La forma de `invoked` cambió dentro de `main`
+antes de que ninguna release la sirviera (ver el aviso de arriba), así que
+ningún consumidor pudo escribirse contra la anterior.
+
+
+## 4.16. `GET /mcp`: qué cuesta cada servidor y cuánto se usa
+
+Los cuatro endpoints anteriores contestan sobre coste. Este contesta sobre
+**valor**: cruza los bytes que un servidor MCP cuesta con las veces que
+realmente se invoca, y es la única pregunta que necesita los dos lados del
+cable a la vez —los bytes viven en la petición, las invocaciones en la
+respuesta— así que solo la puede responder un punto que vea las dos.
+
+```json
+{
+  "threshold": 50,
+  "since": "2026-08-01T09:12:03Z",
+  "servers_omitted": 0,
+  "invoked_never_declared": [],
+  "servers": [
+    {
+      "server": "context7",
+      "kind": "mcp",
+      "declared_in_requests": 200,
+      "bytes_per_request_declared": 12400,
+      "tools_declared": 8,
+      "invocations": 0,
+      "conclusive_requests": 187,
+      "discarded": { "no_extractor": 11, "incomplete": 2, "truncated": 0 },
+      "verdict": {
+        "type": "unused",
+        "conclusive_requests": 187,
+        "bytes_per_request_declared": 12400
+      }
+    }
+  ]
+}
+```
+
+Esa fila es la frase que motiva todo el campo `tool_calls` (§4.15): *pagas
+12.400 B por petición por `context7` y no has invocado ninguna de sus 8
+herramientas en 187 peticiones concluyentes*.
+
+### El veredicto viene con la evidencia, no en su lugar
+
+Recomendar quitar un servidor que sí se usa es el peor fallo posible aquí: el
+usuario pierde una integración que funciona **por consejo del medidor**. Por
+eso cada fila publica en qué se apoya, y una petición solo cuenta como prueba
+de NO-uso si supera los tres filtros:
+
+| Filtro | Qué descarta | Campo |
+|---|---|---|
+| Tiene extractor | `tool_calls: null` — el proveedor no mide, o la fila es anterior al campo | `discarded.no_extractor` |
+| Se escaneó entera | `complete: false` — turno abortado, la lista es un prefijo | `discarded.incomplete` |
+| No está truncada | el cupo recortó, una llamada pudo quedar fuera | `discarded.truncated` |
+
+Los tres se cuentan por separado, y no como un total, porque cada uno se
+arregla de forma distinta: `no_extractor` con un extractor nuevo,
+`truncated` subiendo el cupo, e `incomplete` no se arregla — es tráfico real
+que el usuario abortó.
+
+### La asimetría: ver una llamada prueba el uso; no verla no prueba el no-uso
+
+Una invocación observada en una fila **incompleta** cuenta igual hacia
+`invocations`. Solo el veredicto de NO-uso exige filas concluyentes. Si no
+fuera así, un turno abortado podría esconder la única prueba de que un
+servidor sí se usa, y el recomendador aconsejaría borrarlo.
+
+### Los cuatro veredictos
+
+| `type` | Significa |
+|---|---|
+| `used` | Se invocó al menos una vez. Nunca se recomienda quitarlo |
+| `unused` | Cero invocaciones sobre `umbral` peticiones concluyentes o más |
+| `insufficient_data` | Cero invocaciones, pero sin evidencia suficiente. **No es lo mismo que `unused`** — aquí la respuesta honesta es «todavía no lo sé» |
+| `not_applicable` | `(native)` o `(others)`: no es algo que el usuario pueda quitar de su configuración |
+
+### El umbral viaja en la respuesta
+
+`threshold` es un **juicio, no una medida**, y por eso se publica: quien no esté
+de acuerdo tiene `invocations`, `conclusive_requests` y los descartes para
+aplicar el suyo. Está en 50 y no en 200 porque 200 tarda días en acumularse
+en un uso normal y el consejo llegaría tarde para ser útil; 3 sería ruido que
+cualquier sesión corta produce.
+
+### La ventana: `desde`, y por qué no admite `?since=`
+
+**El agregado NO cubre "todo lo que existió".** Se rehidrata del
+`telemetry.jsonl` al arrancar —como `/stats` y `/sessions`, y por un motivo
+más fuerte: sin histórico arrancaría en blanco tras cada reinicio y no
+llegaría nunca al umbral— pero `rehydrate` solo repone los últimos
+`OXIDEGATE_HISTORY_DAYS` días (**7 por defecto**, y `0` desactiva la
+rehidratación).
+
+Por eso el snapshot publica **`since`**: el timestamp más antiguo que entró en
+el agregado. Sin ese campo, alguien con la ventana corta podría leer un
+`unused` como si cubriera meses y borrar un servidor que usa una vez por
+semana. Con `OXIDEGATE_HISTORY_DAYS=0` y un reinicio reciente, un `unused`
+puede apoyarse en minutos de tráfico — `since` lo dice.
+
+No admite `?since=`, a diferencia de `/stats`: la pregunta es sobre un
+HÁBITO, y acotar más la ventana solo bajaría las peticiones concluyentes y
+convertiría un `unused` en un `insufficient_data`. Si hace falta, entra
+después como parámetro aditivo.
+
+### Dos campos más que evitan un informe engañoso
+
+- **`servers_omitted`**: servidores DISTINTOS que no se admitieron por el
+  tope de 256. Las etiquetas salen de nombres que llegan en la respuesta
+  —texto de fuera—, así que el registro tiene cupo como todos sus hermanos
+  (`SessionRegistry` corta en 10.000, `StatsRegistry` en 50.000). Distinto de
+  cero significa que **este informe está incompleto**.
+- **`invoked_never_declared`**: servidores MCP que se invocaron pero de los que
+  nunca se vio la declaración, así que no hay coste que cruzar. El caso
+  típico es el desborde de `MAX_TOOL_SERVERS`: con más de 32 servidores en
+  una petición, los que sobran se pliegan en `(others)` y pierden su
+  identidad del lado declarado, mientras sus invocaciones sí conservan el
+  nombre real. Sin este campo desaparecían del informe — y son justo los del
+  usuario con la configuración más cara.
+
+### `bytes_per_request_declared` no es un ahorro sobre todo el tráfico
+
+El nombre lleva `_declared` porque promedia **solo sobre las peticiones en las
+que el servidor viajaba**, que es `declared_in_requests`. Un servidor
+declarado en 20 de 1.000 peticiones cuesta eso en esas 20 y nada en las otras
+980; multiplicar por el total exageraría la ganancia 50 veces. Los dos campos
+van juntos en la fila justo para poder hacer la cuenta correcta.
+
+Y ojo al leerlo junto a **`tools_declared`**, que es un valor PUNTUAL (el de
+la última vez que se vio) mientras el coste es una media de toda la ventana:
+si la configuración cambió dentro de ella, las dos cifras describen momentos
+distintos.
 
 ---
 
