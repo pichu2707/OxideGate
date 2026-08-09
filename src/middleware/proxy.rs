@@ -145,6 +145,14 @@ pub async fn handle_openai_codex_responses(state: State<Arc<AppState>>, req: Req
     run(&provider::OPENAI_CODEX_RESPONSES, state, req).await
 }
 
+/// `POST /api/generate` y `POST /api/chat` → dialecto NATIVO de ollama.
+///
+/// Las dos rutas comparten proveedor: mismo dialecto, misma forma de
+/// respuesta, y `prepare` reenvía el path tal cual.
+pub async fn handle_ollama_route(state: State<Arc<AppState>>, req: Request) -> Response {
+    run(&provider::OLLAMA, state, req).await
+}
+
 /// `POST /v1beta/models/{model}:{método}` → proveedor Google Gemini.
 pub async fn handle_gemini_route(state: State<Arc<AppState>>, req: Request) -> Response {
     run(&provider::GEMINI, state, req).await
@@ -313,6 +321,11 @@ async fn send_and_meter(
                 // El upstream nunca contesto, asi que no hubo respuesta que
                 // escanear. Es un cero MEDIDO, no un hueco.
                 scan_us: 0,
+                // El upstream nunca contesto: el motor no reporto ninguna
+                // duracion. `None` es "no lo dijo", no "tardo cero".
+                load_us: None,
+                prompt_eval_us: None,
+                eval_us: None,
                 requested_effort: out.requested_effort,
                 requested_speed: out.requested_speed,
                 served_speed: None,

@@ -198,6 +198,10 @@ pub struct AppConfig {
     /// autenticado con la sesión de ChatGPT en vez de una API key de OpenAI.
     /// Ruta local `/v1/codex/responses` la reenvía a `{target_codex_url}/responses`.
     pub target_codex_url: String,
+    /// Base del motor LOCAL que habla el dialecto nativo de ollama
+    /// (`/api/generate`, `/api/chat`). Por defecto `127.0.0.1:11434`, que es
+    /// donde escucha ollama: el default apunta a esta máquina a propósito.
+    pub target_ollama_url: String,
     pub storage_dir: PathBuf,
     /// Quién eligió [`Self::storage_dir`]. Lo consume el arranque para decidir
     /// si no poder crearlo es mortal — ver [`ensure_storage_dir`].
@@ -267,6 +271,8 @@ impl AppConfig {
                 .unwrap_or_else(|_| "https://generativelanguage.googleapis.com".to_string()),
             target_codex_url: env::var("OXIDEGATE_CODEX_API_BASE")
                 .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex".to_string()),
+            target_ollama_url: env::var("OXIDEGATE_OLLAMA_API_BASE")
+                .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string()),
             storage_dir,
             storage_dir_source,
             force_prompt_cache: env::var("OXIDEGATE_FORCE_CACHE")

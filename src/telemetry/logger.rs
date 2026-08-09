@@ -425,6 +425,24 @@ pub struct RequestMetric {
     /// un dato ausente. `default` es para las filas ya escritas sin él.
     #[serde(default)]
     pub scan_us: u64,
+    /// Microsegundos que el MOTOR dice haber tardado en cargar el modelo,
+    /// procesar el prompt y generar la salida.
+    ///
+    /// Solo los reporta un motor LOCAL (`ollama`), y son lo unico que separa
+    /// CARGAR el modelo de inferir con el: medido, la carga fue el 57% de una
+    /// peticion fria. `ttft_ms` mezcla esa carga con el procesado del prompt.
+    ///
+    /// NO corrigen ningun error de `tokens_per_sec`: en streaming el `ttft_ms`
+    /// ya absorbe la carga, asi que la velocidad publicada ya era correcta.
+    ///
+    /// `None` en los cuatro dialectos de nube: no es que no carguen modelos,
+    /// es que no lo reportan. Ausencia honesta, no un cero.
+    #[serde(default)]
+    pub load_us: Option<u64>,
+    #[serde(default)]
+    pub prompt_eval_us: Option<u64>,
+    #[serde(default)]
+    pub eval_us: Option<u64>,
 
     // --- Cuota de suscripción de Codex (ver `telemetry::codex_quota`) ---
     /// Estado de la cuota de suscripción de Codex, parseado de las doce
@@ -781,6 +799,9 @@ mod tests {
             tools_overhead_bytes: None,
             prepare_us: 0,
             scan_us: 0,
+            load_us: None,
+            prompt_eval_us: None,
+            eval_us: None,
             codex_quota: None,
             session,
         }
