@@ -83,7 +83,6 @@ pub struct SkillsBlock {
     pub format: SkillsFormat,
 }
 
-/// Cabecera del listado plano de Claude Code.
 /// Cabecera de la lista plana de Claude Code.
 ///
 /// `pub(super)` porque el detector de hooks la usa como frontera FINAL de su
@@ -104,8 +103,26 @@ pub fn detect_skills(texto: &str) -> Option<SkillsBlock> {
         .or_else(|| detect_skills_instructions(texto))
 }
 
-/// Lista plana de Claude Code: cabecera y a continuación líneas `- nombre: …`
-/// hasta la primera que no lo sea.
+/// Lista plana de Claude Code: cabecera y a continuación líneas `- nombre: …`,
+/// hasta la primera línea EN BLANCO.
+///
+/// # Por qué la frontera es la línea en blanco y no «la primera que no empiece
+/// por `- `»
+///
+/// Esa era la regla anterior, y estaba mal: la descripción de una skill es
+/// CONTENIDO —texto libre del frontmatter— y puede ocupar varias líneas.
+/// Bastaba con que una sola lo hiciera para que la continuación cortara el
+/// recorrido y se llevara por delante todas las entradas posteriores. Medido
+/// sobre captura del 2026-08-09: **63 entradas publicadas de 66 reales, y
+/// 14.902 B de 16.355 (−8,9%)**, sin que nadie lo notara porque 63 es un
+/// número perfectamente plausible.
+///
+/// Es el mismo principio que `docs/fixed-toll-claude-code.md` §4 deja escrito
+/// tras dos mediciones falsas: **las fronteras las pone el envoltorio, nunca
+/// el contenido.** Una línea en blanco sí es estructura del listado —el
+/// harness no las mete entre entradas, verificado sobre esa captura: las dos
+/// que hay están ANTES de la primera— y es lo que permite seguir reconociendo
+/// un listado embebido en un mensaje más largo.
 fn detect_flat_list(texto: &str) -> Option<SkillsBlock> {
     let inicio = texto.find(CLAUDE_SKILLS_HEADER)?;
     let resto = &texto[inicio + CLAUDE_SKILLS_HEADER.len()..];
@@ -117,12 +134,18 @@ fn detect_flat_list(texto: &str) -> Option<SkillsBlock> {
         if limpia.starts_with("- ") {
             entradas += 1;
             fin += linea.len();
-        } else if entradas > 0 {
-            break;
         } else if limpia.trim().is_empty() {
-            // Línea en blanco entre la cabecera y la primera entrada.
+            // Antes de la primera entrada separa la cabecera; después CIERRA.
+            if entradas > 0 {
+                break;
+            }
+            fin += linea.len();
+        } else if entradas > 0 {
+            // Continuación de la entrada anterior: sus bytes se pagan, pero
+            // NO es una skill nueva. `declared` cuenta entradas, no líneas.
             fin += linea.len();
         } else {
+            // Texto suelto antes de cualquier entrada: no es un listado.
             break;
         }
     }
@@ -249,6 +272,75 @@ mod tests {
             b.listing_bytes > 60,
             "bytes irrisorios: {}",
             b.listing_bytes
+        );
+    }
+
+    /// PRUEBA DE MORDIDA (bug real, medido sobre captura del 2026-08-09).
+    ///
+    /// El recorrido se paraba en la primera línea que no empezara por `- `, así
+    /// que UNA sola skill con la descripción repartida en varias líneas cortaba
+    /// el listado y se llevaba por delante TODAS las siguientes. Medido: 63
+    /// entradas publicadas de 66 reales, y 14.902 B de 16.355 (−8,9%).
+    ///
+    /// Nadie lo notó porque 63 es un número perfectamente plausible.
+    #[test]
+    fn una_descripcion_multilinea_no_corta_el_listado() {
+        let texto = format!(
+            "{CLAUDE_SKILLS_HEADER}\n\
+             - primera: hace algo\n\
+             - claude-api: referencia de la API\n\
+             TRIGGER — lee esto antes de abrir el fichero\n\
+             SKIP solo si otro proveedor esta en juego\n\
+             - segunda: viene DESPUES de la multilinea\n\
+             - tercera: y esta tambien\n"
+        );
+
+        let b = detect_skills(&texto).expect("debe reconocer la lista");
+
+        assert_eq!(
+            b.declared, 4,
+            "las dos de después de la multilínea no pueden perderse"
+        );
+        assert_eq!(
+            b.listing_bytes,
+            texto.len(),
+            "y sus bytes tampoco: el listado llega hasta el final"
+        );
+    }
+
+    /// Una continuación suma BYTES pero no es una entrada nueva. `declared`
+    /// cuenta skills, no líneas — confundirlo inflaría el conteo al arreglar
+    /// el corte.
+    #[test]
+    fn una_continuacion_suma_bytes_pero_no_cuenta_como_entrada() {
+        let sin = format!("{CLAUDE_SKILLS_HEADER}\n- una: hace algo\n");
+        let con = format!("{CLAUDE_SKILLS_HEADER}\n- una: hace algo\n  y sigue aquí\n");
+
+        let a = detect_skills(&sin).expect("a");
+        let b = detect_skills(&con).expect("b");
+
+        assert_eq!(a.declared, b.declared, "la misma skill, no dos");
+        assert!(
+            b.listing_bytes > a.listing_bytes,
+            "pero los bytes de la continuación SÍ se pagan"
+        );
+    }
+
+    /// REGRESIÓN. Una línea en blanco sigue cerrando el listado: es lo que
+    /// permite reconocerlo cuando va embebido en un texto más largo. Sin este
+    /// corte, arreglar la multilínea se tragaría el resto del mensaje — el
+    /// mismo error que este fix viene a deshacer, en la otra dirección.
+    #[test]
+    fn una_linea_en_blanco_sigue_cerrando_el_listado() {
+        let texto =
+            format!("{CLAUDE_SKILLS_HEADER}\n- una: hace algo\n\nY sigue el mensaje del usuario.");
+
+        let b = detect_skills(&texto).expect("debe reconocer la lista");
+
+        assert_eq!(b.declared, 1);
+        assert!(
+            !texto[..b.listing_bytes].contains("mensaje del usuario"),
+            "el listado no puede tragarse lo que viene detrás"
         );
     }
 

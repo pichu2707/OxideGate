@@ -675,6 +675,24 @@ sumarlos.
 
 ---
 
+#### La frontera del listado plano es la línea en blanco
+
+No «la primera línea que no empiece por `- `», que es lo que hacía hasta el
+cierre de #84. La descripción de una skill es **contenido** —texto libre del
+frontmatter— y puede ocupar varias líneas: bastaba con que una sola lo hiciera
+para que la continuación cortara el recorrido y se llevara por delante todas
+las entradas posteriores.
+
+Medido sobre captura del 2026-08-09: publicaba **63 entradas de 66** y
+**14.902 B de 16.355 (−8,9%)**. Nadie lo notó porque 63 es un número
+perfectamente plausible; salió al cruzarlo contra la frontera de `hooks`
+(§4.17), que empieza justo donde este listado acaba. Con las dos corregidas,
+`hooks.bytes + listado` cubre la parte que los contiene **exactamente**.
+
+Una continuación **suma bytes pero no cuenta como entrada**: `declared` cuenta
+skills, no líneas. Y la línea en blanco sigue cerrando el bloque, que es lo que
+permite reconocer un listado embebido en un mensaje más largo.
+
 ### 4.9. `response_bytes`: la otra dirección, con una advertencia
 
 Hasta ahora toda la contabilidad en bytes era de SUBIDA. `response_bytes`
