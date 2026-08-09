@@ -540,6 +540,7 @@ mod tests {
             target_gemini_url: "https://generativelanguage.googleapis.com".to_string(),
             target_codex_url: "https://chatgpt.com/backend-api/codex".to_string(),
             storage_dir: std::path::PathBuf::from("/tmp/oxidegate-test"),
+            storage_dir_source: crate::config::StorageDirSource::Default,
             force_prompt_cache,
             force_effort: force_effort.map(str::to_string),
             force_effort_warning: None,
