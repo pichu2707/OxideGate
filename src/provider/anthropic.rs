@@ -1287,8 +1287,7 @@ mod tests {
         let mut calls = ToolCalls::default();
         ANTHROPIC.extract_tool_use(&evento, &mut calls);
 
-        assert_eq!(
-            nombres(&calls), vec!["get_weather".to_string()]);
+        assert_eq!(nombres(&calls), vec!["get_weather".to_string()]);
         assert!(calls.server_invoked.is_empty(), "no es de servidor");
     }
 
