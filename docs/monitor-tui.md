@@ -757,18 +757,29 @@ Tiene **tres estados y los tres significan cosas distintas**:
 | `ninguno cargado — la próxima petición paga la carga` | Ollama contestó y **no hay nada**. Es un dato, no un hueco |
 | `sin lectura de ollama` | No se pudo preguntar. No se afirma nada |
 
-### Y resuelve una contaminación que no se puede medir de otra forma
+### Y resuelve una contaminación del camino OpenAI-compatible
 
-En el camino **OpenAI-compatible** —el que proxea OxideGate— ollama **no expone**
-`load_duration`. Así que `total_ms` y `tok/s` de una petición fría incluyen
-cargar el modelo, y nada lo dice.
+Por la ruta **compatible con OpenAI**, ollama **no expone** `load_duration`. Así
+que `total_ms` y `tok/s` de una petición fría incluyen cargar el modelo, y nada
+lo dice.
 
-Medido: **el 92%** del tiempo de una petición fría fue carga, no inferencia.
+Cuánto pesa esa carga **depende por completo de cuánto se genere**: medido entre
+el **54%** del tiempo (200 tokens) y el **98%** (un token). No hay un número que
+valga como constante — hay un aviso.
 
-No se puede separar desde aquí, pero **sí se puede decir si el modelo estaba
-residente**. Quien mira el panel sabe entonces si la cifra que ve es de
+Por la ruta **nativa** (`/api/generate`, `/api/chat`) sí se separa: `load_us`,
+`prompt_eval_us` y `eval_us` lo reparten. Ver
+[`telemetry-per-request.md`](telemetry-per-request.md) §4.18.
+
+Por la compatible no se puede separar, pero **sí se puede decir si el modelo
+estaba residente**. Quien mira el panel sabe entonces si la cifra que ve es de
 inferencia o lleva una carga dentro — la diferencia entre un número que se puede
-usar y uno que engaña. Ver #92.
+usar y uno que engaña.
+
+> Y ojo con traducir eso a vatios: **el peso en tiempo no es el peso en
+> energía**. Cargar mueve memoria y no calcula, así que dibuja unos 43 W contra
+> los ~189 W de generar. Una carga que es el 54% del tiempo es el 11% de la
+> energía.
 
 ### `-` no es `0`
 

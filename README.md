@@ -222,6 +222,11 @@ seguirla son lo mismo.
 | Panel de sesión en el monitor TUI | ✅ Tecla `e` — ver [`docs/monitor-tui.md`](docs/monitor-tui.md) §12 |
 | **Persistencia del agregado entre reinicios** | ✅ **Al arrancar se relee `telemetry.jsonl`** y se reconstruyen `/stats` y `/sessions`. Ventana de 7 días por defecto, `OXIDEGATE_HISTORY_DAYS` la cambia y `0` la desactiva. `GET /history` dice desde cuándo mide — ver [`docs/history-rehydration.md`](docs/history-rehydration.md) |
 | **Consultar los agregados por rango** | ✅ `GET /stats?since=7d` y `?since=2026-07-24`, igual en `/sessions`. Un `since` ilegible da **400**, nunca todo el histórico — ver [`docs/history-rehydration.md`](docs/history-rehydration.md) §6 |
+| **El dialecto NATIVO de ollama** | ✅ `/api/generate` y `/api/chat`. Es **NDJSON, no SSE**, y el escáner exigía `data:` a todo el mundo: contra este dialecto habría publicado **cero tokens en silencio**. Ver [§4.18](docs/telemetry-per-request.md) |
+| **La energía de una petición local** | ✅ `energy_wh` + `energy_idle_wh` + `power_peak_w` + `energy_samples`, solo con upstream **local**. Con upstream remoto es `null`: muestrear tu GPU mientras responde Anthropic mide tu escritorio. Ver [§4.19](docs/telemetry-per-request.md) |
+| **Cuánta energía cuesta cargar el modelo** | ✅ **43 W de media contra ~189 W generando.** Cargar mueve memoria, no calcula: es el 54% del tiempo y el 11% de la energía. Corrige una afirmación anterior de este mismo repo que decía 2,5× — ver [§4.18](docs/telemetry-per-request.md) |
+| **Repartir la energía entre peticiones SOLAPADAS** | ⛔ **No se puede con estos datos.** El campo dice «lo que gastó la máquina mientras esta petición estuvo abierta», no «lo que costó esta petición»: dos ventanas que se pisan reclaman los mismos vatios y **sumar la columna es inválido**. Declarado y fijado en test, no descubierto sumando |
+| **La energía de la CPU, y macOS** | ❌ Sin medir: hoy es **Linux con NVIDIA** (`nvidia-smi`). RAPL para la CPU y `powermetrics` en macOS no están, y se declara en vez de que el campo salga `null` sin que nadie sepa por qué |
 
 ---
 
@@ -245,7 +250,10 @@ seguirla son lo mismo.
 | **Medir otro harness sin gastar cuota** | `cargo run --example captura`: banco que guarda el cuerpo crudo y lo reenvía a un modelo LOCAL de ollama. El bloque de instrucciones lo inyecta el harness, no el modelo, así que medir contra `llama3.2:3b` mide lo mismo que contra uno de pago — sin cuenta, sin red y **reproducible por cualquiera**. La seguridad no es apuntar bien, es aislar la config del harness para que no tenga credenciales a las que caer. Ver [`banco-de-captura.md`](docs/banco-de-captura.md) | ✅ |
 | **Ver el peaje fijo en el panel** | Cuarta vista del panel de requests (`c` → `Toll`): `instr`, `hooks`, `skills`, su total y qué fracción de lo pagado son. Vive aparte de `Context` porque no son columnas hermanas sino un **subconjunto** de esos mismos cubos: juntarlas invitaría a sumarlas al total. `-` significa «no se pudo ver», nunca cero, y un total al que le falta un bloque se marca `≥`. Ver [`monitor-tui.md`](docs/monitor-tui.md) §7.3.3 | ✅ |
 | **Cuánto cuesta el propio medidor** | Campo `scan_us`: los microsegundos del escaneo de la respuesta, la mitad del overhead que `prepare_us` no cubría. Medido en streaming real: **259 µs de preparación contra 3.534 de escaneo** — la mitad que se medía era la barata. Los dos juntos son el **0,15% del reloj**, así que la premisa del proyecto se sostiene: ahora como hecho auditable, no como creencia. Columna `prox%` en la vista `Context` | ✅ |
-| **Qué le cuesta a TU máquina un modelo local** | Contador de potencia en el TUI (`g`): vatios, uso de GPU y temperatura, con la aguja sobre el límite de la tarjeta. Es la otra mitad del coste — `estimate_cost_usd` devuelve `null` para un modelo local porque nadie te factura, pero **sí pagas: pagas vatios**. Medido en `qwen2.5:7b`: **277 W de pico contra 35 en reposo**. Y dice de QUÉ es ese consumo: qué modelo tiene ollama residente, con su cuantización y cuánto le queda cargado — o que no hay ninguno, que avisa de que la próxima petición pagará la carga (medido: el **92%** del tiempo de una petición fría). Ver [`monitor-tui.md`](docs/monitor-tui.md) §10 | ✅ |
+| **Qué le cuesta a TU máquina un modelo local** | `estimate_cost_usd` devuelve `null` para un modelo local porque nadie te factura, pero **sí pagas: pagas vatios**. Ahora se miden, **por petición**: `energy_wh` (bruta), `energy_idle_wh` (el reposo de esa misma ventana), `power_peak_w` y `energy_samples`, con la columna `Wh_net` en el TUI justo al lado de `usd`. Medido en `qwen2.5:7b` caliente: **79,1 mWh por 200 tokens**. El reposo se publica **al lado** y no restado, porque la atribución no es limpia y un número ya cocinado fingiría una precisión que no hay. Y **la columna no se puede sumar**: dos peticiones solapadas reclaman los mismos vatios — lo dice la leyenda. Nunca euros: el precio del kWh lo pone quien lee. Ver [§4.19](docs/telemetry-per-request.md) | ✅ |
+| **Si el modelo pequeño sale a cuenta en vatios** | Medido a través del proxy, mismo prompt y `num_predict` fijo para igualar los tokens generados: `llama3.2:3b` es **1,82× más rápido pero 2,89× más barato en energía** que `qwen2.5:7b`. Los dos números no coinciden porque son **dos factores independientes** —tarda 1,72× menos *y* dibuja 1,68× menos potencia— y esa es la prueba de que **el rendimiento no predice el consumo**: estimando por `tok/s` habrías dicho 1,8× de ahorro. Ver [§4.19](docs/telemetry-per-request.md) | ✅ |
+| **Cuánto de una petición fría es cargar el modelo** | Campos `load_us` / `prompt_eval_us` / `eval_us` del dialecto **nativo** de ollama: el endpoint OpenAI-compatible publica solo contadores de tokens y tira el reparto interno del tiempo. Medido: la carga fue el **54% del tiempo**… y solo el **11% de la energía**, porque cargar mueve memoria y no calcula (**43 W** de media contra **~189 W** generando). Esa distancia entre tiempo y vatios es la razón de que una de las dos cifras no sirva para deducir la otra. Ver [§4.18](docs/telemetry-per-request.md) | ✅ |
+| **El contador de potencia en vivo** | Panel `g` del TUI: vatios, uso de GPU, temperatura y VRAM, con la aguja sobre el límite de la tarjeta y **reposo y pico juntos** — sin el reposo no se puede restar nada, sin el pico un número de vatios no dice si vas holgado. Dice además qué modelo tiene ollama residente y cuánto le queda cargado. No atribuye a una petición: eso lo hace la columna `Wh_net`. Ver [`monitor-tui.md`](docs/monitor-tui.md) §10 | ✅ |
 | **Qué servidor MCP pagas y no usas** | `GET /mcp` cruza los bytes por servidor con las invocaciones reales y da un veredicto: `used`, `unused`, `insufficient_data` o `not_applicable`. Cada fila lleva la evidencia que lo sostiene —peticiones concluyentes, descartes por motivo y desde cuándo se mide— y el `threshold` viaja en la respuesta porque es un juicio, no una medida. Ataca la palanca más grande del catálogo (−55.098 B) sin tocar el cable. Ver [§4.16](docs/telemetry-per-request.md) | ✅ |
 | **Skills por petición** | Detecta el listado de skills en el body sea cual sea la herramienta —tres formatos medidos en Claude Code, Gemini CLI, opencode y Codex— y lo expone en `GET /requests` como `{declared, listing_bytes, format}`. Un bloque sin entradas no cuenta: la marca aparece también en el texto del usuario. Ver [`docs/telemetry-per-request.md`](docs/telemetry-per-request.md) §4.8. | ✅ |
 | **Optimizador: forzar `effort`** | Palanca B de Nivel 2, la primera que RECORTA en vez de reorganizar. Con `OXIDEGATE_FORCE_EFFORT=low` el proxy fija `output_config.effort` en las peticiones a Anthropic: **−20,0% de tokens de salida** medido. Apagada por defecto, falla cerrado ante un valor desconocido, y se anuncia al arrancar. La fila publica `requested_effort` (lo que pidió el cliente) **y** `effort_forced` (lo que impuso el proxy), que es lo que impide confundir un ahorro del cliente con una intervención del medidor. Ver [`docs/optimizer-effort.md`](docs/optimizer-effort.md). | ✅ |
@@ -392,12 +400,16 @@ propio reporte, en vez de presentar un ahorro que no existe.
 | `POST /v1/messages` | Anthropic |
 | `POST /v1/chat/completions` | OpenAI (Chat Completions) |
 | `POST /v1/responses` | OpenAI (Responses API) |
+| `POST /v1/codex/responses` | Codex vía OAuth de suscripción (mismo dialecto Responses, backend distinto) |
+| `POST /api/generate` | **ollama nativo** — completado sin conversación |
+| `POST /api/chat` | **ollama nativo** — conversación. Es la vía que publica `load_us` y la energía |
 | `POST /v1beta/*` | Google Gemini |
 | `GET  /health` | Liveness (JSON). No toca la telemetría: responde mientras el proceso sirva |
 | `GET  /version` | Capacidades: versión, versión del contrato, endpoints y campos publicados. Un 404 aquí significa build anterior al contrato — ver [§8](docs/telemetry-per-request.md) |
 | `GET  /stats` | Agregación por modelo (JSON) |
 | `GET  /sessions` | Agregación por sesión: qué costó cada sesión de trabajo (JSON) |
 | `GET  /requests` | Últimas 200 peticiones individuales, en vivo (JSON) |
+| `GET  /history` | Desde cuándo miden los agregados. Ruta aparte y no un campo en `/stats`, porque `/stats` es un ARRAY y añadirle la ventana lo convertiría en objeto — que es ruptura. Ver [`history-rehydration.md`](docs/history-rehydration.md) |
 | `GET  /mcp` | Coste vs uso por servidor MCP: qué pagas por cada uno y cuántas veces lo invocas de verdad, con veredicto y la evidencia que lo sostiene. Ver [§4.16](docs/telemetry-per-request.md) |
 
 ### Variables de entorno
@@ -536,8 +548,10 @@ real, y OxideGate solo lo revela.
 
 ### Modelos locales (Ollama y compatibles)
 
-Cualquier servidor que hable Chat Completions sirve como upstream: basta apuntar
-`OPENAI_API_BASE` a él en vez de a OpenAI.
+Hay **dos vías**, y no miden lo mismo.
+
+**1. La compatible con OpenAI.** Cualquier servidor que hable Chat Completions
+sirve como upstream: basta apuntar `OPENAI_API_BASE` a él en vez de a OpenAI.
 
 ```sh
 OXIDEGATE_PORT=8899 OPENAI_API_BASE=http://localhost:11434/v1 oxidegate
@@ -545,6 +559,25 @@ OXIDEGATE_PORT=8899 OPENAI_API_BASE=http://localhost:11434/v1 oxidegate
 
 El cliente (OpenCode, un SDK, `curl`) sigue apuntando a
 `http://127.0.0.1:8899/v1` sin enterarse de nada.
+
+**2. La nativa de ollama**, que es la que mide de más. Las rutas
+`/api/generate` y `/api/chat` del proxy hablan el dialecto propio del motor:
+
+```sh
+OXIDEGATE_PORT=8899 oxidegate     # el motor se busca en 127.0.0.1:11434
+curl http://127.0.0.1:8899/api/chat -d '{"model":"qwen2.5:7b","messages":[…]}'
+```
+
+Vale la pena porque el endpoint compatible con OpenAI publica **solo contadores
+de tokens** y tira el reparto interno del tiempo. El nativo añade:
+
+- **`load_us` / `prompt_eval_us` / `eval_us`** — lo único que separa *cargar* el
+  modelo de *inferir* con él. `ttft_ms` mezcla las dos y no las distingue.
+- **La energía de la petición** (`energy_wh` y compañía), porque el upstream es
+  local y el proxy sabe exactamente cuándo empieza y acaba la ventana.
+
+`OXIDEGATE_OLLAMA_API_BASE` mueve el motor si no está en el sitio de siempre.
+Y el muestreador de potencia se apaga con `OXIDEGATE_POWER_SAMPLING=off`.
 
 > **Aviso que cuesta caro ignorar: los modelos locales truncan el prompt en
 > silencio.** Ollama corre con `num_ctx` 4096 por defecto, y el body de un agente
@@ -733,6 +766,10 @@ por función con su contrato) y **responsabilidad única estricta** por módulo.
 | [`docs/speed.md`](docs/speed.md) | Tokens y tiempo son monedas distintas: por qué el TTFT no correlaciona con nada medido, y las dos palancas que sí mueven el tok/s |
 | [`docs/monitor-tui.md`](docs/monitor-tui.md) | El monitor de terminal en tiempo real |
 | [`docs/benchmark.md`](docs/benchmark.md) | El harness de benchmark (`bench`) |
+| [`docs/banco-de-captura.md`](docs/banco-de-captura.md) | Medir otro harness sin gastar cuota: guardar el cuerpo crudo y reenviarlo a un modelo local, con la config del harness aislada para que no tenga credenciales a las que caer |
+| [`docs/fixed-toll-claude-code.md`](docs/fixed-toll-claude-code.md) | El peaje fijo de una sesión de Claude Code: 69.613 B antes de escribir nada, desglosados. Incluye la regla que salió de dos mediciones falsas — «leer los bytes, no restarlos» |
+| [`docs/history-rehydration.md`](docs/history-rehydration.md) | Cómo sobreviven `/stats` y `/sessions` a un reinicio, la ventana de días y el endpoint `/history` |
+| [`docs/optimizer-tool-search.md`](docs/optimizer-tool-search.md) | Carga diferida de herramientas: qué cambia cuando el dialecto las declara en vez de mandarlas |
 
 ### Ver también, fuera de este repo
 

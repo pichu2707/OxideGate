@@ -154,13 +154,17 @@ fn parse_gpu_sample(linea: &str) -> Option<GpuSample> {
 ///
 /// El contador dice **cuánto** gasta la máquina. Esto dice **de qué**.
 ///
-/// Y sobre todo resuelve una contaminación que no se puede medir por otra vía:
-/// en el camino OpenAI-compatible —el que proxea OxideGate— ollama **no expone**
-/// `load_duration`, así que `total_ms` y `tok/s` de una petición fría incluyen
-/// cargar el modelo sin que nada lo diga. Medido: **el 92%** del tiempo de una
-/// petición fría fue carga, no inferencia.
+/// Y sobre todo resuelve una contaminación del camino **OpenAI-compatible**:
+/// por ahí ollama **no expone** `load_duration`, así que `total_ms` y `tok/s`
+/// de una petición fría incluyen cargar el modelo sin que nada lo diga.
 ///
-/// No se puede separar, pero sí se puede DECIR si el modelo estaba residente.
+/// Cuánto pesa esa carga depende por completo de cuánto se genere: medido
+/// entre el **54%** del tiempo (200 tokens) y el **98%** (un token). Por eso no
+/// hay un número que valga como constante — hay un aviso.
+///
+/// Por la ruta **nativa** (`/api/chat`) sí se separa, con `load_us`. Por la
+/// compatible no se puede, pero sí se puede DECIR si el modelo estaba
+/// residente.
 /// Quien mire el panel sabe entonces si la cifra que está viendo es de
 /// inferencia o lleva una carga dentro — que es la diferencia entre un número
 /// que se puede usar y uno que engaña.
@@ -2496,7 +2500,9 @@ fn ui(f: &mut Frame, app: &App) {
 /// - **`None`**: no se pudo preguntar a ollama. No se afirma nada.
 /// - **Lista vacía**: ollama contestó y **no hay ningún modelo cargado**. Es un
 ///   dato, no un hueco: la próxima petición pagará la carga, que medida contra
-///   ollama fue el **92%** del tiempo de una petición fría.
+///   ollama fue entre el **54% y el 98%** del tiempo según cuánto se generase.
+///   En VATIOS pesa mucho menos —cargar mueve memoria, no calcula— pero en
+///   `total_ms` y `tok/s` está entera.
 /// - **Con modelos**: lo que está residente, su VRAM y cuánto le queda antes de
 ///   que ollama lo descargue.
 ///
@@ -5429,7 +5435,8 @@ mod tests {
 
     /// **Sin modelos residentes la lista está VACÍA, y eso es un dato.**
     /// Significa que la próxima petición pagará la carga — medido, hasta el
-    /// 92% de una petición fría. No es lo mismo que no poder preguntar.
+    /// 98% del tiempo de una petición fría. No es lo mismo que no poder
+    /// preguntar.
     #[test]
     fn ningun_modelo_cargado_es_una_lista_vacia_no_un_error() {
         assert!(parse_ollama_ps(r#"{"models":[]}"#).is_empty());

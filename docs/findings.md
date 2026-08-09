@@ -235,6 +235,43 @@ julio no cargaba y que su propia nota ya avisaba como limitación.
 Es el mismo error que "no agregues modelos para estimar tasas de tokens",
 aplicado a harnesses en vez de a modelos.
 
+### "Una petición fría infla la cuenta por token unas 2,5 veces"
+
+Escrito al abrir el dialecto nativo de ollama, sobre `load_us`: si la carga es
+el 54% del tiempo de una petición fría, incluirla debe inflar los Wh/token en
+esa proporción.
+
+**Falso**, y el error tiene nombre: se convirtió una proporción de **tiempo**
+en una afirmación sobre **energía** sin medir la segunda.
+
+Cuando el proxy empezó a publicar vatios se pudo comprobar. Con una petición
+que es 98% carga (`num_predict: 1`, modelo frío), la ventana dibuja **43,0 W**
+de media contra los **~189 W** que dibuja la misma tarjeta generando. **Cargar
+mueve memoria; no calcula.**
+
+La carga fue el 54% del tiempo y el **11% de la energía**. La inflación real es
+del **17%**, no del 150%.
+
+Sigue haciendo falta excluirla —un 17% no es ruido, y con respuestas cortas la
+proporción crece— pero por el motivo correcto.
+
+### "Atribuir energía por petición exige NVML en vez de un subproceso"
+
+Escrito en el propio repo, en `monitor.rs` y en `monitor-tui.md`, y sostenido
+con una medición real: invocar `nvidia-smi` cuesta **23,81 ms**, seis veces
+todo el overhead del proxy. Muestrear por petición sería que el instrumento
+pasara a ser el gasto dominante.
+
+La medición era buena. La conclusión no: **23,81 ms es el coste de ARRANCAR
+`nvidia-smi`, no el de leerlo.** Un proceso persistente (`-lms 200`) paga ese
+arranque una vez y luego cuesta **0,1% de un core** — 50 muestras en 10 s,
+medido.
+
+Un número correcto puede sostener una conclusión falsa si se le pregunta otra
+cosa de la que respondió.
+
+---
+
 ## H. Lecciones de método
 
 La parte que sobrevive al proyecto, aunque el proyecto cambie.
@@ -248,6 +285,9 @@ La parte que sobrevive al proyecto, aunque el proyecto cambie.
 | Desconfiar de un número que se repite | Dos muestras de tamaños distintos con idéntico `prompt_tokens` no son casualidad: son un tope |
 | El instrumento también miente | Un barrido de texto que no distingue mayúsculas puede dar un falso limpio |
 | Ante "no se ve algo", sospechar primero de la vista, no del dato | La primera hipótesis debe ser "el dato existe y falta cómo mostrarlo", no "hay que medirlo de nuevo" |
+| Una proporción de tiempo no es una proporción de coste | Cargar un modelo es el 54% del tiempo y el 11% de la energía. Convertir una en otra sin medir produjo la retractación de los "2,5×" |
+| Un número correcto puede sostener una conclusión falsa | Los 23,81 ms de `nvidia-smi` eran ciertos, pero medían **arrancar**, no leer. Preguntar qué respondió de verdad el número antes de apoyarse en él |
+| Un test que inventa datos que el instrumento no puede producir no prueba nada | La guarda de energía pasaba en verde mientras el proxy publicaba `null` en cada petición real: el test metía una muestra en el **futuro** |
 
 ---
 
@@ -259,6 +299,10 @@ Ideas registradas, no implementadas:
   Palanca A cuando `cache_control_forced == true` y `cache_write_tokens` es
   `null` o `0` — misma forma que el detector `TRUNC` ya existente. Detalle:
   `docs/optimizer-prompt-cache.md` §10.
+- **La energía de la CPU y de macOS**: hoy el muestreador es Linux con NVIDIA
+  (`nvidia-smi`). Falta RAPL para el paquete de CPU, y `powermetrics` en macOS
+  pide sudo. La integración ya está separada de quién llena el anillo, así que
+  añadir una fuente no tocaría la cuenta — pero hoy no hay ninguna.
 - **Reporte de `context_management` por petición**: exponer si el cliente
   usa compresión de tokens (`clear_tool_uses_20250919`, `compact_20260112`)
   y con qué configuración, ya que OxideGate parsea esa clave del body pero
