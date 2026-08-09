@@ -113,7 +113,7 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
 | `r` | Resetear baseline |
 | `↑` / `↓` | Elegir el modelo (fila resaltada, afecta el panel ANTES/DESPUÉS y los sparklines) |
 | `p` | Mostrar/ocultar el panel de requests recientes (ver §7) |
-| `c` | Ciclar la vista de columnas del panel de requests recientes — `Latency` → `Context` → `Cache` → `Latency` (ver §7.1). **No-op si el panel está oculto**: no cambia nada mientras `p` lo tenga escondido |
+| `c` | Ciclar la vista de columnas del panel de requests recientes — `Latency` → `Context` → `Cache` → `Toll` → `Latency` (ver §7.1). **No-op si el panel está oculto**: no cambia nada mientras `p` lo tenga escondido |
 | `s` | Mostrar/ocultar el panel de tools por servidor (ver §8). **INDEPENDIENTE** de `p`/`c`: ninguna de las tres teclas afecta el estado de las otras |
 | `e` | Mostrar/ocultar el panel de **gasto por sesión** — `e` de s**e**sión, porque `s` ya es tools (ver §8). **INDEPENDIENTE** de `p`/`c`/`s`/`u` |
 | `u` | Mostrar/ocultar el panel de cuota de suscripción Codex — "uso de cuota" (ver §9). **INDEPENDIENTE** de `p`/`c`/`s` |
@@ -168,27 +168,38 @@ peticiones individuales atendidas por el proxy, no un agregado. Sirve para
 ver la fila puntual que un promedio esconde — el cache-miss aislado, el TTFT
 que se disparó una sola vez. Se alterna con la tecla `p`; arranca visible.
 
-### 7.1. Tres vistas, una tecla (`c`)
+### 7.1. Cuatro vistas, una tecla (`c`)
 
 El panel ya tiene ~12 columnas — cramear más ahí lo haría ilegible. En vez de
-eso, el panel tiene **tres vistas mutuamente excluyentes**, cicladas con `c`:
+eso, el panel tiene **cuatro vistas mutuamente excluyentes**, cicladas con `c`:
 
 | Vista | Para qué sirve | Se muestra con... |
 |---|---|---|
 | `Latency` (default) | Latencia, tokens y coste por request — la que ya existía | `q`/`b`/`r` recién arrancado el monitor |
 | `Context` | Desglose de bytes de contexto por request: cuánto pesa cada bucket del body (`tools`, `history`, `system`, `last_turn`, `other`) | apretando `c` una vez |
 | `Cache` | Atribución de caché por sección: qué cubo cayó dentro del prefijo cacheado (ver §7.3.2) | apretando `c` dos veces |
+| `Toll` | El PEAJE FIJO: qué inyecta el harness antes de que escribas nada (ver §7.3.3) | apretando `c` tres veces |
 
-**`Cache` es una vista aparte y no columnas añadidas a `Context`, y la razón no
-es la falta de sitio.** Las columnas de `Context` son bytes MEDIDOS; las de
-`Cache` son una ESTIMACIÓN que hace el proxy
-([`telemetry-per-request.md`](telemetry-per-request.md) §4.11). Mezclarlas en
-una tabla invitaría a leerlas con la misma confianza — exactamente el error que
-el campo anidado del lado del proxy existe para evitar. La separación de vistas
-es esa misma decisión llevada a la UI.
+**Ni `Cache` ni `Toll` son columnas añadidas a `Context`, y en los dos casos la
+razón de fondo no es la falta de sitio** — aunque `Context` ya mida 164
+columnas y no quepa en un terminal normal.
+
+Las de `Cache` son una ESTIMACIÓN del proxy
+([`telemetry-per-request.md`](telemetry-per-request.md) §4.11) frente a los
+bytes MEDIDOS de `Context`: mezclarlas invitaría a leerlas con la misma
+confianza.
+
+Las de `Toll` son bytes medidos igual que las de `Context`, pero **no son
+hermanas suyas: son un subconjunto**. `tools`, `history`, `system`, `last_turn`
+y `other` PARTICIONAN el prompt y suman el total; el peaje fijo es una
+ATRIBUCIÓN dentro de esos mismos cubos. Ponerlas en la misma tabla invitaría a
+sumarlas al total y contar los bytes dos veces.
+
+En los dos casos, la separación de vistas es la que impide la lectura
+equivocada.
 
 El título del panel muestra la vista activa (`vista:latency` / `vista:context`
-/ `vista:cache`) y el estado del último poll a `/requests`.
+/ `vista:cache` / `vista:toll`) y el estado del último poll a `/requests`.
 
 **`c` es un no-op si el panel está oculto** (`p` lo escondió): no tiene
 sentido cambiar qué columnas se muestran en algo que no se está mostrando, y
@@ -344,6 +355,40 @@ dos igual.
 Lo mismo con una sección que mide cero bytes: su porcentaje es `-`, no `0%`. No
 hay fracción que calcular sobre una sección vacía, y un `0%` se leería como "no
 se cacheó nada" en vez de "no había nada que cachear".
+
+### 7.3.3. Columnas — vista `Toll`
+
+Lo que el harness inyecta **antes de que escribas una palabra**, y que se paga
+en CADA petición de la sesión.
+
+| Columna | Qué es | Campo |
+|---|---|---|
+| `instr` | Bytes del bloque de instrucciones (`CLAUDE.md` y equivalentes). El 48% del peaje medido | `instructions.bytes` |
+| `hooks` | Bytes de la salida de los hooks de `SessionStart`. El 29% | `hooks.bytes` |
+| `nh` | Cuántas marcas `hook success:` traía | `hooks.declared` |
+| `skills` | Bytes del listado de skills declaradas. El 23% | `skills.listing_bytes` |
+| `nsk` | Cuántas entradas tenía el listado | `skills.declared` |
+| `peaje` | Suma de los tres bloques | derivada |
+| `%prom` | Qué fracción de `prompt_bytes` es ese peaje | derivada |
+
+`nh` y `nsk` van al lado de sus bytes a propósito: **«19 kB en 3 hooks» acciona
+y «19 kB» no**. Dice si el peaje viene de uno caro o de muchos baratos, que es
+lo que decide qué quitar.
+
+#### Las dos reglas que gobiernan esta vista
+
+**`-` no es `0`.** Los tres campos son opcionales, y ausente significa «no se
+pudo ver», nunca «no cuesta nada». Un `0` ahí diría que ese bloque es gratis —
+la conclusión contraria a la correcta.
+
+**`≥` significa que el total está incompleto.** Si falta alguno de los tres
+bloques, `peaje` se pinta como `≥12.3k`: es una cota inferior, no el peaje. Un
+número que parece completo y no lo está aconseja peor que no dar ninguno, y
+esta vista existe justamente para decidir si un plugin vale lo que cuesta.
+
+`%prom` es sobre `prompt_bytes` —lo que de verdad se paga— y no sobre los bytes
+medidos de contexto. Sin `prompt_bytes` el total sigue valiendo pero el
+porcentaje se marca ausente: no se sustituye por otro denominador.
 
 ### 7.4. Marcadores de outlier
 
