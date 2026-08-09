@@ -56,7 +56,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table};
+use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, TableState};
 use ratatui::{Frame, Terminal};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -568,6 +568,14 @@ struct StatsRow {
 
 /// Clave lógica de una fila: `(upstream, model)`.
 type ModelKey = (String, String);
+
+/// Marca de la fila seleccionada en la tabla de modelos.
+///
+/// Va ADEMÁS del color de fondo, no en su lugar: el fondo azul se pierde en
+/// un terminal sin color, en una captura de texto y en un `TERM=dumb`, y en
+/// esos casos la tabla vuelve a no decir qué está seleccionado — que es
+/// justamente el problema que este símbolo cierra.
+const SELECTION_SYMBOL: &str = "▶ ";
 
 fn key_of(r: &StatsRow) -> ModelKey {
     (r.upstream.clone(), r.model.clone())
@@ -2056,6 +2064,11 @@ struct App {
     history: HashMap<ModelKey, History>,
     prev_poll: Option<(Instant, HashMap<ModelKey, RawCounters>)>,
     selected: usize,
+    /// Offset del viewport de la tabla de modelos. Guarda SOLO la posición
+    /// del scroll: la fila seleccionada es `selected`, y se copia acá en cada
+    /// dibujado (ver [`draw_table`]). Persistirlo entre frames es lo que hace
+    /// que la tabla scrollee como una lista y no salte.
+    models_scroll: TableState,
     status: String,
     /// Último snapshot bueno de `/requests`, en orden cronológico (más viejo
     /// primero, tal como lo entrega el buffer). Si el último poll a
@@ -2110,6 +2123,7 @@ impl App {
             history: HashMap::new(),
             prev_poll: None,
             selected: 0,
+            models_scroll: TableState::default(),
             status: "esperando el primer poll...".to_string(),
             recent_requests: Vec::new(),
             requests_status: "esperando el primer poll...".to_string(),
@@ -2375,7 +2389,7 @@ fn run_app(
     let mut last_poll = Instant::now() - POLL_INTERVAL; // fuerza un poll inmediato
 
     loop {
-        terminal.draw(|f| ui(f, &app))?;
+        terminal.draw(|f| ui(f, &mut app))?;
 
         if event::poll(Duration::from_millis(250))?
             && let Event::Key(key) = event::read()?
@@ -2434,7 +2448,7 @@ fn run_app(
 /// rango mientras el código que empuja a `constraints` y el que incrementa
 /// `idx` avancen en el mismo orden — que es exactamente lo que hace esta
 /// función.
-fn ui(f: &mut Frame, app: &App) {
+fn ui(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let mut constraints = vec![
         Constraint::Length(3), // header
@@ -2690,7 +2704,38 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_table(f: &mut Frame, area: Rect, app: &App) {
+/// Título de la tabla de modelos, con la posición dentro de la lista.
+///
+/// La tabla casi nunca cabe entera: con los paneles abiertos le quedan tres
+/// filas de datos. Tres de doce no dicen si quedan modelos por debajo, así
+/// que la posición va en el título — es el único sitio que sobrevive al
+/// recorte del viewport.
+///
+/// Función PURA para poder testear el formato sin terminal de por medio,
+/// igual que el resto de la matemática de este archivo.
+fn models_title(selected: usize, total: usize) -> String {
+    if total == 0 {
+        return " modelos (total acumulado) ".to_string();
+    }
+    format!(" modelos ({}/{} · total acumulado) ", selected + 1, total)
+}
+
+/// Tabla de agregados por modelo, con VIEWPORT: se dibuja con estado
+/// (`TableState`) y no como widget plano.
+///
+/// La diferencia no es cosmética. Un `Table` sin estado se recorta a la
+/// altura del área y ya: con todos los paneles abiertos la tabla se queda en
+/// unas pocas filas, y a partir de la última visible la selección se pintaba
+/// FUERA de la pantalla — `↑`/`↓` seguían moviéndola y el panel
+/// ANTES/DESPUÉS seguía respondiendo, pero la tabla no se enteraba de que
+/// tenía que desplazarse. Con estado, ratatui arrastra el offset para que la
+/// fila seleccionada esté siempre dentro del viewport, y las primeras filas
+/// SALEN de la vista en vez de quedarse ancladas arriba.
+///
+/// El offset vive en `app.models_scroll` y NO se recrea por frame a
+/// propósito: un estado nuevo en cada dibujado pegaría la selección al borde
+/// inferior al bajar, en vez de scrollear como una lista normal.
+fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
     let header = Row::new(vec![
         "MODELO",
         "REQ",
@@ -2705,9 +2750,14 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App) {
     let rows: Vec<Row> = app
         .latest
         .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let cells = vec![
+        // El resaltado de la fila seleccionada NO se pinta acá comparando
+        // contra `app.selected`: lo hace `row_highlight_style` a partir del
+        // estado de la tabla, que es el mismo que decide el scroll. Dos
+        // mecanismos para la misma decisión se desincronizan en cuanto uno
+        // se toca — y ese desajuste era exactamente el bug: la fila creía
+        // estar resaltada mientras el viewport la dejaba fuera de pantalla.
+        .map(|r| {
+            Row::new(vec![
                 Cell::from(format!("{}/{}", r.upstream, r.model)),
                 Cell::from(r.requests.to_string()),
                 Cell::from(format!("{:.1}", r.avg_tokens_per_sec)),
@@ -2715,16 +2765,11 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App) {
                 Cell::from(format!("{:.1}%", r.cache_hit_rate() * 100.0)),
                 Cell::from(format!("{:.4}", r.cost_usd)),
                 Cell::from(format!("{:.1}%", r.redundancy_rate * 100.0)),
-            ];
-            let row = Row::new(cells);
-            if i == app.selected {
-                row.style(Style::default().bg(Color::Blue).fg(Color::White))
-            } else {
-                row
-            }
+            ])
         })
         .collect();
 
+    let total = app.latest.len();
     let widths = [
         Constraint::Percentage(30),
         Constraint::Percentage(10),
@@ -2735,13 +2780,23 @@ fn draw_table(f: &mut Frame, area: Rect, app: &App) {
         Constraint::Percentage(12),
     ];
 
-    let table = Table::new(rows, widths).header(header).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" modelos (total acumulado) "),
-    );
+    let table = Table::new(rows, widths)
+        .header(header)
+        .row_highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
+        .highlight_symbol(SELECTION_SYMBOL)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(models_title(app.selected, total)),
+        );
 
-    f.render_widget(table, area);
+    // La selección se sincroniza en el dibujado y no en `select_prev`/
+    // `select_next`: `app.selected` sigue siendo la ÚNICA fuente de verdad
+    // (la leen `selected_row`, `selected_delta` y el filtro de requests), y
+    // `models_scroll` aporta solo el offset del viewport.
+    app.models_scroll
+        .select(if total == 0 { None } else { Some(app.selected) });
+    f.render_stateful_widget(table, area, &mut app.models_scroll);
 }
 
 fn draw_before_after(f: &mut Frame, area: Rect, app: &App) {
@@ -2897,10 +2952,12 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
     if table_area.height > 1 {
         let outliers = classify_outliers(&app.recent_requests);
 
-        // El buffer llega en orden cronológico (más viejo primero); acá lo
-        // invertimos para mostrar MÁS NUEVO ARRIBA, que es como se lee un
-        // panel de "últimos eventos". `classify_outliers` se calculó sobre
-        // el orden original para que las estadísticas del grupo no cambien.
+        // El buffer llega en orden cronológico (más viejo primero); acá se
+        // invierte para mostrar MÁS NUEVO ARRIBA, que es como se lee un
+        // panel de "últimos eventos", y se estrecha al modelo seleccionado si
+        // el filtro (`f`) está puesto. `classify_outliers` se calculó sobre
+        // el orden y el conjunto originales para que las estadísticas del
+        // grupo no cambien — ver [`visible_request_indices`].
         let mut indexed: Vec<(usize, &RequestRow)> =
             app.recent_requests.iter().enumerate().collect();
         indexed.reverse();
@@ -6948,5 +7005,146 @@ mod tests {
         assert_eq!(row.requested_effort.as_deref(), Some("high"));
         assert_eq!(row.requested_speed.as_deref(), Some("fast"));
         assert_eq!(row.served_speed.as_deref(), Some("fast"));
+    }
+
+    // -----------------------------------------------------------------
+    // La tabla de modelos scrollea con la selección
+    // -----------------------------------------------------------------
+
+    fn stats_row(upstream: &str, model: &str) -> StatsRow {
+        StatsRow {
+            upstream: upstream.to_string(),
+            model: model.to_string(),
+            requests: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            cost_usd: 0.0,
+            avg_ttft_ms: 0.0,
+            avg_tokens_per_sec: 0.0,
+            cache_hit_rate: 0.0,
+            redundancy_rate: 0.0,
+            error_rate: 0.0,
+            ttft_ms_sum: 0.0,
+            ttft_ms_count: 0,
+            total_ms_sum: 0.0,
+            errors: 0,
+        }
+    }
+
+    fn buffer_to_string(buf: &ratatui::buffer::Buffer) -> String {
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// EL BUG: con el área apretada (todos los paneles abiertos), la tabla
+    /// recortaba a las primeras filas y la selección se dibujaba FUERA de la
+    /// pantalla. Seleccionar el último de diez modelos tiene que traerlo al
+    /// viewport, no dejarlo invisible.
+    #[test]
+    fn la_tabla_scrollea_hasta_la_fila_seleccionada() {
+        let mut app = App::new("http://x/stats".to_string());
+        // Nombres cortos a propósito: la columna MODELO es el 30% del ancho
+        // y recorta lo que no entra, y acá se mide el SCROLL, no el recorte
+        // de columnas.
+        app.latest = (0..10).map(|i| stats_row("ol", &format!("m{i}"))).collect();
+        app.selected = 9;
+
+        // 6 de alto = 2 de bordes + 1 de header + 3 filas de datos: justo el
+        // apretón que produce tener todos los paneles abiertos.
+        let backend = ratatui::backend::TestBackend::new(60, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_table(f, f.area(), &mut app))
+            .unwrap();
+
+        let pintado = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            pintado.contains("ol/m9"),
+            "la fila seleccionada quedó fuera del viewport:\n{pintado}"
+        );
+    }
+
+    /// El resaltado por color de fondo se pierde en terminales sin color y en
+    /// capturas de texto. El símbolo de selección es la señal que sobrevive.
+    #[test]
+    fn la_fila_seleccionada_lleva_simbolo_visible() {
+        let mut app = App::new("http://x/stats".to_string());
+        // Nombres cortos a propósito: la columna MODELO es el 30% del ancho
+        // y recorta lo que no entra, y acá se mide el SCROLL, no el recorte
+        // de columnas.
+        app.latest = (0..10).map(|i| stats_row("ol", &format!("m{i}"))).collect();
+        app.selected = 9;
+
+        let backend = ratatui::backend::TestBackend::new(60, 6);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_table(f, f.area(), &mut app))
+            .unwrap();
+
+        let pintado = buffer_to_string(terminal.backend().buffer());
+        let linea = pintado
+            .lines()
+            .find(|l| l.contains("ol/m9"))
+            .expect("la fila seleccionada tiene que estar pintada");
+        assert!(
+            linea.contains(SELECTION_SYMBOL.trim()),
+            "la fila seleccionada no lleva el símbolo: {linea}"
+        );
+    }
+
+    /// Con el viewport en DOS filas y la selección en la 4ª posición, lo que
+    /// se ve son la 3ª y la 4ª — no la 1ª y la 2ª ancladas arriba.
+    ///
+    /// Esa es la diferencia entre una tabla con viewport y una recortada: la
+    /// recortada pinta siempre desde la primera fila y deja la selección
+    /// fuera de pantalla; la que tiene viewport arrastra la ventana con la
+    /// selección y las primeras filas SALEN de la vista.
+    #[test]
+    fn bajar_arrastra_la_ventana_y_las_primeras_filas_salen_de_vista() {
+        let mut app = App::new("http://x/stats".to_string());
+        app.latest = (1..=8).map(|i| stats_row("ol", &format!("m{i}"))).collect();
+        app.selected = 3; // 4ª posición (índice 3) = "ol/m4"
+
+        // 5 de alto = 2 bordes + 1 header + DOS filas de datos.
+        let backend = ratatui::backend::TestBackend::new(60, 5);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_table(f, f.area(), &mut app))
+            .unwrap();
+
+        let pintado = buffer_to_string(terminal.backend().buffer());
+        assert!(
+            pintado.contains("ol/m3") && pintado.contains("ol/m4"),
+            "bajando a la 4ª hay que ver la 3ª y la 4ª:\n{pintado}"
+        );
+        assert!(
+            !pintado.contains("ol/m1") && !pintado.contains("ol/m2"),
+            "las dos primeras NO pueden quedarse fijas arriba:\n{pintado}"
+        );
+        assert!(
+            pintado.contains("(4/8"),
+            "el título tiene que decir la posición:\n{pintado}"
+        );
+    }
+
+    /// Cuando la tabla no cabe entera, el título tiene que decir en qué
+    /// posición estás: sin eso, tres filas visibles de doce no dicen si
+    /// quedan modelos por debajo.
+    #[test]
+    fn el_titulo_de_la_tabla_cuenta_la_posicion() {
+        assert_eq!(models_title(3, 12), " modelos (4/12 · total acumulado) ");
+    }
+
+    #[test]
+    fn el_titulo_de_la_tabla_sin_modelos_no_inventa_posicion() {
+        assert_eq!(models_title(0, 0), " modelos (total acumulado) ");
     }
 }
