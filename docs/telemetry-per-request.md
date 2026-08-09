@@ -1633,7 +1633,37 @@ Medido a través del proxy con el modelo **frío**:
 
 `ttft_ms` mezcla la carga con el procesado del prompt y **no los distingue**.
 Estas tres cifras sí, y hacen falta para excluir la carga de cualquier cuenta
-por token — una petición fría la inflaría unas 2,5 veces.
+por token.
+
+#### Corrección medida: cargar cuesta TIEMPO, no vatios
+
+Una versión anterior de esta sección decía que una petición fría inflaría la
+cuenta por token «unas 2,5 veces». **Es falso**, y el error era convertir una
+proporción de TIEMPO en una afirmación sobre ENERGÍA sin medirla.
+
+Medido con una petición que es **98% carga** (`num_predict: 1`, modelo frío):
+
+| | |
+|---|---:|
+| Potencia media de la ventana | **43,0 W** (pico 68,9) |
+| La misma tarjeta **generando** | **~189 W** de media |
+
+**Cargar el modelo mueve memoria, no calcula.** Dibuja del orden de una cuarta
+parte de lo que dibuja generar, así que su peso en el tiempo **sobrestima su
+peso en la energía** unas cuatro veces.
+
+En la comparativa de abajo, sobre `qwen2.5:7b` con 200 tokens fijos:
+
+| | frío | caliente | inflación |
+|---|---:|---:|---:|
+| `load_us` | 1.870 ms | 124 ms | — |
+| Wh atribuibles / 1k tokens | 0,465 | 0,396 | **+17%** |
+
+Diecisiete por ciento, no dos veces y media. La carga fue el **54% del tiempo**
+y el **11% de la energía atribuible** de esa petición.
+
+Excluirla sigue haciendo falta —un 17% no es ruido, y con respuestas cortas la
+proporción crece— pero el motivo correcto es ese, no el que estaba escrito.
 
 ### Lo que NO arregla
 
@@ -1722,6 +1752,35 @@ cambiara la tarifa, y nadie volvería a mirarlo.
 Lo local se decide por el **host parseado** de la URL destino, no por
 `contains`: `localhost.ejemplo.com` es un dominio remoto perfectamente
 registrable y contiene la palabra.
+
+### Lo que se ve al comparar dos modelos
+
+Medido a través del proxy, mismo prompt, `num_predict: 200` para que los dos
+generen **exactamente los mismos tokens**, `temperature: 0`, modelo caliente:
+
+| | tok/s | ventana | Wh netos | W netos medios | pico |
+|---|---:|---:|---:|---:|---:|
+| `qwen2.5:7b` | 126,8 | 1.720 ms | 79,1 mWh | **165,6 W** | 280,9 W |
+| `llama3.2:3b` | 231,1 | 999 ms | 27,4 mWh | **98,7 W** | 188,2 W |
+| **razón** | 1,82× | 1,72× | **2,89×** | 1,68× | |
+
+**El 3b es 1,82× más rápido pero 2,89× más barato en energía.** Los números no
+coinciden porque son **dos factores independientes**: tarda 1,72× menos *y*
+dibuja 1,68× menos potencia mientras lo hace. 1,72 × 1,68 = 2,89.
+
+Esto es exactamente lo que el issue #92 dice que no se puede despejar: **el
+rendimiento no predice el consumo**. Con solo el `tok/s` habrías estimado un
+ahorro de 1,8× y el real es de 2,9× — y el error va en la dirección que hace
+parecer peor de lo que es al modelo pequeño.
+
+Por 1.000 tokens de salida, la energía atribuible:
+
+| | frío | caliente |
+|---|---:|---:|
+| `qwen2.5:7b` | 0,465 Wh | 0,396 Wh |
+| `llama3.2:3b` | 0,200 Wh | 0,137 Wh |
+
+Se publica la energía, no el precio. Multiplicar por tu tarifa es cosa tuya.
 
 ### El muestreador
 

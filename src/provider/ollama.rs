@@ -21,9 +21,23 @@
 //! y no hay forma de saber cuánto fue cada cosa.
 //!
 //! Importa para lo que viene: **los vatios-hora por token exigen excluir la
-//! carga**, o una petición fría inflaría la cifra unas 2,5 veces. Y aparte, el
-//! tráfico nativo de ollama **no se medía en absoluto** — el proxy solo veía
-//! el camino OpenAI-compatible.
+//! carga**. Y aparte, el tráfico nativo de ollama **no se medía en absoluto**
+//! — el proxy solo veía el camino OpenAI-compatible.
+//!
+//! # Corrección: cargar cuesta tiempo, no vatios
+//!
+//! Una versión anterior de este comentario decía que una petición fría
+//! inflaría la cuenta por token «unas 2,5 veces». **Es falso**: convertía una
+//! proporción de TIEMPO en una afirmación sobre ENERGÍA sin medirla.
+//!
+//! Medido con una petición que es 98% carga: la ventana dibuja **43,0 W** de
+//! media, contra los **~189 W** que dibuja la misma tarjeta generando. Cargar
+//! mueve memoria, no calcula. Sobre `qwen2.5:7b` con 200 tokens fijos, la
+//! carga fue el **54% del tiempo** y el **11% de la energía atribuible**: la
+//! cuenta por token se infló un **17%**, no dos veces y media.
+//!
+//! Excluirla sigue haciendo falta —con respuestas cortas la proporción
+//! crece— pero por ese motivo, no por el que estaba escrito.
 //!
 //! # Lo que este dialecto NO arregla
 //!
@@ -273,8 +287,10 @@ mod tests {
     /// la inferencia. Con el modelo frío la carga puede ser la mayor parte de
     /// la petición, y sin `load_us` no hay forma de saber cuánto fue.
     ///
-    /// Importa para los vatios-hora por token: incluir la carga inflaría la
-    /// cifra de una petición fría varias veces.
+    /// Importa para los vatios-hora por token: medido sobre `qwen2.5:7b` con
+    /// 200 tokens fijos, incluir la carga infla la cifra un **17%**. No más,
+    /// porque cargar mueve memoria y no calcula: 43 W de media contra los
+    /// ~189 W de generar (ver el doc del módulo).
     #[test]
     fn load_us_separa_la_carga_del_modelo_de_la_inferencia() {
         let v: Value = serde_json::from_str(FINAL_REAL).expect("json");
