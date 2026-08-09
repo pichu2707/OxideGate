@@ -82,6 +82,19 @@ pub enum InstructionsFormat {
     /// Claude Code: `<system-reminder>` en `messages[0]` con la cabecera
     /// `# claudeMd` dentro. Medido: 33.716 B en una máquina real.
     ClaudeMd,
+    /// opencode: la marca `Instructions from: <ruta absoluta>` en el prompt de
+    /// sistema, con el contenido pegado detrás.
+    ///
+    /// Medido sobre captura real de **opencode 1.18.15** (2026-08-09): con un
+    /// `AGENTS.md` de 202 B el bloque completo son **349 B**, o sea **147 B de
+    /// envoltorio** — y **126 de esos 147 son la RUTA ABSOLUTA** del proyecto.
+    ///
+    /// Eso significa que el «+160 B» que circulaba para opencode **no es una
+    /// constante**: es `~21 B + longitud de la ruta`. Un proyecto en `/home/u/p`
+    /// paga bastante menos que uno en un directorio profundo, y ese número no
+    /// se puede comparar entre máquinas sin decir dónde estaba el proyecto.
+    /// Mismo hallazgo que con Codex.
+    OpencodeAgentsMd,
 }
 
 /// Bloque de instrucciones encontrado en el body de una petición.
@@ -116,12 +129,63 @@ const CLAUDE_ABRE: &str = "<system-reminder>";
 const CLAUDE_CIERRA: &str = "</system-reminder>";
 const CLAUDE_MARCA: &str = "# claudeMd";
 
+/// Marca con la que opencode abre el bloque. Los dos puntos y el espacio van
+/// dentro a propósito: el contenido es markdown de una persona y puede
+/// mencionar la palabra `Instructions` sin ser una marca.
+const OPENCODE_MARCA: &str = "Instructions from: ";
+
+/// Lo único que hay detrás del bloque de opencode, y por tanto su única
+/// frontera final: el preámbulo de su bloque de skills.
+///
+/// **Es prosa del harness, y eso es una fragilidad conocida.** Si opencode
+/// cambia esa frase, este detector deja de encontrar el final y publica `None`
+/// — que significa «no lo reconozco», no «no hay instrucciones». Falla honesto,
+/// no falla mintiendo, que es lo que decide el diseño de abajo.
+const OPENCODE_FIN: &str = "Skills provide specialized instructions";
+
 /// Busca el bloque de instrucciones en un texto plano del body.
 ///
 /// Devuelve `None` si no reconoce ningún dialecto, o si lo que encuentra es un
 /// envoltorio sin la marca interna.
+///
+/// **El orden no es casual.** Claude Code va primero porque su bloque está
+/// delimitado por un envoltorio con apertura Y cierre reales
+/// (`<system-reminder>`…`</system-reminder>`), mientras que el de opencode solo
+/// tiene apertura. Ante un cuerpo donde los dos pudieran aparecer, gana el que
+/// se puede delimitar con certeza.
 pub fn detect_instructions(texto: &str) -> Option<InstructionsBlock> {
-    detect_claude_md(texto)
+    detect_claude_md(texto).or_else(|| detect_opencode(texto))
+}
+
+/// opencode: `Instructions from: <ruta>` y el contenido pegado detrás, hasta
+/// donde empieza el preámbulo de skills.
+///
+/// # La frontera, que es todo el problema
+///
+/// Verificado sobre captura real de opencode 1.18.15: el harness **abre** el
+/// bloque con la marca y **no lo cierra**. Lo único que hay detrás es su
+/// bloque de skills:
+///
+/// ```text
+/// </env>
+/// Instructions from: /ruta/absoluta/AGENTS.md
+/// …contenido del AGENTS.md…
+///
+/// Skills provide specialized instructions and workflows for specific tasks.
+/// ```
+///
+/// Es la tercera vez que aparece esta forma —también en los hooks de Claude
+/// Code— y la respuesta es la misma: **si no se encuentra la frontera, `None`.**
+/// Correr hasta el final del texto se tragaría el listado de skills entero, que
+/// es exactamente el error que `docs/fixed-toll-claude-code.md` §4 documenta
+/// tras cometerlo dos veces. Un `null` es honesto; un número inflado no.
+fn detect_opencode(texto: &str) -> Option<InstructionsBlock> {
+    let inicio = texto.find(OPENCODE_MARCA)?;
+    let fin = texto[inicio..].find(OPENCODE_FIN)? + inicio;
+    Some(InstructionsBlock {
+        bytes: texto[inicio..fin].len(),
+        format: InstructionsFormat::OpencodeAgentsMd,
+    })
 }
 
 /// Claude Code: primer `<system-reminder>` que contenga la cabecera
@@ -208,6 +272,81 @@ mod tests {
              además CONTRACT_VERSION en middleware::version y anótalo en \
              docs/telemetry-per-request.md §8"
         );
+    }
+
+    // --- opencode: `Instructions from: <ruta>` ---
+
+    /// Reproduce la disposición REAL capturada de opencode 1.18.15: la marca
+    /// tras `</env>`, el contenido pegado, y detrás el preámbulo de skills sin
+    /// ninguna marca de cierre en medio.
+    fn parte_de_opencode(contenido: &str) -> String {
+        format!(
+            "...prompt de sistema...\n<env>\n  Platform: linux\n</env>\n\
+             Instructions from: /home/quien/proyecto/AGENTS.md\n{contenido}\n\n\
+             Skills provide specialized instructions and workflows for specific tasks.\n\
+             Use the skill tool to load a skill.\n<available_skills>\n</available_skills>"
+        )
+    }
+
+    #[test]
+    fn reconoce_el_bloque_de_opencode() {
+        let contenido = "# Instrucciones\n\nResponde en una linea.";
+        let texto = parte_de_opencode(contenido);
+
+        let b = detect_instructions(&texto).expect("debe reconocer el bloque");
+
+        assert_eq!(b.format, InstructionsFormat::OpencodeAgentsMd);
+        // De la marca al inicio del preámbulo de skills: cabecera + ruta +
+        // contenido + el `\n\n` que los separa, ni un byte más.
+        let esperado = "Instructions from: /home/quien/proyecto/AGENTS.md\n".len()
+            + contenido.len()
+            + "\n\n".len();
+        assert_eq!(b.bytes, esperado);
+    }
+
+    /// **FALLA CERRADO.** opencode abre el bloque con una marca y NO lo cierra:
+    /// lo único que hay detrás es el preámbulo de skills. Sin esa frontera,
+    /// correr hasta el final se tragaría el listado entero de skills — el mismo
+    /// error que ya se cometió dos veces en este proyecto y que documenta
+    /// `fixed-toll-claude-code.md` §4.
+    #[test]
+    fn sin_la_frontera_de_skills_no_se_adivina_el_final() {
+        let texto = "Instructions from: /x/AGENTS.md\n# algo\n\ny nada más detrás";
+
+        assert!(
+            detect_instructions(texto).is_none(),
+            "sin frontera, `null` — que significa «no lo reconozco», no «no hay instrucciones»"
+        );
+    }
+
+    /// El contenido es markdown de una persona y puede mencionar cualquier
+    /// cosa, incluida la palabra `Instructions`. La marca lleva sus dos
+    /// puntos y el espacio a propósito.
+    #[test]
+    fn una_mencion_en_el_contenido_no_abre_un_bloque() {
+        let texto =
+            parte_de_opencode("Aqui hablo de Instructions y de AGENTS.md sin ser una marca.");
+
+        let b = detect_instructions(&texto).expect("reconoce el bloque de verdad");
+
+        assert!(
+            b.bytes < texto.len(),
+            "no puede tragarse la parte entera: {} de {}",
+            b.bytes,
+            texto.len()
+        );
+    }
+
+    /// Claude Code gana cuando los dos dialectos podrían aparecer: su bloque
+    /// está delimitado por un envoltorio con cierre real, así que es el más
+    /// fiable de los dos. El orden de `detect_instructions` no es casual.
+    #[test]
+    fn el_dialecto_con_cierre_real_tiene_precedencia() {
+        let texto = format!("{}\n{}", bloque_como_el_real(), parte_de_opencode("# otro"));
+
+        let b = detect_instructions(&texto).expect("reconoce alguno");
+
+        assert_eq!(b.format, InstructionsFormat::ClaudeMd);
     }
 
     /// El bloque se mide de marca a marca, envoltorio incluido.

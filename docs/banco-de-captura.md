@@ -124,10 +124,15 @@ Variables del banco: `CAPTURA_PORT` (8912), `CAPTURA_DIR` (`./capturas`),
 
 Mismo `AGENTS.md` de **202 B** en los dos casos.
 
-| Herramienta | Bloque | Envoltorio | Forma |
-|---|---:|---:|---|
-| **Codex 0.142.5** | 380 B | **178 B** | cabecera + `<INSTRUCTIONS>`…`</INSTRUCTIONS>` |
-| **Qwen Code 0.21.7** | 272 B | **70 B** | `--- Context from: X ---`…`--- End of Context from: X ---` |
+| Herramienta | Bloque | Envoltorio | Ruta | Cierre |
+|---|---:|---:|---|---|
+| **Codex 0.142.5** | 380 B | **178 B** | absoluta (116 B) | `</INSTRUCTIONS>` |
+| **Qwen Code 0.21.7** | 272 B | **70 B** | relativa | `--- End of Context… ---` |
+| **opencode 1.18.15** | 349 B | **147 B** | absoluta (126 B) | **ninguno** |
+
+Dos de los tres tienen el envoltorio **dominado por la ruta absoluta del
+proyecto** — 65% en Codex, 86% en opencode. Ninguna de sus cifras publicadas es
+una constante, y no se pueden comparar entre máquinas sin decir la ruta.
 
 ### Codex: el envoltorio depende de DÓNDE tengas el proyecto
 
@@ -187,10 +192,10 @@ corresponde y no con el primero que aparezca.
 
 ## 7. Qué falta
 
-- **opencode y `pi`**: sin capturar. La tabla del issue #66 se escribió contra
-  opencode **1.18.5** y hoy hay **1.18.15** — diez versiones de deriva, así que
-  su marca documentada hay que tratarla como no verificada, igual que pasó con
-  la de Codex.
+- **opencode: capturado.** Su marca documentada (`Instructions from: <ruta>`)
+  **sí sobrevivió** a las diez versiones de deriva, al revés que la de Codex.
+  Detector en `provider::instructions`.
+- **`pi`**: sin capturar.
 - **`pi` manda el cuerpo comprimido con zstd**, único de los cuatro. Sus cifras
   serán **lógicas**; el coste en cable es ~1/3. Publicarlo sin decirlo lo
   penalizaría por partida doble.
