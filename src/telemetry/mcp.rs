@@ -77,10 +77,11 @@ pub const MAX_SERVIDORES: usize = 256;
 
 /// Por qué una petición no pudo usarse como prueba de no-uso.
 ///
-/// Se publican los tres conteos por separado, y no un total, porque cada uno
-/// se arregla de forma distinta: `sin_extractor` con un extractor nuevo,
-/// `incompletas` no se arregla (es tráfico real abortado), y `truncadas`
-/// subiendo el cupo.
+/// Se publican los conteos por separado, y no un total, porque cada uno se
+/// arregla de forma distinta: `no_extractor` con un extractor nuevo,
+/// `incomplete` no se arregla (es tráfico real abortado), `truncated` subiendo
+/// el cupo, y `unattributed` no se arregla desde aquí — depende de que el
+/// conector del proveedor diga de quién era la llamada.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Discarded {
     /// El proveedor de esa fila no mide invocaciones (`tool_calls: null`), o
@@ -92,6 +93,10 @@ pub struct Discarded {
     /// La lista de invocaciones se recortó por el cupo, así que una llamada
     /// pudo quedarse fuera.
     pub truncated: u64,
+    /// Alguna invocación se vio pero no se pudo atribuir a un servidor, así
+    /// que pudo salir de CUALQUIERA — incluido el que esta fila iba a declarar
+    /// sin usar. Ver `ToolCalls::invoked_unattributed`.
+    pub unattributed: u64,
 }
 
 /// Qué se puede afirmar de un servidor con la evidencia disponible.
@@ -184,6 +189,15 @@ pub struct McpSnapshot {
     /// en silencio, porque una lista corta que parece completa es peor que
     /// una que avisa de que no lo está.
     pub servers_omitted: u64,
+    /// `true` si el propio registro de omitidos se llenó, y por tanto
+    /// `servers_omitted` es un **mínimo**, no el total.
+    ///
+    /// El conjunto que lleva la cuenta también está acotado por
+    /// [`MAX_SERVIDORES`] —viene de fuera, no puede crecer sin límite—, así
+    /// que sin esta bandera el contador que existe para hacer VISIBLE el tope
+    /// se topaba él mismo en silencio, y un informe gravemente incompleto
+    /// parecía solo un poco incompleto.
+    pub servers_omitted_saturated: bool,
     /// Timestamp más antiguo que entró en este agregado, o `None` si está
     /// vacío.
     ///
@@ -242,6 +256,9 @@ pub struct McpRegistry {
     /// rechazados creciera sin limite, reintroduciria el agujero de memoria
     /// que el cupo viene a cerrar.
     descartados_por_cupo: std::collections::HashSet<(ToolServerKind, String)>,
+    /// `true` cuando hubo un rechazo que ni siquiera cupo en
+    /// `descartados_por_cupo`. Desde ese momento su `len()` es un MÍNIMO.
+    descartados_por_cupo_saturado: bool,
     /// Timestamp más antiguo ingerido, para publicar la ventana real.
     desde: Option<String>,
 }
@@ -301,6 +318,8 @@ impl McpRegistry {
                         if self.descartados_por_cupo.len() < MAX_SERVIDORES {
                             self.descartados_por_cupo
                                 .insert((llamada.kind, llamada.server.clone()));
+                        } else {
+                            self.descartados_por_cupo_saturado = true;
                         }
                     }
                 }
@@ -321,6 +340,8 @@ impl McpRegistry {
             {
                 if self.descartados_por_cupo.len() < MAX_SERVIDORES {
                     self.descartados_por_cupo.insert(clave);
+                } else {
+                    self.descartados_por_cupo_saturado = true;
                 }
                 continue;
             }
@@ -332,6 +353,7 @@ impl McpRegistry {
             match motivo {
                 Some(Motivo::SinExtractor) => acc.discarded.no_extractor += 1,
                 Some(Motivo::Incompleta) => acc.discarded.incomplete += 1,
+                Some(Motivo::SinAtribuir) => acc.discarded.unattributed += 1,
                 Some(Motivo::Truncada) => acc.discarded.truncated += 1,
                 None => acc.conclusive_requests += 1,
             }
@@ -410,6 +432,7 @@ impl McpRegistry {
             servers,
             since: self.desde.clone(),
             servers_omitted: self.descartados_por_cupo.len() as u64,
+            servers_omitted_saturated: self.descartados_por_cupo_saturado,
             invoked_never_declared,
         }
     }
@@ -420,6 +443,7 @@ impl McpRegistry {
 enum Motivo {
     SinExtractor,
     Incompleta,
+    SinAtribuir,
     Truncada,
 }
 
@@ -430,6 +454,15 @@ fn motivo_de_descarte(m: &RequestMetric) -> Option<Motivo> {
     };
     if !calls.complete {
         return Some(Motivo::Incompleta);
+    }
+    // ANTES que el chequeo del cupo, y el orden no es cosmetico: una
+    // invocacion sin atribuir sube `invoked_total` sin entrar en `invoked`,
+    // asi que dispararia tambien la condicion de truncado de abajo. Publicar
+    // esto como `truncated` mandaria a quien lo lea a subir un cupo que no
+    // tiene nada que ver — el mismo error de atribucion de causa contra el que
+    // avisa el comentario siguiente.
+    if calls.invoked_unattributed > 0 {
+        return Some(Motivo::SinAtribuir);
     }
     // SOLO se mira el cupo de `invoked`. El de `server_invoked` (web_search,
     // web_fetch) tiene su propia cuota independiente y no puede esconder una
@@ -778,6 +811,98 @@ mod tests {
             nativo.bytes_per_request_declared, 5_000,
             "el coste sí se publica"
         );
+    }
+
+    /// CUARTO FILTRO DE HONESTIDAD. Una invocación que no se pudo atribuir
+    /// pudo salir de CUALQUIER servidor, incluido el que estamos a punto de
+    /// declarar sin usar. La fila no prueba el no-uso de nadie.
+    ///
+    /// Y la causa se publica aparte, no como `truncated`: aquella se arregla
+    /// subiendo el cupo y esta no se arregla desde aquí — es el conector del
+    /// proveedor el que no dijo de quién era la llamada.
+    #[test]
+    fn una_invocacion_sin_atribuir_descalifica_la_fila_con_su_propia_causa() {
+        let mut reg = McpRegistry::default();
+        let mut calls = invocando(&[]);
+        calls.invoked_unattributed = 1;
+        calls.invoked_total += 1;
+
+        reg.ingest(&fila("notion", ToolServerKind::Mcp, 900, 3, Some(calls)));
+
+        let snap = reg.snapshot();
+        let notion = snap.servers.iter().find(|s| s.server == "notion").unwrap();
+
+        assert_eq!(notion.discarded.unattributed, 1);
+        assert_eq!(
+            notion.discarded.truncated, 0,
+            "la causa NO es el cupo: subirlo no arreglaria esto"
+        );
+        assert_eq!(
+            notion.conclusive_requests, 0,
+            "una fila con una llamada de dueño desconocido no prueba no-uso"
+        );
+    }
+
+    /// El contador que existe para hacer VISIBLE el tope no puede toparse él
+    /// mismo con un tope en silencio. `descartados_por_cupo` está acotado a
+    /// `MAX_SERVIDORES`, así que a partir de ahí `servers_omitted` deja de
+    /// crecer y un informe muy incompleto parece solo un poco incompleto.
+    #[test]
+    fn el_cupo_de_omitidos_declara_cuando_el_tambien_se_satura() {
+        let mut reg = McpRegistry::default();
+
+        // Se llenan los acumuladores...
+        for i in 0..MAX_SERVIDORES {
+            reg.ingest(&fila(
+                &format!("srv{i:04}"),
+                ToolServerKind::Mcp,
+                100,
+                1,
+                None,
+            ));
+        }
+        // ...y ahora se rechazan MÁS de MAX_SERVIDORES servidores distintos.
+        for i in 0..(MAX_SERVIDORES + 10) {
+            reg.ingest(&fila(
+                &format!("rechazado{i:04}"),
+                ToolServerKind::Mcp,
+                100,
+                1,
+                None,
+            ));
+        }
+
+        let snap = reg.snapshot();
+
+        assert_eq!(
+            snap.servers_omitted, MAX_SERVIDORES as u64,
+            "el conjunto no puede crecer más, así que el conteo se topa"
+        );
+        assert!(
+            snap.servers_omitted_saturated,
+            "y por eso hay que decir que ese número es un MÍNIMO, no el total"
+        );
+    }
+
+    /// Sin saturación, la bandera no se enciende: un informe incompleto pero
+    /// con el conteo exacto no debe leerse como uno que además lo esconde.
+    #[test]
+    fn sin_saturacion_del_cupo_de_omitidos_la_bandera_no_se_enciende() {
+        let mut reg = McpRegistry::default();
+        for i in 0..(MAX_SERVIDORES + 3) {
+            reg.ingest(&fila(
+                &format!("srv{i:04}"),
+                ToolServerKind::Mcp,
+                100,
+                1,
+                None,
+            ));
+        }
+
+        let snap = reg.snapshot();
+
+        assert_eq!(snap.servers_omitted, 3, "tres rechazados, contados exactos");
+        assert!(!snap.servers_omitted_saturated);
     }
 
     /// El desempate llega hasta `kind`, como en `group_tools_by_server`.

@@ -541,11 +541,30 @@ pub struct ToolCalls {
     /// porque no salen de la configuración MCP del usuario y por tanto no
     /// entran en el recuento que alimenta al recomendador.
     pub server_invoked: Vec<String>,
-    /// Invocaciones de cliente VISTAS, sin aplicar el cupo. Si es mayor que
-    /// `invoked.len()`, la lista está recortada — y hay que tratarla como un
-    /// mínimo, no como el total.
+    /// Invocaciones de cliente VISTAS, sin aplicar el cupo.
+    ///
+    /// Si es mayor que `invoked.len()` la lista NO está completa, pero hay dos
+    /// causas posibles y no se distinguen desde aquí: el cupo recortó, o
+    /// alguna invocación no se pudo atribuir y por eso no entró en la lista
+    /// (ver [`Self::invoked_unattributed`]). Quien decide se lo pregunta a los
+    /// dos campos, en ese orden.
     #[serde(default)]
     pub invoked_total: usize,
+    /// Invocaciones vistas cuyo servidor NO se pudo resolver, y que por eso no
+    /// están en `invoked`.
+    ///
+    /// Hoy solo lo alimenta el conector MCP server-side de Anthropic
+    /// (`mcp_tool_use`) cuando llega sin un `server_name` legible. Antes esos
+    /// casos caían en la deducción por nombre, y como esos nombres viajan
+    /// DESNUDOS, `classify` los acreditaba a `(native)` en el 100% de los
+    /// casos: no era un "no lo sé", era una atribución falsa y muda.
+    ///
+    /// Se cuenta en vez de inventar un servidor porque una llamada de dueño
+    /// desconocido pudo salir de cualquiera, incluido el que el recomendador
+    /// esté a punto de declarar sin usar. Distinto de cero descalifica la fila
+    /// como prueba de no-uso.
+    #[serde(default)]
+    pub invoked_unattributed: usize,
     /// Ídem para las de servidor.
     #[serde(default)]
     pub server_invoked_total: usize,
@@ -571,6 +590,16 @@ impl ToolCalls {
     pub fn push_invoked(&mut self, name: &str) {
         let (kind, server) = classify(name);
         self.push_invoked_de(name, server, kind);
+    }
+
+    /// Registra una invocación VISTA cuyo servidor no se pudo resolver.
+    ///
+    /// Sube el total —la llamada existió— y el contador de no atribuidas, pero
+    /// NO entra en `invoked`: no hay servidor al que acreditarla, y `(native)`
+    /// es un servidor. Ver [`ToolCalls::invoked_unattributed`].
+    pub fn push_invoked_sin_atribuir(&mut self) {
+        self.invoked_total = self.invoked_total.saturating_add(1);
+        self.invoked_unattributed = self.invoked_unattributed.saturating_add(1);
     }
 
     /// Registra una invocación cuyo servidor viene DADO, no deducido del
@@ -1461,6 +1490,31 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].server, "alpha");
         assert_eq!(rows[1].server, "zebra");
+    }
+
+    /// Una fila escrita ANTES de que existiera `invoked_unattributed` tiene
+    /// que seguir entrando entera. Sin `default`, `serde` fallaría al parsear
+    /// el `RequestMetric` COMPLETO —no solo este campo— y `rehydrate` tiraría
+    /// sus tokens, su coste y su latencia junto al dato que falta. Es el mismo
+    /// modo de fallo que `8650a75` ya provocó una vez.
+    #[test]
+    fn una_fila_sin_invoked_unattributed_sigue_entrando() {
+        let vieja = serde_json::json!({
+            "invoked": [{"name": "mcp__x__y", "server": "x", "kind": "mcp"}],
+            "server_invoked": [],
+            "invoked_total": 1,
+            "server_invoked_total": 0,
+            "complete": true
+        });
+
+        let calls: ToolCalls = serde_json::from_value(vieja).expect("la fila vieja debe entrar");
+
+        assert_eq!(
+            calls.invoked_unattributed, 0,
+            "ausente es cero, no un error"
+        );
+        assert_eq!(calls.invoked.len(), 1);
+        assert!(calls.complete);
     }
 
     /// PRUEBA DE MORDIDA. La cara opuesta del bug que cerró `cfd9d88`: aquel
