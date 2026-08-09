@@ -271,6 +271,21 @@ pub struct RecentRequest {
     /// NO es `Option`, igual que su hermano y por el mismo motivo: el escaneo
     /// siempre ocurre. Un cero es un cero MEDIDO, no un dato ausente.
     pub scan_us: u64,
+    /// Microsegundos que el MOTOR dice haber tardado en cargar el modelo,
+    /// procesar el prompt y generar la salida.
+    ///
+    /// Solo los reporta un motor LOCAL (`ollama`), y son lo unico que separa
+    /// CARGAR el modelo de inferir con el: medido, la carga fue el 57% de una
+    /// peticion fria. `ttft_ms` mezcla esa carga con el procesado del prompt.
+    ///
+    /// NO corrigen ningun error de `tokens_per_sec`: en streaming el `ttft_ms`
+    /// ya absorbe la carga, asi que la velocidad publicada ya era correcta.
+    ///
+    /// `None` en los cuatro dialectos de nube: no es que no carguen modelos,
+    /// es que no lo reportan. Ausencia honesta, no un cero.
+    pub load_us: Option<u64>,
+    pub prompt_eval_us: Option<u64>,
+    pub eval_us: Option<u64>,
     /// Estado de la cuota de suscripción de Codex (ver
     /// `telemetry::logger::RequestMetric::codex_quota` para el contrato
     /// completo). `None` para tráfico sin cabeceras `x-codex-*` (Anthropic,
@@ -344,6 +359,9 @@ impl From<&RequestMetric> for RecentRequest {
             response_bytes: m.response_bytes,
             prepare_us: m.prepare_us,
             scan_us: m.scan_us,
+            load_us: m.load_us,
+            prompt_eval_us: m.prompt_eval_us,
+            eval_us: m.eval_us,
             codex_quota: m.codex_quota.clone(),
             session: m.session.clone(),
         }
@@ -445,6 +463,9 @@ mod tests {
             response_bytes: None,
             prepare_us: 42,
             scan_us: 7,
+            load_us: None,
+            prompt_eval_us: None,
+            eval_us: None,
             codex_quota: None,
             session: SessionAttribution {
                 source: SessionSource::Unattributed,
@@ -1032,14 +1053,17 @@ mod tests {
             "context_tools_bytes",
             "cost_estimate_usd",
             "effort_forced",
+            "eval_us",
             "hooks",
             "input_share_by_section",
             "input_tokens",
             "instructions",
+            "load_us",
             "model",
             "output_tokens",
             "prepare_us",
             "prompt_bytes",
+            "prompt_eval_us",
             "requested_effort",
             "requested_speed",
             "response_bytes",

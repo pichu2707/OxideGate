@@ -560,6 +560,9 @@ mod tests {
             response_bytes: None,
             prepare_us: 0,
             scan_us: 0,
+            load_us: None,
+            prompt_eval_us: None,
+            eval_us: None,
             codex_quota: None,
             session: SessionAttribution {
                 source: SessionSource::Unattributed,

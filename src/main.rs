@@ -749,6 +749,15 @@ async fn main() {
             "/v1/codex/responses",
             post(middleware::proxy::handle_openai_codex_responses),
         )
+        // Dialecto NATIVO de ollama. Existe aparte del OpenAI-compatible
+        // porque ese endpoint TIRA `load_duration`/`eval_duration`, y sin
+        // ellas `tok/s` se calcula sobre el reloj de pared: 42% de error
+        // medido cuando el modelo está frío (ver `provider::ollama`).
+        .route(
+            "/api/generate",
+            post(middleware::proxy::handle_ollama_route),
+        )
+        .route("/api/chat", post(middleware::proxy::handle_ollama_route))
         // Ruta comodín de Gemini: captura `/v1beta/models/{model}:{método}`.
         .route(
             "/v1beta/*rest",

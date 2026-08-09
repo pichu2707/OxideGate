@@ -161,6 +161,7 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `context_tax_ratio` | `(context_system_bytes + context_tools_bytes + context_history_bytes) / context_measured_bytes` | Cercano a `1.0` (100%) ⇒ casi todo el body de esta petición es contexto YA enviado antes, no turno nuevo — la "tasa" que se paga por repetir contexto en cada request |
 | `prepare_us` | Microsegundos que el proxy pasó dentro de `Provider::prepare` (parseo del body + `decompose` + mutación opcional, p. ej. inyectar `cache_control`) | Ver la nota sobre qué NO incluye, más abajo |
 | `scan_us` | Microsegundos que el proxy pasó ESCANEANDO la respuesta (recorrido SSE por cada chunk, más el cierre). La otra mitad del overhead propio | Los dos juntos son el tiempo de CPU que cuesta observar — ver la nota de abajo |
+| `load_us` · `prompt_eval_us` · `eval_us` | Microsegundos que el MOTOR dice haber tardado en cargar el modelo, procesar el prompt y generar. Solo los reporta un motor **local** (`ollama` nativo) | `null` en los cuatro dialectos de nube: no es que no carguen modelos, es que no lo reportan. Ver §4.18 |
 | `tools_by_server` | Desglose de `context_tools_bytes` por servidor MCP declarante: `[{server, kind, tools, bytes, deferred_tools, tool_names}, …]`, ordenado por `bytes` descendente | `null` si el body no parseó como objeto (o build anterior a este campo); `[]` si SÍ parseó pero no declaraba `tools` — son estados DISTINTOS, ver §4.2. `deferred_tools` (por elemento) es la fuente de verdad POR SERVIDOR de cuánto está diferido, ver §4.2 |
 | `tools_overhead_bytes` | Bytes de `tools` no atribuidos a ningún servidor (brackets/comas del array, wrapper de Gemini, herramientas huérfanas) | `null` en los mismos casos que `tools_by_server` es `null`; `sum(tools_by_server[].bytes) + tools_overhead_bytes == context_tools_bytes` siempre que ambos sean no-nulos |
 | `tool_search` | Señal de carga diferida de herramientas del dialecto Responses/Codex: `{used, deferred_loaded}`, o `null`. `used: false` ⇒ EAGER confirmado este turno; `used: true` ⇒ LAZY (el cliente cargó tools a mitad de sesión) | `null` en Anthropic/Gemini/OpenAI-Chat (no aplica) o si el body no parseó. Es el diferenciador eager-vs-lazy por cliente que `tools_by_server` NO puede dar — ver §4.3 |
@@ -1611,6 +1612,53 @@ subestima el listado cuando una skill trae la descripción en varias líneas
 (issue #84: −1.453 B sobre esta misma captura), y restar convertiría ese error
 en bytes de hooks que nunca existieron. La frontera es el **inicio** de la
 cabecera, no una diferencia entre dos medidas.
+
+---
+
+## 4.18. El dialecto nativo de ollama, y qué separa
+
+`POST /api/generate` y `POST /api/chat`. Existe aparte del endpoint
+OpenAI-compatible —que el proxy ya medía— porque ese endpoint publica **solo
+contadores de tokens**, y tira el reparto interno del tiempo.
+
+Medido a través del proxy con el modelo **frío**:
+
+| | |
+|---|---:|
+| `load_us` | **1.451 ms — el 57%** |
+| `prompt_eval_us` | 23 ms |
+| `eval_us` | 1.070 ms |
+| `total_ms` | 2.548 ms |
+
+`ttft_ms` mezcla la carga con el procesado del prompt y **no los distingue**.
+Estas tres cifras sí, y hacen falta para excluir la carga de cualquier cuenta
+por token — una petición fría la inflaría unas 2,5 veces.
+
+### Lo que NO arregla
+
+**No corrige ningún error de `tokens_per_sec`.** En streaming el proxy calcula
+`salida / (total_ms − ttft_ms)`, y el `ttft_ms` **ya absorbe la carga**: el
+primer chunk no sale hasta que el modelo está cargado. Sobre esa misma
+petición, `ttft_ms` fue 1.477 ms contra 1.474 de `load + prompt_eval`, y la
+velocidad publicada **126,1 frente a 126,2 reales**. Fuera de streaming el
+campo es `null`, no un número malo.
+
+Se deja escrito porque una versión anterior de esta documentación afirmaba lo
+contrario, y hay un test que fija la equivalencia para que no vuelva.
+
+### NDJSON, no SSE
+
+Ollama nativo **hace streaming por defecto** —al revés que OpenAI— y manda
+NDJSON: un objeto JSON por línea, **sin prefijo `data:`**. Los totales viajan
+en la última línea, la del `done: true`.
+
+Eso obligó a que el formato de línea lo decida el proveedor
+(`Provider::payload_de_linea`, sin default) en vez del escáner. Antes el
+escáner exigía `data:` a todo el mundo: contra este dialecto habría ignorado
+cada línea y publicado **cero tokens en silencio**, indistinguible de una
+respuesta sin tokens.
+
+`OXIDEGATE_OLLAMA_API_BASE` apunta al motor; por defecto `127.0.0.1:11434`.
 
 ---
 

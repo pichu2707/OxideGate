@@ -12,6 +12,7 @@ mod block_scan;
 pub mod gemini;
 pub mod hooks;
 pub mod instructions;
+pub mod ollama;
 pub mod openai;
 pub mod skills;
 
@@ -26,8 +27,25 @@ pub use anthropic::ANTHROPIC;
 pub use gemini::GEMINI;
 pub use hooks::HooksBlock;
 pub use instructions::InstructionsBlock;
+pub use ollama::OLLAMA;
 pub use openai::{OPENAI_CHAT, OPENAI_CODEX_RESPONSES, OPENAI_RESPONSES};
 pub use skills::SkillsBlock;
+
+/// Payload JSON de una línea **SSE**: lo que va tras `data:`.
+///
+/// Definición ÚNICA de la regla, para que los cuatro dialectos en la nube no
+/// la copien cuatro veces y puedan divergir. Cada proveedor sigue teniendo que
+/// declarar que la usa —ver [`Provider::payload_de_linea`], que no tiene
+/// default— pero la regla en sí vive en un solo sitio.
+///
+/// `None` para líneas de evento, comentarios, vacías y para el `[DONE]` final.
+pub fn payload_sse(linea: &str) -> Option<&str> {
+    let payload = linea.trim().strip_prefix("data:")?.trim();
+    if payload.is_empty() || payload == "[DONE]" {
+        return None;
+    }
+    Some(payload)
+}
 
 /// Lo que el proxy sabe del request entrante, antes de saber a qué proveedor
 /// pertenece.
@@ -240,6 +258,26 @@ pub struct Usage {
     /// observe el campo presente al menos una vez. Solo Anthropic lo llena;
     /// OpenAI y Gemini lo dejan siempre en `None`.
     pub speed: Option<String>,
+    /// Microsegundos que el MOTOR dice haber tardado en cargar el modelo,
+    /// antes de inferir nada.
+    ///
+    /// Solo lo reporta un motor local (`ollama`), y es lo único que permite
+    /// separar cargar el modelo de inferir con él: medido a través del proxy,
+    /// **la carga fue el 57% de una petición fría**. `ttft_ms` mezcla esa
+    /// carga con el procesado del prompt y no los distingue.
+    ///
+    /// **No corrige ningún error de `tokens_per_sec`**: en streaming el
+    /// `ttft_ms` ya absorbe la carga, así que la velocidad publicada ya era
+    /// correcta (126,1 contra 126,2 reales). Ver `provider::ollama`.
+    ///
+    /// `None` en los cuatro dialectos de nube: no es que no carguen modelos,
+    /// es que no lo reportan. Ausencia honesta, no un cero.
+    pub load_us: Option<u64>,
+    /// Microsegundos procesando el prompt de entrada, según el motor.
+    pub prompt_eval_us: Option<u64>,
+    /// Microsegundos GENERANDO la salida, según el motor. Es el denominador
+    /// correcto de `tok/s`: el reloj de pared incluye carga y espera.
+    pub eval_us: Option<u64>,
 }
 
 /// Descomposición del body de un request por componente, medida en BYTES.
@@ -1096,6 +1134,28 @@ pub trait Provider: Send + Sync {
     /// Sin default, igual que `extract_tool_use`: un proveedor nuevo tiene
     /// que declarar en que lado esta, no heredarlo.
     fn captura_invocaciones(&self) -> bool;
+
+    /// Extrae el JSON de UNA línea del stream de respuesta, o `None` si esa
+    /// línea no lo lleva.
+    ///
+    /// Existe porque **no todos los dialectos hacen SSE**. Los cuatro
+    /// proveedores en la nube mandan `data: {json}`; ollama nativo manda
+    /// **NDJSON**: un objeto por línea, sin prefijo. Antes de esto el escáner
+    /// exigía `data:` a todo el mundo, así que contra ollama habría ignorado
+    /// cada línea y publicado **cero tokens en silencio** — un cero medido
+    /// indistinguible de la verdad.
+    ///
+    /// Vive aquí y no en el escáner a propósito: `telemetry::metered` se
+    /// declara «mecánica PURA de medición: no conoce el dialecto de ningún
+    /// proveedor concreto», y una bandera `is_ndjson` allí rompería justo esa
+    /// separación. El conocimiento del dialecto vive donde ya viven
+    /// [`Provider::extract_usage`] y [`Provider::decompose`].
+    ///
+    /// **Sin default**, por el mismo motivo que `extract_tool_use` y
+    /// `captura_invocaciones`: heredar «SSE» dejaría a un proveedor nuevo
+    /// publicando cero tokens sin que nada fallara. Que no compile obliga a
+    /// decidir de qué forma es su stream.
+    fn payload_de_linea<'a>(&self, linea: &'a str) -> Option<&'a str>;
 
     /// Descompone el body de la petición por componente (ver
     /// [`ContextBreakdown`]). `None` si el body no es un objeto JSON o el

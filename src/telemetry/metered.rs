@@ -175,19 +175,22 @@ impl UsageScanner {
         }
     }
 
-    /// Parsea una línea SSE. Solo nos interesan las líneas `data: {json}`.
+    /// Parsea una línea del stream. **De qué forma es esa línea lo decide el
+    /// PROVEEDOR**, no este módulo: los cuatro dialectos en la nube mandan
+    /// `data: {json}` (SSE) y ollama nativo manda NDJSON, un objeto por línea
+    /// sin prefijo.
+    ///
+    /// Antes esto exigía `data:` a todo el mundo. Contra un dialecto NDJSON
+    /// habría ignorado cada línea y publicado **cero tokens en silencio**, que
+    /// es indistinguible de una respuesta sin tokens. Ver
+    /// `Provider::payload_de_linea`.
     fn scan_sse_line(&mut self, line: &[u8]) {
         let Ok(text) = std::str::from_utf8(line) else {
             return;
         };
-        let text = text.trim();
-        let Some(payload) = text.strip_prefix("data:") else {
+        let Some(payload) = self.provider.payload_de_linea(text) else {
             return;
         };
-        let payload = payload.trim();
-        if payload.is_empty() || payload == "[DONE]" {
-            return;
-        }
         if let Ok(value) = serde_json::from_str::<Value>(payload) {
             self.provider.extract_usage(&value, &mut self.usage);
             self.provider.extract_tool_use(&value, &mut self.calls);
@@ -396,6 +399,9 @@ impl MeteredBody {
             tools_overhead_bytes,
             prepare_us: self.base.prepare_us,
             scan_us: self.scan_us,
+            load_us: self.scanner.usage.load_us,
+            prompt_eval_us: self.scanner.usage.prompt_eval_us,
+            eval_us: self.scanner.usage.eval_us,
             requested_effort: self.base.requested_effort.clone(),
             requested_speed: self.base.requested_speed.clone(),
             served_speed: self.scanner.usage.speed.clone(),

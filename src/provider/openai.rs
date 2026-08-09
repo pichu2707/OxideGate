@@ -148,6 +148,12 @@ impl Provider for OpenAiChat {
 
     /// Dialecto no capturado todavia: la fila publica `None`, no listas
     /// vacias. Ver [`Provider::captura_invocaciones`].
+    /// Dialecto SSE: el JSON va tras `data:`. Se declara explícitamente
+    /// porque el trait no da default — ver `Provider::payload_de_linea`.
+    fn payload_de_linea<'a>(&self, linea: &'a str) -> Option<&'a str> {
+        super::payload_sse(linea)
+    }
+
     fn captura_invocaciones(&self) -> bool {
         false
     }
@@ -340,6 +346,12 @@ impl Provider for OpenAiResponses {
 
     /// Dialecto no capturado todavia: la fila publica `None`, no listas
     /// vacias. Ver [`Provider::captura_invocaciones`].
+    /// Dialecto SSE: el JSON va tras `data:`. Se declara explícitamente
+    /// porque el trait no da default — ver `Provider::payload_de_linea`.
+    fn payload_de_linea<'a>(&self, linea: &'a str) -> Option<&'a str> {
+        super::payload_sse(linea)
+    }
+
     fn captura_invocaciones(&self) -> bool {
         false
     }
@@ -583,6 +595,12 @@ impl Provider for OpenAiCodexResponses {
     }
 
     /// Delega, igual que el extractor: mismo dialecto, misma ausencia.
+    /// Dialecto SSE: el JSON va tras `data:`. Se declara explícitamente
+    /// porque el trait no da default — ver `Provider::payload_de_linea`.
+    fn payload_de_linea<'a>(&self, linea: &'a str) -> Option<&'a str> {
+        super::payload_sse(linea)
+    }
+
     fn captura_invocaciones(&self) -> bool {
         OPENAI_RESPONSES.captura_invocaciones()
     }
@@ -1048,6 +1066,7 @@ mod tests {
             target_anthropic_url: "https://api.anthropic.com/v1".to_string(),
             target_gemini_url: "https://generativelanguage.googleapis.com".to_string(),
             target_codex_url: "https://chatgpt.com/backend-api/codex".to_string(),
+            target_ollama_url: "http://127.0.0.1:11434".to_string(),
             storage_dir: std::path::PathBuf::from("/tmp/oxidegate-test"),
             storage_dir_source: crate::config::StorageDirSource::Default,
             force_prompt_cache: false,
