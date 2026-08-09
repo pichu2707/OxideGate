@@ -124,7 +124,7 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
 
 ## 5. Layout de la pantalla
 
-1. **Header** (NO scrollea): título, URL del endpoint, estado del último fetch
+1. **Header** (NO scrollea, 4 líneas — dos de texto más los bordes): título, URL del endpoint, estado del último fetch
    ("ok · N modelos" o "proxy no disponible en..."), y edad del baseline
    ("baseline hace 12s" o "sin baseline — pulse 'b'").
 2. **Tabla principal**, una fila por `(upstream, model)`, TOTAL acumulado
@@ -185,7 +185,7 @@ del que se derivan el alto del lienzo y el tope del scroll):
 
 | Sección | Líneas | ¿Scrollea? |
 |---|---|---|
-| header | 3 | no |
+| header | 4 | no |
 | tabla de modelos | 8 | sí |
 | ANTES/DESPUÉS | 6 | sí |
 | sparklines | 7 | sí |

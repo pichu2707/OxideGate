@@ -2588,8 +2588,14 @@ const ALTO_TOOLS: u16 = 10;
 const ALTO_CUOTA: u16 = 7;
 const ALTO_SESIONES: u16 = 9;
 const ALTO_GPU: u16 = 8;
-/// Header (3) + footer (1): las dos bandas que NO scrollean.
-const ALTO_HEADER: u16 = 3;
+/// Header (4) + footer (1): las dos bandas que NO scrollean.
+///
+/// El header son CUATRO y no tres porque [`draw_header`] pinta DOS líneas de
+/// texto —título con URL, y estado del poll con la edad del baseline— y los
+/// bordes se comen dos filas. Con `Length(3)` la segunda línea se recortaba
+/// silenciosamente: el estado de la conexión y la edad del baseline llevaban
+/// sin verse desde que el header tiene dos líneas.
+const ALTO_HEADER: u16 = 4;
 const ALTO_FOOTER: u16 = 1;
 
 /// Alto del lienzo desplazable, sumando solo los paneles VISIBLES.
@@ -7694,6 +7700,29 @@ mod tests {
     // Scroll global de la pantalla (lienzo + ventana)
     // -----------------------------------------------------------------
 
+    /// El header pinta DOS líneas de texto; con `Length(3)` los bordes se
+    /// comían la segunda y el estado del poll no se veía nunca.
+    #[test]
+    fn el_header_ensena_sus_dos_lineas_no_solo_el_titulo() {
+        let mut app = App::new("http://127.0.0.1:8899/stats".to_string());
+        app.status = "ok · 4 modelos".to_string();
+
+        let backend = ratatui::backend::TestBackend::new(120, 33);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        let pintado = buffer_to_string(terminal.backend().buffer());
+        assert!(pintado.contains("monitor en vivo"), "falta el título");
+        assert!(
+            pintado.contains("estado: ok · 4 modelos"),
+            "la segunda línea del header sigue recortada:\n{pintado}"
+        );
+        assert!(
+            pintado.contains("sin baseline"),
+            "falta la edad del baseline, que va en esa misma línea"
+        );
+    }
+
     #[test]
     fn el_lienzo_encoge_al_cerrar_paneles() {
         let mut app = App::new("http://x/stats".to_string());
@@ -7752,10 +7781,10 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         terminal.draw(|f| ui(f, &mut app)).unwrap();
 
-        // Ventana = 33 - header(3) - footer(1) = 29.
+        // Ventana = 33 - header(4) - footer(1) = 28.
         assert_eq!(
             app.page_scroll,
-            tope_del_scroll(alto_del_contenido(&app), 29),
+            tope_del_scroll(alto_del_contenido(&app), 33 - ALTO_HEADER - ALTO_FOOTER),
             "el dibujado tiene que dejarlo justo en el final"
         );
     }
