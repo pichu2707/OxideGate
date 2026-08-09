@@ -714,10 +714,24 @@ async fn main() {
              sigue diciendo qué pidió el cliente."
         );
     }
+    // El muestreador de potencia arranca UNA vez y vive con el proxy. Un
+    // proceso persistente cuesta 0,1% de un core; arrancarlo por petición
+    // costaría 23,81 ms, seis veces todo el overhead del proxy. Ver
+    // `telemetry::power`. `None` si no hay `nvidia-smi` o si está apagado por
+    // entorno, y en ese caso los campos de energía valen `None`.
+    //
+    // Arranca ANTES del bind porque viaja dentro de `AppState`, y si el
+    // puerto está ocupado el proceso muere sin ejecutar ningún `Drop`. No deja
+    // huérfano igualmente: al cerrarse la tubería, `nvidia-smi` recibe SIGPIPE
+    // en la siguiente muestra y termina — como mucho una cadencia después.
+    // Verificado tras un arranque fallido: cero procesos supervivientes.
+    let power = telemetry::power::PowerMeter::arrancar();
+    let hay_muestreador = power.is_some();
     let state = AppState {
         config: Arc::new(config),
         http: reqwest::Client::new(),
         telemetry,
+        power,
     };
 
     // Estado congelado de la rehidratación: se resuelve una vez y no cambia,
@@ -806,6 +820,18 @@ async fn main() {
     // expuesto, que sea lo primero que se lee al arrancar.
     if let Some(aviso) = config::exposure_warning(bind_host) {
         eprintln!("{aviso}");
+    }
+
+    // El aviso del muestreador va DESPUÉS del bind por el mismo criterio que
+    // el de exposición: un arranque que falla por puerto ocupado no debe
+    // anunciar una capacidad que nadie va a usar.
+    if hay_muestreador {
+        println!(
+            "⚡ Muestreador de potencia ACTIVO ({} ms). Las peticiones a un upstream LOCAL \n   \
+             publican energy_wh y energy_idle_wh; las remotas, null.\n   Apagable con {}=off.",
+            telemetry::power::CADENCIA_MS,
+            telemetry::power::ENV_APAGADO
+        );
     }
 
     println!("🛰️  Escuchando en http://{addr}");

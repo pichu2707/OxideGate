@@ -563,6 +563,10 @@ mod tests {
             load_us: None,
             prompt_eval_us: None,
             eval_us: None,
+            energy_wh: None,
+            energy_idle_wh: None,
+            power_peak_w: None,
+            energy_samples: None,
             codex_quota: None,
             session: SessionAttribution {
                 source: SessionSource::Unattributed,

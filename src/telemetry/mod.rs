@@ -4,6 +4,7 @@ pub mod codex_quota;
 pub mod logger;
 pub mod mcp;
 pub mod metered;
+pub mod power;
 pub mod pricing;
 pub mod recent;
 pub mod rehydrate;
