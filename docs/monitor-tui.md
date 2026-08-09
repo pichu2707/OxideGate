@@ -117,6 +117,7 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
 | `s` | Mostrar/ocultar el panel de tools por servidor (ver §8). **INDEPENDIENTE** de `p`/`c`: ninguna de las tres teclas afecta el estado de las otras |
 | `e` | Mostrar/ocultar el panel de **gasto por sesión** — `e` de s**e**sión, porque `s` ya es tools (ver §8). **INDEPENDIENTE** de `p`/`c`/`s`/`u` |
 | `u` | Mostrar/ocultar el panel de cuota de suscripción Codex — "uso de cuota" (ver §9). **INDEPENDIENTE** de `p`/`c`/`s` |
+| `g` | Mostrar/ocultar el **contador de potencia** de la máquina (ver §10). **Arranca OCULTO**: muestrear cuesta ~24 ms por poll y lo que no se enseña no se paga. INDEPENDIENTE de `p`/`c`/`s`/`e`/`u` |
 
 ## 5. Layout de la pantalla
 
@@ -706,7 +707,73 @@ servidor (§8.5), con el mismo pipeline puro (`find_quota_source_row` +
 `quota_lines`) y las mismas reglas de ausencia — sin sesión interactiva no
 hay nada que ocultar.
 
-## 10. Dónde vive cada cosa
+## 10. Contador de potencia (`g`)
+
+Qué le está costando a **tu máquina** el modelo que tiene cargado, ahora mismo.
+
+```
+┌ potencia de la máquina ──────────┐┌ vatios (histórico · rango 34..277) ┐
+│  277.0 W / 320 W límite  (87%)   ││        ▁▂▅███▆▃▂▁                  │
+│ uso  93%   55 °C   VRAM 5812/16376││                                    │
+│ NVIDIA GeForce RTX 4080 SUPER    ││                                    │
+└──────────────────────────────────┘└────────────────────────────────────┘
+```
+
+### Es la otra mitad del coste
+
+`estimate_cost_usd` traduce tokens a dinero con la tabla del proveedor, y
+devuelve `null` para un modelo local. Es correcto: nadie te factura.
+
+Pero **sí pagas** — pagas vatios. Este panel es esa mitad, y hasta ahora no
+existía en ningún sitio.
+
+### La aguja va sobre el límite de la tarjeta
+
+No sobre el pico visto ni sobre un máximo inventado. Un cuentarrevoluciones sin
+línea roja no dice si vas holgado o al tope. El color la marca: verde por debajo
+del 60%, amarillo hasta el 84%, rojo a partir de ahí.
+
+Medido durante una inferencia real de `qwen2.5:7b`:
+
+| | |
+|---|---:|
+| Reposo | ~35 W (11%) |
+| Pico | **277 W (87%)**, GPU 93%, 55 °C |
+
+###  no es 
+
+Sin `nvidia-smi`, sin driver, o con una salida que no es la esperada, el panel
+dice que **no hay lectura**. Un `0 W` afirmaría que la máquina no está gastando
+nada, y lo cierto sería que no se sabe. Mismo contrato que el resto del monitor.
+
+### Por qué arranca oculto, y por qué vive aquí y no en el proxy
+
+Medido en una máquina real: una invocación de `nvidia-smi` cuesta **23,81 ms**
+de mediana. El overhead **total** del proxy son **3,79 ms**
+([`telemetry-per-request.md`](telemetry-per-request.md) §4.1).
+
+Muestrear por petición desde el proxy costaría **6,3 veces todo lo que el proxy
+cuesta**: el instrumento pasaría a ser el gasto dominante. El monitor, que
+refresca cada segundo, paga un **2,4%** de su ciclo — y solo mientras el panel
+está abierto.
+
+### Lo que este panel NO hace
+
+**No atribuye a una petición.** Dice «la máquina está a 277 W», no «esta
+petición costó 2,3 Wh». Para eso habría que muestrear dentro de la ventana del
+request, que es trabajo del proxy y exige NVML en vez de un subproceso.
+
+Y **no separa cargar el modelo de inferir con él**. Medido contra ollama, la
+carga puede ser el **92%** del tiempo de una petición fría. Para los vatios da
+igual —esa energía se gasta de verdad— pero cualquier cifra derivada por token
+heredaría la distorsión. Ver el issue #92.
+
+Solo lee la **primera** GPU, y la nombra para que se sepa cuál. Agregar varias
+sin decir cuál sería peor que enseñar una.
+
+---
+
+## 11. Dónde vive cada cosa
 
 | Archivo | Responsabilidad |
 |---|---|

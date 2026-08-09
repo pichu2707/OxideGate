@@ -42,6 +42,9 @@
 //!   s         mostrar/ocultar el panel de "tools por servidor" (desglose
 //!             de bytes de herramientas MCP, con delta contra el baseline
 //!             marcado con `b`); INDEPENDIENTE de `p`/`c`
+//!   g         mostrar/ocultar el contador de potencia de la máquina
+//!             (vatios y uso de GPU); arranca OCULTO porque muestrear
+//!             cuesta ~24 ms por poll
 //!   u         mostrar/ocultar el panel de cuota de suscripción Codex
 //!             (uso de cuota); INDEPENDIENTE de `p`/`c`/`s`
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -62,6 +65,107 @@ use std::time::{Duration, Instant};
 
 /// Intervalo entre polls a `/stats`.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Muestra de la GPU en un instante: lo que la máquina está gastando AHORA.
+///
+/// # Por qué esto vive en el monitor y no en el proxy
+///
+/// Medido en esta máquina: una invocación de `nvidia-smi` cuesta **23,81 ms**
+/// de mediana. El overhead TOTAL del proxy son **3,79 ms** (`prepare_us` +
+/// `scan_us`, ver `docs/telemetry-per-request.md` §4.1). Muestrear por petición
+/// desde el proxy costaría **6,3 veces todo lo que el proxy cuesta**: el
+/// instrumento pasaría a ser el gasto dominante, y publicaría un número
+/// contaminado por su propia medición.
+///
+/// El monitor refresca cada segundo, así que esos 23,81 ms son el **2,4%** de
+/// su ciclo — y solo se pagan mientras el panel está visible.
+///
+/// # Lo que este panel NO es
+///
+/// **No atribuye a una petición.** Dice «la máquina está a 258 W», no «esta
+/// petición costó 2,3 Wh». Para eso haría falta muestrear dentro de la ventana
+/// del request, que es trabajo del proxy y exige NVML en vez de un subproceso.
+///
+/// Y no separa cargar el modelo de inferir con él: medido contra ollama, la
+/// carga puede ser el **92%** del tiempo de una petición fría. Para los VATIOS
+/// da igual —esa energía se gasta de verdad— pero cualquier cifra derivada por
+/// token heredaría la distorsión. Ver el issue #92.
+#[derive(Debug, Clone, PartialEq)]
+struct GpuSample {
+    nombre: String,
+    util_pct: u16,
+    vatios: f64,
+    /// Límite de la tarjeta. Es la línea roja del cuentarrevoluciones: sin
+    /// ella, un número de vatios no dice si vas holgado o al máximo.
+    vatios_max: f64,
+    mem_usada_mb: u64,
+    mem_total_mb: u64,
+    grados: u16,
+}
+
+impl GpuSample {
+    /// Fracción del límite de potencia, de 0 a 1. Cero si no hay límite
+    /// legible: sin denominador no hay aguja, y un `1.0` inventado diría que
+    /// la tarjeta está al tope.
+    fn fraccion_potencia(&self) -> f64 {
+        if self.vatios_max <= 0.0 {
+            return 0.0;
+        }
+        (self.vatios / self.vatios_max).clamp(0.0, 1.0)
+    }
+}
+
+/// Parsea una línea de `nvidia-smi --format=csv,noheader,nounits`.
+///
+/// Función PURA para poder afirmar sobre ella sin una GPU delante — que es
+/// justamente la máquina donde correrá el CI.
+///
+/// Devuelve `None` ante cualquier cosa que no sean los siete campos esperados
+/// y numéricos. **No rellena con ceros**: un `0%` y `0 W` en el panel se
+/// leerían como «la máquina no está haciendo nada», y lo cierto sería «no lo
+/// sé». Mismo contrato de ausencia honesta que el resto del monitor.
+fn parse_gpu_sample(linea: &str) -> Option<GpuSample> {
+    let campos: Vec<&str> = linea.split(',').map(str::trim).collect();
+    if campos.len() != 7 || campos[0].is_empty() {
+        return None;
+    }
+    Some(GpuSample {
+        nombre: campos[0].to_string(),
+        util_pct: campos[1].parse().ok()?,
+        vatios: campos[2].parse().ok()?,
+        vatios_max: campos[3].parse().ok()?,
+        mem_usada_mb: campos[4].parse().ok()?,
+        mem_total_mb: campos[5].parse().ok()?,
+        grados: campos[6].parse().ok()?,
+    })
+}
+
+/// Campos que se le piden a `nvidia-smi`, en el orden que espera
+/// [`parse_gpu_sample`]. Van juntos para que no puedan divergir.
+const GPU_QUERY: &str =
+    "name,utilization.gpu,power.draw,power.limit,memory.used,memory.total,temperature.gpu";
+
+/// Lee la GPU invocando `nvidia-smi`. `None` si no está instalado, si falla, o
+/// si su salida no es la esperada — nunca una muestra fabricada.
+///
+/// Solo la llama el poll cuando el panel está VISIBLE: lo que no se enseña no
+/// se paga, y de paso una GPU con el driver colgado no congela un TUI en el
+/// que nadie está mirando ese panel.
+fn sample_gpu() -> Option<GpuSample> {
+    let salida = std::process::Command::new("nvidia-smi")
+        .args([
+            &format!("--query-gpu={GPU_QUERY}"),
+            "--format=csv,noheader,nounits",
+        ])
+        .output()
+        .ok()?;
+    if !salida.status.success() {
+        return None;
+    }
+    // Primera tarjeta: con varias GPUs esto mide una, y el panel lo dice
+    // nombrándola. Agregar varias sin decir cuál sería peor que enseñar una.
+    parse_gpu_sample(String::from_utf8_lossy(&salida.stdout).lines().next()?)
+}
 /// Cuántas muestras se recuerdan por modelo para los sparklines (~2 min a 1
 /// muestra/seg). Acotado para no crecer sin límite en una sesión larga.
 const HISTORY_CAP: usize = 120;
@@ -1845,6 +1949,14 @@ struct App {
     show_quota_panel: bool,
     /// Panel de sesión: INDEPENDIENTE del resto, igual que el de cuota.
     show_sessions_panel: bool,
+    /// Panel del contador de potencia (`g`). Arranca OCULTO a proposito:
+    /// muestrear cuesta ~24 ms por poll, y lo que no se enseña no se paga.
+    show_gpu_panel: bool,
+    /// Ultima muestra de la GPU. `None` = no se pudo leer, NUNCA un cero.
+    gpu: Option<GpuSample>,
+    /// Historial de vatios para el sparkline del panel. Mismo cupo que el
+    /// resto de historiales del monitor.
+    gpu_watts: VecDeque<u64>,
     sessions: SessionsPayload,
     sessions_url: String,
 }
@@ -1867,6 +1979,9 @@ impl App {
             show_tools_panel: true,
             show_quota_panel: true,
             show_sessions_panel: true,
+            show_gpu_panel: false,
+            gpu: None,
+            gpu_watts: VecDeque::new(),
             sessions: SessionsPayload::default(),
             sessions_url,
         }
@@ -1879,6 +1994,26 @@ impl App {
         self.poll_stats(client, url);
         self.poll_requests(client, requests_url);
         self.poll_sessions(client);
+        self.poll_gpu();
+    }
+
+    /// Muestrea la GPU, pero SOLO con el panel visible: la lectura cuesta
+    /// ~24 ms y no hay motivo para pagarlos por algo que nadie esta mirando.
+    /// De paso, una GPU con el driver colgado no congela un TUI cuyo panel de
+    /// potencia esta cerrado.
+    fn poll_gpu(&mut self) {
+        if !self.show_gpu_panel {
+            return;
+        }
+        self.gpu = sample_gpu();
+        // Solo entran vatios REALES: una lectura fallida no empuja un cero al
+        // historial, porque el sparkline se leeria como una caida de consumo.
+        if let Some(g) = self.gpu.as_ref() {
+            self.gpu_watts.push_back(g.vatios.round().max(0.0) as u64);
+            if self.gpu_watts.len() > HISTORY_CAP {
+                self.gpu_watts.pop_front();
+            }
+        }
     }
 
     /// Hace un fetch de `/stats` y actualiza todo el estado derivado
@@ -1994,6 +2129,17 @@ impl App {
         self.show_sessions_panel = !self.show_sessions_panel;
     }
 
+    /// Alterna el contador de potencia. Al ocultarlo se OLVIDA la ultima
+    /// muestra: dejarla congelada haria que al reabrir el panel se leyera
+    /// como el estado actual cuando es el de hace un rato.
+    fn toggle_gpu_panel(&mut self) {
+        self.show_gpu_panel = !self.show_gpu_panel;
+        if !self.show_gpu_panel {
+            self.gpu = None;
+            self.gpu_watts.clear();
+        }
+    }
+
     /// Marca el baseline en el instante actual con los contadores crudos de
     /// cada modelo visible ahora mismo, Y TAMBIÉN con una foto de
     /// `tools_by_server` (servidor → bytes) de la fila fuente vigente del
@@ -2104,6 +2250,8 @@ fn run_app(
                     KeyCode::Char('u') => app.toggle_quota_panel(),
                     // `e` de sEsión: `s` ya es tools.
                     KeyCode::Char('e') => app.toggle_sessions_panel(),
+                    // `g` de GPU: el contador de potencia de la maquina.
+                    KeyCode::Char('g') => app.toggle_gpu_panel(),
                     _ => {}
                 }
             }
@@ -2160,6 +2308,9 @@ fn ui(f: &mut Frame, app: &App) {
     if app.show_sessions_panel {
         constraints.push(Constraint::Length(9)); // gasto por sesión
     }
+    if app.show_gpu_panel {
+        constraints.push(Constraint::Length(7)); // contador de potencia
+    }
     constraints.push(Constraint::Length(1)); // footer
 
     let chunks = Layout::default()
@@ -2189,7 +2340,96 @@ fn ui(f: &mut Frame, app: &App) {
         draw_sessions_panel(f, chunks[idx], app);
         idx += 1;
     }
+    if app.show_gpu_panel {
+        draw_gpu_panel(f, chunks[idx], app);
+        idx += 1;
+    }
     draw_footer(f, chunks[idx]);
+}
+
+/// Contador de potencia (`g`): qué le está costando a la máquina el modelo que
+/// tiene cargado, ahora mismo.
+///
+/// Es el complemento del coste en dólares. `estimate_cost_usd` traduce tokens a
+/// dinero para un proveedor remoto y devuelve `None` para un modelo local —
+/// correcto, nadie te factura. Pero **sí pagas**: pagas vatios. Este panel es
+/// esa mitad.
+///
+/// La aguja va sobre el **límite de la tarjeta**, no sobre el pico visto ni
+/// sobre un máximo inventado: un cuentarrevoluciones sin línea roja no dice si
+/// vas holgado o al tope.
+///
+/// Sin lectura no se pinta un cero. `-` significa «no lo sé» —no hay
+/// `nvidia-smi`, no hay driver, o la salida no era la esperada— y un `0 W`
+/// diría «la máquina no está gastando nada», que es una afirmación distinta.
+fn draw_gpu_panel(f: &mut Frame, area: Rect, app: &App) {
+    let Some(g) = app.gpu.as_ref() else {
+        let aviso =
+            Paragraph::new("sin lectura de GPU — ¿nvidia-smi instalado? (dato AUSENTE, no cero)")
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" potencia de la máquina "),
+                );
+        f.render_widget(aviso, area);
+        return;
+    };
+
+    let bloques = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+
+    let pct = (g.fraccion_potencia() * 100.0).round() as u16;
+    // El color es la línea roja: verde holgado, amarillo apretando, rojo al
+    // tope. Un número solo no comunica "esto es mucho" de un vistazo.
+    let color = match pct {
+        0..=59 => Color::Green,
+        60..=84 => Color::Yellow,
+        _ => Color::Red,
+    };
+    let texto = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{:>6.1} W", g.vatios),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" / {:.0} W límite  ({pct}%)", g.vatios_max)),
+        ]),
+        Line::from(format!(
+            "uso {:>3}%   {} °C   VRAM {} / {} MB",
+            g.util_pct, g.grados, g.mem_usada_mb, g.mem_total_mb
+        )),
+        Line::from(Span::styled(
+            g.nombre.clone(),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(texto).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" potencia de la máquina "),
+        ),
+        bloques[0],
+    );
+
+    // Historial de vatios. Escala local igual que el resto de sparklines del
+    // monitor: sobre 0..límite, un consumo que oscila entre 40 y 260 W en una
+    // tarjeta de 320 se vería casi plano.
+    let datos: Vec<u64> = app.gpu_watts.iter().copied().collect();
+    let escala = sparkline_visible_scale(&datos);
+    f.render_widget(
+        Sparkline::default()
+            .block(Block::default().borders(Borders::ALL).title(format!(
+                " vatios (histórico · rango {}..{}) ",
+                escala.min, escala.max
+            )))
+            .data(&escala.data)
+            .max(escala.render_max)
+            .style(Style::default().fg(color)),
+        bloques[1],
+    );
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -4871,6 +5111,94 @@ mod tests {
     // -----------------------------------------------------------------
     // RequestsView — enum total, ciclado con `c`
     // -----------------------------------------------------------------
+
+    // --- Contador de potencia (panel `g`) ---
+
+    /// La línea real de `nvidia-smi` en esta máquina, tal cual sale.
+    const MUESTRA_REAL: &str = "NVIDIA GeForce RTX 4080 SUPER, 25, 34.27, 320.00, 723, 16376, 40";
+
+    #[test]
+    fn parsea_la_salida_real_de_nvidia_smi() {
+        let g = parse_gpu_sample(MUESTRA_REAL).expect("debe parsear la línea real");
+
+        assert_eq!(g.nombre, "NVIDIA GeForce RTX 4080 SUPER");
+        assert_eq!(g.util_pct, 25);
+        assert_eq!(g.vatios, 34.27);
+        assert_eq!(g.vatios_max, 320.0);
+        assert_eq!(g.mem_usada_mb, 723);
+        assert_eq!(g.mem_total_mb, 16_376);
+        assert_eq!(g.grados, 40);
+    }
+
+    /// **Sin GPU no se fabrica un cero.** Un `0%` y `0 W` en el panel se
+    /// leerían como "la máquina no está haciendo nada", que es una
+    /// afirmación; lo cierto es "no lo sé". Mismo contrato que el resto del
+    /// monitor.
+    #[test]
+    fn sin_salida_utilizable_no_hay_muestra() {
+        for basura in [
+            "",
+            "   ",
+            "Field \"inventado\" is not a valid field to query.",
+            "solo, tres, campos",
+            "NVIDIA, no-numero, 34.27, 320.00, 723, 16376, 40",
+        ] {
+            assert!(
+                parse_gpu_sample(basura).is_none(),
+                "{basura:?} no puede producir una muestra"
+            );
+        }
+    }
+
+    /// La fracción del gauge es potencia sobre el LÍMITE de la tarjeta, no
+    /// sobre un máximo inventado ni sobre el pico visto. Un cuentarrevoluciones
+    /// sin línea roja no dice nada.
+    #[test]
+    fn la_fraccion_de_potencia_es_sobre_el_limite_de_la_tarjeta() {
+        let g = parse_gpu_sample("X, 50, 160.00, 320.00, 1, 2, 40").expect("parsea");
+
+        assert!((g.fraccion_potencia() - 0.5).abs() < 1e-9);
+    }
+
+    /// Un límite de cero o ausente no puede producir una división: se declara
+    /// que no hay fracción en vez de publicar un infinito o un cero falso.
+    #[test]
+    fn un_limite_de_cero_no_produce_fraccion() {
+        let g = parse_gpu_sample("X, 50, 160.00, 0.00, 1, 2, 40").expect("parsea");
+
+        assert_eq!(g.fraccion_potencia(), 0.0, "sin límite, sin aguja");
+    }
+
+    /// El panel es INDEPENDIENTE del resto, como `s`/`e`/`u`. Y se muestrea
+    /// solo cuando está visible: lo que no se enseña no se paga.
+    #[test]
+    fn la_tecla_g_alterna_el_panel_sin_tocar_los_demas() {
+        let mut app = App::new("http://x".to_string());
+        let antes = (
+            app.show_requests_panel,
+            app.show_tools_panel,
+            app.show_quota_panel,
+            app.show_sessions_panel,
+        );
+        assert!(!app.show_gpu_panel, "arranca oculto: cuesta 24 ms por poll");
+
+        app.toggle_gpu_panel();
+        assert!(app.show_gpu_panel);
+
+        app.toggle_gpu_panel();
+        assert!(!app.show_gpu_panel);
+
+        assert_eq!(
+            antes,
+            (
+                app.show_requests_panel,
+                app.show_tools_panel,
+                app.show_quota_panel,
+                app.show_sessions_panel,
+            ),
+            "no toca ningún otro panel"
+        );
+    }
 
     /// El ciclo cubre las CUATRO variantes y vuelve al inicio. Que cierre el
     /// bucle es la parte que importa: una vista alcanzable pero de la que no
