@@ -1307,6 +1307,7 @@ respuesta— así que solo la puede responder un punto que vea las dos.
   "threshold": 50,
   "since": "2026-08-01T09:12:03Z",
   "servers_omitted": 0,
+  "servers_omitted_saturated": false,
   "invoked_never_declared": [],
   "servers": [
     {
@@ -1317,7 +1318,7 @@ respuesta— así que solo la puede responder un punto que vea las dos.
       "tools_declared": 8,
       "invocations": 0,
       "conclusive_requests": 187,
-      "discarded": { "no_extractor": 11, "incomplete": 2, "truncated": 0 },
+      "discarded": { "no_extractor": 11, "incomplete": 2, "truncated": 0, "unattributed": 0 },
       "verdict": {
         "type": "unused",
         "conclusive_requests": 187,
@@ -1337,18 +1338,30 @@ herramientas en 187 peticiones concluyentes*.
 Recomendar quitar un servidor que sí se usa es el peor fallo posible aquí: el
 usuario pierde una integración que funciona **por consejo del medidor**. Por
 eso cada fila publica en qué se apoya, y una petición solo cuenta como prueba
-de NO-uso si supera los tres filtros:
+de NO-uso si supera los cuatro filtros:
 
 | Filtro | Qué descarta | Campo |
 |---|---|---|
 | Tiene extractor | `tool_calls: null` — el proveedor no mide, o la fila es anterior al campo | `discarded.no_extractor` |
 | Se escaneó entera | `complete: false` — turno abortado, la lista es un prefijo | `discarded.incomplete` |
+| Todo se atribuyó | una invocación se vio pero sin saber de qué servidor era | `discarded.unattributed` |
 | No está truncada | el cupo recortó, una llamada pudo quedar fuera | `discarded.truncated` |
 
-Los tres se cuentan por separado, y no como un total, porque cada uno se
+Los cuatro se cuentan por separado, y no como un total, porque cada uno se
 arregla de forma distinta: `no_extractor` con un extractor nuevo,
-`truncated` subiendo el cupo, e `incomplete` no se arregla — es tráfico real
-que el usuario abortó.
+`truncated` subiendo el cupo, `incomplete` no se arregla —es tráfico real que
+el usuario abortó— y `unattributed` tampoco se arregla desde aquí: depende de
+que el conector del proveedor diga de quién era la llamada.
+
+El cuarto filtro merece una nota porque nació de un agujero real. El conector
+MCP server-side de Anthropic (`mcp_tool_use`) manda el nombre DESNUDO y el
+servidor en un campo hermano. Cuando ese campo no llega legible, la versión
+anterior deducía el servidor del nombre — y como el nombre va desnudo, eso
+resolvía `(native)` en el **100%** de los casos. No era un «no lo sé»: era una
+atribución falsa, y además muda, el único de los cuatro caminos de pérdida de
+evidencia que no se contaba. Ahora la llamada se cuenta como no atribuida y
+descalifica la fila, porque pudo salir de cualquier servidor — incluido el que
+el informe estaba a punto de declarar sin usar.
 
 ### La asimetría: ver una llamada prueba el uso; no verla no prueba el no-uso
 
@@ -1394,13 +1407,19 @@ HÁBITO, y acotar más la ventana solo bajaría las peticiones concluyentes y
 convertiría un `unused` en un `insufficient_data`. Si hace falta, entra
 después como parámetro aditivo.
 
-### Dos campos más que evitan un informe engañoso
+### Tres campos más que evitan un informe engañoso
 
 - **`servers_omitted`**: servidores DISTINTOS que no se admitieron por el
   tope de 256. Las etiquetas salen de nombres que llegan en la respuesta
   —texto de fuera—, así que el registro tiene cupo como todos sus hermanos
   (`SessionRegistry` corta en 10.000, `StatsRegistry` en 50.000). Distinto de
   cero significa que **este informe está incompleto**.
+- **`servers_omitted_saturated`**: el propio registro de omitidos también
+  está acotado a 256, por la misma razón. Cuando se llena, `servers_omitted`
+  deja de crecer y pasa a ser un **mínimo**: esta bandera lo declara. Sin
+  ella, el contador que existe para hacer visible el tope se topaba él mismo
+  en silencio, y un informe gravemente incompleto parecía solo un poco
+  incompleto.
 - **`invoked_never_declared`**: servidores MCP que se invocaron pero de los que
   nunca se vio la declaración, así que no hay coste que cruzar. El caso
   típico es el desborde de `MAX_TOOL_SERVERS`: con más de 32 servidores en

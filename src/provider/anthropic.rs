@@ -287,13 +287,16 @@ fn registra_bloque(bloque: &Value, calls: &mut ToolCalls) {
         // servidor real apareceria sin usar, y el recomendador aconsejaria
         // borrar justo el que se invoca en cada turno.
         //
-        // Sin `server_name` legible no se inventa un servidor: cae a la
-        // deduccion por nombre, que al menos es honesta sobre no saberlo.
+        // Sin `server_name` legible NO se cae a la deduccion por nombre. Ese
+        // era el agujero: el nombre desnudo pasa por `classify` y sale
+        // `(native)` SIEMPRE, o sea la atribucion falsa que el parrafo de
+        // arriba describe, colada por la puerta de atras y sin contarse. Se
+        // registra como no atribuida, que es lo unico cierto que se sabe.
         Some("mcp_tool_use") => match bloque.get("server_name").and_then(Value::as_str) {
             Some(servidor) if !servidor.is_empty() => {
                 calls.push_invoked_de(name, servidor, ToolServerKind::Mcp)
             }
-            _ => calls.push_invoked(name),
+            _ => calls.push_invoked_sin_atribuir(),
         },
 
         Some("server_tool_use") => calls.push_server_invoked(name),
@@ -1637,10 +1640,17 @@ mod tests {
         assert_eq!(llamada.kind, ToolServerKind::Mcp);
     }
 
-    /// Sin `server_name` utilizable no se inventa un servidor: se cae a la
-    /// deducción por nombre, que al menos es honesta sobre no saberlo.
+    /// Sin `server_name` utilizable, la invocación se CUENTA como no
+    /// atribuida en vez de acreditarse a `(native)`.
+    ///
+    /// La versión anterior de este test afirmaba lo contrario y lo llamaba
+    /// «honesto sobre no saberlo». No lo era: los nombres de `mcp_tool_use`
+    /// llegan desnudos, así que `classify` resolvía `(native)` en el 100% de
+    /// los casos. No era un "no lo sé", era una atribución FALSA — y encima
+    /// muda, el único de los cuatro caminos de pérdida de evidencia que no se
+    /// contaba.
     #[test]
-    fn sin_server_name_el_conector_cae_a_la_deduccion_por_nombre() {
+    fn sin_server_name_la_invocacion_se_cuenta_como_no_atribuida() {
         for bloque in [
             serde_json::json!({"type": "mcp_tool_use", "name": "algo"}),
             serde_json::json!({"type": "mcp_tool_use", "name": "algo", "server_name": ""}),
@@ -1648,10 +1658,18 @@ mod tests {
         ] {
             let mut calls = ToolCalls::default();
             ANTHROPIC.extract_tool_use(&serde_json::json!({"content_block": bloque}), &mut calls);
+
+            assert!(
+                calls.invoked.is_empty(),
+                "{bloque}: no se acredita a ningún servidor, y (native) es un servidor"
+            );
             assert_eq!(
-                calls.invoked[0].kind,
-                ToolServerKind::Native,
-                "sin servidor legible, nativo — nunca un servidor inventado"
+                calls.invoked_unattributed, 1,
+                "{bloque}: la invocación existió y tiene que contarse"
+            );
+            assert_eq!(
+                calls.invoked_total, 1,
+                "{bloque}: `invoked_total` son las invocaciones VISTAS, y esta se vio"
             );
         }
     }
