@@ -915,7 +915,7 @@ pub fn group_tools_by_server<'a>(
         push_acotado(&mut entry.names, name);
     }
 
-    let mut rows: Vec<ToolServerBytes> = totals
+    let rows: Vec<ToolServerBytes> = totals
         .into_iter()
         .map(|((kind, server), acc)| ToolServerBytes {
             // MISMO acotado que el lado invocado (`ToolCalls::push_invoked_de`).
@@ -929,6 +929,39 @@ pub fn group_tools_by_server<'a>(
             deferred_tools: acc.deferred,
         })
         .collect();
+
+    // `totals` acumula por el nombre SIN truncar y solo trunca al emitir, así
+    // que dos servidores que compartan los primeros `MAX_TOOL_NAME_LEN`
+    // caracteres llegan aquí como dos filas con la MISMA etiqueta. Fundirlas
+    // es el compromiso que `etiqueta_servidor` ya documenta; lo que no vale es
+    // dejarlas escapar para que las funda quien no sabe que lo está haciendo:
+    // `McpRegistry::ingest` acumula por la etiqueta truncada, y dos filas
+    // homónimas le hacen contar DOS veces la misma petición en
+    // `declared_in_requests`, inflando de paso `bytes_per_request_declared`.
+    //
+    // Cuadrático a propósito: `rows` tiene como mucho `MAX_TOOL_SERVERS + 1`
+    // entradas, y un `HashMap` extra aquí costaría más que los 33 recorridos.
+    let mut fundidas: Vec<ToolServerBytes> = Vec::with_capacity(rows.len());
+    for fila in rows {
+        match fundidas
+            .iter_mut()
+            .find(|f| f.kind == fila.kind && f.server == fila.server)
+        {
+            Some(previa) => {
+                previa.tools += fila.tools;
+                previa.bytes += fila.bytes;
+                previa.deferred_tools += fila.deferred_tools;
+                for nombre in fila.tool_names {
+                    if previa.tool_names.len() >= MAX_TOOL_NAMES {
+                        break;
+                    }
+                    previa.tool_names.push(nombre);
+                }
+            }
+            None => fundidas.push(fila),
+        }
+    }
+    let mut rows = fundidas;
 
     rows.sort_by(|a, b| {
         b.bytes
@@ -1428,6 +1461,82 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].server, "alpha");
         assert_eq!(rows[1].server, "zebra");
+    }
+
+    /// PRUEBA DE MORDIDA. La cara opuesta del bug que cerró `cfd9d88`: aquel
+    /// PARTÍA un servidor en dos claves, este FUNDE dos servidores en una.
+    ///
+    /// `totals` acumula por el nombre SIN truncar y solo trunca al emitir, así
+    /// que dos servidores que compartan los primeros `MAX_TOOL_NAME_LEN`
+    /// caracteres salían como DOS filas con la MISMA etiqueta. Aguas abajo,
+    /// `McpRegistry::ingest` acumula por esa etiqueta ya truncada: las dos
+    /// filas caían en el mismo sitio y `declared_in_requests` se incrementaba
+    /// dos veces por UNA petición, inflando también `bytes_per_request`.
+    ///
+    /// Fundir es el compromiso ya documentado en `etiqueta_servidor`; lo que
+    /// no vale es dejar escapar dos filas homónimas para que otro las funda
+    /// sin querer.
+    #[test]
+    fn dos_servidores_que_colisionan_al_truncar_salen_como_una_sola_fila() {
+        let prefijo = "s".repeat(MAX_TOOL_NAME_LEN);
+        let nombre_a = format!("mcp__{prefijo}AAA__tool");
+        let nombre_b = format!("mcp__{prefijo}BBB__tool");
+
+        // Verificamos la premisa en vez de darla por buena: sin esto el test
+        // podría pasar por no ejercitar la colisión.
+        assert_ne!(classify(&nombre_a).1, classify(&nombre_b).1);
+        assert_eq!(
+            etiqueta_servidor(classify(&nombre_a).1),
+            etiqueta_servidor(classify(&nombre_b).1),
+            "la premisa del test es que las etiquetas truncadas COINCIDEN"
+        );
+
+        let a = serde_json::json!({"name": nombre_a});
+        let b = serde_json::json!({"name": nombre_b});
+        let esperado_bytes = measure_value(&a) + measure_value(&b);
+        let entries = vec![(nombre_a.as_str(), &a), (nombre_b.as_str(), &b)];
+
+        let rows = group_tools_by_server(entries.into_iter());
+
+        assert_eq!(
+            rows.len(),
+            1,
+            "dos filas con la misma etiqueta hacen que aguas abajo se cuente dos veces la misma petición"
+        );
+        assert_eq!(rows[0].tools, 2, "no se pierde ninguna herramienta");
+        assert_eq!(rows[0].bytes, esperado_bytes, "no se pierde ningún byte");
+    }
+
+    /// `ToolCall` es la ÚNICA de las tres estructuras publicadas sin guardián
+    /// de forma, y es justo la que rompió filas ya escritas al cambiar de
+    /// forma en `8650a75`. Si este test falla, el cambio afecta a la
+    /// deserialización tolerante de más abajo y a las filas del histórico.
+    #[test]
+    fn la_forma_de_tool_call_no_cambia_sin_querer() {
+        let v = serde_json::to_value(ToolCall {
+            name: "mcp__x__y".to_string(),
+            server: "x".to_string(),
+            kind: ToolServerKind::Mcp,
+        })
+        .expect("serializa");
+
+        let claves: std::collections::BTreeSet<&str> = v
+            .as_object()
+            .expect("objeto")
+            .keys()
+            .map(String::as_str)
+            .collect();
+
+        assert_eq!(
+            claves,
+            ["kind", "name", "server"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "cambió la forma de ToolCall. Antes de tocar esto: las filas ya \
+             escritas se deserializan con el `impl Deserialize` tolerante de \
+             este mismo módulo, y quitar o renombrar una clave las vuelve \
+             ilegibles ENTERAS (rehydrate tira la fila, no el campo)."
+        );
     }
 
     /// `classify` distingue por tipo, no solo por segmento: un servidor MCP
