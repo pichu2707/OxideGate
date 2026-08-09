@@ -140,6 +140,99 @@ fn parse_gpu_sample(linea: &str) -> Option<GpuSample> {
     })
 }
 
+/// Un modelo que ollama tiene RESIDENTE en memoria ahora mismo.
+///
+/// # Por qué el panel de potencia necesita esto
+///
+/// El contador dice **cuánto** gasta la máquina. Esto dice **de qué**.
+///
+/// Y sobre todo resuelve una contaminación que no se puede medir por otra vía:
+/// en el camino OpenAI-compatible —el que proxea OxideGate— ollama **no expone**
+/// `load_duration`, así que `total_ms` y `tok/s` de una petición fría incluyen
+/// cargar el modelo sin que nada lo diga. Medido: **el 92%** del tiempo de una
+/// petición fría fue carga, no inferencia.
+///
+/// No se puede separar, pero sí se puede DECIR si el modelo estaba residente.
+/// Quien mire el panel sabe entonces si la cifra que está viendo es de
+/// inferencia o lleva una carga dentro — que es la diferencia entre un número
+/// que se puede usar y uno que engaña.
+#[derive(Debug, Clone, PartialEq)]
+struct OllamaModel {
+    nombre: String,
+    vram_bytes: u64,
+    /// Segundos hasta que ollama lo descargue. `None` si no trae fecha
+    /// legible: el modelo cuenta igual, solo que sin cuenta atrás.
+    caduca_en: Option<i64>,
+    cuantizacion: Option<String>,
+    parametros: Option<String>,
+}
+
+/// Parsea la respuesta de `GET /api/ps` de ollama.
+///
+/// Función PURA: el CI no tiene ollama delante, igual que no tiene GPU.
+///
+/// Una lista vacía significa **«no hay ningún modelo cargado»**, que es un dato
+/// real —la próxima petición pagará la carga— y NO lo mismo que «no se pudo
+/// preguntar». Esa distinción la lleva el `Option` de [`App::ollama`], no esta
+/// función.
+fn parse_ollama_ps(cuerpo: &str) -> Vec<OllamaModel> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(cuerpo) else {
+        return Vec::new();
+    };
+    let Some(models) = v.get("models").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    let ahora = chrono::Utc::now();
+    models
+        .iter()
+        .filter_map(|m| {
+            Some(OllamaModel {
+                nombre: m.get("name")?.as_str()?.to_string(),
+                vram_bytes: m.get("size_vram").and_then(|x| x.as_u64()).unwrap_or(0),
+                caduca_en: m
+                    .get("expires_at")
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| (t.with_timezone(&chrono::Utc) - ahora).num_seconds()),
+                cuantizacion: m
+                    .get("details")
+                    .and_then(|d| d.get("quantization_level"))
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string),
+                parametros: m
+                    .get("details")
+                    .and_then(|d| d.get("parameter_size"))
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string),
+            })
+        })
+        .collect()
+}
+
+/// Pregunta a ollama qué modelos tiene cargados.
+///
+/// `None` = no se pudo preguntar (no hay ollama, otro servicio en el puerto,
+/// timeout). `Some(vec![])` = ollama contestó y **no hay nada cargado**. La
+/// distinción importa: lo segundo dice que la próxima petición pagará la carga.
+///
+/// Medido: 0,09 ms de mediana. Es 265 veces más barato que `nvidia-smi`, así
+/// que va en el mismo poll sin discusión.
+fn sample_ollama(client: &reqwest::blocking::Client, base: &str) -> Option<Vec<OllamaModel>> {
+    let cuerpo = client
+        .get(format!("{base}/api/ps"))
+        .timeout(Duration::from_millis(500))
+        .send()
+        .ok()?
+        .text()
+        .ok()?;
+    // Un 200 con basura no es ollama: se trata como "no se pudo preguntar",
+    // no como "cero modelos".
+    if !cuerpo.contains("models") {
+        return None;
+    }
+    Some(parse_ollama_ps(&cuerpo))
+}
+
 /// Campos que se le piden a `nvidia-smi`, en el orden que espera
 /// [`parse_gpu_sample`]. Van juntos para que no puedan divergir.
 const GPU_QUERY: &str =
@@ -1957,6 +2050,12 @@ struct App {
     /// Historial de vatios para el sparkline del panel. Mismo cupo que el
     /// resto de historiales del monitor.
     gpu_watts: VecDeque<u64>,
+    /// Modelos que ollama tiene residentes. `None` = no se pudo preguntar;
+    /// `Some(vec![])` = contestó y no hay ninguno cargado, que es un dato
+    /// distinto: la próxima petición pagará la carga.
+    ollama: Option<Vec<OllamaModel>>,
+    /// Base de ollama. `OLLAMA_HOST` la cambia, igual que hace su propio CLI.
+    ollama_url: String,
     sessions: SessionsPayload,
     sessions_url: String,
 }
@@ -1982,6 +2081,9 @@ impl App {
             show_gpu_panel: false,
             gpu: None,
             gpu_watts: VecDeque::new(),
+            ollama: None,
+            ollama_url: std::env::var("OLLAMA_HOST")
+                .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string()),
             sessions: SessionsPayload::default(),
             sessions_url,
         }
@@ -1994,18 +2096,21 @@ impl App {
         self.poll_stats(client, url);
         self.poll_requests(client, requests_url);
         self.poll_sessions(client);
-        self.poll_gpu();
+        self.poll_gpu(client);
     }
 
     /// Muestrea la GPU, pero SOLO con el panel visible: la lectura cuesta
     /// ~24 ms y no hay motivo para pagarlos por algo que nadie esta mirando.
     /// De paso, una GPU con el driver colgado no congela un TUI cuyo panel de
     /// potencia esta cerrado.
-    fn poll_gpu(&mut self) {
+    fn poll_gpu(&mut self, client: &reqwest::blocking::Client) {
         if !self.show_gpu_panel {
             return;
         }
         self.gpu = sample_gpu();
+        // 0,09 ms de mediana: 265 veces mas barato que `nvidia-smi`, asi que
+        // entra en el mismo poll sin discusion.
+        self.ollama = sample_ollama(client, &self.ollama_url);
         // Solo entran vatios REALES: una lectura fallida no empuja un cero al
         // historial, porque el sparkline se leeria como una caida de consumo.
         if let Some(g) = self.gpu.as_ref() {
@@ -2137,6 +2242,7 @@ impl App {
         if !self.show_gpu_panel {
             self.gpu = None;
             self.gpu_watts.clear();
+            self.ollama = None;
         }
     }
 
@@ -2309,7 +2415,7 @@ fn ui(f: &mut Frame, app: &App) {
         constraints.push(Constraint::Length(9)); // gasto por sesión
     }
     if app.show_gpu_panel {
-        constraints.push(Constraint::Length(7)); // contador de potencia
+        constraints.push(Constraint::Length(8)); // contador de potencia
     }
     constraints.push(Constraint::Length(1)); // footer
 
@@ -2345,6 +2451,59 @@ fn ui(f: &mut Frame, app: &App) {
         idx += 1;
     }
     draw_footer(f, chunks[idx]);
+}
+
+/// Línea de modelos residentes para el panel de potencia.
+///
+/// Tres estados, y los tres significan cosas distintas:
+///
+/// - **`None`**: no se pudo preguntar a ollama. No se afirma nada.
+/// - **Lista vacía**: ollama contestó y **no hay ningún modelo cargado**. Es un
+///   dato, no un hueco: la próxima petición pagará la carga, que medida contra
+///   ollama fue el **92%** del tiempo de una petición fría.
+/// - **Con modelos**: lo que está residente, su VRAM y cuánto le queda antes de
+///   que ollama lo descargue.
+///
+/// Ese tercer caso es el que hace legible al contador: **el gauge dice cuánto,
+/// esto dice de qué**. Y el segundo es el que avisa de que la siguiente cifra
+/// que veas puede llevar una carga dentro sin que nada más lo diga.
+fn linea_modelos_residentes(app: &App) -> Line<'static> {
+    let Some(modelos) = app.ollama.as_ref() else {
+        return Line::from(Span::styled(
+            "modelos: sin lectura de ollama",
+            Style::default().fg(Color::DarkGray),
+        ));
+    };
+    if modelos.is_empty() {
+        return Line::from(Span::styled(
+            "modelos: ninguno cargado — la próxima petición paga la carga",
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    let texto: Vec<String> = modelos
+        .iter()
+        .map(|m| {
+            let caduca = match m.caduca_en {
+                Some(s) if s > 0 => format!(" ·{}m", s / 60),
+                Some(_) => " ·caducado".to_string(),
+                None => String::new(),
+            };
+            let q = m
+                .cuantizacion
+                .as_deref()
+                .map(|q| format!(" {q}"))
+                .unwrap_or_default();
+            format!(
+                "{}{q} {:.1} GB{caduca}",
+                m.nombre,
+                m.vram_bytes as f64 / 1e9
+            )
+        })
+        .collect();
+    Line::from(Span::styled(
+        texto.join("  ·  "),
+        Style::default().fg(Color::Cyan),
+    ))
 }
 
 /// Contador de potencia (`g`): qué le está costando a la máquina el modelo que
@@ -2404,6 +2563,7 @@ fn draw_gpu_panel(f: &mut Frame, area: Rect, app: &App) {
             g.nombre.clone(),
             Style::default().fg(Color::DarkGray),
         )),
+        linea_modelos_residentes(app),
     ];
     f.render_widget(
         Paragraph::new(texto).block(
@@ -5116,6 +5276,58 @@ mod tests {
 
     /// La línea real de `nvidia-smi` en esta máquina, tal cual sale.
     const MUESTRA_REAL: &str = "NVIDIA GeForce RTX 4080 SUPER, 25, 34.27, 320.00, 723, 16376, 40";
+
+    // --- Modelos residentes (ollama `/api/ps`) ---
+
+    /// Respuesta real de `/api/ps`, recortada a lo que se consume.
+    const PS_REAL: &str = r#"{"models":[{"name":"llama3.2:3b","size":2554708622,
+        "details":{"parameter_size":"3.2B","quantization_level":"Q4_K_M"},
+        "expires_at":"2026-08-09T15:24:02.895598913+02:00",
+        "size_vram":2554708622,"context_length":4096}]}"#;
+
+    #[test]
+    fn parsea_los_modelos_residentes_de_ollama() {
+        let ms = parse_ollama_ps(PS_REAL);
+
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].nombre, "llama3.2:3b");
+        assert_eq!(ms[0].vram_bytes, 2_554_708_622);
+        assert_eq!(ms[0].cuantizacion.as_deref(), Some("Q4_K_M"));
+        assert_eq!(ms[0].parametros.as_deref(), Some("3.2B"));
+    }
+
+    /// **Sin modelos residentes la lista está VACÍA, y eso es un dato.**
+    /// Significa que la próxima petición pagará la carga — medido, hasta el
+    /// 92% de una petición fría. No es lo mismo que no poder preguntar.
+    #[test]
+    fn ningun_modelo_cargado_es_una_lista_vacia_no_un_error() {
+        assert!(parse_ollama_ps(r#"{"models":[]}"#).is_empty());
+    }
+
+    /// Basura, otro servicio en el puerto, o un ollama que cambió de forma:
+    /// lista vacía. El panel distingue «no hay nada cargado» de «no se pudo
+    /// preguntar» por otra vía — ver [`App::ollama`], que es `Option`.
+    #[test]
+    fn una_respuesta_que_no_es_de_ollama_no_inventa_modelos() {
+        for basura in ["", "no soy json", "{}", r#"{"models":"no-es-lista"}"#] {
+            assert!(
+                parse_ollama_ps(basura).is_empty(),
+                "{basura:?} no puede producir modelos"
+            );
+        }
+    }
+
+    /// Un modelo sin `expires_at` legible se muestra igual: el nombre y la
+    /// VRAM son lo que importa, y descartarlo por no saber cuándo caduca
+    /// perdería el dato principal.
+    #[test]
+    fn un_modelo_sin_caducidad_legible_sigue_contando() {
+        let ms = parse_ollama_ps(r#"{"models":[{"name":"x","size_vram":100}]}"#);
+
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].nombre, "x");
+        assert!(ms[0].caduca_en.is_none(), "sin fecha, sin cuenta atrás");
+    }
 
     #[test]
     fn parsea_la_salida_real_de_nvidia_smi() {

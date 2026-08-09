@@ -716,6 +716,7 @@ Qué le está costando a **tu máquina** el modelo que tiene cargado, ahora mism
 │  277.0 W / 320 W límite  (87%)   ││        ▁▂▅███▆▃▂▁                  │
 │ uso  93%   55 °C   VRAM 5812/16376││                                    │
 │ NVIDIA GeForce RTX 4080 SUPER    ││                                    │
+│ llama3.2:3b Q4_K_M 2.6 GB ·4m    ││                                    │
 └──────────────────────────────────┘└────────────────────────────────────┘
 ```
 
@@ -740,7 +741,35 @@ Medido durante una inferencia real de `qwen2.5:7b`:
 | Reposo | ~35 W (11%) |
 | Pico | **277 W (87%)**, GPU 93%, 55 °C |
 
-###  no es 
+### La última línea: qué modelo está causando ese consumo
+
+El gauge dice **cuánto**. Esa línea dice **de qué**, preguntándole a ollama por
+`GET /api/ps` (**0,09 ms** de mediana — 265 veces más barato que `nvidia-smi`,
+así que entra en el mismo poll sin discusión). Se lee de `OLLAMA_HOST`, con
+`http://127.0.0.1:11434` por defecto.
+
+Tiene **tres estados y los tres significan cosas distintas**:
+
+| Se ve | Significa |
+|---|---|
+| `llama3.2:3b Q4_K_M 2.6 GB ·4m` | Residente, con cuantización, VRAM y minutos hasta que ollama lo descargue |
+| `ninguno cargado — la próxima petición paga la carga` | Ollama contestó y **no hay nada**. Es un dato, no un hueco |
+| `sin lectura de ollama` | No se pudo preguntar. No se afirma nada |
+
+### Y resuelve una contaminación que no se puede medir de otra forma
+
+En el camino **OpenAI-compatible** —el que proxea OxideGate— ollama **no expone**
+`load_duration`. Así que `total_ms` y `tok/s` de una petición fría incluyen
+cargar el modelo, y nada lo dice.
+
+Medido: **el 92%** del tiempo de una petición fría fue carga, no inferencia.
+
+No se puede separar desde aquí, pero **sí se puede decir si el modelo estaba
+residente**. Quien mira el panel sabe entonces si la cifra que ve es de
+inferencia o lleva una carga dentro — la diferencia entre un número que se puede
+usar y uno que engaña. Ver #92.
+
+### `-` no es `0`
 
 Sin `nvidia-smi`, sin driver, o con una salida que no es la esperada, el panel
 dice que **no hay lectura**. Un `0 W` afirmaría que la máquina no está gastando
