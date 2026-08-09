@@ -18,10 +18,16 @@
   "sessions": [
     { "source": "explicit", "key": "sesion-A", "is_session": true,
       "requests": 3, "input_tokens": 36, "output_tokens": 9,
-      "cache_read_tokens": 0, "cost_usd": 0.001215 },
+      "cache_read_tokens": 0, "cost_usd": 0.001215,
+      "fixed_toll": {
+        "instructions": { "bytes": 33716, "seen_in": 3 },
+        "hooks":        { "bytes": 12097, "seen_in": 3 },
+        "skills":       { "bytes": 14902, "seen_in": 3 }
+      } },
     { "source": "unattributed", "key": "curl/8", "is_session": false,
       "requests": 1, "input_tokens": 12, "output_tokens": 3,
-      "cache_read_tokens": 0, "cost_usd": 0.000405 }
+      "cache_read_tokens": 0, "cost_usd": 0.000405,
+      "fixed_toll": { "instructions": null, "hooks": null, "skills": null } }
   ],
   "saturated": false
 }
@@ -90,13 +96,58 @@ Un endpoint hermano es **aditivo**: una build anterior devuelve 404, que es un
 
 ---
 
-## 5. Lo que NO hace todavía
+## 5. `fixed_toll`: lo que cuesta ARRANCAR con esta configuración
+
+Los tres bloques del peaje fijo —`instructions` 48%, `hooks` 29%, `skills`
+23%— viajan agregados por sesión. Es la cifra que decide si un plugin vale su
+peaje, y no existía: `GET /requests` los publica por petición, pero su buffer
+son 200 filas. Medir sin agregar es medir para el momento.
+
+### `bytes` NO es una suma, y esa es la decisión importante
+
+Los tres bloques son el MISMO texto repetido en cada petición de la sesión.
+Sumarlos daría un número correcto y engañoso: multiplicaría por 500 un bloque
+que se escribió una vez y se cacheó.
+
+Se publica **el valor por petición** y **cuántas peticiones lo trajeron**, y
+multiplica quien quiera con el criterio que quiera:
+
+| Pregunta | Cuenta |
+|---|---|
+| ¿Cuánto pago por arrancar? | `bytes` |
+| ¿Cuánto he pagado ya por este bloque? | `bytes × seen_in` |
+| ¿Y si sigo a este ritmo? | `bytes × requests` |
+
+`seen_in` puede ser menor que `requests`: el bloque no se reconoció en algunas
+filas, o el dialecto no lo publica —`hooks` solo lo trae Anthropic—. Sin ese
+número no se sabe si `bytes` se apoya en una muestra o en mil.
+
+### `bytes` es PUNTUAL, no una media
+
+Si cambias el `CLAUDE.md` a mitad de ventana, lo que sirve para decidir es lo
+que cuesta AHORA arrancar, no el promedio de dos configuraciones que ya no
+conviven. Gana el valor más reciente. Mismo criterio que `tools_declared` en
+`GET /mcp`, y por la misma razón.
+
+### `null` no es cero
+
+Un bloque que no se pudo ver no cuesta cero bytes: cuesta un dato que no
+tenemos. Tratar el hueco como un cero es el error que documenta
+[`telemetry-level-1.md`](telemetry-level-1.md), y aquí daría el consejo
+contrario al correcto — un bloque caro pareciendo gratis.
+
+### Por qué aquí y no en `/stats`
+
+Porque un valor representativo solo significa algo si todas las filas que lo
+producen comparten configuración, y eso pasa dentro de una **sesión**, no
+dentro de un modelo. En `/stats` se mezclarían sesiones con `CLAUDE.md`
+distintos y el número no querría decir nada.
+
+---
+
+## 6. Lo que NO hace todavía
 
 - **Panel de sesión en el monitor TUI.** Los datos están; la vista no.
-- **No hay ventana temporal**: el agregado es desde que arrancó el proceso. No
-  se puede pedir "las últimas 2 horas".
-- **No persiste**: se pierde al reiniciar, igual que `/stats`. El histórico
-  vive en `telemetry.jsonl`, que sí lleva `session` por fila.
 
 ---
 

@@ -436,7 +436,7 @@ struct SessionAccumulator {
     days: std::collections::BTreeMap<chrono::NaiveDate, SessionDay>,
 }
 
-/// Un día de una sesión: cinco sumas, todas fusionables sumando.
+/// Un día de una sesión: cinco sumas más el peaje fijo.
 #[derive(Debug, Default, Clone)]
 struct SessionDay {
     requests: u64,
@@ -444,6 +444,46 @@ struct SessionDay {
     output_tokens: u64,
     cache_read_tokens: u64,
     cost_usd: f64,
+    instructions: PeajeDia,
+    hooks: PeajeDia,
+    skills: PeajeDia,
+}
+
+/// Un bloque del peaje dentro de un día: el último valor visto y cuántas
+/// filas lo trajeron.
+///
+/// Los dos campos se fusionan DISTINTO —`filas` suma, `ultimo` se
+/// sobrescribe— y por eso van juntos en un tipo en vez de sueltos: separarlos
+/// invitaría a fusionar el segundo como si fuera el primero.
+#[derive(Debug, Default, Clone, Copy)]
+struct PeajeDia {
+    ultimo: Option<usize>,
+    filas: u64,
+}
+
+impl PeajeDia {
+    fn observa(&mut self, bytes: Option<usize>) {
+        let Some(b) = bytes else { return };
+        self.ultimo = Some(b);
+        self.filas += 1;
+    }
+
+    /// Fusiona un día POSTERIOR dentro de este. El orden lo garantiza el
+    /// `BTreeMap`, que itera de más viejo a más nuevo: por eso `ultimo` se
+    /// sobrescribe sin comparar fechas.
+    fn fusiona_posterior(&mut self, otro: &PeajeDia) {
+        self.filas += otro.filas;
+        if otro.ultimo.is_some() {
+            self.ultimo = otro.ultimo;
+        }
+    }
+
+    fn publicado(&self) -> Option<FixedTollBlock> {
+        self.ultimo.map(|bytes| FixedTollBlock {
+            bytes,
+            seen_in: self.filas,
+        })
+    }
 }
 
 impl SessionAccumulator {
@@ -457,6 +497,11 @@ impl SessionAccumulator {
         d.output_tokens += m.output_tokens.unwrap_or(0);
         d.cache_read_tokens += m.cache_read_tokens.unwrap_or(0);
         d.cost_usd += m.cost_estimate_usd.unwrap_or(0.0);
+        // `unwrap_or(0)` seria el error de esta funcion: un bloque que no se
+        // pudo ver no cuesta cero bytes, cuesta un dato que no tenemos.
+        d.instructions.observa(m.instructions.map(|i| i.bytes));
+        d.hooks.observa(m.hooks.map(|h| h.bytes));
+        d.skills.observa(m.skills.map(|s| s.listing_bytes));
     }
 
     /// Fusiona los días `>= desde`. `None` si la ventana no tiene ninguno —
@@ -474,9 +519,53 @@ impl SessionAccumulator {
             acc.output_tokens += d.output_tokens;
             acc.cache_read_tokens += d.cache_read_tokens;
             acc.cost_usd += d.cost_usd;
+            acc.instructions.fusiona_posterior(&d.instructions);
+            acc.hooks.fusiona_posterior(&d.hooks);
+            acc.skills.fusiona_posterior(&d.skills);
         }
         out
     }
+}
+
+/// Un bloque del peaje fijo agregado por sesión.
+///
+/// **`bytes` NO es una suma.** Los tres bloques son el MISMO texto repetido en
+/// cada petición de la sesión, así que sumarlos daría un número correcto y
+/// engañoso: multiplicaría por 500 un bloque que se escribió una vez y se
+/// cacheó. Se publica el valor por petición y cuántas lo trajeron, y multiplica
+/// quien quiera con el criterio que quiera.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct FixedTollBlock {
+    /// Bytes que cuesta el bloque en UNA petición, el último valor visto.
+    ///
+    /// Puntual, no media, y por la misma razón que `tools_declared` en el
+    /// recomendador de MCP: si la configuración cambió dentro de la ventana,
+    /// lo que sirve para decidir es lo que cuesta AHORA arrancar, no el
+    /// promedio de dos configuraciones que ya no conviven.
+    pub bytes: usize,
+    /// Peticiones de esta sesión que TRAJERON el dato.
+    ///
+    /// Viaja al lado a propósito: puede ser menor que `requests` —el bloque no
+    /// se reconoció en algunas filas, o el dialecto no lo publica— y sin este
+    /// número no se puede saber si `bytes` se apoya en una muestra o en mil.
+    pub seen_in: u64,
+}
+
+/// Los tres bloques del peaje fijo de una sesión: lo que cuesta ARRANCAR a
+/// trabajar con una configuración concreta, antes de escribir nada.
+///
+/// Cada uno es `None` si ninguna petición de la sesión lo trajo. **`None` es
+/// "no se pudo ver", jamás cero**: tratar un hueco como un cero es el error que
+/// documenta `docs/telemetry-level-1.md`, y aquí produciría el consejo
+/// contrario al correcto — un bloque caro pareciendo gratis.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct FixedToll {
+    /// `CLAUDE.md` y equivalentes. El 48% del peaje medido.
+    pub instructions: Option<FixedTollBlock>,
+    /// Salida de los hooks de `SessionStart`. El 29%.
+    pub hooks: Option<FixedTollBlock>,
+    /// Listado de skills declaradas. El 23%.
+    pub skills: Option<FixedTollBlock>,
 }
 
 /// Una fila de la agregación por sesión.
@@ -496,6 +585,8 @@ pub struct SessionStatsRow {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cost_usd: f64,
+    /// Lo que cuesta ARRANCAR con esta configuración. Ver [`FixedToll`].
+    pub fixed_toll: FixedToll,
 }
 
 /// Vista serializable de la agregación por sesión: filas y si se saturó.
@@ -545,6 +636,11 @@ impl SessionRegistry {
                     output_tokens: d.output_tokens,
                     cache_read_tokens: d.cache_read_tokens,
                     cost_usd: d.cost_usd,
+                    fixed_toll: FixedToll {
+                        instructions: d.instructions.publicado(),
+                        hooks: d.hooks.publicado(),
+                        skills: d.skills.publicado(),
+                    },
                 })
             })
             .collect();
@@ -573,6 +669,140 @@ mod tests {
         m.input_tokens = Some(inp);
         m.cost_estimate_usd = Some(cost);
         m
+    }
+
+    // --- Peaje fijo por sesión ---
+
+    /// Métrica de sesión con los tres bloques del peaje fijo puestos.
+    /// `None` en cualquiera de ellos significa «no se pudo ver».
+    fn metric_con_peaje(
+        key: &str,
+        instr: Option<usize>,
+        hooks: Option<usize>,
+        skills: Option<usize>,
+    ) -> RequestMetric {
+        use crate::provider::hooks::{HooksBlock, HooksFormat};
+        use crate::provider::instructions::{InstructionsBlock, InstructionsFormat};
+        use crate::provider::skills::{SkillsBlock, SkillsFormat};
+
+        let mut m = metric_de_sesion(SessionSource::Native, key, 10, 0.01);
+        m.instructions = instr.map(|bytes| InstructionsBlock {
+            bytes,
+            format: InstructionsFormat::ClaudeMd,
+        });
+        m.hooks = hooks.map(|bytes| HooksBlock {
+            bytes,
+            declared: 1,
+            format: HooksFormat::ClaudeCode,
+        });
+        m.skills = skills.map(|listing_bytes| SkillsBlock {
+            declared: 3,
+            listing_bytes,
+            format: SkillsFormat::FlatList,
+        });
+        m
+    }
+
+    /// El peaje llega al agregado por sesión, que es lo que sobrevive al
+    /// reinicio. `/requests` guarda 200 filas y se pierden.
+    #[test]
+    fn el_peaje_fijo_viaja_al_agregado_por_sesion() {
+        let mut reg = SessionRegistry::default();
+        for _ in 0..3 {
+            reg.ingest(&metric_con_peaje(
+                "s1",
+                Some(33_716),
+                Some(12_097),
+                Some(14_902),
+            ));
+        }
+
+        let snap = reg.snapshot(None);
+        let fila = &snap.0[0];
+
+        assert_eq!(fila.requests, 3);
+        assert_eq!(fila.fixed_toll.instructions.expect("instr").bytes, 33_716);
+        assert_eq!(fila.fixed_toll.hooks.expect("hooks").bytes, 12_097);
+        assert_eq!(fila.fixed_toll.skills.expect("skills").bytes, 14_902);
+    }
+
+    /// NO SE SUMA. Tres peticiones con el MISMO bloque no cuestan tres veces
+    /// su tamaño en concepto de configuración: es el mismo bloque repetido.
+    /// Se publica el valor por petición y cuántas lo trajeron, y multiplica
+    /// quien quiera — sumarlo daría un número correcto y engañoso.
+    #[test]
+    fn el_peaje_no_se_suma_se_publica_por_peticion_con_su_conteo() {
+        let mut reg = SessionRegistry::default();
+        for _ in 0..3 {
+            reg.ingest(&metric_con_peaje("s1", Some(1_000), None, None));
+        }
+
+        let instr = reg.snapshot(None).0[0]
+            .fixed_toll
+            .instructions
+            .expect("instr");
+
+        assert_eq!(instr.bytes, 1_000, "el valor por petición, NO 3.000");
+        assert_eq!(instr.seen_in, 3, "y cuántas peticiones lo trajeron");
+    }
+
+    /// `null` NO es cero. Una fila sin dato no puede bajar el valor ni contar
+    /// como una petición que aportó evidencia — es el error que documenta
+    /// `docs/telemetry-level-1.md`.
+    #[test]
+    fn una_fila_sin_dato_no_cuenta_como_un_cero() {
+        let mut reg = SessionRegistry::default();
+        reg.ingest(&metric_con_peaje("s1", Some(1_000), None, None));
+        reg.ingest(&metric_con_peaje("s1", None, None, None));
+        reg.ingest(&metric_con_peaje("s1", None, None, None));
+
+        let fila = &reg.snapshot(None).0[0];
+        let instr = fila.fixed_toll.instructions.expect("instr");
+
+        assert_eq!(fila.requests, 3, "las tres peticiones existieron");
+        assert_eq!(instr.bytes, 1_000, "el valor no se diluye con los huecos");
+        assert_eq!(instr.seen_in, 1, "pero solo UNA trajo el dato");
+        assert!(
+            fila.fixed_toll.hooks.is_none(),
+            "sin una sola muestra, `null` — nunca un cero inventado"
+        );
+    }
+
+    /// El valor es PUNTUAL, no una media: si cambias el `CLAUDE.md` a mitad de
+    /// semana, lo que te interesa es lo que cuesta AHORA arrancar, no el
+    /// promedio de dos configuraciones que ya no existen juntas. Mismo criterio
+    /// que `tools_declared` en el recomendador de MCP.
+    #[test]
+    fn al_fusionar_dias_gana_el_valor_mas_reciente() {
+        let mut reg = SessionRegistry::default();
+        let mut viejo = metric_con_peaje("s1", Some(1_000), None, None);
+        viejo.timestamp = "2026-01-01T00:00:00Z".to_string();
+        let mut nuevo = metric_con_peaje("s1", Some(2_500), None, None);
+        nuevo.timestamp = "2026-01-05T00:00:00Z".to_string();
+        reg.ingest(&viejo);
+        reg.ingest(&nuevo);
+
+        let instr = reg.snapshot(None).0[0]
+            .fixed_toll
+            .instructions
+            .expect("instr");
+
+        assert_eq!(instr.bytes, 2_500, "gana el día más reciente");
+        assert_eq!(instr.seen_in, 2, "pero los dos días aportaron evidencia");
+    }
+
+    /// Una sesión que nunca trajo peaje publica los tres en `null`. El campo
+    /// existe siempre; lo que falta se declara faltando.
+    #[test]
+    fn una_sesion_sin_peaje_publica_los_tres_nulos() {
+        let mut reg = SessionRegistry::default();
+        reg.ingest(&metric_de_sesion(SessionSource::Native, "s1", 10, 0.01));
+
+        let ft = &reg.snapshot(None).0[0].fixed_toll;
+
+        assert!(ft.instructions.is_none());
+        assert!(ft.hooks.is_none());
+        assert!(ft.skills.is_none());
     }
 
     /// **La trampa que este agregado tiene que evitar.** La misma `key` bajo
@@ -922,6 +1152,7 @@ mod tests {
         let esperadas = [
             "cache_read_tokens",
             "cost_usd",
+            "fixed_toll",
             "input_tokens",
             "is_session",
             "key",
