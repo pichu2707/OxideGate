@@ -113,6 +113,7 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
 | `r` | Resetear baseline |
 | `↑` / `↓` | Elegir el modelo (fila resaltada, afecta el panel ANTES/DESPUÉS y los sparklines). La tabla **scrollea**: la selección arrastra el viewport y las primeras filas SALEN de la vista en vez de quedarse ancladas arriba. Bajando a la 4ª posición con dos filas visibles se ven la 3ª y la 4ª, no la 1ª y la 2ª. El título dice la posición (`4/12`) y la fila lleva `▶` además del fondo, que se pierde en un terminal sin color |
 | `p` | Mostrar/ocultar el panel de requests recientes (ver §7) |
+| `f` | Estrechar el panel de requests recientes al modelo seleccionado con `↑`/`↓` (ver §7.8). **Arranca APAGADO**: el panel es un feed global por defecto. INDEPENDIENTE de `p`/`c` |
 | `c` | Ciclar la vista de columnas del panel de requests recientes — `Latency` → `Context` → `Cache` → `Toll` → `Latency` (ver §7.1). **No-op si el panel está oculto**: no cambia nada mientras `p` lo tenga escondido |
 | `s` | Mostrar/ocultar el panel de tools por servidor (ver §8). **INDEPENDIENTE** de `p`/`c`: ninguna de las tres teclas afecta el estado de las otras |
 | `e` | Mostrar/ocultar el panel de **gasto por sesión** — `e` de s**e**sión, porque `s` ya es tools (ver §8). **INDEPENDIENTE** de `p`/`c`/`s`/`u` |
@@ -527,6 +528,42 @@ anterior puede no tenerlo todavía. Si el fetch falla, el monitor:
 - deja el resto de los paneles (tabla de agregados, ANTES/DESPUÉS,
   sparklines) funcionando con total normalidad, porque el poll de `/stats` y
   el de `/requests` son independientes entre sí.
+
+### 7.8. Filtrar por el modelo seleccionado (`f`)
+
+El panel es un feed global: las últimas N peticiones de TODOS los modelos,
+más nueva arriba. Con doce filas de alto y dos modelos activos, la mitad de
+lo que ves no es del modelo que estás mirando en la tabla — y el modelo poco
+hablador puede no aparecer nunca, aunque sea justo el que estés
+diagnosticando.
+
+`f` estrecha el panel al `(upstream, model)` de la fila seleccionada. El
+título lo anuncia (`· SOLO ollama/qwen3 (f)`) porque un panel filtrado y uno
+con poco tráfico se ven igual, y confundirlos hace pensar que el proxy no
+está recibiendo nada.
+
+Tres decisiones que no son obvias:
+
+- **Arranca APAGADO.** Estrechar la vista es una decisión del usuario, no un
+  default del monitor.
+- **La clave incluye el upstream.** El mismo nombre de modelo servido por dos
+  proveedores son DOS filas distintas en `/stats`; filtrar solo por nombre
+  mezclaría tráfico ajeno.
+- **`unknown` se traduce.** `/stats` agrupa bajo esa clave las peticiones que
+  fallaron antes de conocer el modelo; `/requests` las deja con `model:
+  null`. Es el mismo tráfico con dos nombres, y sin traducir la equivalencia
+  seleccionar la fila `unknown` daría un panel vacío para siempre.
+
+**El filtro es de PINTADO, no de estadística.** Los marcadores de outlier
+(§7.4) se siguen calculando sobre TODO el tráfico reciente, no sobre lo que
+queda tras filtrar. Es deliberado: "lento" solo significa algo comparado con
+el resto del tráfico, y recalcular la σ sobre las dos o tres peticiones de un
+modelo suelto produciría outliers de ruido. Filtrar cambia lo que ves, nunca
+lo que el monitor afirma sobre ello.
+
+Si el filtro no deja ninguna fila, el panel lo dice con una línea explícita
+en vez de quedarse en blanco: una caja vacía no distingue "este modelo no ha
+pedido nada últimamente" de "el panel está roto".
 
 ## 8. Panel de tools por servidor (`s`)
 

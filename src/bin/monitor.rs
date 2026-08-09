@@ -47,6 +47,9 @@
 //!             cuesta ~24 ms por poll
 //!   u         mostrar/ocultar el panel de cuota de suscripción Codex
 //!             (uso de cuota); INDEPENDIENTE de `p`/`c`/`s`
+//!   f         filtrar el panel de requests recientes al modelo seleccionado
+//!             con `↑`/`↓`; arranca APAGADO, porque el panel es un feed
+//!             global por defecto
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -2085,6 +2088,14 @@ struct App {
     /// Ver [`RequestsView`] y [`App::cycle_requests_view`] para el
     /// contrato de qué pasa cuando el panel está oculto.
     requests_view: RequestsView,
+    /// Si el panel de requests recientes se estrecha al modelo seleccionado
+    /// en la tabla (tecla `f`). Arranca APAGADO: el panel es un feed global
+    /// por defecto, y estrecharlo es una decisión del usuario, no del
+    /// monitor.
+    ///
+    /// ORTOGONAL a `show_requests_panel` y a `requests_view`: filtrar no
+    /// abre el panel ni cambia sus columnas.
+    filter_requests_by_model: bool,
     /// Visibilidad del panel de "tools por servidor", toggleable con `s`.
     /// INDEPENDIENTE de `show_requests_panel` y de `requests_view`: las tres
     /// teclas (`p`, `c`, `s`) controlan estados ortogonales entre sí.
@@ -2129,6 +2140,7 @@ impl App {
             requests_status: "esperando el primer poll...".to_string(),
             show_requests_panel: true,
             requests_view: RequestsView::Latency,
+            filter_requests_by_model: false,
             show_tools_panel: true,
             show_quota_panel: true,
             show_sessions_panel: true,
@@ -2269,6 +2281,28 @@ impl App {
         }
     }
 
+    /// Alterna el filtro del panel de requests por el modelo seleccionado
+    /// (tecla `f`). No abre el panel si está oculto ni toca sus columnas: es
+    /// un estado ortogonal a `p` y a `c`, igual que el resto de toggles.
+    fn toggle_requests_filter(&mut self) {
+        self.filter_requests_by_model = !self.filter_requests_by_model;
+    }
+
+    /// Clave `(upstream, model)` con la que filtrar el panel de requests, o
+    /// `None` si el filtro está apagado O si todavía no hay fila
+    /// seleccionada.
+    ///
+    /// Los dos casos devuelven `None` a propósito: filtrar contra una
+    /// selección que no existe dejaría el panel vacío sin que el usuario
+    /// pueda hacer nada al respecto, y un panel vacío por accidente miente
+    /// tanto como un número inventado.
+    fn requests_filter_key(&self) -> Option<ModelKey> {
+        if !self.filter_requests_by_model {
+            return None;
+        }
+        self.selected_row().map(key_of)
+    }
+
     /// Alterna la visibilidad del panel de "tools por servidor" (tecla `s`).
     /// INDEPENDIENTE de [`Self::toggle_requests_panel`]: apagar/prender uno
     /// no toca el estado del otro.
@@ -2406,6 +2440,9 @@ fn run_app(
                     KeyCode::Down => app.select_next(),
                     KeyCode::Char('p') => app.toggle_requests_panel(),
                     KeyCode::Char('c') => app.cycle_requests_view(),
+                    // `f` de filtro: estrecha el panel de requests al modelo
+                    // que esté seleccionado en la tabla.
+                    KeyCode::Char('f') => app.toggle_requests_filter(),
                     KeyCode::Char('s') => app.toggle_tools_panel(),
                     KeyCode::Char('u') => app.toggle_quota_panel(),
                     // `e` de sEsión: `s` ya es tools.
@@ -2922,15 +2959,70 @@ fn sparkline_visible_scale(data: &[u64]) -> SparklineScale {
 /// muy chica el `Constraint::Length(12)` de arriba puede terminar recortado
 /// a un área de 0 filas, y `Layout::split` sobre un área vacía no debe
 /// panickear el render.
+/// ¿Esta fila de `/requests` pertenece al `(upstream, model)` dado?
+///
+/// El upstream forma parte de la comparación porque forma parte de la clave:
+/// el mismo nombre de modelo servido por dos proveedores son DOS filas
+/// distintas en `/stats`, y mezclarlas acá haría que el filtro enseñara
+/// tráfico que no es el que seleccionaste.
+///
+/// El caso `unknown` no es un apaño: `/stats` agrupa bajo esa clave los
+/// requests que fallaron antes de conocer el modelo (ver
+/// `StatsAggregator::ingest` en `telemetry/stats.rs`), mientras que
+/// `/requests` los deja con `model: null`. Son el MISMO tráfico con dos
+/// nombres, y sin traducir esa equivalencia seleccionar la fila `unknown`
+/// daría un panel vacío para siempre.
+fn request_matches_model(r: &RequestRow, key: &ModelKey) -> bool {
+    let (upstream, model) = key;
+    if &r.upstream != upstream {
+        return false;
+    }
+    match r.model.as_deref() {
+        Some(m) => m == model,
+        None => model == "unknown",
+    }
+}
+
+/// Índices de `rows` a pintar en el panel de requests, EN ORDEN DE PINTADO:
+/// más reciente arriba, que es como se lee un panel de últimos eventos.
+///
+/// Devuelve índices sobre el vector ORIGINAL y no filas clonadas para que
+/// los marcadores de [`classify_outliers`] —calculados sobre el orden y el
+/// conjunto completos— se puedan seguir indexando sin desalinearse.
+///
+/// El filtro es de PINTADO, no de estadística: la σ que decide qué es un
+/// outlier se sigue calculando sobre todo el tráfico reciente. Es
+/// deliberado. "Lento" solo significa algo contra el resto del tráfico, y
+/// recalcularlo sobre las dos o tres peticiones de un modelo suelto
+/// produciría outliers de ruido.
+fn visible_request_indices(rows: &[RequestRow], filter: Option<&ModelKey>) -> Vec<usize> {
+    rows.iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, r)| filter.is_none_or(|key| request_matches_model(r, key)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
 fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
     if area.height == 0 || area.width == 0 {
         return;
     }
 
+    let filter = app.requests_filter_key();
+    // El filtro se ANUNCIA en el título. Un panel estrechado y uno con poco
+    // tráfico se ven igual, y confundirlos hace pensar que el proxy no está
+    // recibiendo nada.
+    let filter_label = match (&filter, app.filter_requests_by_model) {
+        (Some((upstream, model)), _) => format!(" · SOLO {upstream}/{model} (f)"),
+        (None, true) => " · filtro (f) activo pero sin modelo seleccionado".to_string(),
+        (None, false) => String::new(),
+    };
     let block = Block::default().borders(Borders::ALL).title(format!(
-        " requests recientes · vista:{} · {} ",
+        " requests recientes · vista:{} · {}{} ",
         app.requests_view.label(),
-        app.requests_status
+        app.requests_status,
+        filter_label
     ));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -2958,9 +3050,7 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
         // el filtro (`f`) está puesto. `classify_outliers` se calculó sobre
         // el orden y el conjunto originales para que las estadísticas del
         // grupo no cambien — ver [`visible_request_indices`].
-        let mut indexed: Vec<(usize, &RequestRow)> =
-            app.recent_requests.iter().enumerate().collect();
-        indexed.reverse();
+        let mut indexed = visible_request_indices(&app.recent_requests, filter.as_ref());
 
         // La tabla reserva su propia primera fila para el header.
         let capacity = (table_area.height - 1) as usize;
@@ -2970,8 +3060,9 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
 
         let rows: Vec<Row> = indexed
             .iter()
-            .map(|(i, r)| {
-                let kinds = &outliers[*i];
+            .map(|&i| {
+                let r = &app.recent_requests[i];
+                let kinds = &outliers[i];
                 let mut cells = requests_row_cells(app.requests_view, r);
                 cells.push(marker_text(kinds));
                 let row = Row::new(cells);
@@ -2985,12 +3076,27 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
 
         let widths = requests_table_widths(app.requests_view);
 
-        // Un terminal angosto no alcanza a mostrar todas las columnas del
-        // ancho declarado (la vista Context es más ancha que Latency):
-        // `ratatui::Table` recorta las columnas que no entran en vez de
-        // hacer wrap o panickear, así que no hace falta guard adicional acá
-        // más allá de los chequeos de área ya hechos arriba.
-        f.render_widget(Table::new(rows, widths).header(header), table_area);
+        // Filtrar puede dejar cero filas, y una caja vacía no distingue "este
+        // modelo no ha pedido nada últimamente" de "el panel está roto". Se
+        // dice cuál de las dos es.
+        if let Some((upstream, model)) = filter.as_ref().filter(|_| rows.is_empty()) {
+            f.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    format!(
+                        "sin peticiones recientes de {upstream}/{model} en el buffer — 'f' quita el filtro"
+                    ),
+                    Style::default().fg(Color::DarkGray),
+                ))),
+                table_area,
+            );
+        } else {
+            // Un terminal angosto no alcanza a mostrar todas las columnas del
+            // ancho declarado (la vista Context es más ancha que Latency):
+            // `ratatui::Table` recorta las columnas que no entran en vez de
+            // hacer wrap o panickear, así que no hace falta guard adicional acá
+            // más allá de los chequeos de área ya hechos arriba.
+            f.render_widget(Table::new(rows, widths).header(header), table_area);
+        }
     }
 
     if legend_area.height > 0 {
@@ -4117,7 +4223,7 @@ fn draw_sessions_panel(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_footer(f: &mut Frame, area: Rect) {
     let text = Line::from(
-        "q salir · b baseline · r reset · ↑/↓ modelo · p requests · c latency/context · s tools · u cuota · e sesión",
+        "q salir · b baseline · r reset · ↑/↓ modelo · f solo modelo sel. · p requests · c latency/context · s tools · u cuota · e sesión",
     );
     f.render_widget(Paragraph::new(text), area);
 }
@@ -7005,6 +7111,109 @@ mod tests {
         assert_eq!(row.requested_effort.as_deref(), Some("high"));
         assert_eq!(row.requested_speed.as_deref(), Some("fast"));
         assert_eq!(row.served_speed.as_deref(), Some("fast"));
+    }
+
+    // -----------------------------------------------------------------
+    // Filtro del panel de requests por el modelo seleccionado (tecla `f`)
+    // -----------------------------------------------------------------
+
+    fn key(upstream: &str, model: &str) -> ModelKey {
+        (upstream.to_string(), model.to_string())
+    }
+
+    /// Fila sana de `(upstream, model)`: lo único que mira el filtro son esos
+    /// dos campos, así que el resto queda en los valores neutros de [`req`].
+    fn req_de(upstream: &str, model: &str) -> RequestRow {
+        req(upstream, model, 200, Some(100.0), 1000.0, Some(10), None)
+    }
+
+    #[test]
+    fn sin_filtro_se_ven_todas_las_filas_mas_nueva_primero() {
+        let rows = vec![
+            req_de("anthropic", "opus"),
+            req_de("ollama", "qwen3"),
+            req_de("anthropic", "opus"),
+        ];
+
+        // Índices sobre el vector ORIGINAL, en orden de pintado (más nueva
+        // arriba): 2, 1, 0.
+        assert_eq!(visible_request_indices(&rows, None), vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn el_filtro_deja_solo_el_upstream_y_modelo_seleccionados() {
+        let rows = vec![
+            req_de("anthropic", "opus"),
+            req_de("ollama", "qwen3"),
+            req_de("anthropic", "opus"),
+        ];
+
+        let solo_opus = visible_request_indices(&rows, Some(&key("anthropic", "opus")));
+        assert_eq!(solo_opus, vec![2, 0]);
+    }
+
+    /// El upstream forma parte de la clave: el mismo nombre de modelo servido
+    /// por dos proveedores distintos son DOS filas distintas en `/stats`, y el
+    /// filtro tiene que respetar esa misma clave o mezclaría tráfico ajeno.
+    #[test]
+    fn el_filtro_no_mezcla_el_mismo_modelo_de_dos_upstreams() {
+        let rows = vec![req_de("openai", "gpt-5"), req_de("azure", "gpt-5")];
+
+        assert_eq!(
+            visible_request_indices(&rows, Some(&key("openai", "gpt-5"))),
+            vec![0]
+        );
+    }
+
+    /// `/stats` agrupa los requests SIN modelo conocido bajo la clave
+    /// `"unknown"` (ver `StatsAggregator::ingest` en `telemetry/stats.rs`),
+    /// mientras que `/requests` los deja como `model: null`. Si el filtro no
+    /// tradujera esa equivalencia, seleccionar la fila `unknown` de la tabla
+    /// daría un panel vacío para siempre.
+    #[test]
+    fn el_filtro_traduce_unknown_a_las_filas_sin_modelo() {
+        let mut sin_modelo = req("anthropic", "x", 500, None, 50.0, None, None);
+        sin_modelo.model = None;
+        let rows = vec![req_de("anthropic", "opus"), sin_modelo];
+
+        assert_eq!(
+            visible_request_indices(&rows, Some(&key("anthropic", "unknown"))),
+            vec![1]
+        );
+        // Y a la inversa: la fila sin modelo NO cae dentro de un modelo real.
+        assert_eq!(
+            visible_request_indices(&rows, Some(&key("anthropic", "opus"))),
+            vec![0]
+        );
+    }
+
+    #[test]
+    fn filtrar_sin_ninguna_coincidencia_devuelve_vacio_no_todo() {
+        let rows = vec![req_de("anthropic", "opus")];
+
+        assert!(visible_request_indices(&rows, Some(&key("ollama", "qwen3"))).is_empty());
+    }
+
+    /// El filtro arranca APAGADO: el panel de requests es un feed global por
+    /// defecto y solo se estrecha si el usuario lo pide.
+    #[test]
+    fn el_filtro_de_requests_arranca_apagado_y_alterna() {
+        let mut app = App::new("http://x/stats".to_string());
+        assert!(!app.filter_requests_by_model);
+        app.toggle_requests_filter();
+        assert!(app.filter_requests_by_model);
+        app.toggle_requests_filter();
+        assert!(!app.filter_requests_by_model);
+    }
+
+    /// La clave del filtro sale de la fila SELECCIONADA. Sin selección
+    /// (todavía no llegó ningún `/stats`) no hay clave, y el panel no puede
+    /// quedarse vacío por filtrar contra la nada.
+    #[test]
+    fn sin_fila_seleccionada_el_filtro_no_produce_clave() {
+        let mut app = App::new("http://x/stats".to_string());
+        app.filter_requests_by_model = true;
+        assert_eq!(app.requests_filter_key(), None);
     }
 
     // -----------------------------------------------------------------
