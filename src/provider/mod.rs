@@ -10,6 +10,7 @@
 pub mod anthropic;
 mod block_scan;
 pub mod gemini;
+pub mod hooks;
 pub mod instructions;
 pub mod openai;
 pub mod skills;
@@ -23,6 +24,7 @@ use std::hash::{Hash, Hasher};
 
 pub use anthropic::ANTHROPIC;
 pub use gemini::GEMINI;
+pub use hooks::HooksBlock;
 pub use instructions::InstructionsBlock;
 pub use openai::{OPENAI_CHAT, OPENAI_CODEX_RESPONSES, OPENAI_RESPONSES};
 pub use skills::SkillsBlock;
@@ -165,6 +167,15 @@ pub struct Outgoing {
     /// Code con un `AGENTS.md` en el proyecto, `None` es la respuesta CORRECTA
     /// porque esa herramienta no lo manda.
     pub instructions: Option<InstructionsBlock>,
+    /// Salida de los hooks de `SessionStart` inyectada en el body, el 29% del
+    /// peaje fijo. Mismo contrato de ausencia honesta que sus dos hermanos:
+    /// `None` es "no se reconocio el bloque", NUNCA "no tienes hooks".
+    ///
+    /// Solo lo rellena el dialecto de Anthropic: la marca `hook success:` es
+    /// de Claude Code, y que los otros tres harnesses inyecten algo
+    /// equivalente esta SIN MEDIR. Medir primero es la regla de este proyecto,
+    /// asi que aqui no se adivina.
+    pub hooks: Option<HooksBlock>,
     /// Nivel de esfuerzo que IMPUSO el proxy (palanca B del optimizador,
     /// `AppConfig::force_effort`), o `None` si no intervino — que es el caso
     /// por defecto, porque la palanca arranca apagada.

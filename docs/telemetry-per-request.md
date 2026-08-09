@@ -167,6 +167,7 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `session` | Sesión resuelta por precedencia de cabeceras del request: `{source, key}`. Nunca `null` — la peor rama es un fallback honesto (`source: "unattributed"`), no una ausencia | Ver §4.6 para la tabla de precedencia completa y cómo estampar el header desde cada harness |
 | `skills` | Listado de skills declarado en el body: `{declared, listing_bytes, format}`, o `null`. Se paga en CADA petición, se invoque una skill o no | `null` = no se reconoció ningún listado, **nunca "cero skills"**. `format` dice qué forma se encontró y, de paso, de qué herramienta viene el tráfico sin fiarse del `User-Agent` — ver §4.8 |
 | `instructions` | Bloque de instrucciones del usuario (`CLAUDE.md`) declarado en el body: `{bytes, format}`, o `null`. Se paga en CADA petición. Medido: el 48% del peaje fijo de una sesión de Claude Code | `null` = no se reconoció ningún bloque, **nunca "el usuario no tiene instrucciones"** — Claude Code IGNORA `AGENTS.md`, así que ahí `null` es correcto. Ver §4.13 |
+| `hooks` | Salida de los hooks de `SessionStart` inyectada en el body: `{bytes, declared, format}`, o `null`. Se paga en CADA petición. Medido: el 29% del peaje fijo, el segundo bloque más caro | `null` = no se reconoció el bloque, **nunca "no tienes hooks"**. Solo lo publica el dialecto de Anthropic: la marca es de Claude Code y los otros tres están SIN MEDIR. Ver §4.17 |
 | `effort_forced` | Nivel de esfuerzo que IMPUSO el proxy (palanca B), o `null` si no intervino — el default | Se lee JUNTO a `requested_effort`, nunca en su lugar: es lo que impide confundir un ahorro del cliente con una intervención del medidor. Ver §4.14 |
 | `tool_calls` | Invocaciones observadas en la RESPUESTA: `invoked` (cliente, MCP incluidas), `server_invoked` (`web_search`…), sus totales sin truncar, y `complete` | Contrapartida de `tool_names` (declaradas). `null` = este proveedor no tiene extractor, que NO es lo mismo que listas vacías. `complete: false` = la lista es un prefijo (turno abortado) y no sirve para concluir que un servidor no se usa. Ver §4.15 |
 | `prompt_bytes` | Bytes del body que MANDÓ EL CLIENTE, en su forma lógica | **No es wire** (en `/v1/codex/responses` y `/v1beta/*` se mide descomprimido), **no es lo que subió al proveedor** (con `cache_control_forced` el body reenviado es mayor) y **no es la suma del desglose**. Ver §4.10 antes de usarlo |
@@ -1443,6 +1444,67 @@ distintos.
 
 ---
 
+## 4.17. `hooks`: el 29% del peaje, y una frontera que no existe
+
+Cierra el último de los tres bloques del peaje fijo de una sesión. Con
+`instructions` (§4.13) y `skills` (§4.8) ya publicados, los tres se ven:
+
+| Bloque | Campo | % del peaje |
+|---|---|---:|
+| `CLAUDE.md` | `instructions` | 48% |
+| **Salida de hooks** | **`hooks`** | **29%** |
+| Listado de skills | `skills` | 23% |
+
+```json
+"hooks": { "bytes": 12097, "declared": 1, "format": "claude_code" }
+```
+
+- **`bytes`**: el bloque completo, marcas incluidas. No es lo que ocupan tus
+  hooks en disco ni lo que imprimen en tu terminal: es lo que el harness
+  inyecta en el cuerpo, y se paga en cada petición de la sesión.
+- **`declared`**: marcas `hook success:` contadas. Cuenta lo que el CABLE
+  trae, no lo que hay en `settings.json` — un hook configurado que no produjo
+  salida no aparece, y es correcto: no cuesta nada.
+- **`format`**: hoy solo `claude_code`.
+
+### La palanca es distinta a la de los otros dos bloques
+
+Este bloque **no lo escribe el usuario**: lo generan los hooks que tiene
+configurados, y muchos vienen de plugins. En la captura de
+[`fixed-toll-claude-code.md`](fixed-toll-claude-code.md), uno solo —el del
+plugin de Vercel— aportaba 7.654 B. La palanca no es «escribe menos», es
+**decidir si cada hook vale su peaje**, la misma conclusión a la que llegó §3
+de ese documento con los plugins.
+
+### La frontera, y por qué `null` aparece más de lo que parecería
+
+El harness **abre** el bloque con una marca (`SessionStart:startup hook
+success:`) y **no lo cierra**. Verificado sobre captura real del 2026-08-09:
+la parte `messages[1]` / `role: "system"` contiene exactamente dos cosas
+pegadas —la salida de los hooks y el listado de skills— sin nada en medio.
+
+Con `instructions` el envoltorio existía (`<system-reminder>`…`</…>`). Aquí no,
+así que la única frontera disponible es dónde EMPIEZA el listado de skills.
+
+**Y si esa cabecera no se encuentra, el campo es `null` en vez de correr hasta
+el final de la parte.** Es deliberado. Correr hasta el final sería correcto
+cuando de verdad no hay skills instaladas, pero si la cabecera cambiara,
+`hooks.bytes` se tragaría el listado y publicaría ~16 kB de más: un número
+plausible y falso. Ese error concreto ya ocurrió dos veces en este proyecto
+—están documentados en §4 de `fixed-toll-claude-code.md`— y el precio de
+evitarlo es un falso negativo en máquinas sin ninguna skill, que con las que
+Claude Code trae de serie es un caso casi vacío.
+
+### Lo que este campo NO hace: restar
+
+`parte − skills.listing_bytes` parece equivalente y no lo es. `listing_bytes`
+subestima el listado cuando una skill trae la descripción en varias líneas
+(issue #84: −1.453 B sobre esta misma captura), y restar convertiría ese error
+en bytes de hooks que nunca existieron. La frontera es el **inicio** de la
+cabecera, no una diferencia entre dos medidas.
+
+---
+
 ## 5. Límite de memoria: 200 filas, y se pierden al reiniciar
 
 `RECENT_CAPACITY = 200` (`src/telemetry/recent.rs`): el buffer es un
@@ -1617,6 +1679,7 @@ que la define:
 | `tool_search` | `la_forma_de_tool_search_signal_no_cambia_sin_querer` | `src/provider/mod.rs` |
 | `skills` | `la_forma_de_skills_no_cambia_sin_querer` | `src/provider/skills.rs` |
 | `instructions` | `la_forma_de_instructions_no_cambia_sin_querer` | `src/provider/instructions.rs` |
+| `hooks` | `la_forma_de_hooks_block_no_cambia_sin_querer` | `src/provider/hooks.rs` |
 | `codex_quota` | `la_forma_de_codex_quota_no_cambia_sin_querer` | `src/telemetry/codex_quota.rs` |
 | `session` | `la_forma_de_session_no_cambia_sin_querer` | `src/telemetry/session.rs` |
 | `cache_by_section` | `el_json_publicado_conserva_method_y_las_cinco_secciones` | `src/telemetry/cache_attribution.rs` |

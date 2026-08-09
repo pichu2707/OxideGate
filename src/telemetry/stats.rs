@@ -711,6 +711,7 @@ mod tests {
             tools_flattened: None,
             skills: None,
             instructions: None,
+            hooks: None,
             effort_forced: None,
             response_bytes: None,
             prepare_us: 0,

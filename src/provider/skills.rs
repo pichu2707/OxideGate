@@ -84,7 +84,15 @@ pub struct SkillsBlock {
 }
 
 /// Cabecera del listado plano de Claude Code.
-const CLAUDE_HEADER: &str = "The following skills are available for use with the Skill tool:";
+/// Cabecera de la lista plana de Claude Code.
+///
+/// `pub(super)` porque el detector de hooks la usa como frontera FINAL de su
+/// bloque: el harness abre la salida de hooks con una marca y no la cierra, y
+/// lo único que hay detrás es este listado (ver `super::hooks`). Compartir la
+/// constante no es estética — dos copias que puedan divergir dejarían un hueco
+/// o un solape entre dos campos que se publican juntos.
+pub(super) const CLAUDE_SKILLS_HEADER: &str =
+    "The following skills are available for use with the Skill tool:";
 
 /// Busca el listado de skills en un texto plano del body.
 ///
@@ -99,8 +107,8 @@ pub fn detect_skills(texto: &str) -> Option<SkillsBlock> {
 /// Lista plana de Claude Code: cabecera y a continuación líneas `- nombre: …`
 /// hasta la primera que no lo sea.
 fn detect_flat_list(texto: &str) -> Option<SkillsBlock> {
-    let inicio = texto.find(CLAUDE_HEADER)?;
-    let resto = &texto[inicio + CLAUDE_HEADER.len()..];
+    let inicio = texto.find(CLAUDE_SKILLS_HEADER)?;
+    let resto = &texto[inicio + CLAUDE_SKILLS_HEADER.len()..];
 
     let mut entradas = 0usize;
     let mut fin = 0usize;
@@ -124,7 +132,7 @@ fn detect_flat_list(texto: &str) -> Option<SkillsBlock> {
     }
     Some(SkillsBlock {
         declared: entradas,
-        listing_bytes: CLAUDE_HEADER.len() + fin,
+        listing_bytes: CLAUDE_SKILLS_HEADER.len() + fin,
         format: SkillsFormat::FlatList,
     })
 }
@@ -230,7 +238,7 @@ mod tests {
     #[test]
     fn reconoce_la_lista_plana_de_claude_code() {
         let texto = format!(
-            "bla bla\n\n{CLAUDE_HEADER}\n\n- branch-pr: Crea PRs.\n- judgment-day: Revisión doble.\n\nY sigue el mensaje."
+            "bla bla\n\n{CLAUDE_SKILLS_HEADER}\n\n- branch-pr: Crea PRs.\n- judgment-day: Revisión doble.\n\nY sigue el mensaje."
         );
 
         let b = detect_skills(&texto).expect("debe reconocer la lista plana");
@@ -315,7 +323,7 @@ mod tests {
     /// listado: mismo criterio que con las menciones del XML.
     #[test]
     fn la_cabecera_de_claude_sin_entradas_no_cuenta() {
-        let texto = format!("{CLAUDE_HEADER}\n\nY aquí no hay ninguna entrada.");
+        let texto = format!("{CLAUDE_SKILLS_HEADER}\n\nY aquí no hay ninguna entrada.");
 
         assert!(detect_skills(&texto).is_none());
     }
@@ -327,7 +335,7 @@ mod tests {
     #[test]
     fn declared_cuenta_tambien_los_slash_commands() {
         let texto = format!(
-            "{CLAUDE_HEADER}\n\n- branch-pr: Crea PRs.\n- micomando: Un slash command cualquiera.\n- engram:memory: Una de plugin.\n\nfin."
+            "{CLAUDE_SKILLS_HEADER}\n\n- branch-pr: Crea PRs.\n- micomando: Un slash command cualquiera.\n- engram:memory: Una de plugin.\n\nfin."
         );
 
         let b = detect_skills(&texto).expect("debe reconocer el listado");

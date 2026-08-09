@@ -76,6 +76,13 @@ impl Provider for Anthropic {
         let instructions = parsed
             .as_ref()
             .and_then(crate::provider::instructions::detect_instructions_in_body);
+        // Solo aqui: la marca `hook success:` es de Claude Code, que habla
+        // este dialecto. Los otros tres publican `None` a proposito — que
+        // inyecten algo equivalente esta sin medir, y medir primero es la
+        // regla.
+        let hooks = parsed
+            .as_ref()
+            .and_then(crate::provider::hooks::detect_hooks_in_body);
         let by_server = parsed
             .as_ref()
             .map(|v| self.tools_by_server(v))
@@ -107,6 +114,7 @@ impl Provider for Anthropic {
             context,
             skills,
             instructions,
+            hooks,
             effort_forced,
             tools_by_server: by_server,
             tools_overhead_bytes: overhead,
