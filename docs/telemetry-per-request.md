@@ -162,6 +162,7 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `prepare_us` | Microsegundos que el proxy pasó dentro de `Provider::prepare` (parseo del body + `decompose` + mutación opcional, p. ej. inyectar `cache_control`) | Ver la nota sobre qué NO incluye, más abajo |
 | `scan_us` | Microsegundos que el proxy pasó ESCANEANDO la respuesta (recorrido SSE por cada chunk, más el cierre). La otra mitad del overhead propio | Los dos juntos son el tiempo de CPU que cuesta observar — ver la nota de abajo |
 | `load_us` · `prompt_eval_us` · `eval_us` | Microsegundos que el MOTOR dice haber tardado en cargar el modelo, procesar el prompt y generar. Solo los reporta un motor **local** (`ollama` nativo) | `null` en los cuatro dialectos de nube: no es que no carguen modelos, es que no lo reportan. Ver §4.18 |
+| `energy_wh` · `energy_idle_wh` · `power_peak_w` · `energy_samples` | Vatios-hora que la GPU consumió **mientras la petición estuvo abierta**, el reposo equivalente, el pico y cuántas muestras reales lo sostienen | `null` con upstream **remoto**, sin `nvidia-smi`, con el muestreo apagado, o si el anillo no cubre la ventana. **Sumar sobre filas solapadas es inválido.** Ver §4.19 |
 | `tools_by_server` | Desglose de `context_tools_bytes` por servidor MCP declarante: `[{server, kind, tools, bytes, deferred_tools, tool_names}, …]`, ordenado por `bytes` descendente | `null` si el body no parseó como objeto (o build anterior a este campo); `[]` si SÍ parseó pero no declaraba `tools` — son estados DISTINTOS, ver §4.2. `deferred_tools` (por elemento) es la fuente de verdad POR SERVIDOR de cuánto está diferido, ver §4.2 |
 | `tools_overhead_bytes` | Bytes de `tools` no atribuidos a ningún servidor (brackets/comas del array, wrapper de Gemini, herramientas huérfanas) | `null` en los mismos casos que `tools_by_server` es `null`; `sum(tools_by_server[].bytes) + tools_overhead_bytes == context_tools_bytes` siempre que ambos sean no-nulos |
 | `tool_search` | Señal de carga diferida de herramientas del dialecto Responses/Codex: `{used, deferred_loaded}`, o `null`. `used: false` ⇒ EAGER confirmado este turno; `used: true` ⇒ LAZY (el cliente cargó tools a mitad de sesión) | `null` en Anthropic/Gemini/OpenAI-Chat (no aplica) o si el body no parseó. Es el diferenciador eager-vs-lazy por cliente que `tools_by_server` NO puede dar — ver §4.3 |
@@ -1659,6 +1660,83 @@ cada línea y publicado **cero tokens en silencio**, indistinguible de una
 respuesta sin tokens.
 
 `OXIDEGATE_OLLAMA_API_BASE` apunta al motor; por defecto `127.0.0.1:11434`.
+
+---
+
+## 4.19. Energía: lo que gasta la máquina, nunca lo que cuesta en euros
+
+Contra un modelo de nube, `cost_estimate_usd` dice exactamente lo que cuesta
+una petición. Contra `ollama` en tu propia máquina decía **nada** — y sin
+embargo se paga: se paga en electricidad.
+
+| Campo | Qué es |
+|---|---|
+| `energy_wh` | Energía **bruta**: el área bajo la curva de potencia durante la ventana, reposo incluido |
+| `energy_idle_wh` | Lo que la máquina habría gastado **en reposo** esa misma ventana |
+| `power_peak_w` | Pico de potencia dentro de la ventana |
+| `energy_samples` | Cuántas muestras **reales** cayeron dentro |
+
+### Lo que este campo NO dice
+
+**No dice «esta petición gastó tanto».** Dice «la máquina gastó tanto MIENTRAS
+esta petición estuvo abierta».
+
+Si dos peticiones se solapan, **las dos integran los mismos vatios y las dos
+los reclaman**. Sumar `energy_wh` sobre filas solapadas da más energía de la
+que la máquina consumió. No es un bug que se pueda arreglar con estos datos: es
+lo que significa el campo. Hay un test que fija la propiedad
+(`dos_ventanas_solapadas_reclaman_la_misma_energia`) para que quede escrita en
+vez de descubrirse sumando una columna.
+
+Es la misma trampa que `fixed-toll-claude-code.md` §4 llama **«leer los bytes,
+no restarlos»**: mezclar dos medidas tomadas en puntos distintos y presentar el
+resultado como si fuera una sola.
+
+### Por qué el reposo se publica y no se resta
+
+Porque la atribución **no es limpia**. Si otra cosa usa la GPU a la vez, la
+muestra no es solo de la inferencia. Un único número ya restado fingiría una
+precisión que no hay; publicando el reposo al lado, la resta la hace quien lee
+**viendo lo que resta**.
+
+Y el reposo tampoco es una constante: es el **mínimo observado** en los últimos
+minutos. Si la GPU nunca estuvo ociosa en esa ventana, será alto y la resta
+dará de menos — cosa que se puede ver, justamente porque está publicado.
+
+### Nunca euros
+
+Se publica la energía. El precio del kWh lo pone quien lee: cambia por país,
+por contrato y por hora del día. Un euro impreso aquí sería falso en cuanto
+cambiara la tarifa, y nadie volvería a mirarlo.
+
+### Cuándo es `null`, y por qué cada caso
+
+| Caso | Por qué |
+|---|---|
+| Upstream **remoto** | Muestrear tu GPU mientras responde Anthropic mide **tu escritorio**, no la inferencia |
+| Sin `nvidia-smi` | No hay nada que leer. Ausencia honesta, no un cero |
+| `OXIDEGATE_POWER_SAMPLING=off` | Lo apagaste |
+| El anillo no cubre la ventana | Típico en la primera petición tras arrancar: cualquier cifra sería una extrapolación disfrazada de medición |
+| Upstream falló (502) | No se llegó a inferir. Los vatios de esa ventana son de otra cosa |
+
+Lo local se decide por el **host parseado** de la URL destino, no por
+`contains`: `localhost.ejemplo.com` es un dominio remoto perfectamente
+registrable y contiene la palabra.
+
+### El muestreador
+
+Un `nvidia-smi -lms 200` **persistente**, arrancado una vez con el proxy. La
+objeción obvia es el coste, y está medida: **arrancar** `nvidia-smi` cuesta
+23,81 ms —seis veces todo el overhead del proxy— pero eso es el coste de
+arrancarlo, no el de leerlo. El proceso persistente cuesta **0,1% de un core**
+(50 muestras en 10 s, medido), y leer el anillo dentro de `emit` cuesta
+microsegundos.
+
+Esto es **Linux con NVIDIA primero**, y se declara en vez de que el campo salga
+`null` en un Mac sin que nadie sepa por qué. RAPL para la CPU y `powermetrics`
+en macOS no están. La integración sí está separada de quién llena el anillo,
+así que añadir otra fuente no tocaría la cuenta — pero hoy no hay ninguna, y
+decir lo contrario sería vender una capacidad que no existe.
 
 ---
 

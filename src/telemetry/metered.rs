@@ -82,6 +82,17 @@ pub struct MetricBase {
     /// Microsegundos que `middleware::proxy::run` pasó dentro de
     /// `provider.prepare(...)`. Viaja intacto hasta `RequestMetric::prepare_us`.
     pub prepare_us: u64,
+    /// `true` si la URL destino apunta a esta misma máquina, resuelto en
+    /// `middleware::proxy::run` a partir del HOST parseado de `Outgoing::url`.
+    ///
+    /// Es la guarda de los campos de energía: con upstream REMOTO, muestrear
+    /// la GPU mediría el escritorio de quien mira y no la inferencia, así que
+    /// se publica `None`. Se decide acá y no en `emit` porque `emit` ya no
+    /// tiene la URL — solo el nombre corto del proveedor, que no basta:
+    /// `OXIDEGATE_OLLAMA_API_BASE` puede apuntar a otra máquina.
+    pub upstream_es_local: bool,
+    /// Muestreador de potencia compartido, o `None` si no hay ninguno.
+    pub power: Option<std::sync::Arc<crate::telemetry::power::PowerMeter>>,
     /// Nivel de esfuerzo de razonamiento PEDIDO por el cliente
     /// (`Outgoing::requested_effort`). Viaja intacto hasta
     /// `RequestMetric::requested_effort`.
@@ -301,7 +312,22 @@ impl MeteredBody {
             .scan_us
             .saturating_add(cierre.elapsed().as_micros() as u64);
 
-        let total_ms = self.start.elapsed().as_secs_f64() * 1000.0;
+        let fin = Instant::now();
+        let total_ms = (fin - self.start).as_secs_f64() * 1000.0;
+
+        // Energía de la ventana. Se resuelve ACÁ porque este es el único punto
+        // del recorrido donde se conocen sus dos extremos: `self.start` es el
+        // instante en que entró el request y `fin` el de cierre de la
+        // respuesta — el mismo par que da `total_ms`, para que la energía y la
+        // duración no puedan describir ventanas distintas.
+        //
+        // Con upstream REMOTO no se mira siquiera el muestreador: los vatios
+        // de esta máquina mientras responde Anthropic son los del escritorio
+        // de quien mira, y publicarlos sería peor que no publicar nada.
+        let energia = match (self.base.upstream_es_local, self.base.power.as_ref()) {
+            (true, Some(medidor)) => medidor.ventana(self.start, fin),
+            _ => None,
+        };
         let cost_estimate_usd = pricing::estimate_cost_usd(
             self.base.model.as_deref(),
             self.scanner.usage.input_tokens,
@@ -397,6 +423,10 @@ impl MeteredBody {
             input_share_by_section,
             tools_by_server,
             tools_overhead_bytes,
+            energy_wh: energia.map(|e| e.wh),
+            energy_idle_wh: energia.map(|e| e.idle_wh),
+            power_peak_w: energia.map(|e| e.peak_w),
+            energy_samples: energia.map(|e| e.samples),
             prepare_us: self.base.prepare_us,
             scan_us: self.scan_us,
             load_us: self.scanner.usage.load_us,
@@ -501,6 +531,8 @@ mod tests {
             tools_by_server: Vec::new(),
             tools_overhead_bytes: 0,
             prepare_us: 0,
+            upstream_es_local: false,
+            power: None,
             requested_effort: None,
             requested_speed: None,
             tool_search: None,
@@ -512,6 +544,138 @@ mod tests {
             provider: &ANTHROPIC,
             codex_quota: None,
         }
+    }
+
+    /// Un anillo como el que produce el muestreador de verdad: muestras
+    /// SOLO en el pasado, a 100 W constantes, hasta el instante en que se
+    /// construye.
+    ///
+    /// Que no haya ninguna en el futuro es deliberado: la primera versión de
+    /// este helper metía una, y con ella el test pasaba mientras el proxy
+    /// publicaba `null` en cada petición real. Un muestreador no puede leer
+    /// el futuro, así que un test que se lo inventa no prueba nada.
+    fn medidor_de_prueba() -> std::sync::Arc<crate::telemetry::power::PowerMeter> {
+        use crate::telemetry::power::{PowerRing, PowerSample};
+        use std::time::Duration;
+        let ahora = Instant::now();
+        let mut anillo = PowerRing::new();
+        for atras in [60, 40, 20, 0] {
+            anillo.push(PowerSample {
+                at: ahora - Duration::from_secs(atras),
+                vatios: 100.0,
+            });
+        }
+        crate::telemetry::power::PowerMeter::con_anillo(anillo)
+    }
+
+    /// Contra un modelo LOCAL la energía se publica: es la simetría que
+    /// `cost_estimate_usd` deja abierta, porque a un modelo local nadie te lo
+    /// factura pero la electricidad se paga igual.
+    #[tokio::test]
+    async fn con_upstream_local_se_publica_la_energia() {
+        let dir = std::env::temp_dir().join(format!("oxi-wh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir de prueba");
+        let sink = TelemetrySink::spawn(dir.clone());
+        let recent = sink.recent();
+
+        let mut base = base_de_prueba(true);
+        base.upstream_es_local = true;
+        base.power = Some(medidor_de_prueba());
+
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = Vec::new();
+        let mut body = MeteredBody::new(
+            futures_util::stream::iter(chunks),
+            sink,
+            base,
+            Instant::now(),
+        );
+        while body.next().await.is_some() {}
+        drop(body);
+
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let filas = recent.read().unwrap_or_else(|p| p.into_inner()).snapshot();
+        let fila = filas.last().expect("debe haber una fila");
+
+        assert!(
+            fila.energy_wh.is_some(),
+            "energia ausente con upstream local"
+        );
+        // 100 W constantes: el reposo del anillo es 100 y la ventana es la
+        // misma, asi que bruto y reposo coinciden. Que coincidan es la prueba
+        // de que el reposo NO se resta por dentro: lo hace quien lee.
+        assert_eq!(fila.energy_wh, fila.energy_idle_wh);
+        assert_eq!(fila.power_peak_w, Some(100.0));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **La guarda del contrato.** Con upstream REMOTO el campo es `None`
+    /// aunque haya medidor: los vatios de esta maquina mientras responde
+    /// Anthropic son los del escritorio de quien mira, y publicarlos como
+    /// coste de la inferencia seria peor que no publicar nada.
+    #[tokio::test]
+    async fn con_upstream_remoto_la_energia_es_none_aunque_haya_medidor() {
+        let dir = std::env::temp_dir().join(format!("oxi-wh-rem-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir de prueba");
+        let sink = TelemetrySink::spawn(dir.clone());
+        let recent = sink.recent();
+
+        let mut base = base_de_prueba(true);
+        base.upstream_es_local = false;
+        base.power = Some(medidor_de_prueba());
+
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = Vec::new();
+        let mut body = MeteredBody::new(
+            futures_util::stream::iter(chunks),
+            sink,
+            base,
+            Instant::now(),
+        );
+        while body.next().await.is_some() {}
+        drop(body);
+
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let filas = recent.read().unwrap_or_else(|p| p.into_inner()).snapshot();
+        let fila = filas.last().expect("debe haber una fila");
+
+        assert_eq!(
+            fila.energy_wh, None,
+            "se midio el escritorio, no la inferencia"
+        );
+        assert_eq!(fila.energy_idle_wh, None);
+        assert_eq!(fila.power_peak_w, None);
+        assert_eq!(fila.energy_samples, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Sin medidor no hay energia, y eso NO es un cero: es que no se pudo
+    /// leer. Un `0.0` diria "esta peticion fue gratis".
+    #[tokio::test]
+    async fn sin_medidor_la_energia_es_ausente_no_cero() {
+        let dir = std::env::temp_dir().join(format!("oxi-wh-nil-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir de prueba");
+        let sink = TelemetrySink::spawn(dir.clone());
+        let recent = sink.recent();
+
+        let mut base = base_de_prueba(true);
+        base.upstream_es_local = true;
+        base.power = None;
+
+        let chunks: Vec<Result<Bytes, reqwest::Error>> = Vec::new();
+        let mut body = MeteredBody::new(
+            futures_util::stream::iter(chunks),
+            sink,
+            base,
+            Instant::now(),
+        );
+        while body.next().await.is_some() {}
+        drop(body);
+
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+        let filas = recent.read().unwrap_or_else(|p| p.into_inner()).snapshot();
+        let fila = filas.last().expect("debe haber una fila");
+
+        assert_eq!(fila.energy_wh, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Los bytes de bajada se acumulan a lo largo de TODOS los chunks, no solo

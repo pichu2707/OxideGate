@@ -286,6 +286,29 @@ pub struct RecentRequest {
     pub load_us: Option<u64>,
     pub prompt_eval_us: Option<u64>,
     pub eval_us: Option<u64>,
+    /// Vatios-hora que la maquina consumio MIENTRAS esta peticion estuvo
+    /// abierta (ver `telemetry::power` para el contrato completo).
+    ///
+    /// NO es "lo que costo esta peticion": si dos peticiones se solapan, las
+    /// dos reclaman los mismos vatios, asi que **sumar esta columna sobre
+    /// filas solapadas es invalido**.
+    ///
+    /// Es energia BRUTA, reposo incluido. Restar `energy_idle_wh` da lo
+    /// atribuible al trabajo, y la resta la hace quien lee. **Nunca se
+    /// convierte a dinero**: el precio del kWh lo pone quien lee.
+    ///
+    /// `None` con upstream REMOTO, sin `nvidia-smi`, con el muestreo apagado,
+    /// o cuando el anillo no cubre la ventana entera.
+    pub energy_wh: Option<f64>,
+    /// Lo que la maquina habria gastado EN REPOSO durante esta misma ventana.
+    /// Se publica al lado del bruto para que la resta sea visible.
+    pub energy_idle_wh: Option<f64>,
+    /// Pico de potencia dentro de la ventana, en vatios.
+    pub power_peak_w: Option<f64>,
+    /// Cuantas muestras REALES cayeron dentro. Con `0`, la energia sale de
+    /// interpolar entre las dos muestras que rodean una peticion mas corta
+    /// que la cadencia: honesta, pero mucho mas basta.
+    pub energy_samples: Option<u32>,
     /// Estado de la cuota de suscripción de Codex (ver
     /// `telemetry::logger::RequestMetric::codex_quota` para el contrato
     /// completo). `None` para tráfico sin cabeceras `x-codex-*` (Anthropic,
@@ -362,6 +385,10 @@ impl From<&RequestMetric> for RecentRequest {
             load_us: m.load_us,
             prompt_eval_us: m.prompt_eval_us,
             eval_us: m.eval_us,
+            energy_wh: m.energy_wh,
+            energy_idle_wh: m.energy_idle_wh,
+            power_peak_w: m.power_peak_w,
+            energy_samples: m.energy_samples,
             codex_quota: m.codex_quota.clone(),
             session: m.session.clone(),
         }
@@ -466,6 +493,10 @@ mod tests {
             load_us: None,
             prompt_eval_us: None,
             eval_us: None,
+            energy_wh: None,
+            energy_idle_wh: None,
+            power_peak_w: None,
+            energy_samples: None,
             codex_quota: None,
             session: SessionAttribution {
                 source: SessionSource::Unattributed,
@@ -1053,6 +1084,9 @@ mod tests {
             "context_tools_bytes",
             "cost_estimate_usd",
             "effort_forced",
+            "energy_idle_wh",
+            "energy_samples",
+            "energy_wh",
             "eval_us",
             "hooks",
             "input_share_by_section",
@@ -1061,6 +1095,7 @@ mod tests {
             "load_us",
             "model",
             "output_tokens",
+            "power_peak_w",
             "prepare_us",
             "prompt_bytes",
             "prompt_eval_us",

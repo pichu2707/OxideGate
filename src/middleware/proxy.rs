@@ -234,6 +234,12 @@ async fn send_and_meter(
     // upstream responde como si falla (ver doc de `session_of`).
     let session = session_of(req_headers);
 
+    // Resuelto ANTES de que `out.url` se mueva, y por el HOST parseado, no
+    // por `contains`: decide si los campos de energía se publican o valen
+    // `None`. Muestrear la GPU mientras responde un modelo REMOTO mediría el
+    // escritorio de quien mira, no la inferencia (ver `telemetry::power`).
+    let upstream_es_local = crate::telemetry::power::es_upstream_local(&out.url);
+
     // Reconstruimos la petición copiando las cabeceras originales (auth,
     // content-type, anthropic-version, x-goog-api-key…).
     let mut outbound = state.http.post(&out.url).body(out.body);
@@ -360,6 +366,13 @@ async fn send_and_meter(
                 // `resp`, no hay cabeceras `x-codex-*` que leer. `None`
                 // honesto, no un dato inventado.
                 codex_quota: None,
+                // Un 502 no llegó a inferir nada: la máquina no gastó por
+                // esta petición. Publicar la energía de la ventana diría que
+                // sí, y lo medido serían los vatios de otra cosa.
+                energy_wh: None,
+                energy_idle_wh: None,
+                power_peak_w: None,
+                energy_samples: None,
             });
             return plain_error(
                 StatusCode::BAD_GATEWAY,
@@ -382,6 +395,8 @@ async fn send_and_meter(
         session,
         prompt_bytes: out.prompt_bytes,
         status: status.as_u16(),
+        upstream_es_local,
+        power: state.power.clone(),
         cache_control_forced: out.cache_control_forced,
         context: out.context,
         tools_by_server: out.tools_by_server,

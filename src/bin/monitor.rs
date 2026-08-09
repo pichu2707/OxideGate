@@ -68,28 +68,36 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Muestra de la GPU en un instante: lo que la máquina está gastando AHORA.
 ///
-/// # Por qué esto vive en el monitor y no en el proxy
+/// # Por qué el monitor invoca `nvidia-smi` y el proxy no
 ///
-/// Medido en esta máquina: una invocación de `nvidia-smi` cuesta **23,81 ms**
-/// de mediana. El overhead TOTAL del proxy son **3,79 ms** (`prepare_us` +
-/// `scan_us`, ver `docs/telemetry-per-request.md` §4.1). Muestrear por petición
-/// desde el proxy costaría **6,3 veces todo lo que el proxy cuesta**: el
-/// instrumento pasaría a ser el gasto dominante, y publicaría un número
-/// contaminado por su propia medición.
+/// Medido en esta máquina: **arrancar** `nvidia-smi` cuesta **23,81 ms** de
+/// mediana, seis veces el overhead TOTAL del proxy: **3,79 ms** entre
+/// `prepare_us` y `scan_us` (ver `docs/telemetry-per-request.md` §4.1). Por eso
+/// el proxy no lo invoca: pagaría ese arranque en cada petición y el
+/// instrumento pasaría a ser el gasto dominante.
 ///
 /// El monitor refresca cada segundo, así que esos 23,81 ms son el **2,4%** de
 /// su ciclo — y solo se pagan mientras el panel está visible.
 ///
+/// # Corrección: el proxy SÍ mide energía, con otro mecanismo
+///
+/// Una versión anterior de este comentario decía que atribuir por petición
+/// «exige NVML en vez de un subproceso». **Es falso**, y lo desmiente una
+/// medición: un `nvidia-smi -lms 200` **persistente** paga el arranque UNA vez
+/// y luego escupe una muestra cada 200 ms por **0,1% de un core** (50 muestras
+/// en 10 s). Lo caro era arrancarlo, no leerlo.
+///
+/// El proxy hace eso desde #92 y publica `energy_wh` por petición
+/// (`telemetry::power`). Este panel sigue siendo otra cosa.
+///
 /// # Lo que este panel NO es
 ///
 /// **No atribuye a una petición.** Dice «la máquina está a 258 W», no «esta
-/// petición costó 2,3 Wh». Para eso haría falta muestrear dentro de la ventana
-/// del request, que es trabajo del proxy y exige NVML en vez de un subproceso.
+/// petición costó 2,3 Wh». Eso lo dice la columna del proxy.
 ///
-/// Y no separa cargar el modelo de inferir con él: medido contra ollama, la
-/// carga puede ser el **92%** del tiempo de una petición fría. Para los VATIOS
-/// da igual —esa energía se gasta de verdad— pero cualquier cifra derivada por
-/// token heredaría la distorsión. Ver el issue #92.
+/// Y no separa cargar el modelo de inferir con él. Para los VATIOS da igual
+/// —esa energía se gasta de verdad— pero cualquier cifra derivada por token
+/// heredaría la distorsión; para eso están `load_us`/`eval_us`.
 #[derive(Debug, Clone, PartialEq)]
 struct GpuSample {
     nombre: String,

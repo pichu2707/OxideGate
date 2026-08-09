@@ -444,6 +444,49 @@ pub struct RequestMetric {
     #[serde(default)]
     pub eval_us: Option<u64>,
 
+    // --- Energía de la máquina (ver `telemetry::power`) ---
+    /// Vatios-hora que la GPU consumió MIENTRAS esta petición estuvo abierta.
+    ///
+    /// **No es «lo que costó esta petición».** Es lo que gastó la máquina
+    /// durante su ventana. Si dos peticiones se solapan, las dos integran los
+    /// mismos vatios y las dos los reclaman: **sumar esta columna sobre filas
+    /// solapadas es inválido** y da más energía de la que hubo. La propiedad
+    /// está fijada en un test (`telemetry::power`), no descubierta sumando.
+    ///
+    /// Es energía BRUTA: incluye el reposo. Restar [`Self::energy_idle_wh`]
+    /// da lo atribuible al trabajo — la resta la hace quien lee, viendo lo
+    /// que resta, en vez de un único número ya cocinado.
+    ///
+    /// **Nunca se convierte a dinero.** El precio del kWh cambia por país,
+    /// por contrato y por hora del día; lo pone quien lee.
+    ///
+    /// `None` con upstream REMOTO —muestrear tu GPU mientras responde
+    /// Anthropic mide tu escritorio—, sin `nvidia-smi`, con el muestreo
+    /// apagado, o cuando el anillo de muestras no cubre la ventana entera
+    /// (típico en la primera petición tras arrancar). Ausencia honesta.
+    #[serde(default)]
+    pub energy_wh: Option<f64>,
+    /// Lo que la máquina habría gastado EN REPOSO durante esta misma ventana:
+    /// el mínimo de potencia observado en los últimos minutos por la duración
+    /// de la petición. Se publica al lado de [`Self::energy_wh`] para que la
+    /// resta sea visible y auditable.
+    #[serde(default)]
+    pub energy_idle_wh: Option<f64>,
+    /// Pico de potencia dentro de la ventana, en vatios. Es la cifra que se
+    /// compara con el límite de la tarjeta; la energía es la que se compara
+    /// con la factura.
+    #[serde(default)]
+    pub power_peak_w: Option<f64>,
+    /// Cuántas muestras REALES cayeron dentro de la ventana.
+    ///
+    /// Sin esto no se distingue una curva de una interpolación: con `0`, la
+    /// energía sale de interpolar entre las dos muestras que rodean una
+    /// petición más corta que la cadencia del muestreador. Sigue siendo una
+    /// estimación honesta, pero mucho más basta, y quien lee tiene derecho a
+    /// saberlo antes de fiarse.
+    #[serde(default)]
+    pub energy_samples: Option<u32>,
+
     // --- Cuota de suscripción de Codex (ver `telemetry::codex_quota`) ---
     /// Estado de la cuota de suscripción de Codex, parseado de las doce
     /// cabeceras `x-codex-*` que manda el backend de Codex cuando el
@@ -802,6 +845,10 @@ mod tests {
             load_us: None,
             prompt_eval_us: None,
             eval_us: None,
+            energy_wh: None,
+            energy_idle_wh: None,
+            power_peak_w: None,
+            energy_samples: None,
             codex_quota: None,
             session,
         }

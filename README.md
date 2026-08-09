@@ -410,6 +410,7 @@ propio reporte, en vez de presentar un ahorro que no existe.
 | `OXIDEGATE_FORCE_CACHE` | Palanca A: fuerza el prompt caching de Anthropic | `false` (apagado) |
 | `OXIDEGATE_STORAGE_DIR` | Dónde se escribe la telemetría. **Aborta el arranque** si la ruta no se puede usar — ver abajo | `~/.config/oxidegate` |
 | `OXIDEGATE_OLLAMA_API_BASE` | Motor local para el dialecto **nativo** de ollama (`/api/generate`, `/api/chat`) | `http://127.0.0.1:11434` |
+| `OXIDEGATE_POWER_SAMPLING` | `off` apaga el muestreador de potencia de la GPU (`energy_wh` pasa a `null`) | activo si hay `nvidia-smi` |
 | `OXIDEGATE_STATS_URL` | URL que consulta el monitor para `/stats` | `http://127.0.0.1:{OXIDEGATE_PORT}/stats` |
 | `OXIDEGATE_REQUESTS_URL` | URL que consulta el monitor para `/requests` | derivada de `OXIDEGATE_STATS_URL` (sufijo `/stats` → `/requests`), o `http://127.0.0.1:{OXIDEGATE_PORT}/requests` |
 
