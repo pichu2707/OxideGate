@@ -1023,7 +1023,7 @@ palanca se aplica.
 | Campo | Qué es |
 |---|---|
 | `bytes` | Bytes del bloque completo, envoltorio incluido. Se pagan en CADA petición |
-| `format` | `claude_md` (por ahora, ver abajo) |
+| `format` | `claude_md` \| `opencode_agents_md` — ver abajo |
 
 #### El bloque se delimita por su ENVOLTORIO, nunca por una cabecera
 
@@ -1063,14 +1063,64 @@ correcto: **Claude Code ignora `AGENTS.md`** — `null` con ese fichero en el
 proyecto es la respuesta buena, no un fallo del detector. El mismo fichero,
 cuatro comportamientos (`docs/skills-across-tools.md` §6).
 
-#### Un solo `format`, y es a propósito
+#### Dos `format`, y cada uno con su captura detrás
 
-`claude_md` es el único dialecto **verificado en el cable**. Codex, opencode y
-`pi` también inyectan el fichero y tienen marca propia documentada
-(`docs/skills-across-tools.md` §6), pero esa tabla se escribió contra versiones
-anteriores —opencode iba por 1.18.5 y hoy va por 1.18.14— y una marca es una
-cadena literal. Añadirlas sin recapturar sería inventar exactamente la medición
-que este campo existe para no inventar. Cada una entra cuando tenga su captura.
+| `format` | Herramienta | Envoltorio | Cierre |
+|---|---|---|---|
+| `claude_md` | Claude Code 2.1.220 | `<system-reminder>` con `# claudeMd` dentro | sí |
+| `opencode_agents_md` | opencode 1.18.15 | `Instructions from: <ruta absoluta>` | **no** |
+
+Cada dialecto entra **cuando tiene captura propia**, nunca desde una tabla. Y el
+motivo dejó de ser teórico: la marca que se documentaba para **Codex**
+—`--- project-doc ---`— **no existe** en 0.142.5. `grep` devuelve cero sobre una
+captura real. Una marca es una cadena literal, y las cadenas cambian.
+
+Faltan **Codex** y **`pi`**, y `pi` además manda el cuerpo en zstd, así que sus
+cifras serán lógicas y habrá que decirlo. Ver #66 y
+[`banco-de-captura.md`](banco-de-captura.md) para el método.
+
+#### El envoltorio de opencode depende de DÓNDE tengas el proyecto
+
+Medido sobre captura real de opencode 1.18.15 con un `AGENTS.md` de **202 B**:
+
+| Parte | Bytes |
+|---|---:|
+| Bloque completo | 349 |
+| Cabecera `Instructions from: ` | 19 |
+| **Ruta absoluta** | **126** |
+| **Envoltorio total** | **147** |
+
+**El 86% del envoltorio es la ruta del proyecto.** Así que el «+160 B» que
+circulaba para opencode **no es una constante**: es `~21 B + longitud de la
+ruta`. Un proyecto en `/home/u/p` paga bastante menos que uno en un directorio
+profundo, y ese número no se puede comparar entre máquinas sin decir dónde
+estaba el proyecto. Mismo hallazgo que con Codex.
+
+#### opencode abre el bloque y no lo cierra
+
+A diferencia de Claude Code, opencode no envuelve: pone la marca y pega el
+contenido. Lo único que hay detrás es su bloque de skills.
+
+```text
+</env>
+Instructions from: /ruta/absoluta/AGENTS.md
+…contenido del AGENTS.md…
+
+Skills provide specialized instructions and workflows for specific tasks.
+```
+
+Así que la frontera final es el preámbulo de skills, y **si no se encuentra, el
+campo es `null`**. Correr hasta el final del texto se tragaría el listado de
+skills entero — el error que §4 de
+[`fixed-toll-claude-code.md`](fixed-toll-claude-code.md) documenta tras
+cometerlo dos veces.
+
+Esa frontera es **prosa del harness**, y es una fragilidad conocida: si opencode
+cambia la frase, el campo pasa a `null`. Falla honesto, no falla mintiendo.
+
+Y por eso `claude_md` se prueba **primero**: su bloque tiene apertura y cierre
+reales, así que ante un cuerpo donde los dos pudieran aparecer gana el que se
+puede delimitar con certeza.
 
 #### Dos avisos sobre la cifra
 
