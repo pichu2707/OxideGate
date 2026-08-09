@@ -612,15 +612,28 @@ async fn main() {
     // Cargamos la configuración independiente de OxideGate
     let config = AppConfig::load();
 
-    // Aseguramos que nuestra carpeta de datos exista de forma interna
-    if !config.storage_dir.exists() {
-        std::fs::create_dir_all(&config.storage_dir).unwrap_or_default();
+    // La carpeta de datos tiene que existir ANTES de arrancar la telemetría.
+    // Antes esto era un `unwrap_or_default()` que se tragaba el error y luego
+    // anunciaba tan campante dónde iba a guardar; ahora el fallo se ve, y si
+    // el directorio lo pidió el usuario por `OXIDEGATE_STORAGE_DIR`, mata el
+    // arranque en vez de caer al histórico real (ver `ensure_storage_dir`).
+    if let Err(fallo) = config::ensure_storage_dir(&config.storage_dir, config.storage_dir_source) {
+        eprintln!("{}", fallo.message);
+        if fallo.fatal {
+            std::process::exit(1);
+        }
     }
 
     println!("🚀 OxideGate inicializado en local.");
     println!(
-        "📦 Almacenamiento de telemetría nativa en: {:?}",
-        config.storage_dir
+        "📦 Almacenamiento de telemetría nativa en: {:?}{}",
+        config.storage_dir,
+        match config.storage_dir_source {
+            // Escribir la telemetría fuera del sitio de siempre no puede ser
+            // invisible: es la diferencia entre leer un histórico y otro.
+            config::StorageDirSource::Env => "  (OXIDEGATE_STORAGE_DIR)",
+            config::StorageDirSource::Default => "",
+        }
     );
     if config.has_opencode_env() {
         println!("🔍 Entorno OpenCode detectado en el sistema.");

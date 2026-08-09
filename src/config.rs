@@ -1,7 +1,7 @@
 //! Lee el entorno
 use std::env;
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Resuelve el host de bind desde el valor crudo de `OXIDEGATE_HOST`.
 /// Función pura para poder afirmar en tests sin tocar el entorno del proceso.
@@ -103,6 +103,82 @@ pub fn parse_force_effort(raw: Option<&str>) -> (Option<String>, Option<String>)
     )
 }
 
+/// Quién eligió el directorio de telemetría.
+///
+/// No es metadato decorativo: es lo único que permite a [`ensure_storage_dir`]
+/// distinguir "no puedo medir" de "voy a escribir donde me dijiste que no".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageDirSource {
+    /// `~/.config/oxidegate/`. Nadie pidió nada.
+    Default,
+    /// `OXIDEGATE_STORAGE_DIR` traía una ruta usable.
+    Env,
+}
+
+/// Fallo al preparar el directorio de telemetría.
+pub struct StorageDirError {
+    pub message: String,
+    /// `true` → el arranque se aborta. Ver [`ensure_storage_dir`].
+    pub fatal: bool,
+}
+
+/// Resuelve el directorio de telemetría desde el valor crudo de
+/// `OXIDEGATE_STORAGE_DIR`. Pura: elige la ruta, no toca el disco.
+///
+/// Vacío o en blanco cuenta como ausente, mismo criterio que
+/// [`parse_bind_host`] y [`parse_force_effort`].
+pub fn resolve_storage_dir(raw: Option<&str>, default: PathBuf) -> (PathBuf, StorageDirSource) {
+    match raw.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(valor) => (PathBuf::from(valor), StorageDirSource::Env),
+        None => (default, StorageDirSource::Default),
+    }
+}
+
+/// Crea el directorio si hace falta, y decide qué gravedad tiene no poder.
+///
+/// **Falla CERRADO, y aquí "cerrado" significa ABORTAR** — al revés que
+/// [`parse_bind_host`] y [`parse_force_effort`], que caen al default y siguen.
+/// La diferencia no es de estilo: es cuál de los dos errores no se deshace.
+///
+/// - En `OXIDEGATE_HOST` el default (loopback) es el lado SEGURO. Volver a él
+///   ante un typo es justamente la protección.
+/// - Aquí el default es el lado PELIGROSO. Quien exporta
+///   `OXIDEGATE_STORAGE_DIR` casi siempre lo hace para NO escribir en su
+///   histórico real; caer al de siempre con un aviso que se pierde entre la
+///   salida de una tanda de pruebas es EXACTAMENTE el accidente que esta
+///   variable viene a impedir. Un histórico contaminado no se deshace.
+///
+/// Si nadie pidió nada, el fallo avisa pero no mata: tumbar el proxy por no
+/// poder persistir seria peor que medir sin guardar.
+pub fn ensure_storage_dir(dir: &Path, source: StorageDirSource) -> Result<(), StorageDirError> {
+    let Err(e) = std::fs::create_dir_all(dir) else {
+        return Ok(());
+    };
+
+    Err(match source {
+        StorageDirSource::Env => StorageDirError {
+            message: format!(
+                "oxidegate: OXIDEGATE_STORAGE_DIR={} no se puede usar ({e}).\n  \
+                 El arranque se aborta A PROPÓSITO: continuar significaría escribir la \
+                 telemetría en el directorio por defecto —el histórico real—, que es lo \
+                 que esta variable sirve para evitar.\n  \
+                 Corrige la ruta, o quita la variable para usar el directorio de siempre.",
+                dir.display()
+            ),
+            fatal: true,
+        },
+        StorageDirSource::Default => StorageDirError {
+            message: format!(
+                "oxidegate: no se pudo preparar el directorio de telemetría {} ({e}).\n  \
+                 El proxy arranca y mide, pero NADA se persistirá: /stats, /sessions y \
+                 /history volverán vacíos tras el próximo reinicio.",
+                dir.display()
+            ),
+            fatal: false,
+        },
+    })
+}
+
 pub struct AppConfig {
     pub local_port: u16,
     /// Interfaz donde bindea el proxy. Por defecto loopback: abrirse a la red
@@ -123,6 +199,9 @@ pub struct AppConfig {
     /// Ruta local `/v1/codex/responses` la reenvía a `{target_codex_url}/responses`.
     pub target_codex_url: String,
     pub storage_dir: PathBuf,
+    /// Quién eligió [`Self::storage_dir`]. Lo consume el arranque para decidir
+    /// si no poder crearlo es mortal — ver [`ensure_storage_dir`].
+    pub storage_dir_source: StorageDirSource,
     /// Palanca A del optimizador: fuerza un breakpoint de `cache_control` en
     /// las peticiones a Anthropic que no gestionan su propio prompt caching.
     ///
@@ -157,9 +236,14 @@ impl AppConfig {
     pub fn load() -> Self {
         // Buscamos la carpeta HOME del usuario para guardar nuestros propios datos de forma limpia
         let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        let mut storage_dir = PathBuf::from(home);
-        storage_dir.push(".config");
-        storage_dir.push("oxidegate"); // Nuestra propia carpeta independiente
+        let mut storage_dir_default = PathBuf::from(home);
+        storage_dir_default.push(".config");
+        storage_dir_default.push("oxidegate"); // Nuestra propia carpeta independiente
+
+        let (storage_dir, storage_dir_source) = resolve_storage_dir(
+            env::var("OXIDEGATE_STORAGE_DIR").ok().as_deref(),
+            storage_dir_default,
+        );
 
         let (bind_host, bind_host_warning) =
             parse_bind_host(env::var("OXIDEGATE_HOST").ok().as_deref());
@@ -184,6 +268,7 @@ impl AppConfig {
             target_codex_url: env::var("OXIDEGATE_CODEX_API_BASE")
                 .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex".to_string()),
             storage_dir,
+            storage_dir_source,
             force_prompt_cache: env::var("OXIDEGATE_FORCE_CACHE")
                 .map(|v| v == "true" || v == "1")
                 .unwrap_or(false),
@@ -350,5 +435,113 @@ mod bind_host_tests {
                 "{ip}: debe nombrar el endpoint"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod storage_dir_tests {
+    use super::*;
+
+    /// Ruta única por test dentro del temporal del sistema. Sin `tempfile` en
+    /// dev-dependencies, el nombre del test hace de discriminante: los tests
+    /// de Cargo corren en paralelo y dos que compartan ruta se pisan.
+    fn ruta_de_prueba(nombre: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("oxidegate-test-{nombre}"));
+        let _ = std::fs::remove_dir_all(&p);
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    /// El default es el de siempre. Nadie que no haya pedido nada puede ver
+    /// su telemetría mudarse de sitio por este cambio.
+    #[test]
+    fn sin_variable_se_usa_el_directorio_de_siempre() {
+        let defecto = PathBuf::from("/home/quien/.config/oxidegate");
+
+        let (dir, origen) = resolve_storage_dir(None, defecto.clone());
+
+        assert_eq!(dir, defecto);
+        assert_eq!(origen, StorageDirSource::Default);
+    }
+
+    /// Vacío o en blanco es "no la he puesto", no un error. Mismo criterio
+    /// que `OXIDEGATE_HOST=` y `OXIDEGATE_FORCE_EFFORT=`.
+    #[test]
+    fn una_variable_vacia_o_en_blanco_no_cuenta_como_pedida() {
+        let defecto = PathBuf::from("/home/quien/.config/oxidegate");
+
+        for crudo in ["", "   ", "\t"] {
+            let (dir, origen) = resolve_storage_dir(Some(crudo), defecto.clone());
+            assert_eq!(dir, defecto, "{crudo:?} no debe cambiar el directorio");
+            assert_eq!(origen, StorageDirSource::Default, "{crudo:?}");
+        }
+    }
+
+    /// Una ruta explícita gana, y queda MARCADA como pedida. El origen no es
+    /// decoración: es lo que decide si un fallo al crearla mata el arranque.
+    #[test]
+    fn una_ruta_explicita_gana_y_queda_marcada_como_pedida() {
+        let (dir, origen) = resolve_storage_dir(
+            Some("  /tmp/oxidegate-sonda  "),
+            PathBuf::from("/home/quien/.config/oxidegate"),
+        );
+
+        assert_eq!(dir, PathBuf::from("/tmp/oxidegate-sonda"));
+        assert_eq!(origen, StorageDirSource::Env);
+    }
+
+    /// Un directorio usable no protesta, exista ya o haya que crearlo.
+    #[test]
+    fn un_directorio_usable_no_produce_error() {
+        let dir = ruta_de_prueba("usable");
+
+        assert!(ensure_storage_dir(&dir, StorageDirSource::Env).is_ok());
+        // Segunda vez: ya existe. Tampoco protesta.
+        assert!(ensure_storage_dir(&dir, StorageDirSource::Env).is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// EL CASO QUE MOTIVA EL ISSUE. Se pidió un directorio, no se puede usar,
+    /// y seguir arrancando significaria escribir en el histórico real del
+    /// usuario — justo lo que la variable venía a evitar. Es FATAL.
+    #[test]
+    fn un_directorio_pedido_que_no_se_puede_crear_es_fatal() {
+        // `create_dir_all` falla de forma portable si un componente del camino
+        // ya es un fichero regular.
+        let fichero = ruta_de_prueba("pedido-imposible");
+        std::fs::write(&fichero, b"no soy un directorio").expect("fixture");
+        let dir = fichero.join("dentro");
+
+        let fallo = ensure_storage_dir(&dir, StorageDirSource::Env)
+            .expect_err("un directorio pedido e inservible tiene que fallar");
+
+        assert!(fallo.fatal, "pedido explícitamente: mata el arranque");
+        assert!(
+            fallo.message.contains("OXIDEGATE_STORAGE_DIR"),
+            "el aviso debe nombrar la variable: {}",
+            fallo.message
+        );
+
+        let _ = std::fs::remove_file(&fichero);
+    }
+
+    /// El mismo fallo sobre el directorio POR DEFECTO no mata: nadie pidió
+    /// nada, y tumbar el proxy por no poder medir seria peor que medir menos.
+    /// Pero deja de tragarse el error, que es lo que hacía `unwrap_or_default`.
+    #[test]
+    fn el_directorio_por_defecto_que_falla_avisa_pero_no_mata() {
+        let fichero = ruta_de_prueba("defecto-imposible");
+        std::fs::write(&fichero, b"no soy un directorio").expect("fixture");
+        let dir = fichero.join("dentro");
+
+        let fallo = ensure_storage_dir(&dir, StorageDirSource::Default)
+            .expect_err("sigue siendo un fallo, aunque no sea mortal");
+
+        assert!(!fallo.fatal, "nadie lo pidió: avisa y sigue");
+        assert!(!fallo.message.is_empty());
+
+        let _ = std::fs::remove_file(&fichero);
     }
 }

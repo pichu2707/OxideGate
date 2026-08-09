@@ -402,11 +402,39 @@ propio reporte, en vez de presentar un ahorro que no existe.
 | `OXIDEGATE_HOST` | Interfaz donde bindea el proxy. `0.0.0.0` para alcanzarlo desde fuera (Docker, LAN) — **lee el aviso de abajo antes** | `127.0.0.1` (solo esta máquina) |
 | `ANTHROPIC_API_BASE` / `OPENAI_API_BASE` / `GEMINI_API_BASE` | Host de cada proveedor | API pública de cada uno |
 | `OXIDEGATE_FORCE_CACHE` | Palanca A: fuerza el prompt caching de Anthropic | `false` (apagado) |
+| `OXIDEGATE_STORAGE_DIR` | Dónde se escribe la telemetría. **Aborta el arranque** si la ruta no se puede usar — ver abajo | `~/.config/oxidegate` |
 | `OXIDEGATE_STATS_URL` | URL que consulta el monitor para `/stats` | `http://127.0.0.1:{OXIDEGATE_PORT}/stats` |
 | `OXIDEGATE_REQUESTS_URL` | URL que consulta el monitor para `/requests` | derivada de `OXIDEGATE_STATS_URL` (sufijo `/stats` → `/requests`), o `http://127.0.0.1:{OXIDEGATE_PORT}/requests` |
 
 La telemetría se escribe en `~/.config/oxidegate/telemetry.jsonl` (una línea
 JSON por petición), fuera del camino crítico del request.
+
+#### Sobre `OXIDEGATE_STORAGE_DIR`: por qué aborta en vez de continuar
+
+Sirve para ejercitar el proxy sin escribir en tu histórico real, y para correr
+dos instancias con historiales separados:
+
+```bash
+OXIDEGATE_STORAGE_DIR=/tmp/sonda OXIDEGATE_PORT=18080 oxidegate
+```
+
+El arranque lo anuncia (`📦 … (OXIDEGATE_STORAGE_DIR)`), porque escribir la
+telemetría fuera del sitio de siempre no puede ser invisible: es la diferencia
+entre leer un histórico y otro.
+
+Y si la ruta no se puede usar, **el proxy no arranca**. Es deliberado, y es lo
+contrario de lo que hace `OXIDEGATE_HOST`: ahí volver al default (loopback) es
+el lado seguro, así que un typo cae ahí y sigue. Aquí el default es el lado
+peligroso — quien exporta esta variable casi siempre lo hace para NO tocar su
+histórico, y caer al de siempre con un aviso que se pierde entre la salida de
+una tanda de pruebas es exactamente el accidente que la variable viene a
+impedir. **Un histórico contaminado no se deshace.**
+
+Sin la variable, nada cambia: el comportamiento de siempre, y un fallo al
+preparar el directorio por defecto ahora avisa en vez de tragarse el error.
+
+Fuera de alcance: mover el `telemetry.jsonl` existente al cambiar de
+directorio. La variable elige dónde escribir a partir de ahora.
 
 #### Sobre `OXIDEGATE_HOST`: qué expones al abrirlo
 
