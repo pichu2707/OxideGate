@@ -192,9 +192,10 @@ corresponde y no con el primero que aparezca.
 
 ## 7. Qué falta
 
-- **opencode: capturado.** Su marca documentada (`Instructions from: <ruta>`)
-  **sí sobrevivió** a las diez versiones de deriva, al revés que la de Codex.
-  Detector en `provider::instructions`.
+- **opencode y Codex: capturados y con detector** en `provider::instructions`
+  (`opencode_agents_md` y `codex_agents_md`). La marca de opencode **sí
+  sobrevivió** a diez versiones de deriva; la de Codex **no existía**. Una de
+  dos: por eso ningún dialecto entra desde una tabla.
 - **`pi`**: sin capturar.
 - **`pi` manda el cuerpo comprimido con zstd**, único de los cuatro. Sus cifras
   serán **lógicas**; el coste en cable es ~1/3. Publicarlo sin decirlo lo
