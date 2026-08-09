@@ -226,6 +226,7 @@ presentación):
 | `gen_ms` | Tiempo de generación, `total_ms - ttft_ms` |
 | `tok/s` | Throughput de generación, `output_tokens / (gen_ms / 1000)` |
 | `usd` | Coste estimado |
+| `Wh_net` | Energía **atribuible** de esta petición: `energy_wh − energy_idle_wh`, en mWh por debajo de 1 Wh. `~` = pocas muestras dentro de la ventana, cifra basta. `-` con upstream remoto, sin `nvidia-smi`, o si falta cualquiera de las dos mitades. **NO se puede sumar la columna**: dos peticiones solapadas reclaman los mismos vatios. Ver `telemetry-per-request.md` §4.19 |
 | `outlier` | Marcadores de esta fila (ver abajo), p. ej. `ERR+TTFT` |
 
 Un valor ausente se muestra como `-`, **nunca como `0`**: un `0` real (p. ej.
@@ -775,27 +776,45 @@ Sin `nvidia-smi`, sin driver, o con una salida que no es la esperada, el panel
 dice que **no hay lectura**. Un `0 W` afirmaría que la máquina no está gastando
 nada, y lo cierto sería que no se sabe. Mismo contrato que el resto del monitor.
 
-### Por qué arranca oculto, y por qué vive aquí y no en el proxy
+### Reposo y pico, juntos
 
-Medido en una máquina real: una invocación de `nvidia-smi` cuesta **23,81 ms**
-de mediana. El overhead **total** del proxy son **3,79 ms**
-([`telemetry-per-request.md`](telemetry-per-request.md) §4.1).
+Una línea del panel dice **reposo** y **pico** del histórico que el monitor
+lleva visto. Van juntos porque sin el reposo no se puede restar nada, y sin el
+pico un número de vatios no dice si vas holgado o al tope.
 
-Muestrear por petición desde el proxy costaría **6,3 veces todo lo que el proxy
-cuesta**: el instrumento pasaría a ser el gasto dominante. El monitor, que
-refresca cada segundo, paga un **2,4%** de su ciclo — y solo mientras el panel
-está abierto.
+**No es el reposo de la tarjeta.** Es lo más bajo que el monitor le ha visto
+desde que se abrió el panel: si la GPU nunca estuvo ociosa en ese rato, será
+alto. El panel lo dice en la propia línea.
+
+### Por qué arranca oculto, y por qué el proxy no invoca `nvidia-smi`
+
+Medido en una máquina real: **arrancar** `nvidia-smi` cuesta **23,81 ms** de
+mediana, seis veces el overhead **total** del proxy —**3,79 ms**,
+([`telemetry-per-request.md`](telemetry-per-request.md) §4.1). Por eso el proxy
+no lo invoca por petición: el instrumento pasaría a ser el gasto dominante.
+
+El monitor, que refresca cada segundo, paga un **2,4%** de su ciclo — y solo
+mientras el panel está abierto.
+
+### Corrección: el proxy SÍ atribuye por petición
+
+Una versión anterior de esta sección decía que hacerlo «exige NVML en vez de un
+subproceso». **Es falso.** Los 23,81 ms son el coste de **arrancar**
+`nvidia-smi`, no el de leer: un `-lms 200` **persistente** paga ese arranque una
+vez y luego cuesta **0,1% de un core** (50 muestras en 10 s, medido).
+
+El proxy hace eso y publica `energy_wh` por petición
+([`telemetry-per-request.md`](telemetry-per-request.md) §4.19). En la tabla de
+requests aparece como la columna **`Wh_net`**.
 
 ### Lo que este panel NO hace
 
 **No atribuye a una petición.** Dice «la máquina está a 277 W», no «esta
-petición costó 2,3 Wh». Para eso habría que muestrear dentro de la ventana del
-request, que es trabajo del proxy y exige NVML en vez de un subproceso.
+petición costó 66 mWh». Eso lo dice la columna `Wh_net`.
 
-Y **no separa cargar el modelo de inferir con él**. Medido contra ollama, la
-carga puede ser el **92%** del tiempo de una petición fría. Para los vatios da
-igual —esa energía se gasta de verdad— pero cualquier cifra derivada por token
-heredaría la distorsión. Ver el issue #92.
+Y **no separa cargar el modelo de inferir con él**. Para los vatios da igual
+—esa energía se gasta de verdad— pero cualquier cifra derivada por token
+heredaría la distorsión; para eso están `load_us`/`eval_us`.
 
 Solo lee la **primera** GPU, y la nombra para que se sepa cuál. Agregar varias
 sin decir cuál sería peor que enseñar una.

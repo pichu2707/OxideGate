@@ -607,6 +607,34 @@ struct RequestRow {
     cache_read_tokens: Option<u64>,
     cache_write_tokens: Option<u64>,
     cost_estimate_usd: Option<f64>,
+    /// Energía BRUTA que la máquina consumió MIENTRAS la petición estuvo
+    /// abierta, reposo incluido, y el reposo equivalente de esa misma ventana
+    /// (espejo de `RecentRequest::energy_wh` / `energy_idle_wh`).
+    ///
+    /// **La columna pinta la NETA**, `bruta − reposo`, porque es la cifra que
+    /// se compara con `usd`: lo atribuible al trabajo. Las dos llegan por
+    /// separado a propósito — el proxy no resta por dentro, y el monitor
+    /// enseña la resta hecha pero no la inventa: si falta cualquiera de las
+    /// dos, la celda es el guion de dato ausente.
+    ///
+    /// `None` con upstream remoto, sin `nvidia-smi`, o con un proxy anterior
+    /// a este campo. El monitor NO distingue esos casos y no lo intenta.
+    energy_wh: Option<f64>,
+    energy_idle_wh: Option<f64>,
+    /// Pico de potencia dentro de la ventana, en vatios. No se pinta en la
+    /// tabla —el panel `g` ya enseña la aguja— pero llega para que la fila
+    /// esté completa frente al contrato de `/requests`.
+    #[allow(dead_code)]
+    power_peak_w: Option<f64>,
+    /// Cuántas muestras REALES sostienen la energía de esta fila.
+    ///
+    /// No tiene columna propia porque es una advertencia SOBRE el dato, no
+    /// otro dato. Por debajo de [`MUESTRAS_MINIMAS`] la celda `Wh_net` sale
+    /// con `~` delante: el número viene de interpolar entre las dos muestras
+    /// que rodean una petición más corta que la cadencia del muestreador.
+    /// Sigue siendo honesto, pero pintarlo con la misma cara que uno sostenido
+    /// por veinte muestras sería fingir una precisión que no hay.
+    energy_samples: Option<u32>,
     #[allow(dead_code)]
     cache_control_forced: bool,
     /// Nivel de esfuerzo de razonamiento PEDIDO por el cliente
@@ -2529,6 +2557,33 @@ fn linea_modelos_residentes(app: &App) -> Line<'static> {
 /// Sin lectura no se pinta un cero. `-` significa «no lo sé» —no hay
 /// `nvidia-smi`, no hay driver, o la salida no era la esperada— y un `0 W`
 /// diría «la máquina no está gastando nada», que es una afirmación distinta.
+/// Línea de reposo y pico del histórico que el MONITOR lleva visto.
+///
+/// Es el par que hace legible un número de vatios: sin el reposo no se puede
+/// restar nada, y sin el pico no se sabe si 258 W es mucho. El mismo par que
+/// el proxy publica por petición (`energy_idle_wh` / `power_peak_w`), pero de
+/// otra fuente y con otro alcance — y por eso lo dice.
+///
+/// **No es el reposo de la tarjeta**: es lo más bajo que el monitor le ha
+/// visto desde que se abrió el panel. Si la GPU nunca estuvo ociosa en ese
+/// rato, será alto. Decirlo cuesta una palabra y evita leerlo como una
+/// especificación del fabricante.
+fn linea_reposo_y_pico(app: &App) -> Line<'static> {
+    let (Some(min), Some(max)) = (
+        app.gpu_watts.iter().copied().min(),
+        app.gpu_watts.iter().copied().max(),
+    ) else {
+        return Line::from(Span::styled(
+            "reposo/pico: aún sin histórico",
+            Style::default().fg(Color::DarkGray),
+        ));
+    };
+    Line::from(Span::styled(
+        format!("reposo {min} W   pico {max} W   (visto por el monitor, no de la tarjeta)"),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
 fn draw_gpu_panel(f: &mut Frame, area: Rect, app: &App) {
     let Some(g) = app.gpu.as_ref() else {
         let aviso =
@@ -2567,6 +2622,7 @@ fn draw_gpu_panel(f: &mut Frame, area: Rect, app: &App) {
             "uso {:>3}%   {} °C   VRAM {} / {} MB",
             g.util_pct, g.grados, g.mem_usada_mb, g.mem_total_mb
         )),
+        linea_reposo_y_pico(app),
         Line::from(Span::styled(
             g.nombre.clone(),
             Style::default().fg(Color::DarkGray),
@@ -3074,7 +3130,7 @@ fn requests_table_labels<'a>(view: RequestsView) -> Vec<&'a str> {
         RequestsView::Latency => {
             vec![
                 "hora", "modelo", "st", "status", "in", "out", "c_rd", "c_wr", "ttft_ms", "gen_ms",
-                "tok/s", "effort", "spd_req", "spd_got", "usd", "outlier",
+                "tok/s", "effort", "spd_req", "spd_got", "usd", "Wh_net", "outlier",
             ]
         }
         RequestsView::Context => {
@@ -3133,6 +3189,7 @@ fn requests_table_widths(view: RequestsView) -> Vec<Constraint> {
             Constraint::Length(8),
             Constraint::Length(7),
             Constraint::Length(7),
+            Constraint::Length(8),
             Constraint::Length(8),
             Constraint::Length(8),
             Constraint::Length(8),
@@ -3369,6 +3426,7 @@ fn requests_row_cells(view: RequestsView, r: &RequestRow) -> Vec<String> {
             opt_str_short(r.requested_speed.as_deref()),
             opt_str_short(r.served_speed.as_deref()),
             opt_fixed(r.cost_estimate_usd, 4),
+            energia_neta_cell(r),
         ],
         RequestsView::Context => vec![
             format_time(&r.timestamp),
@@ -3589,6 +3647,64 @@ fn opt_fixed(v: Option<f64>, decimals: usize) -> String {
     }
 }
 
+/// Advertencia que acompaña SIEMPRE a la columna `Wh_net`.
+///
+/// Una columna de números que no se puede sumar es una trampa puesta por el
+/// instrumento si no lo dice. Dos peticiones solapadas reclaman los mismos
+/// vatios: la suma daría más energía de la que la máquina gastó.
+/// Muestras por debajo de las cuales la energía se marca como aproximada.
+///
+/// Con la cadencia del muestreador del proxy (200 ms), una petición de menos
+/// de medio segundo puede caer entre dos muestras: la cifra sale de
+/// interpolar, no de integrar una curva. Dos es el mínimo para que haya
+/// CURVA dentro de la ventana y no solo extremos.
+const MUESTRAS_MINIMAS: u32 = 2;
+
+const NOTA_ENERGIA: &str = "energía: Wh_net = lo que la máquina gastó MIENTRAS \
+     la petición estuvo abierta, menos el reposo. NO se puede sumar la columna: \
+     dos peticiones solapadas reclaman los mismos vatios. `~` = pocas muestras \
+     dentro de la ventana, cifra basta. Solo upstream local; el precio del kWh \
+     lo pone quien lee (ver docs/telemetry-per-request.md §4.19)";
+
+/// Celda `Wh_net`: la energía ATRIBUIBLE al trabajo de esta petición, que es
+/// `energy_wh − energy_idle_wh`.
+///
+/// # Por qué el monitor resta y el proxy no
+///
+/// El proxy publica las dos mitades por separado a propósito: la atribución no
+/// es limpia —si otra cosa usa la GPU a la vez, la muestra no es solo de la
+/// inferencia— y un único número ya restado fingiría una precisión que no hay.
+///
+/// El monitor SÍ resta, porque una columna de tabla tiene que caber en ocho
+/// caracteres y porque la neta es la que se compara con `usd`. Pero solo resta
+/// lo que le llega: **si falta cualquiera de las dos mitades la celda es el
+/// guion de ausencia**, nunca la bruta disfrazada de neta. El dato completo
+/// sigue estando en `/requests`.
+///
+/// Escala: por debajo de 1 Wh se pinta en **milivatios-hora** con sufijo `m`.
+/// Una petición local corta ronda las decenas de mWh, y `0.0000` en la
+/// columna se leería como «gratis» en vez de «pequeño».
+fn energia_neta_cell(r: &RequestRow) -> String {
+    let (Some(bruta), Some(reposo)) = (r.energy_wh, r.energy_idle_wh) else {
+        return "-".to_string();
+    };
+    let neta = bruta - reposo;
+    if !neta.is_finite() {
+        return "-".to_string();
+    }
+    // `~` cuando el número lo sostienen menos muestras de las mínimas: es
+    // interpolación entre dos puntos de fuera de la ventana, no una curva.
+    let aprox = match r.energy_samples {
+        Some(n) if n < MUESTRAS_MINIMAS => "~",
+        _ => "",
+    };
+    if neta.abs() >= 1.0 {
+        format!("{aprox}{neta:.3}")
+    } else {
+        format!("{aprox}{:.1}m", neta * 1000.0)
+    }
+}
+
 /// Celda de `tok/s` para la tabla: reusa [`generation_throughput`] para que
 /// la columna visible y el cálculo de `SlowGeneration` sean SIEMPRE
 /// consistentes entre sí (mismo criterio de qué filas son calculables).
@@ -3631,7 +3747,7 @@ fn print_requests_table(rows: &[RequestRow]) {
     let outliers = classify_outliers(rows);
 
     println!(
-        "{:<10} {:<16} {:>2} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>7} {:>7} {:>8} {:>8} {:>8} {:<14}",
+        "{:<10} {:<16} {:>2} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:<14}",
         "HORA",
         "MODELO",
         "st",
@@ -3647,12 +3763,13 @@ fn print_requests_table(rows: &[RequestRow]) {
         "spd_req",
         "spd_got",
         "usd",
+        "Wh_net",
         "outlier"
     );
     for (i, r) in rows.iter().enumerate().rev() {
         let cells = requests_row_cells(RequestsView::Latency, r);
         println!(
-            "{:<10} {:<16} {:>2} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>7} {:>7} {:>8} {:>8} {:>8} {:<14}",
+            "{:<10} {:<16} {:>2} {:>6} {:>6} {:>6} {:>6} {:>6} {:>8} {:>8} {:>7} {:>7} {:>8} {:>8} {:>8} {:>8} {:<14}",
             cells[0],
             cells[1],
             cells[2],
@@ -3668,6 +3785,7 @@ fn print_requests_table(rows: &[RequestRow]) {
             cells[12],
             cells[13],
             cells[14],
+            cells[15],
             marker_text(&outliers[i]),
         );
     }
@@ -3677,6 +3795,7 @@ fn print_requests_table(rows: &[RequestRow]) {
     println!(
         "nota: effort = output_config.effort pedido; spd_req = speed pedido (raíz); spd_got = usage.speed servido (Anthropic; documentado pero no observado aún en tráfico real)"
     );
+    println!("{NOTA_ENERGIA}");
 }
 
 /// Imprime la tabla CONTEXT de requests recientes en texto plano (modo
@@ -4233,6 +4352,10 @@ mod tests {
             cache_read_tokens,
             cache_write_tokens: Some(0),
             cost_estimate_usd: Some(0.01),
+            energy_wh: None,
+            energy_idle_wh: None,
+            power_peak_w: None,
+            energy_samples: None,
             cache_control_forced: false,
             requested_effort: None,
             requested_speed: None,
@@ -5578,6 +5701,141 @@ mod tests {
                 "{vista:?}: {celdas} celdas (+outlier) contra {anchos} anchos"
             );
         }
+    }
+
+    /// La columna `Wh_net` es la RESTA, y solo se hace cuando llegan las dos
+    /// mitades. El proxy manda bruta y reposo por separado a propósito.
+    #[test]
+    fn la_columna_de_energia_pinta_la_neta() {
+        let mut r = req(
+            "ollama",
+            "qwen2.5:7b",
+            200,
+            Some(100.0),
+            3382.0,
+            Some(167),
+            None,
+        );
+        r.energy_wh = Some(0.109_894);
+        r.energy_idle_wh = Some(0.043_794);
+        r.energy_samples = Some(17);
+        // 66,1 mWh: la bruta menos el reposo, en milivatios-hora porque
+        // `0.0661` se leería como casi cero.
+        assert_eq!(energia_neta_cell(&r), "66.1m");
+    }
+
+    /// **Media medición no es una medición.** Si falta cualquiera de las dos
+    /// mitades la celda es el guion de ausencia, NUNCA la bruta pintada como
+    /// si fuera neta — que es exactamente el número que engañaría.
+    #[test]
+    fn sin_las_dos_mitades_la_energia_es_ausente_no_la_bruta() {
+        let mut r = req(
+            "ollama",
+            "qwen2.5:7b",
+            200,
+            Some(100.0),
+            3382.0,
+            Some(167),
+            None,
+        );
+        r.energy_wh = Some(0.109_894);
+        r.energy_idle_wh = None;
+        assert_eq!(energia_neta_cell(&r), "-");
+
+        r.energy_wh = None;
+        r.energy_idle_wh = Some(0.043_794);
+        assert_eq!(energia_neta_cell(&r), "-");
+    }
+
+    /// Con upstream remoto no hay energía y la columna lo dice con el guion,
+    /// igual que `usd` hace con un modelo local. Es la misma simetría por el
+    /// otro lado: a nadie le facturan un modelo local, y nadie puede medir los
+    /// vatios de un datacenter ajeno.
+    #[test]
+    fn un_modelo_remoto_no_publica_energia() {
+        let r = req(
+            "anthropic",
+            "claude-opus-4-8",
+            200,
+            Some(500.0),
+            1200.0,
+            Some(80),
+            Some(1000),
+        );
+        assert_eq!(energia_neta_cell(&r), "-");
+    }
+
+    /// Pocas muestras dentro de la ventana → `~`. El número sale de
+    /// interpolar entre dos puntos de FUERA, y pintarlo con la misma cara que
+    /// uno sostenido por diecisiete muestras fingiría una precisión que no hay.
+    #[test]
+    fn con_pocas_muestras_la_energia_se_marca_aproximada() {
+        let mut r = req(
+            "ollama",
+            "qwen2.5:7b",
+            200,
+            Some(50.0),
+            464.0,
+            Some(41),
+            None,
+        );
+        r.energy_wh = Some(0.033_418);
+        r.energy_idle_wh = Some(0.006_003);
+        r.energy_samples = Some(1);
+        assert_eq!(energia_neta_cell(&r), "~27.4m");
+
+        r.energy_samples = Some(3);
+        assert_eq!(energia_neta_cell(&r), "27.4m");
+    }
+
+    /// El panel `g` enseña reposo y pico JUNTOS: sin el reposo no se puede
+    /// restar nada, y sin el pico un número de vatios no dice si vas holgado.
+    /// Es el mismo par que el proxy publica por petición, de otra fuente.
+    #[test]
+    fn el_panel_de_gpu_enseña_reposo_y_pico() {
+        let mut app = App::new("http://x".to_string());
+        for w in [258, 44, 273, 60] {
+            app.gpu_watts.push_back(w);
+        }
+        let texto = linea_reposo_y_pico(&app)
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect::<String>();
+        assert!(texto.contains("reposo 44 W"), "{texto}");
+        assert!(texto.contains("pico 273 W"), "{texto}");
+    }
+
+    /// Sin histórico no se inventa un reposo. Un `0 W` ahí se leería como
+    /// "la tarjeta no consume nada", que es lo contrario de "no lo sé".
+    #[test]
+    fn sin_historico_el_panel_no_inventa_un_reposo() {
+        let app = App::new("http://x".to_string());
+        let texto = linea_reposo_y_pico(&app)
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect::<String>();
+        assert!(texto.contains("sin histórico"), "{texto}");
+    }
+
+    /// Por encima de 1 Wh se pinta en vatios-hora enteros, no en miles de
+    /// mWh: una petición larga daría `1234.5m`, que nadie lee.
+    #[test]
+    fn por_encima_de_un_vatio_hora_cambia_de_unidad() {
+        let mut r = req(
+            "ollama",
+            "qwen2.5:7b",
+            200,
+            Some(100.0),
+            900_000.0,
+            Some(50_000),
+            None,
+        );
+        r.energy_wh = Some(3.5);
+        r.energy_idle_wh = Some(1.25);
+        r.energy_samples = Some(4000);
+        assert_eq!(energia_neta_cell(&r), "2.250");
     }
 
     /// Sin `cache_by_section` la vista no inventa ceros: marca ausente cada
