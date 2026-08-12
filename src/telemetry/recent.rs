@@ -278,8 +278,15 @@ pub struct RecentRequest {
     /// CARGAR el modelo de inferir con el: medido, la carga fue el 57% de una
     /// peticion fria. `ttft_ms` mezcla esa carga con el procesado del prompt.
     ///
-    /// NO corrigen ningun error de `tokens_per_sec`: en streaming el `ttft_ms`
-    /// ya absorbe la carga, asi que la velocidad publicada ya era correcta.
+    /// NO corrigen ningun error de `tokens_per_sec` POR LA CARGA: en streaming
+    /// el `ttft_ms` ya la absorbe, asi que por ese lado la velocidad publicada
+    /// ya era correcta.
+    ///
+    /// La frase se acoto en #102. Antes decia que la velocidad «ya era
+    /// correcta», a secas, y eso era mas de lo que se habia medido: con UN
+    /// SOLO token de salida el campo publicaba 17.462 tok/s. Ese error existia
+    /// y no tenia nada que ver con la carga — ver `generation_throughput` en
+    /// `metered.rs`.
     ///
     /// `None` en los cuatro dialectos de nube: no es que no carguen modelos,
     /// es que no lo reportan. Ausencia honesta, no un cero.

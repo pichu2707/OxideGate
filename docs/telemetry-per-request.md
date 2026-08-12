@@ -151,6 +151,7 @@ reenviado crudo. Ver §4.5 antes de exponer este endpoint fuera de
 | `cache_control_forced` | `true` si OxideGate inyectó el breakpoint de `cache_control` (Palanca A) | Sirve para correlacionar si la palanca estaba activa en esa fila puntual |
 | `ttft_ms` | Time To First Token en ms | `null` si no aplica (sin streaming); un valor mucho más alto que el resto del mismo modelo es la señal de latencia percibida |
 | `total_ms` | Latencia total, del request al cierre de la respuesta | Junto con `ttft_ms`, permite derivar el tiempo de generación (`total_ms - ttft_ms`) fuera del endpoint |
+| `tokens_per_sec` | Tokens de salida por segundo sobre el tramo de generación | `null` cuando **no hay intervalo que medir**: sin streaming, con `total_ms <= ttft_ms`, o con **`output_tokens <= 1`** — una tasa necesita dos puntos, y con un token el primer chunk es el último (ver §4.20). Un consumidor tiene que tratar el `null` como «no medible», nunca como cero |
 | `context_system_bytes` | Bytes del prompt de sistema | `null` si no se pudo calcular el desglose (ver `provider::ContextBreakdown`) |
 | `context_tools_bytes` | Bytes del esquema de herramientas (tool definitions) | En tráfico real medido, esta fue la porción más grande del body (~71%) — un valor alto y estable en todas las filas es candidato a desconectar servidores MCP sin uso |
 | `context_history_bytes` | Bytes de todos los mensajes del historial menos el último | Crece con la conversación; junto con `context_tools_bytes`, compite por ser la porción dominante del body |
@@ -1667,15 +1668,19 @@ proporción crece— pero el motivo correcto es ese, no el que estaba escrito.
 
 ### Lo que NO arregla
 
-**No corrige ningún error de `tokens_per_sec`.** En streaming el proxy calcula
-`salida / (total_ms − ttft_ms)`, y el `ttft_ms` **ya absorbe la carga**: el
-primer chunk no sale hasta que el modelo está cargado. Sobre esa misma
-petición, `ttft_ms` fue 1.477 ms contra 1.474 de `load + prompt_eval`, y la
-velocidad publicada **126,1 frente a 126,2 reales**. Fuera de streaming el
-campo es `null`, no un número malo.
+**No corrige ningún error de `tokens_per_sec` POR LA CARGA.** En streaming el
+proxy calcula `salida / (total_ms − ttft_ms)`, y el `ttft_ms` **ya absorbe la
+carga**: el primer chunk no sale hasta que el modelo está cargado. Sobre esa
+misma petición, `ttft_ms` fue 1.477 ms contra 1.474 de `load + prompt_eval`, y
+la velocidad publicada **126,1 frente a 126,2 reales**.
 
 Se deja escrito porque una versión anterior de esta documentación afirmaba lo
 contrario, y hay un test que fija la equivalencia para que no vuelva.
+
+> **Ojo con el alcance de esa frase.** Esta sección decía antes que el campo no
+> tenía «ningún error», a secas, y eso era más de lo que se había medido:
+> `tokens_per_sec` **sí** tenía uno, ajeno a la carga —con un solo token de
+> salida publicaba 17.462 tok/s—, y se arregló aparte. Ver [§4.20](#420-tokens_per_sec-una-tasa-necesita-dos-puntos).
 
 ### NDJSON, no SSE
 
@@ -1796,6 +1801,111 @@ Esto es **Linux con NVIDIA primero**, y se declara en vez de que el campo salga
 en macOS no están. La integración sí está separada de quién llena el anillo,
 así que añadir otra fuente no tocaría la cuenta — pero hoy no hay ninguna, y
 decir lo contrario sería vender una capacidad que no existe.
+
+---
+
+## 4.20. `tokens_per_sec`: una tasa necesita dos puntos
+
+Midiendo #92 salió esto por el cable, con `num_predict: 1` para aislar el coste
+de cargar el modelo:
+
+```
+MODELO       st status  in  out  ttft_ms  gen_ms      tok/s
+qwen2.5:7b    y    200  34    1   1449.3     0.1   17462.1
+```
+
+**17.462 tokens por segundo** en una tarjeta que ese mismo minuto daba **126,8**.
+
+No era un fallo de cálculo: era la fórmula haciendo lo que dice.
+`salida / (total_ms − ttft_ms)` y, con **un solo token**, el primer chunk *es*
+el último — `ttft` se come la ventana entera y el denominador cae a **0,057 ms**.
+
+### Por qué la guarda anterior no lo veía
+
+Había una, y anulaba el campo fuera de streaming con este razonamiento: *«en
+una respuesta no-streaming todo llega de golpe (ttft ≈ total) y el tramo tiende
+a cero, disparando un número absurdo»*.
+
+El diagnóstico era correcto y estaba **atribuido al dialecto equivocado**. La
+degeneración no la causa el no-streaming: la causa que **no haya intervalo
+entre tokens**. En streaming con un token pasa exactamente igual, y ahí la
+guarda no miraba.
+
+### Lo que rompía, medido
+
+Un valor absurdo no se queda quieto en su fila. Contamina a los demás por dos
+caminos:
+
+**1. Envenena la media de `/stats`.** Medido en vivo:
+
+| modelo | `avg_tokens_per_sec` | peticiones |
+|---|---:|---:|
+| `qwen2.5:7b` | **5.905,8** | 3 |
+| `llama3.2:3b` | 231,2 | 2 |
+
+5.905,8 para un modelo que corre a 127.
+
+**2. Mata la detección de lentitud, en silencio.**
+`classify_slow_generation` marca `SLOW` por debajo de `media − 2σ`, y el valor
+absurdo infla las dos. Con cinco peticiones sanas a 127 tok/s y una de un
+token:
+
+| | |
+|---|---:|
+| media | 3.016,2 |
+| σ | 6.460,5 |
+| umbral `SLOW` | **−9.905** |
+
+Un umbral **negativo**, que ninguna fila puede cruzar. El detector seguía
+corriendo y ya no podía marcar nada — el modo de fallo que este proyecto
+persigue en todas partes.
+
+### La regla
+
+`tokens_per_sec` es `null` con **`output_tokens <= 1`**.
+
+El umbral está ahí porque **sale de la definición de tasa**, no de una
+medición: una tasa necesita dos puntos. Con cero tokens, además, el numerador
+es cero, y publicar `0.0` diría «lentísimo» donde lo cierto es «no generó
+nada».
+
+Se descartaron dos alternativas:
+
+| Opción | Por qué no |
+|---|---|
+| Suelo sobre `gen_ms` (p. ej. ≥ 1 ms) | Cubriría también respuestas de 2-3 tokens en máquinas rápidas, pero el umbral **sí** sería arbitrario: habría que medirlo, no elegirlo |
+| Filtrar solo en el consumidor (TUI, `/stats`) | El número falso seguiría en `/requests` y el siguiente consumidor tropezaría igual |
+
+**No mueve `CONTRACT_VERSION`.** El campo no se renombra, no cambia de tipo ni
+de unidad: sigue siendo un `float` nullable en tok/s. Un consumidor correcto ya
+tenía que manejar el `null` —el campo ya lo era fuera de streaming— así que lo
+único que cambia es que ahora aparece en un caso más. Ver §8.2.
+
+### La regla vive DOS veces, y es a propósito
+
+`oxidegate-monitor` no lee `tokens_per_sec`: lo **recalcula** desde
+`output_tokens`, `total_ms` y `ttft_ms`. Arreglar solo el proxy habría dejado
+la columna `tok/s` y el detector de lentitud igual de rotos.
+
+Son dos binarios y el crate no tiene `lib`, así que la regla no se puede
+compartir. Se duplica con el **mismo nombre** (`generation_throughput`, en
+`src/telemetry/metered.rs` y en `src/bin/monitor.rs`) para que un `grep` las
+encuentre a las dos. Si esto crece, la salida es extraer un `lib`, no
+sincronizarlas a mano.
+
+### Lo que este arreglo NO toca
+
+`total − ttft` es el tiempo que tardan en salir los tokens **2..N**, no los
+`N`. El numerador honesto sería `output_tokens − 1`.
+
+Sobre 200 tokens la diferencia es del 0,5% —ruido—, pero sobre 5 es del **20%**.
+Es una corrección real y cambia **todos** los valores publicados de
+`tokens_per_sec`, así que merece su propia discusión y su propia medida. Queda
+escrita aquí para no perderla.
+
+Igual que `avg_tokens_per_sec`, que promedia tasas por petición y por tanto
+sobrepondera las peticiones cortas aunque ninguna sea degenerada. Problema
+distinto y más leve.
 
 ---
 

@@ -224,7 +224,7 @@ presentación):
 | `c_rd` / `c_wr` | Tokens de caché leídos/escritos |
 | `ttft_ms` | Time To First Token en ms |
 | `gen_ms` | Tiempo de generación, `total_ms - ttft_ms` |
-| `tok/s` | Throughput de generación, `output_tokens / (gen_ms / 1000)` |
+| `tok/s` | Throughput de generación, `output_tokens / (gen_ms / 1000)`. **`-` con `out <= 1`**: una tasa necesita dos puntos, y con un solo token el primer chunk es el último — el denominador cae al ruido de cerrar el stream y la cifra se dispara (medido: **17.462 tok/s** en una tarjeta que hacía 126,8). Esas filas se EXCLUYEN de la métrica, así que tampoco pueden salir marcadas `SLOWGEN`. Ver `telemetry-per-request.md` §4.20 |
 | `usd` | Coste estimado |
 | `Wh_net` | Energía **atribuible** de esta petición: `energy_wh − energy_idle_wh`, en mWh por debajo de 1 Wh. `~` = pocas muestras dentro de la ventana, cifra basta. `-` con upstream remoto, sin `nvidia-smi`, o si falta cualquiera de las dos mitades. **NO se puede sumar la columna**: dos peticiones solapadas reclaman los mismos vatios. Ver `telemetry-per-request.md` §4.19 |
 | `outlier` | Marcadores de esta fila (ver abajo), p. ej. `ERR+TTFT` |

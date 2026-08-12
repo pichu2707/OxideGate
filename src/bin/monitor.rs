@@ -1150,11 +1150,43 @@ fn mean_and_stddev(values: &[f64]) -> Option<(f64, f64)> {
 }
 
 /// Throughput de generación de una fila, en tokens/seg, o `None` si no es
-/// calculable: sin `output_tokens`, sin `ttft_ms`, o con
-/// `total_ms - ttft_ms <= 0` (no-streaming, donde TTFT ≈ total: la resta da
-/// cero o negativo). Estas filas se EXCLUYEN del todo de la métrica, nunca
-/// se tratan como "lentas".
+/// calculable. Estas filas se EXCLUYEN del todo de la métrica, nunca se
+/// tratan como "lentas".
+///
+/// Dos motivos para `None`, y los dos son el mismo: **no hay intervalo sobre
+/// el que medir velocidad**.
+///
+/// 1. **`output_tokens <= 1`.** Una tasa necesita dos puntos. Con un solo
+///    token el primer chunk *es* el último, así que `total − ttft` no mide el
+///    tiempo entre tokens sino el ruido de cerrar el stream. Medido con
+///    `num_predict: 1` (#102): `ttft` 1.449,3 ms contra `total` 1.449,4 daban
+///    un denominador de **0,057 ms** y **17.462 tok/s** en una tarjeta que ese
+///    mismo minuto hacía 126,8. Con cero tokens el numerador además es cero, y
+///    publicar `0.0` diría «lentísimo» donde lo cierto es «no generó nada».
+/// 2. **`total_ms - ttft_ms <= 0`** (no-streaming, donde TTFT ≈ total: la
+///    resta da cero o negativo).
+///
+/// El umbral está en `<= 1` porque **sale de la definición de tasa**, no de
+/// una medición: cualquier otro número habría que medirlo antes de elegirlo.
+///
+/// Lo que hace este `None` imprescindible no es la fila que lo produce, sino
+/// lo que el valor absurdo le hacía al GRUPO: `classify_slow_generation` marca
+/// por debajo de `media − 2σ`, y una sola fila de 17.462 tok/s entre cinco
+/// sanas dejaba el umbral en **−9.905** — negativo, imposible de cruzar. El
+/// detector seguía corriendo sin poder marcar nada.
+///
+/// ## El gemelo del proxy
+///
+/// `src/telemetry/metered.rs` tiene una función con este MISMO nombre y
+/// contrato, la que puebla `tokens_per_sec` en `/requests`. El TUI no lee ese
+/// campo: lo recalcula desde los crudos, así que arreglar una sola dejaría la
+/// otra mitad rota. Son dos binarios y el crate no tiene `lib`, así que la
+/// regla se duplica a propósito, con el nombre igual para que un `grep` las
+/// encuentre a las dos. Si esto crece, la salida es extraer un `lib`.
 fn generation_throughput(output_tokens: u64, total_ms: f64, ttft_ms: f64) -> Option<f64> {
+    if output_tokens <= 1 {
+        return None;
+    }
     let gen_ms = total_ms - ttft_ms;
     if gen_ms <= 0.0 {
         return None;
@@ -4568,6 +4600,90 @@ mod tests {
         let result = classify_outliers(&rows);
 
         assert!(!result[4].contains(&OutlierKind::SlowGeneration));
+    }
+
+    /// REGRESIÓN (#102). Una respuesta de UN SOLO token no tiene tasa: el
+    /// primer chunk es también el último, así que `total − ttft` no mide el
+    /// tiempo entre tokens sino el ruido de cerrar el stream. Medido con
+    /// `num_predict: 1`: un denominador de 0,057 ms daba **17.462 tok/s**.
+    #[test]
+    fn un_solo_token_no_tiene_tasa() {
+        assert_eq!(
+            generation_throughput(1, 1449.4, 1449.3),
+            None,
+            "con un token no hay intervalo que medir"
+        );
+        assert_eq!(
+            generation_throughput(0, 500.0, 100.0),
+            None,
+            "y con cero, publicar 0.0 diria «lentisimo» en vez de «no genero nada»"
+        );
+        let tasa = generation_throughput(2, 1100.0, 1000.0).expect("2 tokens en 100 ms");
+        assert!(
+            (tasa - 20.0).abs() < 1e-9,
+            "dos tokens ya son un intervalo: 20 tok/s, salio {tasa}"
+        );
+    }
+
+    /// REGRESIÓN (#102), y esta es la que duele: una sola fila degenerada NO
+    /// puede desactivar el detector de lentitud del resto del grupo.
+    ///
+    /// `classify_slow_generation` marca `SLOW` por debajo de `media − 2σ`. Con
+    /// cinco filas sanas a ~127 tok/s y una de un token a 17.462, la media se
+    /// iba a 3.016 y σ a 6.460: umbral **−9.905**, que ninguna fila puede
+    /// cruzar. El detector seguía corriendo sin poder marcar nada — fallo en
+    /// silencio, que es justo el modo que este proyecto persigue.
+    ///
+    /// Con la fila degenerada EXCLUIDA, la lenta de verdad vuelve a salir.
+    #[test]
+    fn una_fila_de_un_token_no_desactiva_la_deteccion_de_lentitud() {
+        // Cinco sanas: 200 tokens en 1.000 ms de generacion = 200 tok/s.
+        let mut rows: Vec<RequestRow> = (0..5)
+            .map(|_| {
+                req(
+                    "ollama",
+                    "qwen2.5:7b",
+                    200,
+                    Some(100.0),
+                    1100.0,
+                    Some(200),
+                    Some(0),
+                )
+            })
+            .collect();
+
+        // La lenta de verdad: 200 tokens en 10.000 ms = 20 tok/s.
+        rows.push(req(
+            "ollama",
+            "qwen2.5:7b",
+            200,
+            Some(100.0),
+            10100.0,
+            Some(200),
+            Some(0),
+        ));
+
+        // La degenerada: 1 token, ttft ~= total. Antes publicaba 17.462 tok/s.
+        rows.push(req(
+            "ollama",
+            "qwen2.5:7b",
+            200,
+            Some(1449.3),
+            1449.4,
+            Some(1),
+            Some(0),
+        ));
+
+        let result = classify_outliers(&rows);
+
+        assert!(
+            result[5].contains(&OutlierKind::SlowGeneration),
+            "la fila lenta de verdad tiene que seguir saliendo marcada"
+        );
+        assert!(
+            !result[6].contains(&OutlierKind::SlowGeneration),
+            "la de un token se EXCLUYE, nunca se trata como lenta"
+        );
     }
 
     #[test]
