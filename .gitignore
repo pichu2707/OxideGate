@@ -11,3 +11,10 @@ presentations/
 # Cuerpos capturados por `cargo run --example captura`. Llevan el CLAUDE.md,
 # el AGENTS.md y la configuracion de quien los capture: NUNCA se versionan.
 /capturas/
+
+# Respaldos que deja `git mergetool` al resolver un conflicto (los deja por
+# defecto: `mergetool.keepBackup` viene activado). Son una copia entera del
+# fichero, asi que un `git add -A` distraido commitea cientos de KB de codigo
+# duplicado y viejo. Ya paso una vez con `src/bin/monitor.rs.orig`, que ademas
+# se quedo dias en el arbol y confundio el diagnostico de una rama.
+*.orig
