@@ -117,8 +117,211 @@ pub enum InstructionsFormat {
     OpencodeAgentsMd,
 }
 
-/// Bloque de instrucciones encontrado en el body de una petición.
+/// Tope de filas con cabecera propia que publica [`desglosar`].
+///
+/// El contenido del bloque es entrada de terceros: nada impide un fichero con
+/// diez mil cabeceras, y estas filas viven además en el buffer de 200 de
+/// `/requests`, así que el coste se multiplica. Mismo espíritu que
+/// `MAX_TOOL_SERVERS`.
+///
+/// **El desborde SIGUE contándose**: todo lo que pase del cupo colapsa en un
+/// único bucket [`InstructionsHeadingKind::Others`], así que las filas siempre
+/// suman el total exacto del bloque. Se pierde el desglose fino, nunca un byte.
+///
+/// 32 sobra de largo: el `CLAUDE.md` real con el que se midió #97 da **21
+/// filas** a nivel ≤2.
+pub const MAX_INSTRUCTIONS_HEADINGS: usize = 32;
+
+/// Tope de bytes de cada nombre de cabecera publicado. Una cabecera real no se
+/// acerca; una de 1 MB sería una entrada hostil, no un caso de uso. Mismo
+/// motivo y mismo valor que `MAX_TOOL_NAME_LEN`.
+pub const MAX_HEADING_LEN: usize = 128;
+
+/// Qué representa una fila del desglose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InstructionsHeadingKind {
+    /// Todo lo que va ANTES de la primera cabecera: el envoltorio del harness
+    /// (`<system-reminder>`, `# claudeMd`, la ruta absoluta de Codex…) y la
+    /// prosa que el usuario haya puesto antes de titular nada.
+    ///
+    /// Existe para que la suma cuadre con [`InstructionsBlock::bytes`] sin
+    /// tener que restar. Un fichero sin cabeceras da exactamente esta fila y
+    /// nada más, que es la lectura correcta: «esto no está dividido».
+    Preamble,
+    /// Una sección abierta por una cabecera markdown de nivel 1 o 2.
+    Heading,
+    /// Bucket de desborde: todo lo que quedó pasado [`MAX_INSTRUCTIONS_HEADINGS`].
+    Others,
+}
+
+/// Una fila del desglose interior del bloque de instrucciones.
+///
+/// # Qué es esta partición, y qué NO es
+///
+/// **Las fronteras del BLOQUE las pone el envoltorio del harness** — eso está
+/// resuelto en los detectores de este módulo y no se toca. Esto reparte lo que
+/// hay DENTRO, y lo reparte por las cabeceras markdown **del usuario**: es
+/// «cómo lo organizó quien lo escribió», no una partición definida por el
+/// harness ni por el proxy.
+///
+/// La distinción importa porque `docs/optimizer-claude-md.md` documenta que
+/// cortar POR CABECERA para encontrar el FINAL del bloque midió 8.254 B de
+/// 33.716 reales. Ese error fue usar el contenido para delimitar; aquí el
+/// contenido solo se usa para repartir lo ya delimitado.
+///
+/// # No se publica el porcentaje
+///
+/// Un consumidor divide por [`InstructionsBlock::bytes`] y lo tiene. Publicar
+/// la fracción ya cocinada añadiría un campo que puede desincronizarse con los
+/// bytes sin que nada lo note — mismo criterio por el que `energy_idle_wh` se
+/// publica al lado y no restado.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InstructionsHeading {
+    /// Qué clase de fila es. Ver [`InstructionsHeadingKind`].
+    pub kind: InstructionsHeadingKind,
+    /// Nivel de la cabecera markdown (1 o 2). `None` en el preámbulo y en el
+    /// bucket de desborde, que no salen de ninguna cabecera concreta.
+    pub level: Option<u8>,
+    /// Bytes de esta fila, cabecera incluida. La suma de todas las filas es
+    /// EXACTAMENTE [`InstructionsBlock::bytes`].
+    pub bytes: usize,
+    /// Texto de la cabecera, recortado a [`MAX_HEADING_LEN`].
+    ///
+    /// **`None` salvo que la palanca esté puesta** — ver
+    /// [`InstructionsBlock::publicable`]. Un nombre de herramienta ya viajaba
+    /// al proveedor porque lo eligió el cliente; una cabecera de `CLAUDE.md`
+    /// es texto libre de una persona, y puede llevar nombre de cliente, de
+    /// proyecto o de cualquier cosa que no debería salir de la máquina.
+    pub heading: Option<String>,
+}
+
+/// Reparte los bytes de `bloque` entre sus cabeceras markdown de nivel 1 y 2.
+///
+/// # Por qué el nivel 3 no corta
+///
+/// Medido sobre un `CLAUDE.md` real de 33.460 B: a nivel ≤2 salen **21 filas**
+/// y las cuatro mayores son el **86,7%**. Bajar a ≤3 da 44 filas y **destruye
+/// la señal** — «Model Assignments» pasa de 9.809 B (29,3%) a 1.705 B (5,1%)
+/// porque su contenido se reparte entre hijos `###`. La fila que había que ver
+/// deja de existir, y con ella la pregunta que el desglose viene a hacer
+/// contestable: *¿esto que pago siempre, lo uso siempre?*
+///
+/// # Los fences
+///
+/// Una cabecera dentro de un bloque de código **no es una cabecera**: un
+/// `CLAUDE.md` que documenta comandos lleva `# comentario` dentro de un fence,
+/// y contarlo partiría la sección por un sitio que no existe. Se rastrean los
+/// fences de tres backticks, que es la forma que usan los cuatro dialectos.
+///
+/// # La invariante
+///
+/// Las filas suman EXACTAMENTE `bloque.len()`. Lo sostiene el recorrido: se
+/// avanza por líneas con `split_inclusive`, así que ningún salto de línea se
+/// pierde por el camino, y cada corte es el offset donde empieza la siguiente.
+fn desglosar(bloque: &str) -> Vec<InstructionsHeading> {
+    // (offset donde empieza la línea, nivel, título ya recortado)
+    let mut cortes: Vec<(usize, u8, String)> = Vec::new();
+    // Offset de la PRIMERA cabecera rechazada por cupo: donde empieza el
+    // bucket de desborde. `None` si nunca se agotó.
+    let mut desborde: Option<usize> = None;
+    let mut offset = 0usize;
+    let mut en_fence = false;
+
+    for linea in bloque.split_inclusive('\n') {
+        let sin_sangria = linea.trim_end_matches(['\n', '\r']).trim_start();
+
+        if sin_sangria.starts_with("```") {
+            en_fence = !en_fence;
+        } else if !en_fence {
+            if let Some((nivel, titulo)) = cabecera(sin_sangria) {
+                if cortes.len() < MAX_INSTRUCTIONS_HEADINGS {
+                    cortes.push((offset, nivel, titulo));
+                } else {
+                    // Cupo agotado. Se anota dónde empieza el sobrante y se
+                    // deja de mirar: lo único que falta saber es el offset, y
+                    // seguir escaneando solo gastaría tiempo del request.
+                    desborde = Some(offset);
+                    break;
+                }
+            }
+        }
+        offset += linea.len();
+    }
+
+    let mut filas = Vec::with_capacity(cortes.len() + 2);
+    // Frontera final de la última cabecera admitida: donde empieza el
+    // desborde, o el final del bloque si no lo hubo.
+    let tope = desborde.unwrap_or(bloque.len());
+
+    // Preámbulo: del inicio a la primera cabecera. Sin cabeceras es el bloque
+    // entero — y esa es la lectura correcta de un fichero sin titular.
+    let primer_corte = cortes.first().map(|c| c.0).unwrap_or(bloque.len());
+    if primer_corte > 0 {
+        filas.push(InstructionsHeading {
+            kind: InstructionsHeadingKind::Preamble,
+            level: None,
+            bytes: primer_corte,
+            heading: None,
+        });
+    }
+
+    for (i, (inicio, nivel, titulo)) in cortes.iter().enumerate() {
+        let fin = cortes.get(i + 1).map(|c| c.0).unwrap_or(tope);
+        filas.push(InstructionsHeading {
+            kind: InstructionsHeadingKind::Heading,
+            level: Some(*nivel),
+            bytes: fin.saturating_sub(*inicio),
+            heading: Some(titulo.clone()),
+        });
+    }
+
+    if let Some(inicio) = desborde {
+        filas.push(InstructionsHeading {
+            kind: InstructionsHeadingKind::Others,
+            level: None,
+            bytes: bloque.len().saturating_sub(inicio),
+            heading: None,
+        });
+    }
+
+    filas
+}
+
+/// Reconoce una cabecera markdown de nivel 1 o 2 y devuelve `(nivel, título)`.
+///
+/// Exige el espacio tras las almohadillas: `#hashtag` no es una cabecera, y en
+/// un fichero de instrucciones esa forma aparece de verdad.
+fn cabecera(linea: &str) -> Option<(u8, String)> {
+    let almohadillas = linea.len() - linea.trim_start_matches('#').len();
+    if !(1..=2).contains(&almohadillas) {
+        return None;
+    }
+    let resto = &linea[almohadillas..];
+    let titulo = resto.strip_prefix(' ')?.trim();
+    if titulo.is_empty() {
+        return None;
+    }
+    Some((almohadillas as u8, recortar(titulo, MAX_HEADING_LEN)))
+}
+
+/// Recorta `s` a como mucho `max` BYTES sin partir un carácter.
+///
+/// El body es entrada de terceros: un `&s[..max]` a media secuencia UTF-8 sería
+/// un `panic` en el camino crítico de la petición.
+fn recortar(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let corte = (0..=max)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0);
+    s[..corte].to_string()
+}
+
+/// Bloque de instrucciones encontrado en el body de una petición.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InstructionsBlock {
     /// Bytes del bloque COMPLETO, envoltorio incluido. Es lo que se paga en
     /// CADA petición.
@@ -141,6 +344,49 @@ pub struct InstructionsBlock {
     pub bytes: usize,
     /// Qué dialecto se reconoció.
     pub format: InstructionsFormat,
+    /// Reparto de [`Self::bytes`] entre las cabeceras markdown del contenido.
+    ///
+    /// Las filas suman EXACTAMENTE `bytes`, siempre — ver [`desglosar`]. Nunca
+    /// está vacío para un bloque reconocido: sin cabeceras sale una sola fila
+    /// de preámbulo con el bloque entero.
+    ///
+    /// Los NOMBRES no viajan salvo que la palanca esté puesta. Ver
+    /// [`Self::publicable`].
+    pub by_heading: Vec<InstructionsHeading>,
+}
+
+impl InstructionsBlock {
+    /// Devuelve el bloque listo para publicar, quitando los nombres de las
+    /// cabeceras si `con_nombres` es `false`.
+    ///
+    /// # Por qué se filtra AQUÍ y no en el detector
+    ///
+    /// El detector es puro y no conoce la configuración. La decisión de qué
+    /// sale por el cable la toma quien tiene el `AppConfig` delante —
+    /// `Provider::prepare`— y la toma una vez, antes de que el bloque entre en
+    /// `Outgoing`. A partir de ese punto ya no hay nombre que se pueda escapar
+    /// ni a `telemetry.jsonl` ni al buffer de `/requests`.
+    ///
+    /// # Por qué el default es sin nombres
+    ///
+    /// Los tamaños no identifican nada; el texto sí puede. Una cabecera de
+    /// `CLAUDE.md` la escribió una persona y puede llevar nombre de cliente o
+    /// de proyecto. El precedente de `tool_names` no aplica: aquellos nombres
+    /// los eligió el cliente y YA viajaban al proveedor en el mismo body, así
+    /// que publicarlos no añadía exposición. Un nombre de sección viaja igual
+    /// al proveedor, sí — pero también acaba en un fichero en disco y en un
+    /// endpoint HTTP, que es donde alguien lo mira sin haberlo pedido.
+    ///
+    /// Quitar el nombre **no quita el dato**: los bytes, el nivel y la posición
+    /// siguen ahí, y con el fichero delante se sabe qué fila es cuál.
+    pub fn publicable(mut self, con_nombres: bool) -> Self {
+        if !con_nombres {
+            for fila in &mut self.by_heading {
+                fila.heading = None;
+            }
+        }
+        self
+    }
 }
 
 /// Envoltorio del bloque en Claude Code, y la marca que lo distingue de
@@ -200,9 +446,11 @@ fn detect_codex(texto: &str) -> Option<InstructionsBlock> {
     let inicio = texto.find(CODEX_CABECERA)?;
     let abre = texto[inicio..].find(CODEX_ABRE)? + inicio;
     let cierra = texto[abre..].find(CODEX_CIERRA)? + abre + CODEX_CIERRA.len();
+    let bloque = &texto[inicio..cierra];
     Some(InstructionsBlock {
-        bytes: texto[inicio..cierra].len(),
+        bytes: bloque.len(),
         format: InstructionsFormat::CodexAgentsMd,
+        by_heading: desglosar(bloque),
     })
 }
 
@@ -231,19 +479,22 @@ fn detect_codex(texto: &str) -> Option<InstructionsBlock> {
 fn detect_opencode(texto: &str) -> Option<InstructionsBlock> {
     let inicio = texto.find(OPENCODE_MARCA)?;
     let fin = texto[inicio..].find(OPENCODE_FIN)? + inicio;
+    let bloque = &texto[inicio..fin];
     Some(InstructionsBlock {
-        bytes: texto[inicio..fin].len(),
+        bytes: bloque.len(),
         format: InstructionsFormat::OpencodeAgentsMd,
+        by_heading: desglosar(bloque),
     })
 }
 
 /// Claude Code: primer `<system-reminder>` que contenga la cabecera
 /// `# claudeMd`.
 fn detect_claude_md(texto: &str) -> Option<InstructionsBlock> {
-    primer_bloque_con(texto, CLAUDE_ABRE, CLAUDE_CIERRA, CLAUDE_MARCA).map(|(bytes, _)| {
+    primer_bloque_con(texto, CLAUDE_ABRE, CLAUDE_CIERRA, CLAUDE_MARCA).map(|(bloque, _)| {
         InstructionsBlock {
-            bytes,
+            bytes: bloque.len(),
             format: InstructionsFormat::ClaudeMd,
+            by_heading: desglosar(bloque),
         }
     })
 }
@@ -301,6 +552,7 @@ mod tests {
         let v = serde_json::to_value(InstructionsBlock {
             bytes: 33_716,
             format: InstructionsFormat::ClaudeMd,
+            by_heading: Vec::new(),
         })
         .expect("serializa");
 
@@ -313,7 +565,7 @@ mod tests {
 
         assert_eq!(
             claves,
-            ["bytes", "format"]
+            ["bytes", "format", "by_heading"]
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>(),
             "cambió la forma de instructions. Si es ADITIVO, actualiza esta \
@@ -609,6 +861,238 @@ mod tests {
         assert!(
             b.bytes < texto.len(),
             "límite conocido: el cierre del usuario trunca la medida"
+        );
+    }
+
+    // ---- Desglose por cabecera (#97) ----
+
+    /// LA INVARIANTE. Las filas del desglose suman EXACTAMENTE los bytes del
+    /// bloque, siempre. Es la misma garantía que da `group_tools_by_server`, y
+    /// existe por el mismo motivo: un desglose que no cuadra con su total
+    /// invita a restarlos, y esa resta sería una medición inventada.
+    ///
+    /// El preámbulo es lo que hace que cuadre: se lleva el envoltorio del
+    /// harness y todo lo que haya antes de la primera cabecera.
+    #[test]
+    fn el_desglose_suma_exactamente_los_bytes_del_bloque() {
+        let texto = bloque_como_el_real();
+        let b = detect_instructions(&texto).expect("reconoce el bloque");
+
+        let suma: usize = b.by_heading.iter().map(|s| s.bytes).sum();
+        assert_eq!(
+            suma, b.bytes,
+            "el desglose tiene que sumar el bloque entero, sin perder ni un byte"
+        );
+    }
+
+    /// Un fichero SIN cabeceras da UNA fila, y se puede leer como tal: no es
+    /// un desglose vacío ni un error, es «esto no está dividido».
+    ///
+    /// Se prueba sobre el dialecto de **opencode** a propósito: es el único
+    /// cuya marca (`Instructions from: `) no es una cabecera markdown. En
+    /// Claude Code este caso NO EXISTE — ver
+    /// [`la_marca_del_harness_cuenta_como_cabecera`].
+    #[test]
+    fn sin_cabeceras_sale_una_sola_fila_de_preambulo() {
+        let texto = format!(
+            "</env>\n{OPENCODE_MARCA}/home/u/p/AGENTS.md\n\
+             Responde siempre en español.\n\n{OPENCODE_FIN} y lo que siga."
+        );
+        let b = detect_instructions(&texto).expect("reconoce");
+
+        assert_eq!(b.by_heading.len(), 1);
+        assert_eq!(b.by_heading[0].kind, InstructionsHeadingKind::Preamble);
+        assert_eq!(b.by_heading[0].bytes, b.bytes, "se lleva el bloque entero");
+    }
+
+    /// HALLAZGO (#97). La marca del envoltorio de Claude Code, `# claudeMd`,
+    /// **es una cabecera markdown de nivel 1** — y el desglose la cuenta como
+    /// tal, porque por las reglas de markdown lo es.
+    ///
+    /// No se filtra, y es deliberado: filtrarla exigiría que el desglose
+    /// supiera qué líneas puso el harness, que es EXACTAMENTE la dependencia
+    /// del contenido que este módulo evita en la frontera del bloque. Se
+    /// publica el nivel para que un consumidor pueda decidir por su cuenta, y
+    /// se documenta que las primeras filas suelen ser andamiaje.
+    ///
+    /// Le pasa igual a Codex, cuya marca es `# AGENTS.md instructions for …`.
+    #[test]
+    fn la_marca_del_harness_cuenta_como_cabecera() {
+        let texto = format!("{CLAUDE_ABRE}\n{CLAUDE_MARCA}\ncontenido\n{CLAUDE_CIERRA}");
+        let b = detect_instructions(&texto)
+            .expect("reconoce")
+            .publicable(true);
+
+        assert_eq!(
+            b.by_heading
+                .iter()
+                .filter_map(|s| s.heading.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["claudeMd"],
+            "la marca del harness sale como fila, con su nombre"
+        );
+        let suma: usize = b.by_heading.iter().map(|s| s.bytes).sum();
+        assert_eq!(suma, b.bytes, "y la invariante aguanta igual");
+    }
+
+    /// Una cabecera DENTRO de un bloque de código no es una cabecera. Es el
+    /// caso más probable de todos: un `CLAUDE.md` que documenta comandos lleva
+    /// `# comentario` dentro de un fence, y contarlo partiría la sección por
+    /// un sitio que no existe.
+    #[test]
+    fn las_cabeceras_dentro_de_un_fence_no_cortan() {
+        let texto = format!(
+            "{CLAUDE_ABRE}\n{CLAUDE_MARCA}\n\
+             ## Uno\n\
+             ```sh\n\
+             # esto es un comentario de shell, no una cabecera\n\
+             ## y esto tampoco\n\
+             ```\n\
+             ## Dos\n\
+             {CLAUDE_CIERRA}"
+        );
+        let b = detect_instructions(&texto).expect("reconoce");
+
+        let b = b.publicable(true);
+        let nombres: Vec<&str> = b
+            .by_heading
+            .iter()
+            .filter_map(|s| s.heading.as_deref())
+            .collect();
+        // `claudeMd` es la marca del harness, que tambien es cabecera.
+        assert_eq!(
+            nombres,
+            vec!["claudeMd", "Uno", "Dos"],
+            "lo de dentro del fence no puede aparecer"
+        );
+    }
+
+    /// El nivel 3 NO corta. Medido sobre el fichero real: bajar a `###` lleva
+    /// las filas de 21 a 44 y DESTRUYE la señal — «Model Assignments» pasa de
+    /// 9.809 B (29,3%) a 1.705 B (5,1%) porque su contenido se reparte entre
+    /// hijos. El bloque que hay que ver desaparece como fila.
+    #[test]
+    fn el_nivel_3_no_corta_seccion() {
+        let texto = format!(
+            "{CLAUDE_ABRE}\n{CLAUDE_MARCA}\n\
+             ## Padre\ntexto\n\
+             ### Hijo\nmas texto\n\
+             ## Otro\nfin\n\
+             {CLAUDE_CIERRA}"
+        );
+        let b = detect_instructions(&texto).expect("reconoce");
+
+        let b = b.publicable(true);
+        let nombres: Vec<&str> = b
+            .by_heading
+            .iter()
+            .filter_map(|s| s.heading.as_deref())
+            .collect();
+        assert_eq!(
+            nombres,
+            vec!["claudeMd", "Padre", "Otro"],
+            "`### Hijo` va DENTRO de `## Padre`, no es fila propia"
+        );
+        let padre = b
+            .by_heading
+            .iter()
+            .find(|s| s.heading.as_deref() == Some("Padre"))
+            .expect("hay padre");
+        assert!(
+            padre.bytes > "## Padre\ntexto\n".len(),
+            "el padre se queda los bytes del hijo"
+        );
+    }
+
+    /// POR DEFECTO los nombres NO viajan. El contenido es texto libre de una
+    /// persona y puede llevar nombres de cliente o de proyecto; el campo va a
+    /// `telemetry.jsonl` en claro y al buffer de `/requests`.
+    #[test]
+    fn por_defecto_los_nombres_no_viajan() {
+        let texto = bloque_como_el_real();
+        let b = detect_instructions(&texto)
+            .expect("reconoce")
+            .publicable(false);
+
+        assert!(
+            b.by_heading.iter().all(|s| s.heading.is_none()),
+            "sin la palanca no sale ni un nombre"
+        );
+        assert!(
+            b.by_heading.iter().any(|s| s.bytes > 0),
+            "pero los tamaños siguen ahí: quitar el nombre no quita el dato"
+        );
+    }
+
+    /// Con la palanca puesta sí salen, y esa es toda la diferencia.
+    #[test]
+    fn con_la_palanca_los_nombres_viajan() {
+        let texto = bloque_como_el_real();
+        let b = detect_instructions(&texto)
+            .expect("reconoce")
+            .publicable(true);
+
+        let nombres: Vec<&str> = b
+            .by_heading
+            .iter()
+            .filter_map(|s| s.heading.as_deref())
+            .collect();
+        assert!(
+            nombres.contains(&"Rules"),
+            "esperaba la cabecera `## Rules`, salieron {nombres:?}"
+        );
+    }
+
+    /// El cupo colapsa el sobrante en UN bucket, y ese bucket SIGUE contando
+    /// sus bytes: se pierde el desglose fino, nunca un byte. Igual que
+    /// `(others)` en `group_tools_by_server`.
+    #[test]
+    fn el_cupo_colapsa_en_others_sin_perder_un_byte() {
+        let mut cuerpo = String::new();
+        for i in 0..(MAX_INSTRUCTIONS_HEADINGS + 10) {
+            cuerpo.push_str(&format!("## Seccion {i}\ncontenido de la seccion\n"));
+        }
+        let texto = format!("{CLAUDE_ABRE}\n{CLAUDE_MARCA}\n{cuerpo}{CLAUDE_CIERRA}");
+        let b = detect_instructions(&texto).expect("reconoce");
+
+        let suma: usize = b.by_heading.iter().map(|s| s.bytes).sum();
+        assert_eq!(suma, b.bytes, "el cupo no puede perder bytes");
+        assert_eq!(
+            b.by_heading
+                .iter()
+                .filter(|s| s.kind == InstructionsHeadingKind::Others)
+                .count(),
+            1,
+            "todo el sobrante en UN bucket"
+        );
+        assert!(
+            b.by_heading.len() <= MAX_INSTRUCTIONS_HEADINGS + 2,
+            "cupo + preambulo + others, y ni una fila mas"
+        );
+    }
+
+    /// Un nombre absurdamente largo se recorta, y el recorte NO puede partir
+    /// un carácter multibyte: el body es entrada de terceros y un `panic` en
+    /// el camino crítico de la petición sería peor que cualquier dato feo.
+    #[test]
+    fn un_nombre_largo_se_trunca_sin_partir_un_caracter() {
+        let largo = "ñ".repeat(MAX_HEADING_LEN * 2);
+        let texto =
+            format!("{CLAUDE_ABRE}\n{CLAUDE_MARCA}\n## {largo}\ncontenido\n{CLAUDE_CIERRA}");
+        let b = detect_instructions(&texto)
+            .expect("reconoce")
+            .publicable(true);
+
+        let nombre = b
+            .by_heading
+            .iter()
+            .filter_map(|s| s.heading.as_deref())
+            .find(|n| n.starts_with('ñ'))
+            .expect("hay una cabecera larga");
+        assert!(nombre.len() <= MAX_HEADING_LEN, "recortado a bytes");
+        assert!(
+            nombre.chars().all(|c| c == 'ñ'),
+            "y sin dejar medio caracter suelto"
         );
     }
 }

@@ -234,6 +234,16 @@ pub struct AppConfig {
     /// Aviso pendiente de imprimir si `OXIDEGATE_FORCE_EFFORT` traía basura.
     /// Se arrastra por el mismo motivo que [`Self::bind_host_warning`].
     pub force_effort_warning: Option<String>,
+    /// `true` si se publican los NOMBRES de las cabeceras en el desglose del
+    /// bloque de instrucciones (`OXIDEGATE_INSTRUCTIONS_HEADINGS=on`).
+    ///
+    /// **Apagada por defecto, y no es simetría con las otras palancas.** Las
+    /// demás deciden si el proxy INTERVIENE; esta decide si un texto libre
+    /// escrito por una persona —que puede llevar nombre de cliente o de
+    /// proyecto— sale por `GET /requests` y se escribe en `telemetry.jsonl`.
+    /// El desglose (bytes, nivel, posición) se publica SIEMPRE: lo que esta
+    /// palanca añade es solo la etiqueta.
+    pub instructions_headings: bool,
 }
 
 impl AppConfig {
@@ -280,6 +290,15 @@ impl AppConfig {
                 .unwrap_or(false),
             force_effort,
             force_effort_warning,
+            // Solo `on`/`true`/`1`. Cualquier otra cosa deja los nombres
+            // fuera: ante una variable mal escrita, la salida segura es no
+            // publicar.
+            instructions_headings: env::var("OXIDEGATE_INSTRUCTIONS_HEADINGS")
+                .map(|v| {
+                    let v = v.trim().to_ascii_lowercase();
+                    v == "on" || v == "true" || v == "1"
+                })
+                .unwrap_or(false),
         }
     }
 

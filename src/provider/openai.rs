@@ -80,7 +80,8 @@ impl Provider for OpenAiChat {
             .and_then(crate::provider::skills::detect_skills_in_body);
         let instructions = parsed
             .as_ref()
-            .and_then(crate::provider::instructions::detect_instructions_in_body);
+            .and_then(crate::provider::instructions::detect_instructions_in_body)
+            .map(|b| b.publicable(cfg.instructions_headings));
         let by_server = parsed
             .as_ref()
             .map(|v| self.tools_by_server(v))
@@ -287,7 +288,8 @@ impl Provider for OpenAiResponses {
             .and_then(crate::provider::skills::detect_skills_in_body);
         let instructions = parsed
             .as_ref()
-            .and_then(crate::provider::instructions::detect_instructions_in_body);
+            .and_then(crate::provider::instructions::detect_instructions_in_body)
+            .map(|b| b.publicable(cfg.instructions_headings));
         let by_server = parsed
             .as_ref()
             .map(|v| self.tools_by_server(v))
@@ -539,7 +541,8 @@ impl Provider for OpenAiCodexResponses {
             .and_then(crate::provider::skills::detect_skills_in_body);
         let instructions = parsed
             .as_ref()
-            .and_then(crate::provider::instructions::detect_instructions_in_body);
+            .and_then(crate::provider::instructions::detect_instructions_in_body)
+            .map(|b| b.publicable(cfg.instructions_headings));
         let by_server = parsed
             .as_ref()
             .map(|v| self.tools_by_server(v))
@@ -1072,6 +1075,7 @@ mod tests {
             force_prompt_cache: false,
             force_effort: None,
             force_effort_warning: None,
+            instructions_headings: false,
         }
     }
 

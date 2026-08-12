@@ -75,7 +75,8 @@ impl Provider for Anthropic {
             .and_then(crate::provider::skills::detect_skills_in_body);
         let instructions = parsed
             .as_ref()
-            .and_then(crate::provider::instructions::detect_instructions_in_body);
+            .and_then(crate::provider::instructions::detect_instructions_in_body)
+            .map(|b| b.publicable(cfg.instructions_headings));
         // Solo aqui: la marca `hook success:` es de Claude Code, que habla
         // este dialecto. Los otros tres publican `None` a proposito — que
         // inyecten algo equivalente esta sin medir, y medir primero es la
@@ -562,6 +563,7 @@ mod tests {
             force_prompt_cache,
             force_effort: force_effort.map(str::to_string),
             force_effort_warning: None,
+            instructions_headings: false,
         }
     }
 

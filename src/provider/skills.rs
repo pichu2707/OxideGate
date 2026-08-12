@@ -171,9 +171,9 @@ fn detect_xml(texto: &str) -> Option<SkillsBlock> {
         "</available_skills>",
         "<skill>",
     )
-    .map(|(bytes, n)| SkillsBlock {
+    .map(|(bloque, n)| SkillsBlock {
         declared: n,
-        listing_bytes: bytes,
+        listing_bytes: bloque.len(),
         format: SkillsFormat::AvailableSkillsXml,
     })
 }
@@ -186,9 +186,9 @@ fn detect_skills_instructions(texto: &str) -> Option<SkillsBlock> {
         "</skills_instructions>",
         "(file:",
     )
-    .map(|(bytes, n)| SkillsBlock {
+    .map(|(bloque, n)| SkillsBlock {
         declared: n,
-        listing_bytes: bytes,
+        listing_bytes: bloque.len(),
         format: SkillsFormat::SkillsInstructions,
     })
 }

@@ -707,6 +707,16 @@ async fn main() {
     }
     // Y si SÍ está encendida se anuncia, porque a partir de aquí el proxy deja
     // de ser un observador puro: muta cada petición a Anthropic.
+    // Los nombres de las cabeceras del CLAUDE.md son texto de una persona. Si
+    // van a salir por el cable y al disco, se dice — igual que se dice cuando
+    // el proxy deja de ser un observador puro.
+    if config.instructions_headings {
+        eprintln!(
+            "🔧 instructions: el desglose por cabecera publica los NOMBRES \
+             (OXIDEGATE_INSTRUCTIONS_HEADINGS).\n   Son texto de tu CLAUDE.md y \
+             viajan a GET /requests y a telemetry.jsonl."
+        );
+    }
     if let Some(nivel) = &config.force_effort {
         eprintln!(
             "🔧 Palanca B ACTIVA: se fuerza output_config.effort={nivel} en las peticiones a \

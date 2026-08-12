@@ -1180,6 +1180,120 @@ recorrido fusionaba una apertura sin cerrar con el bloque siguiente y publicaba
 **No dobla bytes.** Ya los cuenta `context_history_bytes`. `instructions` sólo
 **atribuye**; nunca vuelve a sumarlos.
 
+#### 4.13.1. `by_heading`: dice de QUÉ es ese número
+
+`instructions.bytes` publicaba 33.777 B y ahí se acababa. Con eso no se puede
+decidir nada: la pregunta accionable no es *cuánto pago* sino **qué parte de lo
+que pago siempre la uso siempre** — que es literalmente lo que `GET /mcp`
+contesta para los servidores MCP.
+
+`by_heading` reparte esos bytes entre las cabeceras markdown del contenido.
+Medido sobre un `CLAUDE.md` real de 33.460 B:
+
+| Sección | Bytes | % |
+|---|---:|---:|
+| Model Assignments | 9.827 | **29,3%** |
+| SDD Workflow | 9.392 | **28,0%** |
+| Agent Teams Orchestrator | 5.967 | 17,8% |
+| Engram Protocol | 3.857 | 11,5% |
+| **Subtotal** | **29.043** | **86,6%** |
+
+Cuatro secciones son el 87%, y las cuatro son protocolo de un flujo concreto que
+viaja en cada petición de cada sesión, se use o no.
+
+**Forma:**
+
+```json
+"instructions": {
+  "bytes": 33507,
+  "format": "claude_md",
+  "by_heading": [
+    { "kind": "preamble", "level": null, "bytes": 18,   "heading": null },
+    { "kind": "heading",  "level": 2,    "bytes": 9827, "heading": null }
+  ]
+}
+```
+
+##### Esto NO contradice «las fronteras las pone el envoltorio»
+
+`docs/optimizer-claude-md.md` documenta que cortar por cabecera midió **8.254 B
+de 33.716 reales**: se paró en una cabecera del propio fichero del usuario. De
+ahí la regla del proyecto.
+
+La regla sigue intacta, y la distinción es toda la clave:
+
+- **La frontera del BLOQUE** la pone el envoltorio del harness
+  (`<system-reminder>`…`</system-reminder>`). Eso no se toca.
+- **El reparto INTERIOR** usa las cabeceras del usuario, que son su propia
+  estructura. No se busca dónde acaba el bloque: se reparte lo que hay dentro.
+
+El error de entonces fue usar el contenido para **delimitar**. Aquí el contenido
+solo **reparte** lo ya delimitado.
+
+##### Los nombres NO viajan por defecto
+
+`heading` es `null` salvo que se ponga `OXIDEGATE_INSTRUCTIONS_HEADINGS=on`, y el
+proxy lo anuncia al arrancar cuando está activa.
+
+El precedente de `tool_names` **no aplica**. Aquellos nombres los eligió el
+cliente y ya viajaban al proveedor en el mismo body, así que publicarlos no
+añadía exposición. Una cabecera de `CLAUDE.md` la escribió una persona, puede
+llevar nombre de cliente o de proyecto, y además de viajar al proveedor acaba en
+`telemetry.jsonl` en claro y en `GET /requests` — donde alguien la mira sin
+haberla pedido.
+
+Quitar el nombre **no quita el dato**: bytes, nivel y posición siguen ahí, y con
+el fichero delante se sabe qué fila es cuál.
+
+##### Nivel ≤2, y el nivel 3 no es «más detalle»
+
+Bajar a `###` lleva el mismo fichero de 21 filas a 44 y **destruye la señal**:
+«Model Assignments» pasa de 9.809 B (29,3%) a **1.705 B (5,1%)** porque su
+contenido se reparte entre hijos. La fila que hay que ver deja de existir.
+
+##### La invariante: las filas suman el bloque, siempre
+
+Igual que `group_tools_by_server`. Lo sostienen dos piezas:
+
+- **`preamble`** se lleva todo lo anterior a la primera cabecera — incluido el
+  envoltorio del harness. Es lo que hace que cuadre sin restar.
+- **`others`** recoge el desborde del cupo (`MAX_INSTRUCTIONS_HEADINGS`, 32) y
+  **sigue contando sus bytes**: se pierde el desglose fino, nunca un byte.
+
+Un fichero sin cabeceras da **una sola fila** de `preamble` con el bloque
+entero, y esa es la lectura correcta: «esto no está dividido».
+
+##### Hallazgo: la marca del harness es una cabecera más
+
+`# claudeMd` **es una cabecera markdown de nivel 1**, así que sale como fila. Le
+pasa igual a Codex, cuya marca es `# AGENTS.md instructions for <ruta>`.
+
+No se filtra, y es deliberado: filtrarla exigiría que el reparto supiera qué
+líneas puso el harness — justo la dependencia del contenido que este módulo
+evita en la frontera. Se publica el `level` para que un consumidor decida por su
+cuenta, y se dice aquí que las primeras filas suelen ser andamiaje.
+
+##### No se publica el porcentaje
+
+Un consumidor divide por `bytes`. Publicar la fracción ya cocinada añadiría un
+campo que puede desincronizarse con los bytes sin que nada lo note — mismo
+criterio por el que `energy_idle_wh` se publica al lado y no restado.
+
+##### Verificado solo en `claude_md`
+
+El reparto es markdown puro, así que **debería** valer igual para
+`codex_agents_md` y `opencode_agents_md`. No se afirma que valga: la regla de
+#66 es que ningún dialecto entra sin captura propia, y las capturas de #88 no
+están en el árbol (`capturas/` está en `.gitignore`). Hay tests de forma para los
+tres dialectos; medición contra tráfico real, solo del primero.
+
+##### No mueve `CONTRACT_VERSION`
+
+Clave nueva dentro de un objeto que ya existía: aditivo. `/version` la declara en
+`fields` como `by_heading` —con su nombre literal, porque la comprobación recorre
+el JSON en profundidad— para que una lente pueda sondear la capacidad sin
+comparar versiones. Ver §8.2.
+
 ---
 
 ### 4.14. `effort_forced`: la única fila donde el medidor confiesa

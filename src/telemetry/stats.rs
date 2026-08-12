@@ -499,7 +499,8 @@ impl SessionAccumulator {
         d.cost_usd += m.cost_estimate_usd.unwrap_or(0.0);
         // `unwrap_or(0)` seria el error de esta funcion: un bloque que no se
         // pudo ver no cuesta cero bytes, cuesta un dato que no tenemos.
-        d.instructions.observa(m.instructions.map(|i| i.bytes));
+        d.instructions
+            .observa(m.instructions.as_ref().map(|i| i.bytes));
         d.hooks.observa(m.hooks.map(|h| h.bytes));
         d.skills.observa(m.skills.map(|s| s.listing_bytes));
     }
@@ -689,6 +690,7 @@ mod tests {
         m.instructions = instr.map(|bytes| InstructionsBlock {
             bytes,
             format: InstructionsFormat::ClaudeMd,
+            by_heading: Vec::new(),
         });
         m.hooks = hooks.map(|bytes| HooksBlock {
             bytes,
