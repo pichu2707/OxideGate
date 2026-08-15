@@ -73,12 +73,12 @@
 /// literales, pero un `debug_assert` desaparece en release y lo que se colgaría
 /// es el hilo que atiende la petición. Un guardián que sí viaja en el binario
 /// cuesta una comparación por llamada.
-pub(super) fn primer_bloque_con(
-    texto: &str,
+pub(super) fn primer_bloque_con<'a>(
+    texto: &'a str,
     abre: &str,
     cierra: &str,
     requerido: &str,
-) -> Option<(usize, usize)> {
+) -> Option<(&'a str, usize)> {
     if abre.is_empty() {
         return None;
     }
@@ -120,7 +120,7 @@ pub(super) fn primer_bloque_con(
         let bloque = &texto[i..fin_cierra + cierra.len()];
         let n = bloque.matches(requerido).count();
         if n > 0 {
-            return Some((bloque.len(), n));
+            return Some((bloque, n));
         }
         desde = contenido;
     }
@@ -136,9 +136,9 @@ mod tests {
     fn mide_el_bloque_entero_incluidas_las_marcas() {
         let texto = "ruido <a>xx MARCA xx</a> ruido";
 
-        let (bytes, n) = primer_bloque_con(texto, "<a>", "</a>", "MARCA").expect("hay bloque");
+        let (bloque, n) = primer_bloque_con(texto, "<a>", "</a>", "MARCA").expect("hay bloque");
 
-        assert_eq!(bytes, "<a>xx MARCA xx</a>".len());
+        assert_eq!(bloque.len(), "<a>xx MARCA xx</a>".len());
         assert_eq!(n, 1);
     }
 
@@ -148,9 +148,9 @@ mod tests {
     fn se_salta_las_menciones_hasta_dar_con_el_bloque_bueno() {
         let texto = "habla de <a>nada</a> y luego <a>MARCA</a>";
 
-        let (bytes, n) = primer_bloque_con(texto, "<a>", "</a>", "MARCA").expect("hay bloque");
+        let (bloque, n) = primer_bloque_con(texto, "<a>", "</a>", "MARCA").expect("hay bloque");
 
-        assert_eq!(bytes, "<a>MARCA</a>".len());
+        assert_eq!(bloque.len(), "<a>MARCA</a>".len());
         assert_eq!(n, 1);
     }
 
@@ -177,7 +177,7 @@ mod tests {
         let texto = "<system-reminder>\nrecordatorio abierto que nunca cierra\n".to_string()
             + "<system-reminder>\n# claudeMd\ncontenido de verdad\n</system-reminder>";
 
-        let (bytes, n) = primer_bloque_con(
+        let (bloque, n) = primer_bloque_con(
             &texto,
             "<system-reminder>",
             "</system-reminder>",
@@ -186,7 +186,8 @@ mod tests {
         .expect("hay bloque real tras el señuelo");
 
         assert_eq!(
-            bytes, 67,
+            bloque.len(),
+            67,
             "debe medir sólo el bloque real, no el señuelo fusionado"
         );
         assert_eq!(n, 1);
@@ -204,9 +205,13 @@ mod tests {
     fn un_par_de_marcadores_solapado_no_hace_panic_y_mide_bien() {
         let texto = "<X>MARCA</X>";
 
-        let (bytes, n) = primer_bloque_con(texto, "<X", "X>", "MARCA").expect("hay bloque");
+        let (bloque, n) = primer_bloque_con(texto, "<X", "X>", "MARCA").expect("hay bloque");
 
-        assert_eq!(bytes, texto.len(), "mide el bloque entero, no un trozo");
+        assert_eq!(
+            bloque.len(),
+            texto.len(),
+            "mide el bloque entero, no un trozo"
+        );
         assert_eq!(n, 1);
     }
 

@@ -82,7 +82,7 @@ pub const ENDPOINTS: [&str; 6] = [
 /// Un test (`telemetry::recent`) comprueba que cada entrada de aquí aparece de
 /// verdad en el JSON de `/requests`: esta lista no puede anunciar una
 /// capacidad que el proxy no tenga.
-pub const FIELDS: [&str; 23] = [
+pub const FIELDS: [&str; 24] = [
     "cache_by_section",
     "input_share_by_section",
     "prompt_bytes",
@@ -106,6 +106,12 @@ pub const FIELDS: [&str; 23] = [
     "energy_idle_wh",
     "power_peak_w",
     "energy_samples",
+    // Clave ANIDADA dentro de `instructions`, y el test que guarda esta lista
+    // recorre el JSON en profundidad, asi que se declara con el nombre literal
+    // que lleva en la fila. Declarar solo `instructions` no bastaria: una lente
+    // que quiera pintar el desglose necesita saber si ESTE proxy lo publica, y
+    // el objeto padre existe desde antes.
+    "by_heading",
 ];
 
 /// Payload de `/version`. Función pura para poder afirmar sobre ella en tests

@@ -482,7 +482,7 @@ impl MeteredBody {
             tool_search: self.base.tool_search.clone(),
             tools_flattened: self.base.tools_flattened,
             skills: self.base.skills,
-            instructions: self.base.instructions,
+            instructions: self.base.instructions.clone(),
             hooks: self.base.hooks,
             effort_forced: self.base.effort_forced.clone(),
             // `None` si este proveedor no tiene extractor: publicar listas

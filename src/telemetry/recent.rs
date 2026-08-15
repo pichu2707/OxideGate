@@ -381,7 +381,7 @@ impl From<&RequestMetric> for RecentRequest {
             tool_search: m.tool_search.clone(),
             tools_flattened: m.tools_flattened,
             skills: m.skills,
-            instructions: m.instructions,
+            instructions: m.instructions.clone(),
             hooks: m.hooks,
             effort_forced: m.effort_forced.clone(),
             tool_calls: m.tool_calls.clone(),
@@ -491,7 +491,15 @@ mod tests {
             tool_search: None,
             tools_flattened: None,
             skills: None,
-            instructions: None,
+            // Con `None` la fila publica `"instructions": null` y la clave
+            // ANIDADA `by_heading` no existe, asi que
+            // `version_no_anuncia_campos_que_requests_no_publique` no podria
+            // verificarla. El fixture trae un bloque minimo por eso.
+            instructions: Some(crate::provider::InstructionsBlock {
+                bytes: 120,
+                format: crate::provider::instructions::InstructionsFormat::ClaudeMd,
+                by_heading: Vec::new(),
+            }),
             hooks: None,
             effort_forced: None,
             response_bytes: None,
