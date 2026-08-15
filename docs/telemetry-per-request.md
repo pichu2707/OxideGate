@@ -1026,7 +1026,7 @@ palanca se aplica.
 | Campo | Qué es |
 |---|---|
 | `bytes` | Bytes del bloque completo, envoltorio incluido. Se pagan en CADA petición |
-| `format` | `claude_md` \| `codex_agents_md` \| `opencode_agents_md` \| `pi_agents_md` — ver abajo |
+| `format` | `claude_md` \| `codex_agents_md` \| `opencode_agents_md` \| `pi_agents_md` \| `qwen_agents_md` — ver abajo |
 
 #### El bloque se delimita por su ENVOLTORIO, nunca por una cabecera
 
@@ -1066,7 +1066,7 @@ correcto: **Claude Code ignora `AGENTS.md`** — `null` con ese fichero en el
 proyecto es la respuesta buena, no un fallo del detector. El mismo fichero,
 cuatro comportamientos (`docs/skills-across-tools.md` §6).
 
-#### Cuatro `format`, y cada uno con su captura detrás
+#### Cinco `format`, y cada uno con su captura detrás
 
 | `format` | Herramienta | Envoltorio | Cierre | Ruta |
 |---|---|---|---|---|
@@ -1074,6 +1074,7 @@ cuatro comportamientos (`docs/skills-across-tools.md` §6).
 | `codex_agents_md` | Codex 0.142.5 | cabecera + `<INSTRUCTIONS>`…`</INSTRUCTIONS>` | sí | **absoluta** |
 | `opencode_agents_md` | opencode 1.18.15 | `Instructions from: <ruta absoluta>` | **no** | **absoluta** |
 | `pi_agents_md` | `pi` 0.80.10 | `<project_instructions path="…">`…`</project_instructions>` | sí | **absoluta** |
+| `qwen_agents_md` | Qwen Code 0.21.7 | `--- Context from: AGENTS.md ---`…`--- End of Context… ---` | sí | **relativa** |
 
 Cada dialecto entra **cuando tiene captura propia**, nunca desde una tabla. Y el
 motivo dejó de ser teórico **dos veces**:
@@ -1092,17 +1093,57 @@ nadie lo habría notado.
 
 ##### El envoltorio lo domina la RUTA, y por eso no hay constante que publicar
 
-Las tres capturas con `AGENTS.md` de **202 B**, para que sean comparables:
+Las cuatro capturas con `AGENTS.md` de **202 B**, para que sean comparables:
 
 | `format` | Bloque | Envoltorio | De eso, la ruta | Fijo real |
 |---|---:|---:|---:|---|
 | `codex_agents_md` | 380 B | 178 B | 116 B (65%) | `62 B + ruta` |
 | `opencode_agents_md` | 349 B | 147 B | 126 B (86%) | `21 B + ruta` |
 | `pi_agents_md` | 377 B | 175 B | 120 B (69%) | `55 B + ruta` |
+| `qwen_agents_md` | 272 B | **70 B** | — (relativa) | **70 B, de verdad** |
 
 Los «+159 B», «+160 B» y «+200 B» que circulaban **no son constantes**: un
 proyecto en `/home/u/p` paga bastante menos que uno en un directorio profundo.
 Ninguna de esas cifras se puede comparar entre máquinas sin decir la ruta.
+
+**Qwen es la excepción, y es el más barato de los cuatro por eso mismo.** Su
+ruta es **relativa**, así que su envoltorio no crece con la profundidad del
+directorio: 70 B (31 de apertura + 1 + 38 de cierre) valgan lo que valgan las
+rutas de tu máquina. Es la única de estas cifras que se puede comparar entre
+instalaciones sin más contexto.
+
+##### Qwen manda TRES bloques, y el del proyecto no es el primero
+
+Capturado con un `AGENTS.md` global además del de proyecto:
+
+| Orden | `Context from:` | Bloque |
+|---|---|---:|
+| 1.º | `../home/.qwen/AGENTS.md` — el **global** | 176 B |
+| 2.º | `AGENTS.md` — **el del proyecto** | **272 B** |
+| 3.º | `.qwen/output-language.md` — config de Qwen | 136 B |
+
+Dos trampas, las dos reales:
+
+1. **Coger el primer `Context from:` da el bloque equivocado.**
+2. **Buscar por sufijo tampoco vale**, porque la ruta del global *también*
+   acaba en `AGENTS.md`.
+
+La única marca que selecciona el fichero del proyecto es la ruta **exacta**
+`AGENTS.md` — la del fichero en el directorio actual. Si Qwen se lanza desde un
+subdirectorio y el `AGENTS.md` aparece como `../AGENTS.md`, el campo sale
+`null`: no se reconoce, y `null` significa exactamente eso.
+
+##### Lo que `qwen_agents_md` NO cuenta
+
+El `AGENTS.md` **global** viaja en su propio bloque (176 B arriba) y **no se
+suma**. Es una diferencia real con `claude_md`, donde el `CLAUDE.md` de proyecto
+y el global viajan **concatenados dentro del mismo `<system-reminder>`** y por
+tanto sí se cuentan juntos.
+
+No es un descuido: sumar dos bloques disjuntos daría un `by_heading` que no
+corresponde a ningún texto real, y el desglose se publica al lado de `bytes`.
+Quien compare `claude_md` con `qwen_agents_md` tiene que saber que uno incluye
+el fichero global y el otro no.
 
 ##### El zstd de `pi` depende del PROVEEDOR, no del harness
 
@@ -1175,10 +1216,11 @@ cometerlo dos veces.
 Esa frontera es **prosa del harness**, y es una fragilidad conocida: si opencode
 cambia la frase, el campo pasa a `null`. Falla honesto, no falla mintiendo.
 
-Y por eso **opencode se prueba el ÚLTIMO**: `claude_md`, `codex_agents_md` y
-`pi_agents_md` delimitan su bloque con apertura Y cierre reales, así que ante un
-cuerpo donde varios pudieran aparecer gana el que se puede delimitar con certeza.
-El que tiene que adivinar su final va detrás de todos.
+Y por eso **opencode se prueba el ÚLTIMO**: `claude_md`, `codex_agents_md`,
+`pi_agents_md` y `qwen_agents_md` delimitan su bloque con apertura Y cierre
+reales, así que ante un cuerpo donde varios pudieran aparecer gana el que se
+puede delimitar con certeza. opencode es el único que tiene que adivinar su
+final, así que va detrás de todos.
 
 #### Dos avisos sobre la cifra
 
@@ -1316,10 +1358,11 @@ criterio por el que `energy_idle_wh` se publica al lado y no restado.
 ##### Verificado solo en `claude_md`
 
 El reparto es markdown puro, así que **debería** valer igual para
-`codex_agents_md`, `opencode_agents_md` y `pi_agents_md`. No se afirma que valga:
-la regla de #66 es que ningún dialecto entra sin captura propia, y las capturas
-de #88 no están en el árbol (`capturas/` está en `.gitignore`). Hay tests de
-forma para los cuatro dialectos; medición contra tráfico real, solo del primero.
+`codex_agents_md`, `opencode_agents_md`, `pi_agents_md` y `qwen_agents_md`. No se
+afirma que valga: la regla de #66 es que ningún dialecto entra sin captura
+propia, y las capturas de #88 no están en el árbol (`capturas/` está en
+`.gitignore`). Hay tests de forma para los cinco dialectos; medición contra
+tráfico real, solo del primero.
 
 ##### No mueve `CONTRACT_VERSION`
 

@@ -1,9 +1,8 @@
 # El banco de captura — medir lo que inyecta un harness sin gastar un token
 
-> Validado el **2026-08-09** con Codex 0.142.5 y Qwen Code 0.21.7, y el
-> **2026-08-15** con `pi` 0.80.10, contra `ollama` local. Coste: **cero**. El
-> método es reproducible en cualquier máquina con ollama; los números son de
-> esta.
+> Validado el **2026-08-09** con Codex 0.142.5, y el **2026-08-15** con `pi`
+> 0.80.10 y Qwen Code 0.21.7, contra `ollama` local. Coste: **cero**. El método
+> es reproducible en cualquier máquina con ollama; los números son de esta.
 
 ---
 
@@ -207,13 +206,28 @@ decir la ruta.**
 --- End of Context from: AGENTS.md ---
 ```
 
-70 B fijos, con **apertura y cierre reales** —encaja directo en
-[`block_scan`](../src/provider/block_scan.rs)— y ruta **relativa**, así que no
-varía con la profundidad del directorio.
+70 B fijos —31 de apertura, el `\n` de después, y 38 de cierre— con **apertura y
+cierre reales**, y ruta **relativa**, así que no varía con la profundidad del
+directorio. Es el único de los cuatro cuya cifra se puede comparar entre
+máquinas sin más contexto.
 
-Qwen inyecta además otros bloques `Context from:` (por ejemplo
-`.qwen/output-language.md`), así que el detector tendrá que quedarse con el que
-corresponde y no con el primero que aparezca.
+> El `\n` que separa el contenido del cierre **es el del propio fichero**, no lo
+> pone el harness: un fichero de texto acaba en salto de línea. Contarlo como
+> envoltorio da 71 y no 70.
+
+**Qwen manda TRES bloques `Context from:`, y el del proyecto es el SEGUNDO.**
+Recapturado el 2026-08-15 con un `AGENTS.md` global además del de proyecto:
+
+| Orden | `Context from:` | Bloque |
+|---|---|---:|
+| 1.º | `../home/.qwen/AGENTS.md` — el **global** | 176 B |
+| 2.º | `AGENTS.md` — **el del proyecto** | **272 B** |
+| 3.º | `.qwen/output-language.md` — config de Qwen | 136 B |
+
+El aviso que había aquí —«quedarse con el que corresponde y no con el primero»—
+se quedaba corto: **buscar por sufijo tampoco vale**, porque la ruta del global
+*también* acaba en `AGENTS.md`. La única marca que selecciona el fichero del
+proyecto es la ruta **exacta** `AGENTS.md`.
 
 ---
 
@@ -248,12 +262,14 @@ corresponde y no con el primero que aparezca.
   WebSocket manda JSON sin comprimir incluso ahí. La captura de 0.80.10 contra
   un proveedor `openai-completions` viaja en **JSON plano**. Es una propiedad
   del **endpoint de Codex**, no del harness `pi`.
-- **Qwen Code**: capturado y medido (§5), pero **sin detector**. Es el único que
-  queda de #66, y el más barato: envoltorio fijo de 70 B, ruta relativa, y
-  apertura **y** cierre reales, así que encaja directo en
-  [`block_scan`](../src/provider/block_scan.rs). Aun así hay que **recapturar**:
-  §5 es una tabla, y la regla de #66 es que ningún dialecto entra desde una
-  tabla. La recaptura cuesta cero.
+- **Qwen Code: capturado y con detector** (`qwen_agents_md`). Se recapturó en
+  vez de escribirlo desde la tabla de §5 —la regla de #66 es que ningún dialecto
+  entra desde una tabla, y §5 **es** una tabla— y la recaptura pagó: descubrió
+  que Qwen manda **tres** bloques `Context from:` y que buscar por sufijo coge
+  el global. Coste de la recaptura: cero.
+- **Ya no queda ninguno.** Los cuatro harnesses instalados que inyectan el
+  fichero tienen captura propia y detector. Lo que entre a partir de aquí es un
+  harness nuevo, o una versión que derive.
 - **Los detectores en sí**: este documento es la condición de entrada de #66,
   no su implementación. Un dialecto por PR, cada uno con su captura.
 

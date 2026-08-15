@@ -79,10 +79,11 @@ use super::block_scan::primer_bloque_con;
 /// la que le faltaba su condición.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-// Las cuatro variantes acaban en `Md` y clippy sugiere quitar el sufijo. NO se
+// Las cinco variantes acaban en `Md` y clippy sugiere quitar el sufijo. NO se
 // hace: estos nombres se serializan con `rename_all` y son VALORES PUBLICADOS
 // del campo `instructions.format` (`claude_md`, `codex_agents_md`,
-// `opencode_agents_md`, `pi_agents_md`), que consume `oxidegate-lens`. Renombrarlos por
+// `opencode_agents_md`, `pi_agents_md`, `qwen_agents_md`), que consume
+// `oxidegate-lens`. Renombrarlos por
 // ergonomía interna rompería el contrato de un consumidor externo — y el sufijo
 // no es ruido: nombra el fichero que cada harness inyecta.
 #[allow(clippy::enum_variant_names)]
@@ -151,6 +152,43 @@ pub enum InstructionsFormat {
     /// deshace el zstd antes de medir (ver [`super::maybe_decompress`]) y la
     /// cifra vuelve a ser lógica; con cualquier otro proveedor, coinciden.
     PiAgentsMd,
+    /// Qwen Code: el bloque `--- Context from: AGENTS.md ---`…
+    /// `--- End of Context from: AGENTS.md ---`.
+    ///
+    /// Medido sobre captura real de **Qwen Code 0.21.7** (2026-08-15): con un
+    /// `AGENTS.md` de 202 B el bloque son **272 B**, o sea **70 B de
+    /// envoltorio** (31 de apertura + 1 + 38 de cierre).
+    ///
+    /// **Es el único de los cuatro con un envoltorio de verdad constante.** Su
+    /// ruta es **relativa**, así que no crece con la profundidad del
+    /// directorio, frente al `62 B + ruta` de Codex, el `21 B + ruta` de
+    /// opencode y el `55 B + ruta` de `pi`. Su cifra sí se puede comparar entre
+    /// máquinas.
+    ///
+    /// # Por qué la marca lleva la ruta EXACTA
+    ///
+    /// En la captura real hay **TRES** bloques `Context from:` y el del
+    /// proyecto es el **segundo**:
+    ///
+    /// ```text
+    /// --- Context from: ../home/.qwen/AGENTS.md ---      (global)
+    /// --- Context from: AGENTS.md ---                    (el del proyecto)
+    /// --- Context from: .qwen/output-language.md ---     (config de Qwen)
+    /// ```
+    ///
+    /// Coger el primero da el global. Y como la ruta del global **también acaba
+    /// en `AGENTS.md`**, buscar por sufijo falla igual. La única marca que
+    /// selecciona el fichero del proyecto es la ruta exacta `AGENTS.md`.
+    ///
+    /// # Lo que este número NO incluye
+    ///
+    /// El `AGENTS.md` **global** viaja en su propio bloque (176 B en la
+    /// captura) y **no se suma aquí**. Es una diferencia real con
+    /// [`Self::ClaudeMd`], donde el `CLAUDE.md` de proyecto y el global viajan
+    /// concatenados dentro del MISMO `<system-reminder>` y por tanto sí se
+    /// cuentan juntos. Sumar dos bloques disjuntos daría además un
+    /// `by_heading` que no corresponde a ningún texto real.
+    QwenAgentsMd,
 }
 
 /// Tope de filas con cabecera propia que publica [`desglosar`].
@@ -452,15 +490,17 @@ const OPENCODE_FIN: &str = "Skills provide specialized instructions";
 ///
 /// **El orden no es casual: mandan los que cierran de verdad.** Claude Code
 /// (`<system-reminder>`…`</system-reminder>`), Codex (`<INSTRUCTIONS>`…
-/// `</INSTRUCTIONS>`) y `pi` (`<project_instructions>`…`</project_instructions>`)
-/// delimitan su bloque con apertura Y cierre reales. opencode va el ÚLTIMO
-/// porque solo tiene apertura y su final hay que deducirlo de una frase en
-/// prosa. Ante un cuerpo donde varios pudieran aparecer, gana el que se puede
-/// delimitar con certeza.
+/// `</INSTRUCTIONS>`), `pi` (`<project_instructions>`…`</project_instructions>`)
+/// y Qwen (`--- Context from: AGENTS.md ---`…`--- End of Context… ---`)
+/// delimitan su bloque con apertura Y cierre reales. **opencode va el ÚLTIMO**
+/// porque es el único que solo tiene apertura y su final hay que deducirlo de
+/// una frase en prosa. Ante un cuerpo donde varios pudieran aparecer, gana el
+/// que se puede delimitar con certeza.
 pub fn detect_instructions(texto: &str) -> Option<InstructionsBlock> {
     detect_claude_md(texto)
         .or_else(|| detect_codex(texto))
         .or_else(|| detect_pi(texto))
+        .or_else(|| detect_qwen(texto))
         .or_else(|| detect_opencode(texto))
 }
 
@@ -531,6 +571,34 @@ fn detect_pi(texto: &str) -> Option<InstructionsBlock> {
     Some(InstructionsBlock {
         bytes: bloque.len(),
         format: InstructionsFormat::PiAgentsMd,
+        by_heading: desglosar(bloque),
+    })
+}
+
+/// Marca de Qwen Code. Lleva la ruta **exacta** `AGENTS.md`, no un sufijo: en
+/// la captura real conviven tres bloques `Context from:` y el del `AGENTS.md`
+/// global —que también acaba en `AGENTS.md`— va ANTES que el del proyecto.
+const QWEN_ABRE: &str = "--- Context from: AGENTS.md ---";
+const QWEN_CIERRA: &str = "--- End of Context from: AGENTS.md ---";
+
+/// Qwen Code: el bloque `--- Context from: AGENTS.md ---` con su cierre real.
+///
+/// Envoltorio **fijo de 70 B** y ruta relativa: el único de los cuatro cuya
+/// cifra no depende de dónde tengas el proyecto.
+///
+/// Abre y cierra de verdad, así que la frontera final no se adivina. Sin
+/// `--- End of Context from: AGENTS.md ---` no es su forma y se devuelve `None`.
+///
+/// **No suma el `AGENTS.md` global**, que viaja en su propio bloque. Ver
+/// [`InstructionsFormat::QwenAgentsMd`] para por qué, y para la diferencia con
+/// `claude_md`.
+fn detect_qwen(texto: &str) -> Option<InstructionsBlock> {
+    let inicio = texto.find(QWEN_ABRE)?;
+    let cierra = texto[inicio..].find(QWEN_CIERRA)? + inicio + QWEN_CIERRA.len();
+    let bloque = &texto[inicio..cierra];
+    Some(InstructionsBlock {
+        bytes: bloque.len(),
+        format: InstructionsFormat::QwenAgentsMd,
         by_heading: desglosar(bloque),
     })
 }
@@ -878,6 +946,99 @@ mod tests {
     fn una_mencion_de_project_instructions_no_abre_un_bloque() {
         let texto = "El harness envuelve el fichero en project_instructions, \
                      dentro de <project_context>, y no lo comprime.";
+
+        assert!(detect_instructions(texto).is_none());
+    }
+
+    // --- Qwen Code: `--- Context from: AGENTS.md ---` ---
+
+    /// Reproduce la disposición REAL capturada de Qwen Code 0.21.7: **TRES**
+    /// bloques `Context from:`, con el del proyecto en MEDIO. El primero es el
+    /// `AGENTS.md` global —cuya ruta también acaba en `AGENTS.md`— y el último
+    /// es un fichero de configuración del propio Qwen.
+    ///
+    /// `contenido` entra **VERBATIM**: en el cable es el fichero tal cual, y un
+    /// fichero de texto acaba en `\n`. Ese salto es lo que separa el contenido
+    /// del cierre — **no lo pone el harness**. Por eso el envoltorio son 70 B
+    /// (31 de apertura + el `\n` de después + 38 de cierre) y no 71.
+    fn parte_de_qwen(contenido: &str) -> String {
+        format!(
+            "...prompt de sistema de qwen...\n\n\
+             --- Context from: ../home/.qwen/AGENTS.md ---\n\
+             # Contexto global\n\
+             --- End of Context from: ../home/.qwen/AGENTS.md ---\n\n\
+             --- Context from: AGENTS.md ---\n\
+             {contenido}\
+             --- End of Context from: AGENTS.md ---\n\n\
+             --- Context from: .qwen/output-language.md ---\n\
+             Responde siempre en espanol neutro.\n\
+             --- End of Context from: .qwen/output-language.md ---\n\n\
+             ---\n\n# auto memory\n"
+        )
+    }
+
+    #[test]
+    fn reconoce_el_bloque_de_qwen() {
+        let contenido = "# Instrucciones\n\nResponde en una linea.\n";
+        let texto = parte_de_qwen(contenido);
+
+        let b = detect_instructions(&texto).expect("debe reconocer el bloque");
+
+        assert_eq!(b.format, InstructionsFormat::QwenAgentsMd);
+        let esperado = "--- Context from: AGENTS.md ---\n".len()
+            + contenido.len()
+            + "--- End of Context from: AGENTS.md ---".len();
+        assert_eq!(b.bytes, esperado);
+    }
+
+    /// **El test que decide el detector.** En la captura real hay TRES bloques
+    /// `Context from:` y el del proyecto es el SEGUNDO. Coger el primero da el
+    /// `AGENTS.md` global; y como la ruta de ese global **también acaba en
+    /// `AGENTS.md`**, buscar por sufijo falla igual. La marca tiene que ser la
+    /// ruta EXACTA `AGENTS.md`, que es la del fichero en el directorio actual.
+    #[test]
+    fn el_agents_md_global_de_qwen_no_gana_al_del_proyecto() {
+        let contenido = "contenido del proyecto\n";
+        let texto = parte_de_qwen(contenido);
+
+        let b = detect_instructions(&texto).expect("reconoce");
+
+        let bloque = &texto[texto
+            .find("--- Context from: AGENTS.md ---")
+            .expect("existe")..];
+        assert!(
+            bloque[..b.bytes].contains(contenido),
+            "midió el bloque equivocado: no contiene el contenido del proyecto"
+        );
+        assert!(
+            !bloque[..b.bytes].contains("Contexto global"),
+            "se tragó el bloque global"
+        );
+    }
+
+    /// Qwen es el ÚNICO de los cuatro cuyo envoltorio es de verdad constante:
+    /// su ruta es **relativa**, así que no crece con la profundidad del
+    /// directorio. 70 B medidos en la captura real (31 de apertura + 1 + 38 de
+    /// cierre), frente a los `55/62/21 B + ruta` de `pi`, Codex y opencode.
+    #[test]
+    fn el_envoltorio_de_qwen_es_de_verdad_fijo() {
+        let contenido = "x\n";
+        let texto = parte_de_qwen(contenido);
+
+        let b = detect_instructions(&texto).expect("reconoce");
+
+        assert_eq!(
+            b.bytes - contenido.len(),
+            70,
+            "70 B FIJOS: la ruta es relativa y no infla el envoltorio"
+        );
+    }
+
+    /// Sin cierre no hay bloque. Qwen SÍ cierra, así que un cuerpo sin
+    /// `--- End of Context from: AGENTS.md ---` no es su forma y no se adivina.
+    #[test]
+    fn sin_cierre_el_bloque_de_qwen_no_se_adivina() {
+        let texto = "--- Context from: AGENTS.md ---\ncontenido sin cerrar\n\n# otra cosa";
 
         assert!(detect_instructions(texto).is_none());
     }
