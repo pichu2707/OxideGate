@@ -139,7 +139,9 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
    lo largo del tiempo, últimas ~120 muestras (~2 minutos a 1 poll/seg).
 5. **Panel de requests recientes** (toggleable con `p`, ver §7): las últimas
    peticiones individuales, más nueva arriba, con marcadores de outlier, en
-   una de dos vistas cicladas con `c` (`Latency` o `Context`, ver §7.1).
+   una de dos vistas cicladas con `c` (`Latency` o `Context`, ver §7.1). El
+   título lleva la antigüedad de lo último que enseña (`· última hace 3h
+   47m`) y la columna `hora` va en hora local — ver §7.9.
 6. **Panel de tools por servidor** (toggleable con `s`, ver §8): desglose de
    bytes de herramientas por servidor MCP de la petición más reciente que
    los declare, con delta contra el baseline. Independiente del panel
@@ -185,7 +187,7 @@ del que se derivan el alto del lienzo y el tope del scroll):
 
 | Sección | Líneas | ¿Scrollea? |
 |---|---|---|
-| header | 3 | no |
+| header | 4 | no |
 | tabla de modelos | 8 | sí |
 | ANTES/DESPUÉS | 6 | sí |
 | sparklines | 7 | sí |
@@ -288,7 +290,7 @@ presentación):
 
 | Columna | Qué muestra |
 |---|---|
-| `hora` | `HH:MM:SS` UTC extraído del timestamp RFC 3339 |
+| `hora` | `HH:MM:SS` en la **zona horaria de esta máquina**, convertido del timestamp RFC 3339 que el proxy sella en UTC (ver §7.9) |
 | `modelo` | Modelo solicitado, truncado a 16 caracteres; `-` si no venía en el body |
 | `st` | `y`/`n` — si el request pidió streaming |
 | `status` | Código HTTP devuelto al cliente |
@@ -629,6 +631,50 @@ lo que el monitor afirma sobre ello.
 Si el filtro no deja ninguna fila, el panel lo dice con una línea explícita
 en vez de quedarse en blanco: una caja vacía no distingue "este modelo no ha
 pedido nada últimamente" de "el panel está roto".
+
+### 7.9. Hora local y antigüedad: distinguir "parado" de "otra zona horaria"
+
+El proxy sella cada petición en UTC. El panel pintaba ese `HH:MM:SS` tal cual,
+y en cualquier zona que no sea UTC eso produce una trampa de diagnóstico:
+
+> En CEST (UTC+2), una petición medida **hace treinta segundos** se pintaba
+> como `20:06` con el reloj del usuario marcando `22:07`.
+
+Dos horas de desfase aparente sobre un dato perfectamente fresco. Y al revés:
+un buffer congelado se ve exactamente igual. **La columna no puede distinguir
+"viejo" de "otra zona horaria"**, así que la conclusión natural mirando la
+pantalla —"el monitor se ha quedado pillado"— podía ser justo la equivocada.
+
+Dos cambios, y hacen falta los dos:
+
+1. **`hora` va en la zona de esta máquina.** El monitor mira la máquina que
+   tienes delante; la referencia es su reloj. La conversión es real
+   (`with_timezone`), no un recorte del string: un timestamp que ya venga con
+   desplazamiento cae en el mismo instante que su equivalente en `Z`.
+2. **El título del panel lleva la antigüedad de lo último medido** —
+   `· última hace 3h 47m`. Sale de la fila más reciente de las que el panel
+   PINTA, no del buffer entero: con el filtro (`f`) puesto en un modelo
+   callado, la última petición del buffer puede ser de otro modelo y mucho
+   más nueva que todo lo que estás viendo. Un título que hablara del buffer
+   describiría filas que no están en pantalla — justo el desajuste que esta
+   cifra existe para eliminar.
+
+El segundo es el que resuelve el problema. Pasar la hora a local quita el
+desfase falso, pero `18:20` con el reloj en `22:07` **sigue** sin gritar que
+eso es de hace casi cuatro horas. La antigüedad contesta de un vistazo a la
+única pregunta que importa mirando un panel en vivo: *¿esto está pasando
+ahora?*
+
+Detalles del cálculo:
+
+- La escala cambia con la magnitud (`hace 45s` / `hace 12m` / `hace 3h 47m`):
+  `hace 13620s` no responde a ninguna pregunta.
+- Un timestamp del **futuro** —relojes desincronizados entre proxy y monitor—
+  se trata como "ahora mismo", nunca como antigüedad negativa ni como un
+  número enorme por desbordamiento.
+- Si el timestamp no parsea, no se inventa antigüedad: no aparece el
+  indicador. Y la columna `hora` enseña el string crudo, porque mostrar un
+  dato raro es mejor que taparlo con un placeholder que parece normal.
 
 ## 8. Panel de tools por servidor (`s`)
 
