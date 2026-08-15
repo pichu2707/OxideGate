@@ -1,8 +1,9 @@
 # El banco de captura — medir lo que inyecta un harness sin gastar un token
 
-> Validado el **2026-08-09** con Codex 0.142.5 y Qwen Code 0.21.7 contra
-> `ollama` local. Coste: **cero**. El método es reproducible en cualquier
-> máquina con ollama; los números son de esta.
+> Validado el **2026-08-09** con Codex 0.142.5 y Qwen Code 0.21.7, y el
+> **2026-08-15** con `pi` 0.80.10, contra `ollama` local. Coste: **cero**. El
+> método es reproducible en cualquier máquina con ollama; los números son de
+> esta.
 
 ---
 
@@ -115,6 +116,45 @@ OPENAI_MODEL=llama3.2:3b \
   qwen -p "Responde solo: ok" < /dev/null
 ```
 
+**`pi`** — proveedor propio declarado en un fichero, con `HOME` aislado.
+
+El registro de proveedores es **`$HOME/.pi/agent/models.json`**. No sirve
+`models-store.json`, que es solo la caché del catálogo: escribir ahí da
+`Unknown provider "banco"`.
+
+```json
+{
+  "providers": {
+    "banco": {
+      "baseUrl": "http://127.0.0.1:8912/v1",
+      "api": "openai-completions",
+      "apiKey": "banco-no-se-usa",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false
+      },
+      "models": [{ "id": "llama3.2:3b" }]
+    }
+  }
+}
+```
+
+```sh
+env -i -C /tmp/sonda \
+  HOME=/tmp/home-aislado PATH="$PATH" TERM=dumb PI_OFFLINE=1 \
+  pi --provider banco --model llama3.2:3b --api-key banco-no-se-usa \
+     --print --no-session --offline --approve \
+     "Responde solo: ok" < /dev/null
+```
+
+> **`--approve` no es opcional.** Sin él `pi` puede no confiar en los ficheros
+> project-local, no inyectar el `AGENTS.md` y dejar la captura vacía — sin dar
+> ningún error que lo delate.
+
+Las credenciales de `pi` viven en `~/.pi/agent/auth.json`, así que aislar `HOME`
+las deja fuera y el peor caso sigue siendo un error de auth. `env -i` lo remata:
+el proceso no hereda ninguna variable de la sesión.
+
 Variables del banco: `CAPTURA_PORT` (8912), `CAPTURA_DIR` (`./capturas`),
 `CAPTURA_MODELO` (`qwen2.5:7b`), `CAPTURA_OLLAMA` (11434).
 
@@ -122,17 +162,19 @@ Variables del banco: `CAPTURA_PORT` (8912), `CAPTURA_DIR` (`./capturas`),
 
 ## 5. Lo que se midió el 2026-08-09
 
-Mismo `AGENTS.md` de **202 B** en los dos casos.
+Mismo `AGENTS.md` de **202 B** en todos los casos.
 
 | Herramienta | Bloque | Envoltorio | Ruta | Cierre |
 |---|---:|---:|---|---|
 | **Codex 0.142.5** | 380 B | **178 B** | absoluta (116 B) | `</INSTRUCTIONS>` |
 | **Qwen Code 0.21.7** | 272 B | **70 B** | relativa | `--- End of Context… ---` |
 | **opencode 1.18.15** | 349 B | **147 B** | absoluta (126 B) | **ninguno** |
+| **`pi` 0.80.10** | 377 B | **175 B** | absoluta (120 B) | `</project_instructions>` |
 
-Dos de los tres tienen el envoltorio **dominado por la ruta absoluta del
-proyecto** — 65% en Codex, 86% en opencode. Ninguna de sus cifras publicadas es
-una constante, y no se pueden comparar entre máquinas sin decir la ruta.
+Tres de los cuatro tienen el envoltorio **dominado por la ruta absoluta del
+proyecto** — 65% en Codex, 86% en opencode, 69% en `pi`. Ninguna de sus cifras
+publicadas es una constante, y no se pueden comparar entre máquinas sin decir la
+ruta. Solo Qwen, con ruta **relativa**, publica un envoltorio de verdad fijo.
 
 ### Codex: el envoltorio depende de DÓNDE tengas el proyecto
 
@@ -192,14 +234,26 @@ corresponde y no con el primero que aparezca.
 
 ## 7. Qué falta
 
-- **opencode y Codex: capturados y con detector** en `provider::instructions`
-  (`opencode_agents_md` y `codex_agents_md`). La marca de opencode **sí
-  sobrevivió** a diez versiones de deriva; la de Codex **no existía**. Una de
-  dos: por eso ningún dialecto entra desde una tabla.
-- **`pi`**: sin capturar.
-- **`pi` manda el cuerpo comprimido con zstd**, único de los cuatro. Sus cifras
-  serán **lógicas**; el coste en cable es ~1/3. Publicarlo sin decirlo lo
-  penalizaría por partida doble.
+- **opencode, Codex y `pi`: capturados y con detector** en
+  `provider::instructions` (`opencode_agents_md`, `codex_agents_md` y
+  `pi_agents_md`). Las marcas de opencode y `pi` **sí sobrevivieron** a su
+  deriva de versiones; la de Codex **no existía**. Por eso ningún dialecto entra
+  desde una tabla.
+- **El zstd de `pi` era una verdad a medias.** Se documentaba aquí que `pi`
+  «manda el cuerpo comprimido con zstd, único de los cuatro», y que por eso sus
+  cifras serían lógicas con un cable de ~1/3. La medición era real, pero **le
+  faltaba la condición**: `pi` comprime SOLO cuando habla la API
+  `openai-codex-responses`, y solo en su ruta SSE. Su código lo dice —*«the same
+  endpoint the official Codex client compresses against»*— y el transporte
+  WebSocket manda JSON sin comprimir incluso ahí. La captura de 0.80.10 contra
+  un proveedor `openai-completions` viaja en **JSON plano**. Es una propiedad
+  del **endpoint de Codex**, no del harness `pi`.
+- **Qwen Code**: capturado y medido (§5), pero **sin detector**. Es el único que
+  queda de #66, y el más barato: envoltorio fijo de 70 B, ruta relativa, y
+  apertura **y** cierre reales, así que encaja directo en
+  [`block_scan`](../src/provider/block_scan.rs). Aun así hay que **recapturar**:
+  §5 es una tabla, y la regla de #66 es que ningún dialecto entra desde una
+  tabla. La recaptura cuesta cero.
 - **Los detectores en sí**: este documento es la condición de entrada de #66,
   no su implementación. Un dialecto por PR, cada uno con su captura.
 

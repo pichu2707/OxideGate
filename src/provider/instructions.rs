@@ -70,18 +70,19 @@ use super::block_scan::primer_bloque_con;
 /// tráfico **sin depender del `User-Agent`**, que es contenido controlado por
 /// el cliente.
 ///
-/// Hoy tiene una sola variante **a propósito**: es la única verificada en el
-/// cable. Codex, opencode y `pi` también inyectan el fichero y tienen marca
-/// propia documentada (`docs/skills-across-tools.md` §6), pero esa tabla se
-/// escribió contra versiones anteriores y una marca es una cadena literal:
-/// añadirlas sin recapturar sería inventar la medición que este módulo existe
-/// para no inventar. Cada una entra cuando su captura exista.
+/// **Cada variante entró con su propia captura del cable**, nunca desde la
+/// tabla de `docs/skills-across-tools.md` §6: una marca es una cadena literal,
+/// y añadirla sin recapturar sería inventar la medición que este módulo existe
+/// para no inventar. La regla se ganó el sueldo dos veces: la marca documentada
+/// de Codex **no existía en el binario**, y el zstd que se le atribuía a `pi`
+/// resultó ser del **endpoint de Codex**, no del harness — una medición real a
+/// la que le faltaba su condición.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-// Las tres variantes acaban en `Md` y clippy sugiere quitar el sufijo. NO se
+// Las cuatro variantes acaban en `Md` y clippy sugiere quitar el sufijo. NO se
 // hace: estos nombres se serializan con `rename_all` y son VALORES PUBLICADOS
 // del campo `instructions.format` (`claude_md`, `codex_agents_md`,
-// `opencode_agents_md`), que consume `oxidegate-lens`. Renombrarlos por
+// `opencode_agents_md`, `pi_agents_md`), que consume `oxidegate-lens`. Renombrarlos por
 // ergonomía interna rompería el contrato de un consumidor externo — y el sufijo
 // no es ruido: nombra el fichero que cada harness inyecta.
 #[allow(clippy::enum_variant_names)]
@@ -115,6 +116,41 @@ pub enum InstructionsFormat {
     /// se puede comparar entre máquinas sin decir dónde estaba el proyecto.
     /// Mismo hallazgo que con Codex.
     OpencodeAgentsMd,
+    /// `pi`: el bloque `<project_instructions path="<ruta absoluta>">`, dentro
+    /// del contenedor `<project_context>` del prompt de sistema.
+    ///
+    /// Medido sobre captura real de **`pi` 0.80.10** (2026-08-15): con un
+    /// `AGENTS.md` de 202 B el bloque son **377 B**, o sea **175 B de
+    /// envoltorio** — y **120 de esos 175 son la RUTA ABSOLUTA** del proyecto.
+    /// El «+200 B lógicos» que circulaba es en realidad `55 B + longitud de la
+    /// ruta`. Tercer dialecto seguido con el envoltorio dominado por la ruta
+    /// (Codex 65%, opencode 86%, `pi` 69%).
+    ///
+    /// **La marca documentada para `pi` SÍ existe**, al contrario que la de
+    /// Codex.
+    ///
+    /// # El zstd depende del PROVEEDOR, no del harness
+    ///
+    /// Se documentaba que `pi` manda el cuerpo comprimido con zstd y que es
+    /// «el único de los cuatro» que lo hace, y de ahí que sus cifras fueran
+    /// lógicas con un cable de ~1/3. **Esa medición era real, pero le falta la
+    /// condición.** En esta captura —`pi` contra un proveedor
+    /// `openai-completions`— el cuerpo viaja en **JSON plano**, así que estos
+    /// 377 B son de CABLE.
+    ///
+    /// El motivo está en el código de `pi`: `zstd` aparece SOLO en
+    /// `pi-ai/dist/api/openai-codex-responses.js`, y su propio comentario dice
+    /// *«The Codex backend accepts zstd-compressed request bodies on the SSE
+    /// responses endpoint (the same endpoint the official Codex client
+    /// compresses against)»*. Es propiedad del **endpoint de Codex**, no del
+    /// harness — y encima el transporte WebSocket manda JSON sin comprimir
+    /// incluso ahí.
+    ///
+    /// Consecuencia para quien lea `bytes`: son lógicos o de cable **según a
+    /// qué backend se enrute `pi`**. Con Codex detrás, `maybe_decompress` ya
+    /// deshace el zstd antes de medir (ver [`super::maybe_decompress`]) y la
+    /// cifra vuelve a ser lógica; con cualquier otro proveedor, coinciden.
+    PiAgentsMd,
 }
 
 /// Tope de filas con cabecera propia que publica [`desglosar`].
@@ -414,14 +450,17 @@ const OPENCODE_FIN: &str = "Skills provide specialized instructions";
 /// Devuelve `None` si no reconoce ningún dialecto, o si lo que encuentra es un
 /// envoltorio sin la marca interna.
 ///
-/// **El orden no es casual.** Claude Code va primero porque su bloque está
-/// delimitado por un envoltorio con apertura Y cierre reales
-/// (`<system-reminder>`…`</system-reminder>`), mientras que el de opencode solo
-/// tiene apertura. Ante un cuerpo donde los dos pudieran aparecer, gana el que
-/// se puede delimitar con certeza.
+/// **El orden no es casual: mandan los que cierran de verdad.** Claude Code
+/// (`<system-reminder>`…`</system-reminder>`), Codex (`<INSTRUCTIONS>`…
+/// `</INSTRUCTIONS>`) y `pi` (`<project_instructions>`…`</project_instructions>`)
+/// delimitan su bloque con apertura Y cierre reales. opencode va el ÚLTIMO
+/// porque solo tiene apertura y su final hay que deducirlo de una frase en
+/// prosa. Ante un cuerpo donde varios pudieran aparecer, gana el que se puede
+/// delimitar con certeza.
 pub fn detect_instructions(texto: &str) -> Option<InstructionsBlock> {
     detect_claude_md(texto)
         .or_else(|| detect_codex(texto))
+        .or_else(|| detect_pi(texto))
         .or_else(|| detect_opencode(texto))
 }
 
@@ -450,6 +489,48 @@ fn detect_codex(texto: &str) -> Option<InstructionsBlock> {
     Some(InstructionsBlock {
         bytes: bloque.len(),
         format: InstructionsFormat::CodexAgentsMd,
+        by_heading: desglosar(bloque),
+    })
+}
+
+/// Apertura del bloque de `pi`. Lleva el `path="` a propósito: el prompt de
+/// sistema de `pi` y su documentación hablan de sus propias etiquetas, y una
+/// mención suelta del nombre no puede abrir un bloque.
+const PI_ABRE: &str = "<project_instructions path=\"";
+const PI_CIERRA: &str = "</project_instructions>";
+
+/// `pi`: el bloque `<project_instructions path="…">`, con la ruta absoluta en
+/// la apertura y un cierre real.
+///
+/// # Dónde se corta, y por qué no en el contenedor
+///
+/// El bloque vive dentro de `<project_context>`, que en la captura real añade
+/// **86 B más** (463 B frente a 377 B). Ese contenedor **queda fuera**: es
+/// genérico —su nombre no dice «instructions»— y su preámbulo es prosa del
+/// harness, no algo atribuible al fichero del usuario. La frontera honesta es
+/// el bloque que nombra la ruta.
+///
+/// Se mide **desde `<project_instructions`**, no desde el `>` de la apertura:
+/// la ruta absoluta vive ahí y son **120 de los 175 B de envoltorio**. Cortar
+/// después dejaría fuera el 69% de lo que cuesta.
+///
+/// Como Codex —y a diferencia de opencode— `pi` **sí cierra**, así que la
+/// frontera final es real y no hay que adivinarla. Sin `</project_instructions>`
+/// no es su forma y se devuelve `None` en vez de inventar un final.
+///
+/// # Un solo bloque
+///
+/// `pi` descubre `AGENTS.md` **y** `CLAUDE.md`, así que cabía esperar dos
+/// bloques dentro del contenedor. Verificado en el cable con los dos ficheros
+/// presentes: emite **uno solo**, el de `AGENTS.md`. Por eso se mide el primero
+/// y no se suma una lista.
+fn detect_pi(texto: &str) -> Option<InstructionsBlock> {
+    let inicio = texto.find(PI_ABRE)?;
+    let cierra = texto[inicio..].find(PI_CIERRA)? + inicio + PI_CIERRA.len();
+    let bloque = &texto[inicio..cierra];
+    Some(InstructionsBlock {
+        bytes: bloque.len(),
+        format: InstructionsFormat::PiAgentsMd,
         by_heading: desglosar(bloque),
     })
 }
@@ -700,6 +781,105 @@ mod tests {
             b.bytes,
             texto.len()
         );
+    }
+
+    // --- pi: `<project_instructions path="…">` dentro de `<project_context>` ---
+
+    /// Reproduce la disposición REAL capturada de `pi` 0.80.10: el contenedor
+    /// `<project_context>` con su preámbulo en prosa, el bloque con la ruta
+    /// absoluta EN LA APERTURA, y el `cwd` detrás del contenedor.
+    fn parte_de_pi(contenido: &str) -> String {
+        format!(
+            "...prompt de sistema de pi...\n\n\
+             <project_context>\n\n\
+             Project-specific instructions and guidelines:\n\n\
+             <project_instructions path=\"/home/quien/proyecto/AGENTS.md\">\n\
+             {contenido}\n\
+             </project_instructions>\n\n\
+             </project_context>\n\n\
+             Current working directory: /home/quien/proyecto"
+        )
+    }
+
+    #[test]
+    fn reconoce_el_bloque_de_pi() {
+        let contenido = "# Instrucciones\n\nResponde en una linea.";
+        let texto = parte_de_pi(contenido);
+
+        let b = detect_instructions(&texto).expect("debe reconocer el bloque");
+
+        assert_eq!(b.format, InstructionsFormat::PiAgentsMd);
+        // De la apertura CON la ruta al cierre real, ni un byte más.
+        let esperado = "<project_instructions path=\"/home/quien/proyecto/AGENTS.md\">\n".len()
+            + contenido.len()
+            + "\n</project_instructions>".len();
+        assert_eq!(b.bytes, esperado);
+    }
+
+    /// La ruta absoluta vive DENTRO de la apertura, y es lo que domina el
+    /// envoltorio: en la captura real son **120 de los 175 B**, un 69%. Medir
+    /// desde `>` en vez de desde `<project_instructions` tiraría ese 69% —
+    /// mismo error que ya se evitó en Codex (116 de 178) y opencode (126 de 147).
+    #[test]
+    fn la_ruta_de_pi_entra_en_la_cuenta() {
+        const RUTA: &str = "/home/quien/proyecto/AGENTS.md";
+        let contenido = "x";
+        let texto = parte_de_pi(contenido);
+
+        let b = detect_instructions(&texto).expect("reconoce");
+
+        // Lo que se paga de más por tener el fichero, con este contenido.
+        let envoltorio = b.bytes - contenido.len();
+        assert_eq!(
+            envoltorio - RUTA.len(),
+            55,
+            "el envoltorio de pi es `55 B FIJOS + la ruta`, no una constante: \
+             en la captura real la ruta eran 120 de 175 B (69%)"
+        );
+    }
+
+    /// **El contenedor `<project_context>` queda FUERA a propósito.** En la
+    /// captura real añade 86 B más (bloque 463 B frente a 377 B), pero es un
+    /// contenedor genérico —su nombre no dice «instructions»— y su preámbulo en
+    /// prosa no es atribuible al fichero del usuario. La frontera honesta es el
+    /// bloque que SÍ nombra la ruta, que además abre y cierra de verdad.
+    #[test]
+    fn el_contenedor_de_pi_queda_fuera_de_la_cuenta() {
+        let texto = parte_de_pi("# algo");
+        let contenedor = texto.find("<project_context>").expect("hay contenedor");
+        let fin_contenedor =
+            texto.find("</project_context>").expect("cierra") + "</project_context>".len();
+
+        let b = detect_instructions(&texto).expect("reconoce");
+
+        assert!(
+            b.bytes < fin_contenedor - contenedor,
+            "no puede tragarse el contenedor entero: {} vs {}",
+            b.bytes,
+            fin_contenedor - contenedor
+        );
+    }
+
+    /// Sin cierre no hay bloque. `pi` SÍ cierra —como Codex y a diferencia de
+    /// opencode— así que un cuerpo sin `</project_instructions>` no es su forma
+    /// y no se adivina el final.
+    #[test]
+    fn sin_cierre_el_bloque_de_pi_no_se_adivina() {
+        let texto = "<project_context>\n<project_instructions path=\"/x/AGENTS.md\">\nsin cerrar";
+
+        assert!(detect_instructions(texto).is_none());
+    }
+
+    /// La marca lleva el atributo `path="` a propósito. El contenido es markdown
+    /// de una persona —y la documentación de `pi` habla de `custom-provider.md`
+    /// y de sus propias etiquetas—, así que una mención suelta del nombre no
+    /// puede abrir un bloque.
+    #[test]
+    fn una_mencion_de_project_instructions_no_abre_un_bloque() {
+        let texto = "El harness envuelve el fichero en project_instructions, \
+                     dentro de <project_context>, y no lo comprime.";
+
+        assert!(detect_instructions(texto).is_none());
     }
 
     /// Claude Code gana cuando los dos dialectos podrían aparecer: su bloque

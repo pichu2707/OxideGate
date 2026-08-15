@@ -245,8 +245,11 @@ pub struct RecentRequest {
     ///
     /// 1. **No es el tamaño de wire.** En `/v1/codex/responses` y `/v1beta/*`
     ///    se mide sobre el body ya DESCOMPRIMIDO (ver
-    ///    `provider::maybe_decompress`): si el cliente comprimió —`pi` manda
-    ///    zstd— por el cable subieron menos bytes que los que dice este campo.
+    ///    `provider::maybe_decompress`): si el cliente comprimió —el endpoint
+    ///    SSE de Codex acepta zstd, y tanto su cliente oficial como `pi` lo
+    ///    usan ahí— por el cable subieron menos bytes que los que dice este
+    ///    campo. Fuera de ese endpoint `pi` manda JSON plano: la compresión es
+    ///    del endpoint, no del harness.
     /// 2. **No es lo que subió al proveedor.** Se calcula sobre el body
     ///    ORIGINAL, antes de cualquier mutación. Con
     ///    [`Self::cache_control_forced`] en `true` el body reenviado es MAYOR

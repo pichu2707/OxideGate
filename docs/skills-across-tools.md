@@ -111,24 +111,52 @@ sin el fichero:
 | **pi** 0.80.10 | `system` | **+200 B** | +126 B |
 
 Las tres que lo leen lo envuelven con un marcador y **la ruta absoluta del
-fichero**: Codex con `--- project-doc ---` dentro de `<INSTRUCTIONS>`, opencode
-con `Instructions from: /ruta/completa/AGENTS.md`. Es el mismo patrón que
-encarece sus listados de skills (§2): pagan por decirle al modelo dónde está un
-fichero que el modelo no va a abrir.
+fichero**. Es el mismo patrón que encarece sus listados de skills (§2): pagan
+por decirle al modelo dónde está un fichero que el modelo no va a abrir.
 
-El sobrecoste es **fijo por fichero**, no proporcional: en un `AGENTS.md` real
-de varios kB se amortiza. Sobre uno de 74 B, más que dobla el contenido.
+> **Las marcas de esta tabla se recapturaron después, y una no existía.** Aquí
+> se documentaba que Codex usa `--- project-doc ---` dentro de
+> `<INSTRUCTIONS>`: `grep` sobre la captura real de 0.142.5 devuelve **cero**.
+> La de verdad es `# AGENTS.md instructions for <ruta>`. Las marcas verificadas,
+> con la versión con la que se capturó cada una, están en
+> [`telemetry-per-request.md`](telemetry-per-request.md) §4.13.
+
+El sobrecoste **no es fijo**, aunque estas tres cifras lo parezcan. Recapturado
+con un `AGENTS.md` de 202 B, el envoltorio de las tres está **dominado por la
+ruta absoluta** —65% en Codex, 86% en opencode, 69% en `pi`— así que los +159,
++160 y +200 B de arriba son en realidad `62 B + ruta`, `21 B + ruta` y
+`55 B + ruta`. Salen de las rutas de ESTA máquina. Un proyecto en `/home/u/p`
+paga bastante menos que uno en un directorio profundo, y **ninguna de estas
+cifras se puede comparar entre máquinas sin decir la ruta**. Ver
+[`banco-de-captura.md`](banco-de-captura.md) §5.
+
+Lo que sí es cierto es que el sobrecoste no es proporcional al contenido: en un
+`AGENTS.md` real de varios kB se amortiza. Sobre uno de 74 B, más que dobla el
+fichero.
 
 > **Para quien use `AGENTS.md` como fuente única entre herramientas:** en
 > Claude Code el fichero es gratis porque **se ignora** —hay que convertirlo a
 > `CLAUDE.md` o no se aplica— y en las otras tres se paga en cada petición.
 > El mismo fichero, cuatro comportamientos.
 
-### `pi` comprime, y eso cambia cómo leer la cifra
+### `pi` comprime —pero solo contra un backend— y eso cambia cómo leer la cifra
 
 Re-medido con captura de body a cero cuota (la primera medida fue por delta a
-través del proxy, y no podía ver esto): **`pi` manda su body comprimido con
-zstd.** Es el único de los cuatro que lo hace.
+través del proxy, y no podía ver esto): **`pi` mandó su body comprimido con
+zstd.**
+
+> **Corrección (2026-08-15): no es una propiedad de `pi`.** Aquí se escribió que
+> es «el único de los cuatro que lo hace», y eso generaliza de más. `zstd`
+> aparece en un solo sitio de su código —`pi-ai/dist/api/openai-codex-responses.js`—
+> con este comentario: *«The Codex backend accepts zstd-compressed request
+> bodies on the SSE responses endpoint (the same endpoint the official Codex
+> client compresses against)»*. O sea: comprime **solo cuando habla la API
+> `openai-codex-responses`**, solo en la ruta SSE, y porque lo hace el cliente
+> oficial de Codex contra ese endpoint. El transporte WebSocket manda JSON sin
+> comprimir incluso ahí.
+>
+> Capturado el 2026-08-15 contra un proveedor `openai-completions`, `pi` 0.80.10
+> manda **JSON plano**. La compresión es del **endpoint**, no del harness.
 
 | | con `AGENTS.md` | sin | delta |
 |---|---:|---:|---:|
@@ -136,17 +164,26 @@ zstd.** Es el único de los cuatro que lo hace.
 | **Cable (zstd)** | 43.379 B | 43.306 B | **+73 B** |
 
 Sobre un fichero de 67 B. Concuerda con la primera medida —74 B daban +200 B—:
-el sobrecoste es constante, ~127 B, y confirma el modelo.
+~127 B de envoltorio.
 
-> **Las cifras de la tabla de arriba son LÓGICAS.** Para `pi`, el coste real en
-> el cable es **~1/3**, porque comprime. Las otras tres mandan JSON plano, así
-> que en ellas lógico y cable coinciden. Comparar el +200 B de `pi` con el
-> +159 B de Codex sin decir esto **penaliza a `pi` por partida doble**: se le
-> cuenta el bloque descomprimido y se le ignora la compresión.
+> **Ese ~127 B no es una constante, y las dos medidas no lo prueban.** Se
+> tomaron en la MISMA máquina, con la MISMA ruta de proyecto, así que coincidir
+> era lo esperable. La recaptura de 0.80.10 con ruta larga da 175 B de
+> envoltorio, de los cuales **120 son la ruta**: el fijo real de `pi` son 55 B.
+> Ver §6 y [`banco-de-captura.md`](banco-de-captura.md) §5.
+
+> **Cuándo son LÓGICAS las cifras de la tabla de arriba.** Solo cuando `pi` va
+> contra el backend de Codex, que es donde comprime: ahí el cable es ~1/3 del
+> lógico. Contra cualquier otro proveedor `pi` manda JSON plano y las dos cifras
+> coinciden, igual que en las otras tres herramientas. Comparar el +200 B de
+> `pi` con el +159 B de Codex **sin decir contra qué backend iba** lo penaliza
+> por partida doble: se le cuenta el bloque descomprimido y se le ignora una
+> compresión que además no siempre ocurre.
 
 Lo lógico sigue siendo lo que se factura —el proveedor tokeniza el JSON, no el
 zstd— así que la tabla no está mal. Pero si lo que se mira es **ancho de banda**
-y no tokens, `pi` es el más barato de los cuatro, no el más caro.
+y no tokens, `pi` **contra el backend de Codex** es el más barato de los cuatro,
+no el más caro. Contra otros proveedores, viaja como todos.
 
 El envoltorio es `<project_instructions path="/ruta/absoluta/AGENTS.md">` dentro
 de un bloque `<project_context>`, en el bucket `instructions`.

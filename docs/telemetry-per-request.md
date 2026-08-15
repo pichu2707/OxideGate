@@ -1026,7 +1026,7 @@ palanca se aplica.
 | Campo | Qué es |
 |---|---|
 | `bytes` | Bytes del bloque completo, envoltorio incluido. Se pagan en CADA petición |
-| `format` | `claude_md` \| `codex_agents_md` \| `opencode_agents_md` — ver abajo |
+| `format` | `claude_md` \| `codex_agents_md` \| `opencode_agents_md` \| `pi_agents_md` — ver abajo |
 
 #### El bloque se delimita por su ENVOLTORIO, nunca por una cabecera
 
@@ -1066,27 +1066,59 @@ correcto: **Claude Code ignora `AGENTS.md`** — `null` con ese fichero en el
 proyecto es la respuesta buena, no un fallo del detector. El mismo fichero,
 cuatro comportamientos (`docs/skills-across-tools.md` §6).
 
-#### Tres `format`, y cada uno con su captura detrás
+#### Cuatro `format`, y cada uno con su captura detrás
 
 | `format` | Herramienta | Envoltorio | Cierre | Ruta |
 |---|---|---|---|---|
 | `claude_md` | Claude Code 2.1.220 | `<system-reminder>` con `# claudeMd` dentro | sí | — |
 | `codex_agents_md` | Codex 0.142.5 | cabecera + `<INSTRUCTIONS>`…`</INSTRUCTIONS>` | sí | **absoluta** |
 | `opencode_agents_md` | opencode 1.18.15 | `Instructions from: <ruta absoluta>` | **no** | **absoluta** |
+| `pi_agents_md` | `pi` 0.80.10 | `<project_instructions path="…">`…`</project_instructions>` | sí | **absoluta** |
 
 Cada dialecto entra **cuando tiene captura propia**, nunca desde una tabla. Y el
-motivo dejó de ser teórico: la marca que se documentaba para **Codex**
-—`--- project-doc ---`— **no existe** en 0.142.5. `grep` devuelve cero sobre la
-captura real; la de verdad es `# AGENTS.md instructions for <ruta>`. La de
-opencode, en cambio, **sí sobrevivió** a diez versiones de deriva.
+motivo dejó de ser teórico **dos veces**:
 
-Una de dos. Escribir ambos detectores desde la tabla habría dejado uno roto
-publicando `null` — y `null` es un valor legítimo en este campo, así que nadie
-lo habría notado.
+1. La marca que se documentaba para **Codex** —`--- project-doc ---`— **no
+   existe** en 0.142.5. `grep` devuelve cero sobre la captura real; la de verdad
+   es `# AGENTS.md instructions for <ruta>`.
+2. De **`pi`** se documentaba que manda el cuerpo en zstd y que por eso sus
+   cifras serían lógicas. La medición era real, pero **le faltaba la
+   condición** — ver abajo.
 
-Falta **`pi`**, que además manda el cuerpo en zstd: sus cifras serán lógicas y
-habrá que decirlo. Ver #66 y
-[`banco-de-captura.md`](banco-de-captura.md) para el método.
+La marca de opencode, en cambio, **sí sobrevivió** a diez versiones de deriva, y
+la de `pi` a la suya. Escribir esos detectores desde la tabla habría dejado uno
+roto publicando `null` — y `null` es un valor legítimo en este campo, así que
+nadie lo habría notado.
+
+##### El envoltorio lo domina la RUTA, y por eso no hay constante que publicar
+
+Las tres capturas con `AGENTS.md` de **202 B**, para que sean comparables:
+
+| `format` | Bloque | Envoltorio | De eso, la ruta | Fijo real |
+|---|---:|---:|---:|---|
+| `codex_agents_md` | 380 B | 178 B | 116 B (65%) | `62 B + ruta` |
+| `opencode_agents_md` | 349 B | 147 B | 126 B (86%) | `21 B + ruta` |
+| `pi_agents_md` | 377 B | 175 B | 120 B (69%) | `55 B + ruta` |
+
+Los «+159 B», «+160 B» y «+200 B» que circulaban **no son constantes**: un
+proyecto en `/home/u/p` paga bastante menos que uno en un directorio profundo.
+Ninguna de esas cifras se puede comparar entre máquinas sin decir la ruta.
+
+##### El zstd de `pi` depende del PROVEEDOR, no del harness
+
+`pi` comprime con zstd **solo cuando habla la API `openai-codex-responses`**, y
+solo en su ruta SSE. Su código lo dice literalmente: *«The Codex backend accepts
+zstd-compressed request bodies on the SSE responses endpoint (the same endpoint
+the official Codex client compresses against)»*. El transporte WebSocket manda
+JSON sin comprimir incluso ahí.
+
+Contra un proveedor `openai-completions` —la captura de 0.80.10— el cuerpo viaja
+en **JSON plano**, así que esos 377 B son de **cable**. Con el backend de Codex
+detrás, `maybe_decompress` deshace el zstd antes de medir y la cifra vuelve a ser
+**lógica**. En ambos casos el número publicado es el mismo; lo que cambia es
+cuántos bytes viajaron por el cable para llevarlo.
+
+Ver #66 y [`banco-de-captura.md`](banco-de-captura.md) para el método.
 
 #### La cabecera de Codex va FUERA del envoltorio, y se cuenta
 
@@ -1143,9 +1175,10 @@ cometerlo dos veces.
 Esa frontera es **prosa del harness**, y es una fragilidad conocida: si opencode
 cambia la frase, el campo pasa a `null`. Falla honesto, no falla mintiendo.
 
-Y por eso `claude_md` se prueba **primero**: su bloque tiene apertura y cierre
-reales, así que ante un cuerpo donde los dos pudieran aparecer gana el que se
-puede delimitar con certeza.
+Y por eso **opencode se prueba el ÚLTIMO**: `claude_md`, `codex_agents_md` y
+`pi_agents_md` delimitan su bloque con apertura Y cierre reales, así que ante un
+cuerpo donde varios pudieran aparecer gana el que se puede delimitar con certeza.
+El que tiene que adivinar su final va detrás de todos.
 
 #### Dos avisos sobre la cifra
 
@@ -1283,10 +1316,10 @@ criterio por el que `energy_idle_wh` se publica al lado y no restado.
 ##### Verificado solo en `claude_md`
 
 El reparto es markdown puro, así que **debería** valer igual para
-`codex_agents_md` y `opencode_agents_md`. No se afirma que valga: la regla de
-#66 es que ningún dialecto entra sin captura propia, y las capturas de #88 no
-están en el árbol (`capturas/` está en `.gitignore`). Hay tests de forma para los
-tres dialectos; medición contra tráfico real, solo del primero.
+`codex_agents_md`, `opencode_agents_md` y `pi_agents_md`. No se afirma que valga:
+la regla de #66 es que ningún dialecto entra sin captura propia, y las capturas
+de #88 no están en el árbol (`capturas/` está en `.gitignore`). Hay tests de
+forma para los cuatro dialectos; medición contra tráfico real, solo del primero.
 
 ##### No mueve `CONTRACT_VERSION`
 
