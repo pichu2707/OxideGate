@@ -59,3 +59,10 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
 
       - run: cargo test
+
+      # `cargo test` NO ejecuta los tests que viven dentro de un `example`:
+      # los compila y se para ahi. Las herramientas de medicion viven en
+      # `examples/` a proposito (Cargo no las instala), asi que sin esta linea
+      # su logica pura tendria tests que nadie corre — que es peor que no
+      # tenerlos, porque dan una seguridad que no existe.
+      - run: cargo test --examples
