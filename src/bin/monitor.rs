@@ -56,11 +56,42 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Sparkline, Table, TableState};
+use ratatui::widgets::{
+    Block, Borders, Cell, Paragraph, Row, Sparkline, StatefulWidget, Table, TableState, Widget,
+};
 use ratatui::{Frame, Terminal};
+
+/// Pintado sobre un `Buffer` cualquiera, dentro o fuera de pantalla.
+///
+/// `Frame::render_widget` solo sabe pintar sobre el buffer del frame, que es
+/// exactamente del tamaño del terminal. Este monitor necesita lo contrario:
+/// pintar los paneles a su TAMAÑO COMPLETO sobre un lienzo más alto que la
+/// pantalla y luego asomarse a un trozo (ver [`ui`]). Los widgets de ratatui
+/// ya saben hacerlo —`Widget::render` recibe el buffer destino—, así que lo
+/// único que falta es darle a `Buffer` la misma forma de llamada que tenían
+/// las funciones de dibujado cuando hablaban con `Frame`.
+///
+/// Los métodos NO se llaman `render_widget` a propósito: un nombre idéntico
+/// al de `Frame` haría creer que se está pintando en pantalla cuando puede
+/// que no.
+trait Lienzo {
+    fn pinta<W: Widget>(&mut self, widget: W, area: Rect);
+    fn pinta_con_estado<W: StatefulWidget>(&mut self, widget: W, area: Rect, state: &mut W::State);
+}
+
+impl Lienzo for Buffer {
+    fn pinta<W: Widget>(&mut self, widget: W, area: Rect) {
+        widget.render(area, self);
+    }
+
+    fn pinta_con_estado<W: StatefulWidget>(&mut self, widget: W, area: Rect, state: &mut W::State) {
+        widget.render(area, self, state);
+    }
+}
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Stdout};
@@ -579,6 +610,15 @@ type ModelKey = (String, String);
 /// esos casos la tabla vuelve a no decir qué está seleccionado — que es
 /// justamente el problema que este símbolo cierra.
 const SELECTION_SYMBOL: &str = "▶ ";
+
+/// Cuántas líneas mueve `PgUp`/`PgDn` la ventana sobre el lienzo.
+///
+/// Fijo y no "una pantalla completa" a propósito: con una pantalla entera por
+/// pulsación no queda NINGUNA línea en común entre el antes y el después, y
+/// se pierde el hilo de dónde estabas. Ocho líneas dejan solapamiento con
+/// cualquier ventana razonable y bastan para cruzar un panel entero en dos
+/// toques.
+const PASO_DE_PAGINA: i32 = 8;
 
 fn key_of(r: &StatsRow) -> ModelKey {
     (r.upstream.clone(), r.model.clone())
@@ -2104,6 +2144,13 @@ struct App {
     /// dibujado (ver [`draw_table`]). Persistirlo entre frames es lo que hace
     /// que la tabla scrollee como una lista y no salte.
     models_scroll: TableState,
+    /// Primera fila del lienzo visible en la ventana (ver [`ui`]). Es el
+    /// scroll de la PANTALLA ENTERA, no el de ningún panel: los paneles se
+    /// pintan siempre completos y lo que se mueve es por dónde te asomas.
+    ///
+    /// Se topea al DIBUJAR y no al pulsar la tecla, porque el tope depende
+    /// del alto de la ventana, que solo se conoce con el frame delante.
+    page_scroll: u16,
     status: String,
     /// Último snapshot bueno de `/requests`, en orden cronológico (más viejo
     /// primero, tal como lo entrega el buffer). Si el último poll a
@@ -2167,6 +2214,7 @@ impl App {
             prev_poll: None,
             selected: 0,
             models_scroll: TableState::default(),
+            page_scroll: 0,
             status: "esperando el primer poll...".to_string(),
             recent_requests: Vec::new(),
             requests_status: "esperando el primer poll...".to_string(),
@@ -2311,6 +2359,23 @@ impl App {
         if self.show_requests_panel {
             self.requests_view = self.requests_view.next();
         }
+    }
+
+    /// Desplaza la ventana sobre el lienzo, en líneas. Positivo baja.
+    ///
+    /// NO se topea acá: el tope depende del alto de la ventana, que solo se
+    /// conoce al dibujar. Pasarse es inofensivo — el siguiente frame lo
+    /// corrige antes de que se vea nada (ver [`ui`]).
+    fn scroll_pagina(&mut self, lineas: i32) {
+        let nuevo = self.page_scroll as i32 + lineas;
+        self.page_scroll = nuevo.max(0) as u16;
+    }
+
+    /// Vuelve al principio del lienzo. `Fin` no tiene par acá porque el tope
+    /// no se conoce sin la ventana: se pide un scroll enorme y el clamp del
+    /// dibujado lo deja exactamente en el final.
+    fn scroll_al_inicio(&mut self) {
+        self.page_scroll = 0;
     }
 
     /// Alterna el filtro del panel de requests por el modelo seleccionado
@@ -2475,6 +2540,17 @@ fn run_app(
                     // `f` de filtro: estrecha el panel de requests al modelo
                     // que esté seleccionado en la tabla.
                     KeyCode::Char('f') => app.toggle_requests_filter(),
+                    // Scroll de la PANTALLA entera sobre el lienzo. `↑`/`↓`
+                    // ya son la selección de modelo, así que el
+                    // desplazamiento va en las teclas de página — que es
+                    // donde lo busca cualquiera que haya usado un `less`.
+                    KeyCode::PageDown => app.scroll_pagina(PASO_DE_PAGINA),
+                    KeyCode::PageUp => app.scroll_pagina(-PASO_DE_PAGINA),
+                    KeyCode::Home => app.scroll_al_inicio(),
+                    // Un salto deliberadamente enorme: el clamp del dibujado
+                    // lo deja justo en el final, sin tener que saber acá
+                    // cuánto mide la ventana.
+                    KeyCode::End => app.scroll_pagina(i32::from(u16::MAX)),
                     KeyCode::Char('s') => app.toggle_tools_panel(),
                     KeyCode::Char('u') => app.toggle_quota_panel(),
                     // `e` de sEsión: `s` ya es tools.
@@ -2499,81 +2575,217 @@ fn run_app(
 // UI
 // ---------------------------------------------------------------------------
 
-/// Arma el layout vertical y despacha cada panel a su `chunk`.
+/// Alturas de las secciones del lienzo, en su tamaño COMPLETO.
 ///
-/// Tres paneles son toggleables de forma INDEPENDIENTE (`p` para requests
-/// recientes, `s` para tools por servidor, `u` para cuota Codex): cuando uno
-/// está oculto, no se reserva su espacio, para que los paneles fijos no se
-/// vean apretados sin necesidad. Eso da OCHO combinaciones de visibilidad
-/// posibles.
+/// Este es el catálogo único de "cuánto pide cada panel". Todo lo demás
+/// —el alto total del lienzo, el tope del scroll, el reparto real— se deriva
+/// de acá, así que añadir un panel nuevo es tocar un sitio y no cuatro.
+const ALTO_TABLA: u16 = 8;
+const ALTO_ANTES_DESPUES: u16 = 6;
+const ALTO_SPARKLINES: u16 = 7;
+const ALTO_REQUESTS: u16 = 12;
+const ALTO_TOOLS: u16 = 10;
+const ALTO_CUOTA: u16 = 7;
+const ALTO_SESIONES: u16 = 9;
+const ALTO_GPU: u16 = 8;
+/// Header (3) + footer (1): las dos bandas que NO scrollean.
+const ALTO_HEADER: u16 = 3;
+const ALTO_FOOTER: u16 = 1;
+
+/// Alto del lienzo desplazable, sumando solo los paneles VISIBLES.
 ///
-/// Para que las ocho queden cubiertas sin lógica especial por caso (y sin el
-/// riesgo de indexar un `chunks[i]` que no exista si algún día se agrega un
-/// cuarto panel toggleable), el índice de cada chunk se calcula avanzando un
-/// contador (`idx`) a medida que cada panel opcional se agrega a
-/// `constraints` y se dibuja — nunca se hardcodea una posición fija. La
-/// longitud de `chunks` es SIEMPRE igual a la de `constraints`
-/// (`Layout::split` lo garantiza), así que `idx` nunca puede quedar fuera de
-/// rango mientras el código que empuja a `constraints` y el que incrementa
-/// `idx` avancen en el mismo orden — que es exactamente lo que hace esta
+/// Función PURA: depende únicamente de qué toggles están puestos, no del
+/// terminal. Eso permite testear el tope del scroll sin abrir una TUI, y
+/// permite calcularlo antes de saber cuánto mide la pantalla.
+fn alto_del_contenido(app: &App) -> u16 {
+    ALTO_TABLA
+        + ALTO_ANTES_DESPUES
+        + ALTO_SPARKLINES
+        + if app.show_requests_panel {
+            ALTO_REQUESTS
+        } else {
+            0
+        }
+        + if app.show_tools_panel { ALTO_TOOLS } else { 0 }
+        + if app.show_quota_panel { ALTO_CUOTA } else { 0 }
+        + if app.show_sessions_panel {
+            ALTO_SESIONES
+        } else {
+            0
+        }
+        + if app.show_gpu_panel { ALTO_GPU } else { 0 }
+}
+
+/// Cuánto se puede bajar como máximo: lo que sobresale del lienzo por debajo
+/// de la ventana. Cero cuando el contenido cabe entero — y entonces el scroll
+/// no existe, no es que esté en el tope.
+fn tope_del_scroll(alto_contenido: u16, alto_ventana: u16) -> u16 {
+    alto_contenido.saturating_sub(alto_ventana)
+}
+
+/// Arma la pantalla y la pinta.
+///
+/// # El lienzo, y por qué no se dibuja directo sobre el frame
+///
+/// Los ocho paneles piden 63 líneas con todo abierto. Un terminal normal
+/// tiene 33. Dibujando directo sobre el frame, `Layout::split` reparte esas
+/// 33 líneas entre todos y **el hambre se reparte**: el panel de requests
+/// pide 12, recibe 4, y enseña UNA petición. Ningún ajuste de `Constraint`
+/// arregla eso, porque no es un problema de reparto sino de que el contenido
+/// no cabe. Lo único que se puede elegir ajustando constraints es a quién se
+/// le pasa el hambre.
+///
+/// Así que no se reparte: los paneles se pintan a su TAMAÑO COMPLETO sobre un
+/// lienzo tan alto como haga falta, y el terminal es una ventana que se
+/// desplaza sobre ese lienzo (`app.page_scroll`, teclas `PgUp`/`PgDn`/
+/// `Inicio`/`Fin`). Cada panel se ve entero cuando lo miras.
+///
+/// # Header y footer NO scrollean
+///
+/// Se pintan directamente sobre el frame, fuera del lienzo. El header lleva
+/// el estado de la conexión y el footer las teclas: perder de vista
+/// cualquiera de los dos mientras te desplazas dejaría al usuario sin saber
+/// ni si el proxy responde ni cómo volver arriba.
+///
+/// # Los paneles opcionales
+///
+/// Cinco paneles son toggleables de forma INDEPENDIENTE (`p`, `s`, `u`, `e`,
+/// `g`): cuando uno está oculto no se reserva su espacio, así que el lienzo
+/// ENCOGE y el scroll se vuelve más corto —o innecesario—. El índice de cada
+/// chunk se calcula avanzando un contador (`idx`) a medida que cada panel se
+/// agrega a `constraints` y se dibuja, nunca se hardcodea una posición fija:
+/// la longitud de `chunks` es SIEMPRE igual a la de `constraints`
+/// (`Layout::split` lo garantiza), así que `idx` no puede quedar fuera de
+/// rango mientras ambos avancen en el mismo orden — que es lo que hace esta
 /// función.
 fn ui(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    // Las tres bandas de la pantalla. El header y el footer son fijos; lo del
+    // medio es la ventana por la que se ve el lienzo.
+    let bandas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(ALTO_HEADER),
+            Constraint::Min(0),
+            Constraint::Length(ALTO_FOOTER),
+        ])
+        .split(area);
+    let (banda_header, ventana, banda_footer) = (bandas[0], bandas[1], bandas[2]);
+
+    let alto_contenido = alto_del_contenido(app);
+    // El clamp vive acá y no en las teclas a propósito: el tope depende del
+    // alto de la ventana, que solo se conoce al dibujar. Una tecla que
+    // intente pasarse queda corregida en el siguiente frame, que es el mismo
+    // en el que se vería el efecto.
+    app.page_scroll = app
+        .page_scroll
+        .min(tope_del_scroll(alto_contenido, ventana.height));
+
     let mut constraints = vec![
-        Constraint::Length(3), // header
-        Constraint::Min(5),    // tabla principal
-        Constraint::Length(6), // panel antes/después
-        Constraint::Length(7), // sparklines
+        Constraint::Length(ALTO_TABLA),
+        Constraint::Length(ALTO_ANTES_DESPUES),
+        Constraint::Length(ALTO_SPARKLINES),
     ];
     if app.show_requests_panel {
-        constraints.push(Constraint::Length(12)); // requests recientes + leyenda
+        constraints.push(Constraint::Length(ALTO_REQUESTS));
     }
     if app.show_tools_panel {
-        constraints.push(Constraint::Length(10)); // tools por servidor
+        constraints.push(Constraint::Length(ALTO_TOOLS));
     }
     if app.show_quota_panel {
-        constraints.push(Constraint::Length(7)); // cuota codex
+        constraints.push(Constraint::Length(ALTO_CUOTA));
     }
     if app.show_sessions_panel {
-        constraints.push(Constraint::Length(9)); // gasto por sesión
+        constraints.push(Constraint::Length(ALTO_SESIONES));
     }
     if app.show_gpu_panel {
-        constraints.push(Constraint::Length(8)); // contador de potencia
+        constraints.push(Constraint::Length(ALTO_GPU));
     }
-    constraints.push(Constraint::Length(1)); // footer
 
+    // El lienzo mide EXACTAMENTE lo que suman los paneles, así que
+    // `Layout::split` le da a cada uno su tamaño declarado sin negociar. Ese
+    // es el punto entero de este diseño.
+    let lienzo_area = Rect::new(0, 0, area.width, alto_contenido);
+    let mut lienzo = Buffer::empty(lienzo_area);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
-        .split(area);
+        .split(lienzo_area);
 
-    draw_header(f, chunks[0], app);
-    draw_table(f, chunks[1], app);
-    draw_before_after(f, chunks[2], app);
-    draw_sparklines(f, chunks[3], app);
+    draw_table(&mut lienzo, chunks[0], app);
+    draw_before_after(&mut lienzo, chunks[1], app);
+    draw_sparklines(&mut lienzo, chunks[2], app);
 
-    let mut idx = 4;
+    let mut idx = 3;
     if app.show_requests_panel {
-        draw_requests_panel(f, chunks[idx], app);
+        draw_requests_panel(&mut lienzo, chunks[idx], app);
         idx += 1;
     }
     if app.show_tools_panel {
-        draw_tools_panel(f, chunks[idx], app);
+        draw_tools_panel(&mut lienzo, chunks[idx], app);
         idx += 1;
     }
     if app.show_quota_panel {
-        draw_quota_panel(f, chunks[idx], app);
+        draw_quota_panel(&mut lienzo, chunks[idx], app);
         idx += 1;
     }
     if app.show_sessions_panel {
-        draw_sessions_panel(f, chunks[idx], app);
+        draw_sessions_panel(&mut lienzo, chunks[idx], app);
         idx += 1;
     }
     if app.show_gpu_panel {
-        draw_gpu_panel(f, chunks[idx], app);
-        idx += 1;
+        draw_gpu_panel(&mut lienzo, chunks[idx], app);
     }
-    draw_footer(f, chunks[idx]);
+
+    asoma(f.buffer_mut(), &lienzo, ventana, app.page_scroll);
+
+    draw_header(f.buffer_mut(), banda_header, app);
+    draw_footer(
+        f.buffer_mut(),
+        banda_footer,
+        indicador_de_scroll(app.page_scroll, alto_contenido, ventana.height),
+    );
+}
+
+/// Vuelca en `destino` el trozo de `lienzo` que empieza en la fila `scroll`.
+///
+/// Copiar celda a celda y no por filas enteras es deliberado: una celda de
+/// ratatui lleva su símbolo Y su estilo, y quedarse solo con el texto
+/// perdería los colores, el resaltado de la fila seleccionada y los
+/// marcadores de outlier.
+///
+/// Si el lienzo se acaba antes que la ventana, las filas que sobran se dejan
+/// como estén: la ventana ya venía en blanco del frame.
+fn asoma(destino: &mut Buffer, lienzo: &Buffer, ventana: Rect, scroll: u16) {
+    for y in 0..ventana.height {
+        let fila_origen = scroll + y;
+        if fila_origen >= lienzo.area.height {
+            break;
+        }
+        for x in 0..ventana.width.min(lienzo.area.width) {
+            destino[(ventana.x + x, ventana.y + y)] = lienzo[(x, fila_origen)].clone();
+        }
+    }
+}
+
+/// Texto de posición para el footer, o `None` si el contenido cabe entero.
+///
+/// `None` y "estoy arriba del todo" son cosas distintas y se ven distintas:
+/// anunciar un scroll que no existe haría buscar contenido que no hay debajo.
+fn indicador_de_scroll(scroll: u16, alto_contenido: u16, alto_ventana: u16) -> Option<String> {
+    let tope = tope_del_scroll(alto_contenido, alto_ventana);
+    if tope == 0 {
+        return None;
+    }
+    Some(format!(
+        "  ·  ↕ {}/{} lín. (PgUp/PgDn/Inicio/Fin)",
+        scroll + alto_ventana,
+        alto_contenido
+    ))
 }
 
 /// Línea de modelos residentes para el panel de potencia.
@@ -2673,7 +2885,7 @@ fn linea_reposo_y_pico(app: &App) -> Line<'static> {
     ))
 }
 
-fn draw_gpu_panel(f: &mut Frame, area: Rect, app: &App) {
+fn draw_gpu_panel(lienzo: &mut Buffer, area: Rect, app: &App) {
     let Some(g) = app.gpu.as_ref() else {
         let aviso =
             Paragraph::new("sin lectura de GPU — ¿nvidia-smi instalado? (dato AUSENTE, no cero)")
@@ -2682,7 +2894,7 @@ fn draw_gpu_panel(f: &mut Frame, area: Rect, app: &App) {
                         .borders(Borders::ALL)
                         .title(" potencia de la máquina "),
                 );
-        f.render_widget(aviso, area);
+        lienzo.pinta(aviso, area);
         return;
     };
 
@@ -2718,7 +2930,7 @@ fn draw_gpu_panel(f: &mut Frame, area: Rect, app: &App) {
         )),
         linea_modelos_residentes(app),
     ];
-    f.render_widget(
+    lienzo.pinta(
         Paragraph::new(texto).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -2732,7 +2944,7 @@ fn draw_gpu_panel(f: &mut Frame, area: Rect, app: &App) {
     // tarjeta de 320 se vería casi plano.
     let datos: Vec<u64> = app.gpu_watts.iter().copied().collect();
     let escala = sparkline_visible_scale(&datos);
-    f.render_widget(
+    lienzo.pinta(
         Sparkline::default()
             .block(Block::default().borders(Borders::ALL).title(format!(
                 " vatios (histórico · rango {}..{}) ",
@@ -2745,7 +2957,7 @@ fn draw_gpu_panel(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_header(f: &mut Frame, area: Rect, app: &App) {
+fn draw_header(lienzo: &mut Buffer, area: Rect, app: &App) {
     let baseline_age = match &app.baseline {
         Some(b) => format!("baseline hace {}s", b.at.elapsed().as_secs()),
         None => "sin baseline — pulse 'b'".to_string(),
@@ -2767,7 +2979,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         ]),
     ];
 
-    f.render_widget(
+    lienzo.pinta(
         Paragraph::new(text).block(Block::default().borders(Borders::ALL)),
         area,
     );
@@ -2804,7 +3016,7 @@ fn models_title(selected: usize, total: usize) -> String {
 /// El offset vive en `app.models_scroll` y NO se recrea por frame a
 /// propósito: un estado nuevo en cada dibujado pegaría la selección al borde
 /// inferior al bajar, en vez de scrollear como una lista normal.
-fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
+fn draw_table(lienzo: &mut Buffer, area: Rect, app: &mut App) {
     let header = Row::new(vec![
         "MODELO",
         "REQ",
@@ -2865,10 +3077,10 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
     // `models_scroll` aporta solo el offset del viewport.
     app.models_scroll
         .select(if total == 0 { None } else { Some(app.selected) });
-    f.render_stateful_widget(table, area, &mut app.models_scroll);
+    lienzo.pinta_con_estado(table, area, &mut app.models_scroll);
 }
 
-fn draw_before_after(f: &mut Frame, area: Rect, app: &App) {
+fn draw_before_after(lienzo: &mut Buffer, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" ANTES/DESPUÉS (ventana desde baseline) ");
@@ -2894,10 +3106,10 @@ fn draw_before_after(f: &mut Frame, area: Rect, app: &App) {
         (None, _) => vec![Line::from("sin modelo seleccionado todavía")],
     };
 
-    f.render_widget(Paragraph::new(text).block(block), area);
+    lienzo.pinta(Paragraph::new(text).block(block), area);
 }
 
-fn draw_sparklines(f: &mut Frame, area: Rect, app: &App) {
+fn draw_sparklines(lienzo: &mut Buffer, area: Rect, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -2932,8 +3144,8 @@ fn draw_sparklines(f: &mut Frame, area: Rect, app: &App) {
         .max(ttft_scale.render_max)
         .style(Style::default().fg(Color::Yellow));
 
-    f.render_widget(throughput_sparkline, chunks[0]);
-    f.render_widget(ttft_sparkline, chunks[1]);
+    lienzo.pinta(throughput_sparkline, chunks[0]);
+    lienzo.pinta(ttft_sparkline, chunks[1]);
 }
 
 struct SparklineScale {
@@ -3036,7 +3248,7 @@ fn visible_request_indices(rows: &[RequestRow], filter: Option<&ModelKey>) -> Ve
         .collect()
 }
 
-fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
+fn draw_requests_panel(lienzo: &mut Buffer, area: Rect, app: &App) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -3057,7 +3269,7 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
         filter_label
     ));
     let inner = block.inner(area);
-    f.render_widget(block, area);
+    lienzo.pinta(block, area);
 
     if inner.height == 0 || inner.width == 0 {
         return;
@@ -3112,7 +3324,7 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
         // modelo no ha pedido nada últimamente" de "el panel está roto". Se
         // dice cuál de las dos es.
         if let Some((upstream, model)) = filter.as_ref().filter(|_| rows.is_empty()) {
-            f.render_widget(
+            lienzo.pinta(
                 Paragraph::new(Line::from(Span::styled(
                     format!(
                         "sin peticiones recientes de {upstream}/{model} en el buffer — 'f' quita el filtro"
@@ -3127,7 +3339,7 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
             // `ratatui::Table` recorta las columnas que no entran en vez de
             // hacer wrap o panickear, así que no hace falta guard adicional acá
             // más allá de los chequeos de área ya hechos arriba.
-            f.render_widget(Table::new(rows, widths).header(header), table_area);
+            lienzo.pinta(Table::new(rows, widths).header(header), table_area);
         }
     }
 
@@ -3135,7 +3347,7 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
         let legend = Paragraph::new(Line::from(
             "leyenda: ERR=error(status>=400) · MISS=cache-miss atípico · TTFT=TTFT lento(>=2σ) · SLOW=generación lenta(>=2σ) · TRUNC=tope de tokens (ver docs)",
         ));
-        f.render_widget(legend, legend_area);
+        lienzo.pinta(legend, legend_area);
     }
 }
 
@@ -3152,7 +3364,7 @@ fn draw_requests_panel(f: &mut Frame, area: Rect, app: &App) {
 /// El delta contra el baseline (columna `Δ baseline`) sale de
 /// [`diff_against_baseline`], función PURA testeada aparte: acá solo se
 /// formatea su resultado vía [`tools_row_cells`].
-fn draw_tools_panel(f: &mut Frame, area: Rect, app: &App) {
+fn draw_tools_panel(lienzo: &mut Buffer, area: Rect, app: &App) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -3162,12 +3374,12 @@ fn draw_tools_panel(f: &mut Frame, area: Rect, app: &App) {
             .borders(Borders::ALL)
             .title(" tools por servidor ");
         let inner = block.inner(area);
-        f.render_widget(block, area);
+        lienzo.pinta(block, area);
         if inner.height > 0 && inner.width > 0 {
             let text = Line::from(
                 "sin desglose de tools todavía (proxy anterior a este slice, o ninguna petición reciente declara tools)",
             );
-            f.render_widget(Paragraph::new(text), inner);
+            lienzo.pinta(Paragraph::new(text), inner);
         }
         return;
     };
@@ -3178,7 +3390,7 @@ fn draw_tools_panel(f: &mut Frame, area: Rect, app: &App) {
         source.model.as_deref().unwrap_or("-"),
     ));
     let inner = block.inner(area);
-    f.render_widget(block, area);
+    lienzo.pinta(block, area);
     if inner.height == 0 || inner.width == 0 {
         return;
     }
@@ -3258,7 +3470,7 @@ fn draw_tools_panel(f: &mut Frame, area: Rect, app: &App) {
     // espacio vertical disponible, `ratatui::Table` recorta las que no
     // entran sin panickear — mismo comportamiento (documentado) que ya usa
     // `draw_requests_panel` para columnas angostas.
-    f.render_widget(Table::new(rows, widths).header(header), inner);
+    lienzo.pinta(Table::new(rows, widths).header(header), inner);
 }
 
 /// Panel de cuota de suscripción Codex (tecla `u`), alimentado por la fila
@@ -3271,7 +3483,7 @@ fn draw_tools_panel(f: &mut Frame, area: Rect, app: &App) {
 /// es anterior a la captura de cuota), se muestra una única línea
 /// explicativa dentro del borde; nunca una caja vacía ni un gauge fabricado
 /// en 0%.
-fn draw_quota_panel(f: &mut Frame, area: Rect, app: &App) {
+fn draw_quota_panel(lienzo: &mut Buffer, area: Rect, app: &App) {
     if area.height == 0 || area.width == 0 {
         return;
     }
@@ -3281,12 +3493,12 @@ fn draw_quota_panel(f: &mut Frame, area: Rect, app: &App) {
             .borders(Borders::ALL)
             .title(" cuota codex ");
         let inner = block.inner(area);
-        f.render_widget(block, area);
+        lienzo.pinta(block, area);
         if inner.height > 0 && inner.width > 0 {
             let text = Line::from(
                 "sin datos de cuota (ninguna petición reciente usó el backend de Codex, o el proxy es anterior a la captura de cuota)",
             );
-            f.render_widget(Paragraph::new(text), inner);
+            lienzo.pinta(Paragraph::new(text), inner);
         }
         return;
     };
@@ -3309,7 +3521,7 @@ fn draw_quota_panel(f: &mut Frame, area: Rect, app: &App) {
         format_time(&source.timestamp),
         source.model.as_deref().unwrap_or("-"),
     ));
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    lienzo.pinta(Paragraph::new(lines).block(block), area);
 }
 
 /// Header de columnas del panel/tabla de requests, según la vista activa.
@@ -4244,20 +4456,29 @@ fn print_sessions_table(stats_url: &str) {
 }
 
 /// Panel de gasto por sesión: responde "quién gastó", no "qué modelo".
-fn draw_sessions_panel(f: &mut Frame, area: Rect, app: &App) {
+fn draw_sessions_panel(lienzo: &mut Buffer, area: Rect, app: &App) {
     let lineas = session_lines(&app.sessions.sessions, app.sessions.saturated);
     let text: Vec<Line> = lineas.into_iter().map(Line::from).collect();
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" gasto por sesión (e) ");
-    f.render_widget(Paragraph::new(text).block(block), area);
+    lienzo.pinta(Paragraph::new(text).block(block), area);
 }
 
-fn draw_footer(f: &mut Frame, area: Rect) {
-    let text = Line::from(
-        "q salir · b baseline · r reset · ↑/↓ modelo · f solo modelo sel. · p requests · c latency/context · s tools · u cuota · e sesión",
-    );
-    f.render_widget(Paragraph::new(text), area);
+/// Recordatorio de teclas, más la posición del scroll cuando el contenido no
+/// cabe entero (ver [`indicador_de_scroll`]).
+///
+/// El footer NO scrollea: es la única línea que le dice al usuario cómo
+/// volver: perderla justo cuando te has ido al fondo del lienzo sería el peor
+/// momento posible.
+fn draw_footer(lienzo: &mut Buffer, area: Rect, scroll: Option<String>) {
+    let mut text =
+        "q salir · b baseline · r reset · ↑/↓ modelo · f solo modelo sel. · p requests · c latency/context · s tools · u cuota · e sesión"
+            .to_string();
+    if let Some(indicador) = scroll {
+        text.push_str(&indicador);
+    }
+    lienzo.pinta(Paragraph::new(Line::from(text)), area);
 }
 
 impl StatsRow {
@@ -7387,7 +7608,10 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(60, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw_table(f, f.area(), &mut app))
+            .draw(|f| {
+                let area = f.area();
+                draw_table(f.buffer_mut(), area, &mut app)
+            })
             .unwrap();
 
         let pintado = buffer_to_string(terminal.backend().buffer());
@@ -7411,7 +7635,10 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(60, 6);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw_table(f, f.area(), &mut app))
+            .draw(|f| {
+                let area = f.area();
+                draw_table(f.buffer_mut(), area, &mut app)
+            })
             .unwrap();
 
         let pintado = buffer_to_string(terminal.backend().buffer());
@@ -7442,7 +7669,10 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(60, 5);
         let mut terminal = Terminal::new(backend).unwrap();
         terminal
-            .draw(|f| draw_table(f, f.area(), &mut app))
+            .draw(|f| {
+                let area = f.area();
+                draw_table(f.buffer_mut(), area, &mut app)
+            })
             .unwrap();
 
         let pintado = buffer_to_string(terminal.backend().buffer());
@@ -7458,6 +7688,162 @@ mod tests {
             pintado.contains("(4/8"),
             "el título tiene que decir la posición:\n{pintado}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Scroll global de la pantalla (lienzo + ventana)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn el_lienzo_encoge_al_cerrar_paneles() {
+        let mut app = App::new("http://x/stats".to_string());
+        // Todo abierto menos la GPU, que arranca oculta.
+        let todo = alto_del_contenido(&app);
+        assert_eq!(
+            todo,
+            ALTO_TABLA
+                + ALTO_ANTES_DESPUES
+                + ALTO_SPARKLINES
+                + ALTO_REQUESTS
+                + ALTO_TOOLS
+                + ALTO_CUOTA
+                + ALTO_SESIONES
+        );
+
+        app.toggle_requests_panel();
+        assert_eq!(alto_del_contenido(&app), todo - ALTO_REQUESTS);
+        app.toggle_gpu_panel();
+        assert_eq!(alto_del_contenido(&app), todo - ALTO_REQUESTS + ALTO_GPU);
+    }
+
+    /// Si el contenido cabe entero, no hay scroll — y eso NO es lo mismo que
+    /// estar arriba del todo.
+    #[test]
+    fn sin_desbordamiento_no_hay_scroll_ni_indicador() {
+        assert_eq!(tope_del_scroll(20, 40), 0);
+        assert_eq!(tope_del_scroll(40, 40), 0);
+        assert_eq!(indicador_de_scroll(0, 20, 40), None);
+    }
+
+    #[test]
+    fn con_desbordamiento_el_tope_es_lo_que_sobresale() {
+        assert_eq!(tope_del_scroll(63, 33), 30);
+        assert!(
+            indicador_de_scroll(0, 63, 33)
+                .unwrap()
+                .contains("33/63 lín.")
+        );
+        assert!(
+            indicador_de_scroll(30, 63, 33)
+                .unwrap()
+                .contains("63/63 lín.")
+        );
+    }
+
+    /// El clamp vive en el dibujado: pulsar `Fin` pide un salto enorme y la
+    /// pantalla lo deja exactamente en el final, sin pasarse.
+    #[test]
+    fn el_scroll_se_topea_al_dibujar_no_al_pulsar() {
+        let mut app = App::new("http://x/stats".to_string());
+        app.scroll_pagina(i32::from(u16::MAX));
+        assert_eq!(app.page_scroll, u16::MAX, "la tecla no topea");
+
+        let backend = ratatui::backend::TestBackend::new(120, 33);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        // Ventana = 33 - header(3) - footer(1) = 29.
+        assert_eq!(
+            app.page_scroll,
+            tope_del_scroll(alto_del_contenido(&app), 29),
+            "el dibujado tiene que dejarlo justo en el final"
+        );
+    }
+
+    #[test]
+    fn el_scroll_nunca_sube_por_encima_del_principio() {
+        let mut app = App::new("http://x/stats".to_string());
+        app.scroll_pagina(-100);
+        assert_eq!(app.page_scroll, 0);
+    }
+
+    /// EL PUNTO ENTERO DEL LIENZO: con 33 líneas de terminal, el panel de
+    /// requests recibía 4 de las 12 que pide y enseñaba UNA petición.
+    /// Pintándolo sobre el lienzo recibe sus 12 completas, y para verlas se
+    /// baja con `PgDn` en vez de repartir el hambre entre todos.
+    #[test]
+    fn en_el_lienzo_cada_panel_recibe_su_altura_completa() {
+        let app = App::new("http://x/stats".to_string());
+        let alto = alto_del_contenido(&app);
+        assert!(
+            alto > 33,
+            "el caso interesante es justo cuando NO cabe: {alto}"
+        );
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(ALTO_TABLA),
+                Constraint::Length(ALTO_ANTES_DESPUES),
+                Constraint::Length(ALTO_SPARKLINES),
+                Constraint::Length(ALTO_REQUESTS),
+                Constraint::Length(ALTO_TOOLS),
+                Constraint::Length(ALTO_CUOTA),
+                Constraint::Length(ALTO_SESIONES),
+            ])
+            .split(Rect::new(0, 0, 120, alto));
+
+        assert_eq!(chunks[0].height, ALTO_TABLA);
+        assert_eq!(chunks[3].height, ALTO_REQUESTS, "requests entero, no 4");
+        assert_eq!(chunks[6].height, ALTO_SESIONES);
+    }
+
+    /// `asoma` tiene que copiar la celda ENTERA (símbolo y estilo): quedarse
+    /// solo con el texto perdería el resaltado de la fila seleccionada y los
+    /// marcadores de outlier.
+    #[test]
+    fn asomarse_conserva_simbolo_y_estilo_y_respeta_el_desplazamiento() {
+        let mut lienzo = Buffer::empty(Rect::new(0, 0, 3, 6));
+        for y in 0..6u16 {
+            lienzo[(0, y)].set_symbol(&y.to_string());
+        }
+        lienzo[(0, 4)].set_style(Style::default().fg(Color::Red));
+
+        let mut destino = Buffer::empty(Rect::new(0, 0, 3, 10));
+        let ventana = Rect::new(0, 2, 3, 2);
+        asoma(&mut destino, &lienzo, ventana, 4);
+
+        assert_eq!(destino[(0, 2)].symbol(), "4", "scroll=4 empieza en la 4ª");
+        assert_eq!(destino[(0, 3)].symbol(), "5");
+        assert_eq!(
+            destino[(0, 2)].style().fg,
+            Some(Color::Red),
+            "estilo perdido"
+        );
+    }
+
+    /// Si el lienzo se acaba antes que la ventana, no se lee fuera de rango:
+    /// las filas que sobran se quedan como venían.
+    #[test]
+    fn asomarse_al_final_no_se_sale_del_lienzo() {
+        let lienzo = Buffer::empty(Rect::new(0, 0, 3, 4));
+        let mut destino = Buffer::empty(Rect::new(0, 0, 3, 10));
+        asoma(&mut destino, &lienzo, Rect::new(0, 0, 3, 8), 2);
+    }
+
+    /// El footer no scrollea y anuncia la posición solo cuando hay scroll de
+    /// verdad; y sigue llevando las teclas, que es su razón de ser.
+    #[test]
+    fn el_footer_lleva_las_teclas_y_la_posicion_cuando_hay_scroll() {
+        let mut app = App::new("http://x/stats".to_string());
+        let backend = ratatui::backend::TestBackend::new(160, 33);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|f| ui(f, &mut app)).unwrap();
+
+        let pintado = buffer_to_string(terminal.backend().buffer());
+        let ultima = pintado.lines().next_back().unwrap();
+        assert!(ultima.contains("q salir"), "sin teclas: {ultima}");
+        assert!(ultima.contains("PgUp/PgDn"), "sin indicador: {ultima}");
     }
 
     /// Cuando la tabla no cabe entera, el título tiene que decir en qué

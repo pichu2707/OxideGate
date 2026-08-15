@@ -114,6 +114,8 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
 | `↑` / `↓` | Elegir el modelo (fila resaltada, afecta el panel ANTES/DESPUÉS y los sparklines). La tabla **scrollea**: la selección arrastra el viewport y las primeras filas SALEN de la vista en vez de quedarse ancladas arriba. Bajando a la 4ª posición con dos filas visibles se ven la 3ª y la 4ª, no la 1ª y la 2ª. El título dice la posición (`4/12`) y la fila lleva `▶` además del fondo, que se pierde en un terminal sin color |
 | `p` | Mostrar/ocultar el panel de requests recientes (ver §7) |
 | `f` | Estrechar el panel de requests recientes al modelo seleccionado con `↑`/`↓` (ver §7.8). **Arranca APAGADO**: el panel es un feed global por defecto. INDEPENDIENTE de `p`/`c` |
+| `PgUp` / `PgDn` | Desplazar la PANTALLA ENTERA sobre el lienzo, 8 líneas por pulsación (ver §5.1). El footer muestra la posición (`↕ 29/59`) solo cuando el contenido no cabe |
+| `Inicio` / `Fin` | Saltar al principio o al final del lienzo |
 | `c` | Ciclar la vista de columnas del panel de requests recientes — `Latency` → `Context` → `Cache` → `Toll` → `Latency` (ver §7.1). **No-op si el panel está oculto**: no cambia nada mientras `p` lo tenga escondido |
 | `s` | Mostrar/ocultar el panel de tools por servidor (ver §8). **INDEPENDIENTE** de `p`/`c`: ninguna de las tres teclas afecta el estado de las otras |
 | `e` | Mostrar/ocultar el panel de **gasto por sesión** — `e` de s**e**sión, porque `s` ya es tools (ver §8). **INDEPENDIENTE** de `p`/`c`/`s`/`u` |
@@ -122,18 +124,15 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
 
 ## 5. Layout de la pantalla
 
-1. **Header**: título, URL del endpoint, estado del último fetch ("ok · N
-   modelos" o "proxy no disponible en..."), y edad del baseline ("baseline
-   hace 12s" o "sin baseline — pulse 'b'").
+1. **Header** (NO scrollea): título, URL del endpoint, estado del último fetch
+   ("ok · N modelos" o "proxy no disponible en..."), y edad del baseline
+   ("baseline hace 12s" o "sin baseline — pulse 'b'").
 2. **Tabla principal**, una fila por `(upstream, model)`, TOTAL acumulado
    desde que el proxy arrancó: `MODELO | REQ | tok/s | TTFT ms | cache-hit |
-   coste $ | redun%`. Fila seleccionada resaltada con `▶` y fondo.
-
-   La tabla tiene **viewport propio**: es la única sección elástica del
-   layout (`Constraint::Min(5)`), así que con los paneles abiertos se queda
-   en pocas filas y el resto se alcanza scrolleando. Antes se dibujaba sin
-   estado y se recortaba al área: `↑`/`↓` seguían moviendo la selección, pero
-   a partir de la última fila visible se pintaba FUERA de la pantalla.
+   coste $ | redun%`. Fila seleccionada resaltada con `▶` y fondo. Tiene
+   **viewport propio** y scrollea con `↑`/`↓` — ver §5.1 para por qué su
+   altura es la que es. El título lleva la posición (`4/12`) porque cinco
+   filas de doce no dicen cuántos modelos quedan por debajo.
 3. **Panel ANTES/DESPUÉS**: delta de ventana del modelo seleccionado desde
    el baseline (ver §3). Si no hay baseline, muestra el aviso para marcarlo.
 4. **Sparklines**: throughput (tok/s) y TTFT (ms) del modelo seleccionado a
@@ -149,7 +148,73 @@ de la ventana como `Δsuma / Δcount`, que sí es correcto.
    gauge de estado de cuenta (no una tabla por fila) de la petición más
    reciente que traiga cabeceras `x-codex-*`. Independiente de los paneles
    anteriores.
-8. **Footer**: recordatorio de teclas.
+8. **Footer** (NO scrollea): recordatorio de teclas, más la posición del
+   scroll (`↕ 29/59`) cuando el contenido no cabe entero.
+
+### 5.1. El lienzo: por qué la pantalla no se reparte, se recorre
+
+Los ocho paneles piden **63 líneas** con todo abierto. Un terminal normal
+tiene 33. Es la restricción de la que sale todo lo demás de esta sección.
+
+**El diseño anterior repartía.** `Layout::split` sobre el área del terminal
+daba a cada panel una fracción de lo que pedía, así que **el hambre se
+repartía entre todos**. Medido en un terminal de 33 líneas:
+
+| Panel | Pide | Recibía |
+|---|---|---|
+| requests | 12 | **4** (una sola petición visible) |
+| tools | 10 | 3 |
+| sesiones | 9 | 3 |
+| sparklines | 7 | 3 |
+
+Y no había ajuste de `Constraint` que lo arreglara, porque **no era un
+problema de reparto sino de que el contenido no cabe**. Lo único que se podía
+elegir tocando constraints era a quién pasarle el hambre: subir el mínimo de
+la tabla se lo quitaba a los paneles, y bajarlo dejaba la tabla en dos filas.
+
+**El diseño actual no reparte.** Los paneles se pintan a su tamaño COMPLETO
+sobre un `Buffer` fuera de pantalla tan alto como haga falta —el lienzo— y el
+terminal es una ventana que se desplaza sobre él con `PgUp`/`PgDn`. Cada
+panel se ve entero cuando lo miras. El header y el footer se pintan aparte,
+directamente sobre el frame, y **no scrollean**: perder de vista el estado de
+la conexión o las teclas justo cuando te has ido al fondo sería el peor
+momento posible.
+
+Alturas declaradas (constantes `ALTO_*` en `monitor.rs`, el catálogo único
+del que se derivan el alto del lienzo y el tope del scroll):
+
+| Sección | Líneas | ¿Scrollea? |
+|---|---|---|
+| header | 3 | no |
+| tabla de modelos | 8 | sí |
+| ANTES/DESPUÉS | 6 | sí |
+| sparklines | 7 | sí |
+| requests | 12 | sí |
+| tools | 10 | sí |
+| cuota | 7 | sí |
+| sesiones | 9 | sí |
+| potencia (`g`) | 8 | sí |
+| footer | 1 | no |
+
+Cerrar un panel (`p`/`s`/`u`/`e`/`g`) **encoge el lienzo**, así que el scroll
+se acorta — o desaparece, si lo que queda ya cabe. El indicador del footer
+distingue los dos casos: sin desbordamiento no se pinta nada, porque anunciar
+un scroll que no existe haría buscar contenido que no hay debajo.
+
+#### Dos hallazgos del camino, para que nadie los repita
+
+- **`Constraint::Min` es DURA; `Percentage` y `Fill` son BLANDAS.** En un
+  layout dominado por `Length` fijos, `Percentage(25)` y `Fill(1)` —las dos
+  opciones que parecen más elegantes— pierden la negociación y **colapsan su
+  sección a CERO** en terminales de 30 a 50 líneas. Medido, no razonado.
+- **`ratatui` 0.29 no tiene `scroll_padding`** ni en `Table` ni en `List`, así
+  que no hay forma de mantener filas de contexto alrededor de una selección.
+  Ver más filas solo se consigue con más altura — que es exactamente lo que
+  el lienzo regala.
+
+La tabla de modelos conserva **además** su propio viewport (§4, tecla
+`↑`/`↓`): el lienzo le da sus 8 líneas completas —5 filas de modelo— y el
+viewport cubre el caso de tener más modelos que eso.
 
 ## 6. Enhance del snapshot (`ModelStatsRow`)
 
