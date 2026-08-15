@@ -272,6 +272,53 @@ pub struct MeteredBody {
     emitted: bool,
 }
 
+/// Tokens de salida por segundo sobre el tramo de GENERACIÓN (`total_ms −
+/// ttft_ms`), o `None` cuando no hay tasa que publicar.
+///
+/// Devuelve `None` en dos casos, y los dos significan lo mismo: **no hay
+/// intervalo sobre el que medir velocidad**.
+///
+/// 1. **`output_tokens <= 1`.** Una tasa necesita dos puntos. Con un solo
+///    token el primer chunk *es* el último, así que `total − ttft` no mide el
+///    tiempo entre tokens sino el ruido de cerrar el stream. Medido con
+///    `num_predict: 1` (#102): `ttft` 1.449,3 ms contra `total` 1.449,4 daban
+///    un denominador de **0,057 ms** y **17.462 tok/s** en una tarjeta que ese
+///    mismo minuto hacía 126,8. Con cero tokens, además, el numerador es cero:
+///    publicar `0.0` diría «lentísimo» donde lo cierto es «no generó nada».
+/// 2. **El tramo no es positivo.** Sin tiempo transcurrido no hay división que
+///    valga, y un `ttft > total` es un reloj raro, no una medida.
+///
+/// El umbral está en `<= 1` **porque sale de la definición de tasa**, no de
+/// una medición. Un suelo sobre `gen_ms` —«al menos 1 ms»— taparía también
+/// respuestas de dos o tres tokens en máquinas rápidas, pero habría que MEDIR
+/// dónde ponerlo; mientras nadie lo mida, sería un número elegido.
+///
+/// `None` no es una renuncia: es el mismo criterio de ausencia honesta que el
+/// resto del contrato. Un valor absurdo, en cambio, no se queda quieto —
+/// envenena la media de `/stats` y deja el umbral de `SLOW` en negativo, donde
+/// ninguna fila puede cruzarlo y el detector falla EN SILENCIO.
+///
+/// ## El gemelo del TUI
+///
+/// `oxidegate-monitor` tiene una función con este MISMO nombre y contrato:
+/// recalcula la tasa desde los campos crudos en vez de leer `tokens_per_sec`,
+/// así que arreglar solo esta dejaría el panel igual de roto. Son dos binarios
+/// y este crate no tiene `lib`, así que la regla no se puede compartir: se
+/// duplica a propósito, con el nombre igual para que un `grep` las encuentre a
+/// las dos. Si esto crece, la salida es extraer un `lib`, no sincronizarlas a
+/// mano.
+fn generation_throughput(output_tokens: u64, total_ms: f64, ttft_ms: f64) -> Option<f64> {
+    if output_tokens <= 1 {
+        return None;
+    }
+    let gen_ms = total_ms - ttft_ms;
+    if gen_ms <= 0.0 {
+        return None;
+    }
+    let value = output_tokens as f64 / (gen_ms / 1000.0);
+    if value.is_finite() { Some(value) } else { None }
+}
+
 impl MeteredBody {
     /// Envuelve `inner` con la telemetría descrita en `base`.
     ///
@@ -336,18 +383,15 @@ impl MeteredBody {
             self.scanner.usage.cache_write_tokens,
         );
 
-        // Velocidad de generación = tokens de salida / tramo de generación
-        // (total − TTFT). Solo tiene sentido en STREAMING: en una respuesta
-        // no-streaming todo llega de golpe (ttft ≈ total) y el tramo tiende a
-        // cero, disparando un número absurdo. Fuera de streaming la anulamos.
+        // Velocidad de generación. Solo se calcula en STREAMING: fuera de
+        // streaming el cuerpo entero llega de golpe y no hay tramo que medir.
+        // El resto del criterio vive en `generation_throughput`.
         let tokens_per_sec = match (
             self.base.stream,
             self.scanner.usage.output_tokens,
             self.ttft_ms,
         ) {
-            (true, Some(out), Some(ttft)) if total_ms > ttft => {
-                Some(out as f64 / ((total_ms - ttft) / 1000.0))
-            }
+            (true, Some(out), Some(ttft)) => generation_throughput(out, total_ms, ttft),
             _ => None,
         };
 
@@ -497,7 +541,7 @@ impl Drop for MeteredBody {
 
 #[cfg(test)]
 mod tests {
-    use super::{MeteredBody, MetricBase, UsageScanner};
+    use super::{MeteredBody, MetricBase, UsageScanner, generation_throughput};
     use crate::provider::{ANTHROPIC, ToolCalls};
     use crate::telemetry::{SessionAttribution, SessionSource, TelemetrySink};
     use bytes::Bytes;
@@ -884,5 +928,59 @@ mod tests {
 
         assert_eq!(scanner.usage.output_tokens, Some(4), "lo bueno sobrevive");
         assert!(scanner.calls.invoked.is_empty(), "lo roto se ignora");
+    }
+
+    /// REGRESIÓN (#102). Una respuesta de UN SOLO token no tiene tasa: el
+    /// primer chunk es también el último, así que `total − ttft` no mide el
+    /// tiempo entre tokens sino el ruido de cerrar el stream.
+    ///
+    /// Medido en vivo con `num_predict: 1`: `ttft` 1.449,3 ms y `total`
+    /// 1.449,4 ms daban un denominador de 0,057 ms y **17.462 tok/s** en una
+    /// tarjeta que ese minuto hacía 126,8.
+    #[test]
+    fn un_solo_token_no_tiene_tasa() {
+        assert_eq!(
+            generation_throughput(1, 1449.4, 1449.3),
+            None,
+            "con un token no hay intervalo que medir"
+        );
+    }
+
+    /// Cero tokens es el mismo caso llevado al extremo, y encima el numerador
+    /// es cero: publicar `0.0` diría «va lentísimo» cuando lo cierto es que no
+    /// se generó nada. `None` es «no se pudo ver», que es la verdad.
+    #[test]
+    fn cero_tokens_tampoco_tiene_tasa() {
+        assert_eq!(generation_throughput(0, 500.0, 100.0), None);
+    }
+
+    /// DOS tokens es el primer caso legítimo: ya hay un intervalo entre el
+    /// primero y el segundo. El umbral está en `<= 1` y no más arriba porque
+    /// cualquier otro número sería arbitrario — este sale de la definición de
+    /// tasa, no de una medición.
+    #[test]
+    fn dos_tokens_ya_son_una_tasa() {
+        let tasa = generation_throughput(2, 1100.0, 1000.0).expect("2 tokens en 100 ms");
+        assert!(
+            (tasa - 20.0).abs() < 1e-9,
+            "2 tokens / 0,1 s = 20 tok/s, salio {tasa}"
+        );
+    }
+
+    /// La guarda que YA existía sigue en pie: sin tramo de generación no hay
+    /// tasa, por muchos tokens que haya. Este test está aquí para que el
+    /// arreglo de #102 no la pise al añadir la suya.
+    #[test]
+    fn sin_tramo_de_generacion_no_hay_tasa() {
+        assert_eq!(
+            generation_throughput(200, 900.0, 900.0),
+            None,
+            "total == ttft: el denominador es cero"
+        );
+        assert_eq!(
+            generation_throughput(200, 800.0, 900.0),
+            None,
+            "ttft > total: relojes raros, no se inventa nada"
+        );
     }
 }
