@@ -18,3 +18,9 @@ presentations/
 # duplicado y viejo. Ya paso una vez con `src/bin/monitor.rs.orig`, que ademas
 # se quedo dias en el arbol y confundio el diagnostico de una rama.
 *.orig
+
+# Bytecode de Python del banco de tareas (#29). Se genera al ejecutar el
+# verificador in situ y no es fuente: si se rastrea, una ejecucion sucia
+# puede alterar la siguiente.
+__pycache__/
+*.pyc
