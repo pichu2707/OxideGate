@@ -85,23 +85,68 @@ git diff main <rama> -- <fichero> | grep -c '^-[^-]'   # solo en main
 
 ## Por qué `git branch -d` no sustituye a esto
 
-`-d` se niega a borrar lo no fusionado, y por eso **siempre se usa `-d` primero**:
-es el propio git quien certifica cada borrado, no quien escribe el comando.
+`-d` parece la red de seguridad —se niega a borrar lo no fusionado— y por eso se
+usa siempre primero. **Pero no certifica lo que uno cree que certifica.** Del
+manual:
 
-Pero su criterio no es el que uno espera. Si la rama tiene upstream, `-d` exige
-que esté fusionada **también en ese upstream**; una rama enteramente contenida
-en `main` pero por delante de un remoto viejo sale rechazada. En la limpieza del
-2026-08-16 le pasó a `fix/monitor-visibilidad-y-scroll`: `rev-list` daba 0 y
-`cherry` daba 0, y aun así `-d` la rechazó por ir 11 por delante de su remoto.
+> The branch must be fully merged in its upstream branch, **or** in HEAD if no
+> upstream was set with `--track` or `--set-upstream-to`.
 
-Un rechazo de `-d` es una **pregunta**, no un veredicto. Se contesta con las
-comprobaciones 3 y 4, y solo entonces `-D`.
+`or`, no `and`. La regla es de **sustitución**: si la rama tiene upstream, git
+comprueba **solo** el upstream y deja de mirar `main` por completo. De ahí salen
+dos errores, y van en direcciones opuestas.
+
+### Falso negativo: rechaza lo que sí se puede borrar
+
+Una rama enteramente contenida en `main` pero por delante de un remoto viejo sale
+rechazada. En la limpieza del 2026-08-16 le pasó a
+`fix/monitor-visibilidad-y-scroll`: `rev-list` daba 0 y `cherry` daba 0, y aun así
+`-d` la rechazó por ir 11 por delante de su remoto.
+
+Molesto, e **inofensivo**: te obliga a mirar.
+
+### Falso positivo: acepta lo que NO está en `main`
+
+Este es el peligroso. Una rama con upstream propio **siempre está fusionada
+consigo misma**, así que `-d` la aprueba siempre, tenga dentro lo que tenga.
+
+Al borrar `backup/monitor-antes-del-rebase` el 2026-08-24 se usó `-d` primero,
+como manda este documento, esperando un rechazo. Git la **aceptó**, con seis
+commits fuera de `main`, y lo dijo por escrito:
+
+```
+advertencia: deleting branch 'backup/monitor-antes-del-rebase' that has been
+merged to 'refs/remotes/origin/backup/monitor-antes-del-rebase',
+but not yet merged to HEAD
+```
+
+Una rama de respaldo con remoto propio es justo la clase de rama para la que se
+quiere una red, y es justo donde la red no está.
+
+### La conclusión práctica
+
+Un rechazo de `-d` es una **pregunta**, no un veredicto. Y una aceptación de `-d`
+**tampoco es un veredicto**. Las dos se contestan igual: con las comprobaciones 3
+y 4, y solo entonces se borra.
+
+En el caso del backup salió bien precisamente porque el criterio ya había dictado
+sentencia antes de tocar `-d`. Esa es la razón de que las cuatro comprobaciones no
+sean opcionales aunque `-d` diga que sí.
+
+Para leer el estado real en vez del de `-d`, una guarda que no cuesta nada:
+
+```sh
+git branch --no-merged main    # lo que NO está en main, diga lo que diga -d
+```
+
+Contado entero en la [E-010](fe-de-erratas.md).
 
 ## Lo hecho el 2026-08-16
 
 `main` en `84cea7b`. Quince ramas locales además de `main`.
 
-**Catorce borradas.** Trece con `-d` —git certificó que estaban fusionadas— y
+**Catorce borradas.** Trece con `-d` —sin objeción de git, que como se ve arriba
+no basta por sí solo— y
 `fix/monitor-visibilidad-y-scroll` con `-D` (SHA `64ebd08`) tras comprobar que
 sus 79 líneas propias eran redacciones anteriores de ficheros que `main` ya
 tiene actualizados. Sus hallazgos publicados (`86%`, `65% en Codex`, `202 B`,

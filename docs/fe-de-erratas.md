@@ -320,9 +320,60 @@ la lectura de lo que esa comprobación encontró.
 
 ---
 
+## E-010 · «`-d` exige que esté fusionada también en ese upstream»
+
+- **Publicado**: [`limpieza-de-ramas.md`](limpieza-de-ramas.md), sección «Por qué
+  `git branch -d` no sustituye a esto» — escrita en `e1f5e0d` y en `main` desde el
+  2026-08-16 (PR #127)
+- **Corregido**: 2026-08-24, ocho días después, al borrar la rama de la que hablaba
+
+La frase describía el criterio de `git branch -d` como una **suma**: fusionada en
+`main` **y además** en el upstream. Es una **sustitución**. Del manual:
+
+> The branch must be fully merged in its upstream branch, **or** in HEAD if no
+> upstream was set with `--track` or `--set-upstream-to`.
+
+`or`, no `and`. Si la rama tiene upstream, git comprueba **solo** el upstream y
+deja de mirar `main` por completo.
+
+**Cómo se cazó**: borrando `backup/monitor-antes-del-rebase`, la rama de la
+[E-009](#e-009--12-líneas-que-main-no-tiene-en-ninguna-parte). Se usó `-d`
+primero, como manda el documento, **esperando un rechazo**. Git la aceptó —con
+seis commits fuera de `main`— y lo dijo por escrito:
+
+```
+advertencia: deleting branch 'backup/monitor-antes-del-rebase' that has been
+merged to 'refs/remotes/origin/backup/monitor-antes-del-rebase',
+but not yet merged to HEAD
+```
+
+**Por qué importa más que un matiz de manual.** El documento vendía `-d` como red
+de seguridad: «es el propio git quien certifica cada borrado, no quien escribe el
+comando». Con la regla real, una rama de respaldo con remoto propio **siempre está
+fusionada consigo misma**, así que `-d` la aprueba siempre, tenga dentro lo que
+tenga. La red falla exactamente en la clase de rama para la que se quiere una red.
+
+**El origen del error**: el documento conocía el fallo en UNA dirección —el falso
+negativo de `fix/monitor-visibilidad-y-scroll`, rechazada por ir 11 por delante de
+su remoto— y **generalizó desde ese único caso** a una regla que lo explicaba. La
+regla encajaba con el dato que había y era falsa. Faltaba la dirección contraria,
+que es la peligrosa: un falso negativo molesta, un falso positivo borra trabajo.
+
+**Qué cambió**: la sección se reescribe con las dos direcciones, el aviso literal
+de git y la guarda `git branch --no-merged main`. Y la conclusión se invierte:
+además de «un rechazo de `-d` es una pregunta, no un veredicto», ahora dice que
+**una aceptación de `-d` tampoco es un veredicto**.
+
+**Sigue en pie**: usar `-d` antes que `-D` sigue siendo lo correcto — lo que no se
+sostiene es tratar su silencio como certificación. Y el criterio de cuatro
+comprobaciones queda **reforzado**: este borrado salió bien precisamente porque las
+comprobaciones 3 y 4 dictaron sentencia antes de tocar `-d`.
+
+---
+
 ## El patrón, que es lo más útil de esta lista
 
-De las nueve entradas, **seis fallan hacia el mismo lado**: E-001, E-003, E-004,
+De las diez entradas, **seis fallan hacia el mismo lado**: E-001, E-003, E-004,
 E-005, E-007 y E-009 son casos en los que el instrumento le cargó al material que
 medía un defecto propio, publicó azar como si fuera señal, o lo suspendió por una
 regla suya mal puesta.
@@ -334,11 +385,15 @@ clasificador solo miraba un campo», y más fácil escribir «el rebase se comi�
 medición» que «mi `grep` no distingue perder de retractar».
 
 Las otras tres comparten causas distintas y también repetidas: **dar por buena
-una cifra o un criterio sin comprobarlo** porque parecía evidente (E-002, E-006),
-y **salvar de más al retractar** — quedarse con la parte de una afirmación falsa
-que parecía sólida, sin volver a comprobarla (E-008).
+una cifra o un criterio sin comprobarlo** porque parecía evidente (E-002, E-006,
+E-010), y **salvar de más al retractar** — quedarse con la parte de una afirmación
+falsa que parecía sólida, sin volver a comprobarla (E-008).
 
-**Ninguna de las nueve la encontró un test en rojo.** La suite estuvo en verde
+La E-010 afina esa primera causa: no es solo no comprobar, es **generalizar desde
+un único caso**. Una regla inventada para explicar la observación que tienes
+delante encaja con ella por construcción, y eso no la hace cierta.
+
+**Ninguna de las diez la encontró un test en rojo.** La suite estuvo en verde
 todo el tiempo, porque ninguna era un fallo de código. Las cazaron cosas
 distintas, y ninguna es automática:
 
@@ -350,6 +405,7 @@ distintas, y ninguna es automática:
 | **repetir** la misma medición | E-005 |
 | **comprobar el contenido**, no el recuento | E-006 |
 | **mirar el historial del dato** (`log -S`), no solo el dato (`grep`) | E-009 |
+| **usar la herramienta y leer lo que responde**, en vez de fiarse de la regla escrita | E-010 |
 | **subir el `n`** y ver cambiar un veredicto que no debía cambiar | E-007, E-008 |
 
 De ahí que las guardas de este proyecto **aborten en vez de avisar**: un aviso se
