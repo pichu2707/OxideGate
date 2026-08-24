@@ -169,8 +169,15 @@ publicado era casi el doble del real.
 
 ## E-006 · «Los 6 commits del backup son gemelos del rebase»
 
+> [!WARNING]
+> **Esta entrada es ella misma una errata.** Su conclusión —que el backup
+> guardaba 12 líneas que `main` no tenía— es falsa: `main` las tiene, y
+> mejoradas. Retractada en la [E-009](#e-009--12-líneas-que-main-no-tiene-en-ninguna-parte).
+> Se conserva entera por la regla 1.
+
 - **Publicado**: en conversación, durante la limpieza de ramas del 2026-08-16
 - **Corregido**: el mismo día, antes de borrar nada
+- **Retractada**: 2026-08-24, [E-009](#e-009--12-líneas-que-main-no-tiene-en-ninguna-parte)
 
 Al limpiar ramas locales se afirmó que `backup/monitor-antes-del-rebase` era
 redundante: sus seis commits tenían los mismos asuntos que seis de `main`, luego
@@ -238,24 +245,100 @@ lo cazó — el mismo fallo que la E-005, dos veces en el mismo fichero.
 
 ---
 
+## E-009 · «12 líneas que `main` no tiene en ninguna parte»
+
+- **Publicado**: [#125](https://github.com/pichu2707/OxideGate/issues/125),
+  [`limpieza-de-ramas.md`](limpieza-de-ramas.md) y la E-006 de este mismo fichero
+- **Corregido**: comprobado el 2026-08-23, publicado el 2026-08-24
+
+La E-006 acertó en lo importante —el recuento de commits no basta para borrar una
+rama— y erró en su conclusión. Dijo que `backup/monitor-antes-del-rebase`
+guardaba una medición que `main` había perdido en el rebase de #109–#113. **No se
+perdió: fue retractada**, siete días antes de que nadie mirase esa rama.
+
+Quien la retracta es `64063bf docs: poner la documentacion al dia con ollama y
+con los vatios` (2026-08-09). Está en `main` y **no** está en el backup:
+
+```sh
+$ git merge-base --is-ancestor 64063bf main                              # cierto
+$ git merge-base --is-ancestor 64063bf backup/monitor-antes-del-rebase   # falso
+```
+
+Sustituye el 92% por un rango en los tres sitios exactos donde vivía:
+
+```diff
+-/// cargar el modelo sin que nada lo diga. Medido: **el 92%** del tiempo de una
+-/// petición fría fue carga, no inferencia.
++/// Cuánto pesa esa carga depende por completo de cuánto se genere: medido
++/// entre el **54%** del tiempo (200 tokens) y el **98%** (un token). Por eso no
++/// hay un número que valga como constante — hay un aviso.
+```
+
+Vivos hoy en `main`: `src/bin/monitor.rs:208`, `:2819` y `:6036`.
+
+**`main` es estrictamente mejor.** El 92% es un punto suelto presentado como
+constante. El 54%–98% es un rango CON la razón de que no exista constante
+—depende de cuánto se genere— más el dato de que la ruta **nativa**
+(`/api/chat`) sí separa la carga con `load_us`. La misma corrección está en
+`README.md`, `docs/findings.md`, `docs/monitor-tui.md`,
+`docs/telemetry-per-request.md` y `src/provider/ollama.rs`.
+
+**Las otras líneas tampoco eran únicas.** De las 12, una no era del 92%
+(`generation_throughput`, «Estas filas se EXCLUYEN»): `main` la tiene
+**ampliada** en `src/bin/monitor.rs:1216-1229`, partida en lista numerada y con
+la medición de #102 dentro. El inventario completo del diff: **12 líneas solo en
+el backup, 129 solo en `main`**.
+
+**El instrumento, otra vez.** `git grep "92%" main` no devuelve nada, y de ahí
+salió «se perdió». Pero un `grep` por una cifra literal **no distingue perder de
+retractar**: da exactamente cero en los dos casos. Lo que sí los separa es mirar
+el historial en las dos puntas:
+
+```sh
+$ git log --oneline -S "92%" main -- src/bin/monitor.rs                     # 4 commits
+$ git log --oneline -S "92%" backup/monitor-antes-del-rebase -- src/bin/monitor.rs   # 3 commits
+```
+
+Los tres que la introducen están en ambas. El cuarto —el que la quita— solo está
+en `main`. **Ese commit de más ES la retractación.**
+
+La pista estaba en el propio #125: decía que la rama «arrastraba bloques de doc
+de `docs/al-dia-con-ollama-y-vatios`». Ese es el nombre de la rama de `64063bf`.
+La causalidad estaba al revés — el rebase no se comió los docs, el backup es una
+foto ANTERIOR a la corrección.
+
+**Qué cambió**: `limpieza-de-ramas.md` pasa de tres comprobaciones a **cuatro**;
+la nueva pregunta si el dato ausente fue SUPERADO antes de declararlo perdido.
+`backup/monitor-antes-del-rebase` se borra (SHA `0ec8392`) y #125 se cierra sin
+rescatar nada: rescatar el 92% habría sido una **regresión documental**,
+reintroducir una cifra retractada en un área que ya se retractó una vez.
+
+**Sigue en pie de la E-006**: el recuento de commits no basta, `git cherry` marca
+`+` un commit rebasado con conflictos, y la comprobación de contenido es
+obligatoria. Todo eso es correcto y sigue en el criterio. Lo único que falla es
+la lectura de lo que esa comprobación encontró.
+
+---
+
 ## El patrón, que es lo más útil de esta lista
 
-De las ocho entradas, **cinco fallan hacia el mismo lado**: E-001, E-003, E-004,
-E-005 y E-007 son casos en los que el instrumento le cargó al modelo un defecto
-propio, publicó azar como si fuera señal, o lo suspendió por una regla suya mal
-puesta.
+De las nueve entradas, **seis fallan hacia el mismo lado**: E-001, E-003, E-004,
+E-005, E-007 y E-009 son casos en los que el instrumento le cargó al material que
+medía un defecto propio, publicó azar como si fuera señal, o lo suspendió por una
+regla suya mal puesta.
 
 Un banco de medida no se equivoca al azar. Se equivoca **hacia donde le resulta
 cómodo**, y aquí lo cómodo siempre fue creer que el examinado era malo antes que
 revisar el examen. Es más fácil escribir «este modelo no sabe» que «mi
-clasificador solo miraba un campo».
+clasificador solo miraba un campo», y más fácil escribir «el rebase se comió la
+medición» que «mi `grep` no distingue perder de retractar».
 
 Las otras tres comparten causas distintas y también repetidas: **dar por buena
 una cifra o un criterio sin comprobarlo** porque parecía evidente (E-002, E-006),
 y **salvar de más al retractar** — quedarse con la parte de una afirmación falsa
 que parecía sólida, sin volver a comprobarla (E-008).
 
-**Ninguna de las ocho la encontró un test en rojo.** La suite estuvo en verde
+**Ninguna de las nueve la encontró un test en rojo.** La suite estuvo en verde
 todo el tiempo, porque ninguna era un fallo de código. Las cazaron cosas
 distintas, y ninguna es automática:
 
@@ -266,11 +349,19 @@ distintas, y ninguna es automática:
 | **desconfiar de un resultado demasiado limpio** (`5/5 ignoró`) | E-004 |
 | **repetir** la misma medición | E-005 |
 | **comprobar el contenido**, no el recuento | E-006 |
+| **mirar el historial del dato** (`log -S`), no solo el dato (`grep`) | E-009 |
 | **subir el `n`** y ver cambiar un veredicto que no debía cambiar | E-007, E-008 |
 
 De ahí que las guardas de este proyecto **aborten en vez de avisar**: un aviso se
 ignora, y aquí hicieron falta dos abortos para descubrir que el instrumento
 estaba mal planteado.
+
+Y una novedad incómoda que trae la E-009: **una corrección también se
+retracta.** La E-006 era una entrada de esta misma lista, escrita con la guardia
+alta y con la comprobación hecha, y aun así era falsa. Corregir no vacuna. Lo
+único que separa una fe de erratas de un segundo montón de afirmaciones sin
+comprobar es aplicarle sus propias reglas —sobre todo la 4— también a lo que ella
+misma publica.
 
 Y de ahí también la regla que no se puede automatizar: **un resultado redondo
 merece más desconfianza que uno feo.** `5/5 ignoró` era un fallo del clasificador
