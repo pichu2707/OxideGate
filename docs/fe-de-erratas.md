@@ -434,10 +434,86 @@ propia E-004.
 
 ---
 
+## E-012 · El ancla del suelo suspendía a un modelo con el suelo LIMPIO
+
+- **Publicado**: guarda `suelo_discrimina` de
+  [`examples/sonda-herramientas.rs`](../examples/sonda-herramientas.rs), en `main`
+  desde el 2026-08-16 (PR #126). Es la regla que la
+  [E-007](#e-007--el-ancla-del-suelo-hacía-que-medir-mejor-empeorase-el-veredicto)
+  puso para arreglar la anterior
+- **Corregido**: 2026-08-25, la primera vez que se midió el candidato del nivel 1
+
+La sonda **descartó** a `qwen3:14b` con el razonamiento apagado —el candidato que
+la [E-011](#e-011--qwen314b-hace-esto-55-y-el-content-vacío-como-propiedad-del-modelo)
+acababa de rescatar— con este veredicto:
+
+```
+DESCARTADO — el SUELO emitió 0/30 llamadas ante un saludo, sin tarea ni
+fichero, y el encargo más flojo dio 0/30. (…) este modelo llama demasiado a
+ciegas para que la batería discrimine.
+```
+
+**El modelo emitió 0/30 ante el saludo.** Acusarlo de «llamar demasiado a ciegas»
+es decir exactamente lo contrario de lo que el propio mensaje acababa de imprimir.
+
+### Lo que había medido, que es lo que se perdía
+
+| redacción | emite |
+|---|---|
+| techo (se le nombra) | 30/30 |
+| `averigua` | 30/30 |
+| `arréglalo`, `arregla` (seco), constatación | 0/30 |
+| **suelo (saludo)** | **0/30** |
+
+30/30 contra 0/30 con el suelo impecable es **la discriminación máxima que esta
+batería puede dar**. La guarda la suspendió.
+
+### La causa: `min` sobre los encargos
+
+La regla era `suelo * 2 < min(encargos)`. Con un encargo a 0, eso es `0 * 2 < 0`
+—falso—, y el modelo cae aunque otro encargo esté al máximo. La regla trataba «el
+encargo más flojo dio 0» como «este modelo no llama nunca», y no era el caso.
+
+**Qué cambió**: el suelo se compara contra **el encargo más flojo DE LOS QUE LO
+SUPERAN**. Un encargo que no supera al suelo no está contaminado por él —es
+indistinguible de él—, así que no tiene voto. El margen del doble sigue
+aplicándose donde hace falta y deja de aplicarse contra tasas que no dicen nada.
+El caso que sigue suspendiendo es que **ningún** encargo supere al suelo, ahora
+con un mensaje que dice eso y no lo contrario. Tres tests nuevos fijan las
+piezas.
+
+### El primer arreglo estaba mal, y lo cazó la revisión
+
+El primer intento trataba **aparte el suelo limpio**: si el suelo era 0, aprobar
+mientras algo discriminase. Pasaba todos los tests y **dejaba el fallo a una
+llamada de distancia**: con `suelo = 1` y encargos `[30, 0, 0, 0]` la regla volvía
+a comparar contra el 0 y volvía a suspender.
+
+Y no es hipotético. La [E-011](#e-011--qwen314b-hace-esto-55-y-el-content-vacío-como-propiedad-del-modelo)
+—en este mismo lote— es justo la entrada que establece que estas tasas se mueven
+entre ejecuciones idénticas. Ese `1` llega solo.
+
+**Arreglar el borde en vez de la comparación es aplazar la errata, no
+corregirla**, y es la tercera forma que toma el mismo defecto en esta ancla.
+
+**Sigue en pie**: todo el razonamiento de la E-007. No exigir `suelo == 0` era
+correcto y lo sigue siendo; lo que estaba mal era contra QUÉ se comparaba cuando
+el suelo ya era limpio.
+
+### Es la segunda vez que esta ancla falla hacia el mismo lado
+
+La E-007 la cambió porque **medir mejor empeoraba el veredicto** —`qwen2.5:7b`
+aprobaba a `n=5` y suspendía a `n=30`—. La E-012 es el mismo defecto con otra
+forma: **el modelo con el suelo más limpio de todos los medidos es el único al
+que la guarda suspendió**. Una guarda que aborta es lo correcto; una guarda cuyo
+criterio no se vuelve a mirar después de arreglarlo, no.
+
+---
+
 ## El patrón, que es lo más útil de esta lista
 
-De las once entradas, **siete fallan hacia el mismo lado**: E-001, E-003, E-004,
-E-005, E-007, E-009 y E-011 son casos en los que el instrumento le cargó al material que
+De las doce entradas, **ocho fallan hacia el mismo lado**: E-001, E-003, E-004,
+E-005, E-007, E-009, E-011 y E-012 son casos en los que el instrumento le cargó al material que
 medía un defecto propio, publicó azar como si fuera señal, o lo suspendió por una
 regla suya mal puesta.
 
@@ -456,7 +532,7 @@ La E-010 afina esa primera causa: no es solo no comprobar, es **generalizar desd
 un único caso**. Una regla inventada para explicar la observación que tienes
 delante encaja con ella por construcción, y eso no la hace cierta.
 
-**Ninguna de las once la encontró un test en rojo.** La suite estuvo en verde
+**Ninguna de las doce la encontró un test en rojo.** La suite estuvo en verde
 todo el tiempo, porque ninguna era un fallo de código. Las cazaron cosas
 distintas, y ninguna es automática:
 
@@ -470,10 +546,17 @@ distintas, y ninguna es automática:
 | **mirar el historial del dato** (`log -S`), no solo el dato (`grep`) | E-009 |
 | **usar la herramienta y leer lo que responde**, en vez de fiarse de la regla escrita | E-010 |
 | **subir el `n`** y ver cambiar un veredicto que no debía cambiar | E-007, E-008, E-011 |
+| **leer el mensaje de la propia guarda** y ver que se contradecía | E-012 |
 
 De ahí que las guardas de este proyecto **aborten en vez de avisar**: un aviso se
 ignora, y aquí hicieron falta dos abortos para descubrir que el instrumento
 estaba mal planteado.
+
+Y de ahí también el reverso, que trae la E-012: **una guarda que aborta también
+puede equivocarse**, y cuando se equivoca lo hace con toda la autoridad de un
+veredicto. La misma ancla del suelo ha fallado dos veces hacia el mismo lado
+—suspender al modelo que se estaba midiendo mejor— con dos reglas distintas. Un
+aborto obliga a leer el motivo; nadie obliga a comprobarlo.
 
 Y una novedad incómoda que trae la E-009, y que la E-011 repite: **una
 corrección también se retracta.** La E-006 y la E-004 eran entradas de esta misma
