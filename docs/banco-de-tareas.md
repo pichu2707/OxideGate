@@ -92,9 +92,20 @@ separe harnesses.
 ### Lo que este 4/10 NO dice
 
 Es el **suelo**. El corredor del nivel 1 pondrá un harness en medio, que además
-tiene que encontrar los ficheros y decidir qué ejecutar, así que su tasa será
-**igual o menor**. El corredor tiene que contar con `n` alto — que es gratis
-aquí — y con tasas absolutas bajas.
+tiene que encontrar los ficheros y decidir qué ejecutar. El corredor tiene que
+contar con `n` alto — que es gratis aquí.
+
+> [!WARNING]
+> **Aquí ponía que la tasa del corredor sería «igual o menor», y es falso.**
+> Un harness no solo añade dificultad: añade la capacidad de **iterar** — corre
+> los tests y reintenta—, y un turno único no puede. Con `qwen3:14b-nothink`
+> medido el 2026-08-30, el suelo de un turno da **30/30** y el corredor da
+> **30/30** con `pi` y con `opencode`: igual, y **al techo**.
+>
+> El 4/10 de arriba es de `qwen2.5:7b`, **otro modelo**. Comparar la tasa del
+> corredor contra un suelo medido sobre otro modelo no dice nada, y estuvo a
+> punto de hacer leer un 30/30 como mérito del harness.
+> Ver [`corredor-nivel-1.md`](corredor-nivel-1.md) §3.
 
 ---
 
@@ -171,5 +182,7 @@ supo extraer) y `mezclados` (hubo que limpiar la respuesta). Un banco cuyo
   hacen posible el nivel 1.
 - [`floor-across-tools.md`](floor-across-tools.md) — el peaje fijo por
   herramienta, que es lo que se resta para obtener el **trabajo real**.
+- [`corredor-nivel-1.md`](corredor-nivel-1.md) — el corredor que usa esta
+  tarea, qué harnesses la cruzan y cuánto les cuesta.
 - [`benchmark.md`](benchmark.md) — la barrida por tamaño de input, con el
   esqueleto de corredor reaprovechable.
