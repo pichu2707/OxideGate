@@ -159,6 +159,14 @@ const ENCARGO: &str = "test_tarifa.py falla. Haz que pase.";
 /// §1, para que las dos mediciones hablen del mismo estímulo.
 const ENCARGO_PEAJE: &str = "Responde solo: ok";
 
+/// La ruta que OxideGate expone para el backend de Codex, y la que el plugin de
+/// enrutado tiene que recibir ENTERA.
+///
+/// **No es `/v1/responses`**: esa va a `api.openai.com`, que rechaza un token
+/// OAuth de suscripción. `/v1/codex/responses` va a
+/// `chatgpt.com/backend-api/codex`, que es el que lo acepta.
+const RUTA_CODEX: &str = "/v1/codex/responses";
+
 /// Qué harness conduce esta corrida.
 ///
 /// Empezó siendo una constante —Codex— y **tuvo que dejar de serlo**: Codex
@@ -200,7 +208,11 @@ impl Harness {
         match self {
             Harness::Opencode => Some(".local/share/opencode/auth.json"),
             Harness::Pi => Some(".pi/agent/auth.json"),
-            Harness::Codex => Some(".codex/auth.json"),
+            // OJO: `lanzar` pone CODEX_HOME=hogar, asi que Codex busca su auth
+            // en `hogar/auth.json` y NO en `hogar/.codex/auth.json`. Escribirla
+            // en el sitio de un HOME normal la dejaba donde nadie la lee — y el
+            // token real ya estaba en disco.
+            Harness::Codex => Some("auth.json"),
         }
     }
 
@@ -368,11 +380,16 @@ fn clasificar(
 ///
 /// **Nunca se imprime el valor**, ni en un error: el mensaje dice qué
 /// proveedor faltaba, no lo que había.
-fn copiar_credencial(h: Harness, hogar: &Path, proveedor: &str) -> Result<(), String> {
+fn copiar_credencial(
+    h: Harness,
+    hogar: &Path,
+    proveedor: &str,
+    home_real: &Path,
+) -> Result<(), String> {
     let rel = h
         .ruta_credencial()
         .ok_or_else(|| format!("no se donde guarda `{}` sus credenciales", h.binario()))?;
-    let real = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rel);
+    let real = home_real.join(rel);
     let bruto = std::fs::read_to_string(&real)
         .map_err(|e| format!("no puedo leer {}: {e}", real.display()))?;
     let v: Value =
@@ -401,19 +418,52 @@ fn copiar_credencial(h: Harness, hogar: &Path, proveedor: &str) -> Result<(), St
     if let Some(padre) = destino.parent() {
         std::fs::create_dir_all(padre).map_err(|e| format!("no puedo crear {padre:?}: {e}"))?;
     }
-    std::fs::write(&destino, solo_una.to_string())
+    escribir_privado(&destino, solo_una.to_string().as_bytes())
         .map_err(|e| format!("no puedo escribir la credencial aislada: {e}"))
+}
+
+/// Escribe un fichero con permisos **0600**, nunca los del `umask`.
+///
+/// `std::fs::write` crea con `0666 & !umask` — normalmente `0644`. Los ficheros
+/// de credenciales de origen son `0600`; copiarlos con `write` los dejaba
+/// **legibles por cualquiera** en un temporal de nombre predecible, que en una
+/// maquina compartida o en CI es un token OAuth vivo al alcance de todos.
+fn escribir_privado(destino: &Path, datos: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut abrir = std::fs::OpenOptions::new();
+    abrir.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        abrir.mode(0o600);
+    }
+    abrir.open(destino)?.write_all(datos)
+}
+
+/// Crea un directorio y, en unix, lo deja en **0700**.
+///
+/// La raiz de trabajo se creaba con `create_dir_all` (0755) y lleva un nombre
+/// predecible por PID: el directorio que contiene la credencial no puede ser
+/// atravesable por terceros.
+fn crear_privado(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 /// Copia al `HOME` aislado **el plugin de enrutado y ninguno más**.
 ///
 /// Ver [`Harness::ruta_plugin`] para por qué hace falta. Si el harness no
 /// necesita plugin, no hace nada y no es un error.
-fn copiar_plugin(h: Harness, hogar: &Path) -> Result<(), String> {
+fn copiar_plugin(h: Harness, hogar: &Path, home_real: &Path) -> Result<(), String> {
     let Some(rel) = h.ruta_plugin() else {
         return Ok(());
     };
-    let real = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rel);
+    let real = home_real.join(rel);
     if !real.exists() {
         return Err(format!(
             "falta el plugin de enrutado en {}. Sin el, el harness va DIRECTO al \
@@ -521,6 +571,44 @@ fn config_codex(puerto: &str, modelo: &str, wire: &str) -> String {
          base_url = \"http://127.0.0.1:{puerto}/v1\"\n\
          wire_api = \"{wire}\"\n"
     )
+}
+
+/// Lee un tope de cuota. Ausente es 0 («sin tope»); **ilegible aborta**.
+///
+/// La diferencia importa: `parse().unwrap_or(0)` convertia una errata en «sin
+/// tope» sin decir nada, y para un valor cuyo unico proposito es acotar el
+/// gasto, degradar a ilimitado es el peor defecto posible.
+fn tope<T: std::str::FromStr + Default>(nombre: &str) -> T {
+    match std::env::var(nombre) {
+        Err(_) => T::default(),
+        Ok(v) if v.trim().is_empty() => T::default(),
+        Ok(v) => match v.trim().parse() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("ABORTA: {nombre}={v:?} no es un numero entero.");
+                eprintln!("  Un tope ilegible NO se degrada a «sin tope»: eso desactivaria en");
+                eprintln!("  silencio lo unico que acota el gasto.");
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
+/// Borra el arbol de trabajo y sale con error.
+///
+/// Existe porque la limpieza corria SOLO al terminar el bucle: cada
+/// `process::exit` de dentro se la saltaba, incluida la del aborto **esperado**
+/// del fail-open. O sea que la guarda pensada para ser el caso seguro era justo
+/// la que dejaba el token OAuth en `/tmp` para siempre.
+fn abortar(raiz: &Path, mensaje: &str) -> ! {
+    eprintln!("{mensaje}");
+    if let Err(e) = std::fs::remove_dir_all(raiz) {
+        if raiz.exists() {
+            eprintln!("  AVISO: no pude borrar {}: {e}", raiz.display());
+            eprintln!("  Si la corrida era de NIVEL 2, ahi dentro hay una credencial real.");
+        }
+    }
+    std::process::exit(1);
 }
 
 fn var(nombre: &str, defecto: &str) -> String {
@@ -840,7 +928,18 @@ async fn lanzar(
         // El plugin de enrutado lee esto para saber donde escucha el proxy.
         // Sin ello apuntaria al puerto por defecto, que puede no ser el nuestro
         // — y como es fail-open, el fallo seria MUDO.
-        cmd.env("OXIDEGATE_URL", format!("http://127.0.0.1:{puerto}"));
+        // OJO: el plugin usa esto como ENDPOINT COMPLETO, no como origen —
+        // hace `originalFetch(OXIDEGATE_URL, init)` tal cual. Su defecto es
+        // `http://127.0.0.1:8899/v1/codex/responses`, y su propio doc avisa:
+        // «IT MUST BE /v1/codex/responses, NOT /v1/responses».
+        //
+        // Poner aqui solo el origen mandaba cada peticion a `/`, que no es una
+        // ruta: la variable que existe para que el enrutado sea correcto era
+        // justo la que lo rompia.
+        cmd.env(
+            "OXIDEGATE_URL",
+            format!("http://127.0.0.1:{puerto}{RUTA_CODEX}"),
+        );
     }
 
     match h {
@@ -864,14 +963,27 @@ async fn lanzar(
             cmd.arg(encargo);
         }
         Harness::Opencode => {
-            cmd.args([
-                "run",
+            cmd.arg("run");
+            if nivel == 1 {
                 // Sin plugins externos: lo que se mide es opencode, no lo que
-                // alguien le haya instalado encima.
-                "--pure", "-m",
-            ])
-            .arg(format!("oxidegate/{modelo}"))
-            .arg(encargo);
+                // alguien le haya instalado encima. Y el modelo va por el
+                // proveedor `oxidegate` que escribe `escribir_config`.
+                cmd.arg("--pure")
+                    .arg("-m")
+                    .arg(format!("oxidegate/{modelo}"));
+            } else {
+                // NIVEL 2: `--pure` NO puede ir. Desactiva plugins externos, y
+                // el que enruta a OxideGate es uno de ellos: sin el, el harness
+                // va DIRECTO al upstream de pago y no se captura nada. Como el
+                // HOME aislado solo lleva ESE plugin, quitarlo carga ese y nada
+                // mas.
+                //
+                // Y el modelo va DESNUDO -sin el prefijo `oxidegate/`- para que
+                // opencode use su proveedor propio y su credencial OAuth, que
+                // es lo que el nivel 2 mide.
+                cmd.arg("-m").arg(modelo);
+            }
+            cmd.arg(encargo);
         }
         Harness::Codex => {
             // Su config vive en CODEX_HOME, no bajo HOME.
@@ -958,8 +1070,11 @@ async fn main() {
     let proveedor = var("CORREDOR_PROVEEDOR", "");
     // Topes de CUOTA, no de dolares: los dos harnesses hablan por OAuth de
     // suscripcion, asi que lo que se gasta no es una factura sino cuota.
-    let tope_peticiones: usize = var("CORREDOR_TOPE_PETICIONES", "0").parse().unwrap_or(0);
-    let tope_tokens: u64 = var("CORREDOR_TOPE_TOKENS", "0").parse().unwrap_or(0);
+    // `unwrap_or(0)` seria fatal aqui: 0 significa «sin tope», asi que una
+    // errata al escribirlo -`1e6`, un espacio de mas- desactivaba en silencio
+    // la unica cosa que acota el gasto. Un valor ilegible ABORTA.
+    let tope_peticiones: usize = tope("CORREDOR_TOPE_PETICIONES");
+    let tope_tokens: u64 = tope("CORREDOR_TOPE_TOKENS");
     let datos = var("CORREDOR_DATOS", "./datos-corredor.jsonl");
     let n: usize = var("CORREDOR_N", "3").parse().unwrap_or(3);
     let plazo: u64 = var("CORREDOR_TIMEOUT", "300").parse().unwrap_or(300);
@@ -988,10 +1103,14 @@ async fn main() {
             eprintln!("  decision, no un descuido.");
             std::process::exit(1);
         }
-        if tope_peticiones == 0 && tope_tokens == 0 {
-            eprintln!("ABORTA: el nivel 2 gasta CUOTA REAL y no lleva tope.");
-            eprintln!("  Pon CORREDOR_TOPE_PETICIONES y/o CORREDOR_TOPE_TOKENS. #123 recuerda");
-            eprintln!("  el precedente: 16.185 tokens quemados sin capturar nada.");
+        if tope_peticiones == 0 {
+            eprintln!(
+                "ABORTA: el nivel 2 gasta CUOTA REAL y CORREDOR_TOPE_PETICIONES es obligatorio."
+            );
+            eprintln!("  No vale con el tope de tokens: `input_tokens`/`output_tokens` son");
+            eprintln!("  opcionales y hay filas reales con los dos a null, asi que ese tope");
+            eprintln!("  puede quedarse a cero para siempre. Las peticiones siempre se cuentan.");
+            eprintln!("  #123 recuerda el precedente: 16.185 tokens quemados sin capturar nada.");
             std::process::exit(1);
         }
         println!(
@@ -1042,11 +1161,40 @@ async fn main() {
     }
 
     let cliente = reqwest::Client::new();
-    if let Err(e) = guarda_proxy(&cliente, &puerto, &modelo).await {
-        eprintln!("ABORTA: {e}");
-        std::process::exit(1);
+    if nivel == 2 {
+        // La guarda del proxy manda una PETICION REAL de inferencia. En el
+        // nivel 1 es gratis; en el 2 gasta cuota que ademas no se contaria en
+        // ningun tope. Y sondea `/v1/responses`, que va a api.openai.com y
+        // RECHAZA un token OAuth de suscripcion: abortaria con un error
+        // enganoso aconsejando apuntar el proxy a ollama, que es lo contrario
+        // de lo que el nivel 2 quiere.
+        //
+        // Se sustituye por una comprobacion de LIVENESS, que no gasta nada. Lo
+        // que de verdad valida el enrutado es la guarda de telemetria por
+        // repeticion, que ya no perdona ni una.
+        match cliente
+            .get(format!("http://127.0.0.1:{puerto}/health"))
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                println!("  proxy: vivo en {puerto} (sin sondeo de inferencia: costaria cuota)")
+            }
+            _ => {
+                eprintln!("ABORTA: OxideGate no responde en {puerto}.");
+                eprintln!("  El plugin de enrutado es FAIL-OPEN: si el proxy no esta, el");
+                eprintln!("  harness va DIRECTO al backend de pago y no se captura nada.");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        if let Err(e) = guarda_proxy(&cliente, &puerto, &modelo).await {
+            eprintln!("ABORTA: {e}");
+            std::process::exit(1);
+        }
+        println!("  proxy: enruta a {modelo}");
     }
-    println!("  proxy: enruta a {modelo}");
 
     // La guarda de contexto manda un prompt ENORME a proposito, para que lo que
     // el proveedor diga haber leido sea el techo efectivo. Contra un modelo
@@ -1078,7 +1226,14 @@ async fn main() {
     // ---- La corrida ----
 
     let telemetria = ruta_telemetria();
+    let home_real = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let raiz = std::env::temp_dir().join(format!("corredor-{}", std::process::id()));
+    // 0700: la raiz lleva un nombre predecible por PID y, en el nivel 2,
+    // contiene una credencial real.
+    if let Err(e) = crear_privado(&raiz) {
+        eprintln!("ABORTA: no puedo crear {} en privado: {e}", raiz.display());
+        std::process::exit(1);
+    }
     // Los rastros sobreviven a la corrida a proposito: son lo que se mira
     // cuando el resultado no se explica solo.
     let rastros = PathBuf::from(var("CORREDOR_RASTROS", "./rastros-corredor"));
@@ -1102,21 +1257,23 @@ async fn main() {
             preparar(&tarea, &trabajo)
         };
         if let Err(e) = preparado {
-            eprintln!("  rep {i}: no puedo preparar el directorio: {e}");
-            std::process::exit(1);
+            abortar(
+                &raiz,
+                &format!("  rep {i}: no puedo preparar el directorio: {e}"),
+            );
         }
         if let Err(e) = escribir_config(harness, &hogar, &puerto, &modelo, &wire) {
-            eprintln!("  rep {i}: no puedo escribir la config aislada: {e}");
-            std::process::exit(1);
+            abortar(
+                &raiz,
+                &format!("  rep {i}: no puedo escribir la config aislada: {e}"),
+            );
         }
         if nivel == 2 {
-            if let Err(e) = copiar_credencial(harness, &hogar, &proveedor) {
-                eprintln!("  rep {i}: {e}");
-                std::process::exit(1);
+            if let Err(e) = copiar_credencial(harness, &hogar, &proveedor, &home_real) {
+                abortar(&raiz, &format!("  rep {i}: {e}"));
             }
-            if let Err(e) = copiar_plugin(harness, &hogar) {
-                eprintln!("  rep {i}: {e}");
-                std::process::exit(1);
+            if let Err(e) = copiar_plugin(harness, &hogar, &home_real) {
+                abortar(&raiz, &format!("  rep {i}: {e}"));
             }
         }
 
@@ -1188,9 +1345,15 @@ async fn main() {
         // el plugin de enrutado es FAIL-OPEN, asi que si algo va mal el
         // trafico sigue saliendo — pero al menos se para aqui.
         peticiones_totales += filas.len();
+        // Input Y output. Contar solo el input dejaba fuera la mitad mas cara.
+        // Y los dos campos son opcionales: hay filas reales con los dos a
+        // `null`, asi que un tope SOLO en tokens puede quedarse a cero para
+        // siempre. Por eso el de peticiones es obligatorio (ver la guarda de
+        // intencion): las peticiones siempre se cuentan.
         tokens_totales += filas
             .iter()
-            .filter_map(|f| f["input_tokens"].as_u64())
+            .flat_map(|f| [f["input_tokens"].as_u64(), f["output_tokens"].as_u64()])
+            .flatten()
             .sum::<u64>();
         if let Some(c) = llamadas {
             llamadas_totales = Some(llamadas_totales.unwrap_or(0) + c);
@@ -1212,16 +1375,20 @@ async fn main() {
         // da error — gasta cuota y no captura nada, que es exactamente lo que
         // le paso a la captura de #62 (16.185 tokens quemados).
         //
-        // Se comprueba tras la PRIMERA repeticion y se aborta: una repeticion
-        // perdida es el precio minimo posible por descubrirlo.
-        if nivel == 2 && i == 0 && filas.is_empty() {
+        // Se comprueba en CADA repeticion, no solo en la primera. Y esto es lo
+        // que cierra el agujero de los topes: los contadores salen de `filas`,
+        // asi que cuando el enrutado se rompe a mitad de corrida NO suben —
+        // ninguno de los dos topes se dispararia nunca y la corrida quemaria
+        // las `n` repeticiones enteras. Un cero de filas es la unica senal que
+        // queda, y aqui para en seco.
+        if nivel == 2 && filas.is_empty() {
             eprintln!("\nABORTA: la primera repeticion no dejo NI UNA fila de telemetria.");
             eprintln!("  El harness gasto cuota y el proxy no vio nada, asi que el enrutado");
             eprintln!("  NO esta funcionando. El plugin es fail-open: no da error, solo");
             eprintln!("  deja de medir.");
             eprintln!("  Comprueba que OxideGate escucha en {puerto} y que el plugin apunta");
-            eprintln!("  ahi (OXIDEGATE_URL). Se para tras UNA repeticion, no tras {n}.");
-            std::process::exit(1);
+            eprintln!("  ahi (OXIDEGATE_URL). Se para AQUI, no al final de las {n}.");
+            abortar(&raiz, "");
         }
 
         if nivel == 2 {
@@ -1564,32 +1731,30 @@ mod tests {
     }
 
     /// La garantia del nivel 2 no es «ninguna credencial» sino «SOLO la
-    /// nombrada». Este test la fija: el auth real de opencode lleva cuatro
-    /// proveedores, y llevarse las cuatro a un temporal por comodidad seria
-    /// regalar tres que no hacen falta.
+    /// nombrada». El auth real de opencode lleva cuatro proveedores, y
+    /// llevarselas todas por comodidad seria regalar tres que no hacen falta.
+    ///
+    /// Estos tests reciben el HOME por PARAMETRO. La version anterior lo movia
+    /// con `set_var`, que es global al proceso: `cargo test` los corre en
+    /// paralelo, asi que dos podian pisarse el HOME entre si. Y si HOME no
+    /// estaba definido, se quedaba apuntando al temporal para el resto del
+    /// proceso.
     #[test]
-    fn se_copia_UNA_credencial_y_no_el_fichero_entero() {
+    fn se_copia_una_credencial_y_no_el_fichero_entero() {
         let raiz = std::env::temp_dir().join(format!("cred-{}", std::process::id()));
-        let falso_home = raiz.join("home-real");
+        let home = raiz.join("home-real");
         let aislado = raiz.join("aislado");
         let rel = Harness::Opencode.ruta_credencial().unwrap();
-        std::fs::create_dir_all(falso_home.join(rel).parent().unwrap()).unwrap();
+        std::fs::create_dir_all(home.join(rel).parent().unwrap()).unwrap();
         std::fs::write(
-            falso_home.join(rel),
+            home.join(rel),
             r#"{"openai":{"type":"oauth","access":"AAA"},
                 "google":{"type":"oauth","access":"BBB"},
                 "anthropic":{"type":"oauth","access":"CCC"}}"#,
         )
         .unwrap();
 
-        // `copiar_credencial` lee de $HOME; se apunta al falso.
-        let previo = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", &falso_home) };
-        let r = copiar_credencial(Harness::Opencode, &aislado, "openai");
-        if let Some(h) = previo {
-            unsafe { std::env::set_var("HOME", h) };
-        }
-        r.expect("deberia copiar");
+        copiar_credencial(Harness::Opencode, &aislado, "openai", &home).expect("deberia copiar");
 
         let copiado = std::fs::read_to_string(aislado.join(rel)).unwrap();
         assert!(copiado.contains("openai"), "falta la que se pidio");
@@ -1599,27 +1764,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&raiz);
     }
 
+    /// Una credencial copiada con `fs::write` sale `0644`: legible por
+    /// cualquiera, en un temporal de nombre predecible. El origen es `0600`.
+    #[cfg(unix)]
+    #[test]
+    fn la_credencial_copiada_no_queda_legible_por_terceros() {
+        use std::os::unix::fs::PermissionsExt;
+        let raiz = std::env::temp_dir().join(format!("perm-{}", std::process::id()));
+        let home = raiz.join("home-real");
+        let aislado = raiz.join("aislado");
+        let rel = Harness::Opencode.ruta_credencial().unwrap();
+        std::fs::create_dir_all(home.join(rel).parent().unwrap()).unwrap();
+        std::fs::write(home.join(rel), r#"{"openai":{"access":"AAA"}}"#).unwrap();
+
+        copiar_credencial(Harness::Opencode, &aislado, "openai", &home).unwrap();
+        let modo = std::fs::metadata(aislado.join(rel))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(modo, 0o600, "la credencial quedo en {modo:o}, no en 600");
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
     /// Un proveedor que no esta se reporta SIN imprimir lo que si habia: el
     /// mensaje de error de un fichero de credenciales no puede ser un volcado.
     #[test]
     fn un_proveedor_ausente_no_filtra_los_valores_de_los_demas() {
         let raiz = std::env::temp_dir().join(format!("cred-no-{}", std::process::id()));
-        let falso_home = raiz.join("home-real");
+        let home = raiz.join("home-real");
         let rel = Harness::Opencode.ruta_credencial().unwrap();
-        std::fs::create_dir_all(falso_home.join(rel).parent().unwrap()).unwrap();
+        std::fs::create_dir_all(home.join(rel).parent().unwrap()).unwrap();
         std::fs::write(
-            falso_home.join(rel),
+            home.join(rel),
             r#"{"google":{"type":"oauth","access":"SECRETO-QUE-NO-DEBE-SALIR"}}"#,
         )
         .unwrap();
 
-        let previo = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", &falso_home) };
-        let e = copiar_credencial(Harness::Opencode, &raiz.join("aislado"), "openai")
+        let e = copiar_credencial(Harness::Opencode, &raiz.join("aislado"), "openai", &home)
             .expect_err("no esta, tiene que fallar");
-        if let Some(h) = previo {
-            unsafe { std::env::set_var("HOME", h) };
-        }
         assert!(e.contains("openai") && e.contains("google"), "{e}");
         assert!(
             !e.contains("SECRETO-QUE-NO-DEBE-SALIR"),
@@ -1629,25 +1812,39 @@ mod tests {
     }
 
     /// El plugin es FAIL-OPEN: si falta, el harness va directo al upstream y
-    /// gasta cuota sin capturar nada. Faltar tiene que ser un ERROR, no un
-    /// silencio.
+    /// gasta cuota sin capturar nada. Faltar tiene que ser un ERROR.
     #[test]
     fn un_plugin_de_enrutado_ausente_es_un_error_y_no_un_silencio() {
         let raiz = std::env::temp_dir().join(format!("plug-{}", std::process::id()));
-        let previo = std::env::var("HOME").ok();
-        unsafe { std::env::set_var("HOME", raiz.join("home-vacio")) };
-        let e = copiar_plugin(Harness::Opencode, &raiz.join("aislado"))
+        let vacio = raiz.join("home-vacio");
+        let e = copiar_plugin(Harness::Opencode, &raiz.join("aislado"), &vacio)
             .expect_err("sin plugin tiene que fallar");
-        if let Some(h) = previo {
-            unsafe { std::env::set_var("HOME", h) };
-        }
         assert!(
             e.contains("cuota"),
             "el error tiene que decir QUE se arriesga: {e}"
         );
         // Y un harness que no necesita plugin no falla por no tenerlo.
-        assert!(copiar_plugin(Harness::Pi, &raiz.join("aislado")).is_ok());
+        assert!(copiar_plugin(Harness::Pi, &raiz.join("aislado"), &vacio).is_ok());
         let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// `lanzar` pone CODEX_HOME=hogar, asi que Codex busca su auth en
+    /// `hogar/auth.json`. Escribirla en `hogar/.codex/auth.json` -el sitio de
+    /// un HOME normal- la dejaba donde nadie la lee, con el token real ya en
+    /// disco.
+    #[test]
+    fn la_credencial_de_codex_va_donde_codex_la_busca() {
+        assert_eq!(Harness::Codex.ruta_credencial(), Some("auth.json"));
+    }
+
+    /// El plugin usa OXIDEGATE_URL como ENDPOINT COMPLETO, no como origen. Y
+    /// tiene que ser `/v1/codex/responses`: `/v1/responses` va a
+    /// api.openai.com, que rechaza un token OAuth de suscripcion.
+    #[test]
+    fn la_ruta_del_plugin_es_la_de_codex_y_no_la_generica() {
+        assert_eq!(RUTA_CODEX, "/v1/codex/responses");
+        assert_ne!(RUTA_CODEX, "/v1/responses");
+        assert!(RUTA_CODEX.starts_with('/'), "es una ruta, no un origen");
     }
 
     #[test]
