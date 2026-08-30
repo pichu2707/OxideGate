@@ -257,15 +257,27 @@ enum Encadenado {
     ///
     /// # El caso que se contaba como `Ignoro` mintiendo
     ///
-    /// `qwen3:14b` hace esto **5/5** (medido el 2026-08-16). Una versión
-    /// anterior de esta función solo miraba `content` y le apuntaba «ignoró el
-    /// resultado» a un modelo que lo había leído perfectamente — un fallo del
-    /// instrumento cargado a la cuenta del modelo, igual que los que #120 dejó
-    /// documentados en `calibrar.rs`.
+    /// `qwen3:14b` hace esto **18/30** por `/api/chat` y **13/30** por `/v1`
+    /// (medido el 2026-08-25 a `n=30`). Una versión anterior de esta función
+    /// solo miraba `content` y le apuntaba «ignoró el resultado» a un modelo que
+    /// lo había leído perfectamente — un fallo del instrumento cargado a la
+    /// cuenta del modelo, igual que los que #120 dejó documentados en
+    /// `calibrar.rs`.
     ///
     /// No se cuenta como `Uso` porque **un harness consume `content`**: si viene
     /// vacío, el agente se queda sin nada aunque el modelo lo supiera. Son dos
     /// hechos distintos y se publican por separado.
+    ///
+    /// # No es incurable, y creerlo costó ocho días
+    ///
+    /// Este doc-comment publicaba **5/5**, que era `n=5` y se leía como
+    /// «siempre» (E-011). De ahí se dedujo que `qwen3:14b` no servía para el
+    /// nivel 1, y con esa deducción #121 se quedó sin candidato local.
+    ///
+    /// Es una propiedad del modelo **con el razonamiento encendido**. Apagado,
+    /// el mismo modelo entrega 30/30. La cura no es un campo en la petición
+    /// —que ningún harness manda— sino **otro tag**, con el razonamiento
+    /// apagado dentro del modelo.
     PensoSinContestar,
     /// Contestó sin el centinela por ninguna parte: ignoró el resultado.
     Ignoro,
@@ -426,9 +438,24 @@ fn var(nombre: &str, defecto: &str) -> String {
 /// # Por qué no se fija ni la temperatura ni el modo de razonamiento
 ///
 /// Mismo criterio que `calibrar.rs`: con el muestreo por defecto, la PROPORCIÓN
-/// sobre `n` repeticiones es el dato. Y `think` se deja como venga de fábrica
-/// porque apagarlo cambia lo que se mide —un modelo razonador con el
-/// razonamiento apagado no es el modelo que luego conduciría el harness—.
+/// sobre `n` repeticiones es el dato.
+///
+/// Y `think` se deja **como venga de fábrica en el tag que se le pase**, porque
+/// eso es exactamente lo que recibiría un harness: ninguno manda ese campo. La
+/// sonda mide el modelo tal y como se lo van a encontrar.
+///
+/// El razonamiento se apaga —cuando hay que apagarlo— **en otro tag**, no aquí:
+/// `SONDA_MODELOS=qwen3:14b-nothink`. Así el modo de razonamiento viaja dentro
+/// del modelo, es constante para los cuatro harnesses del nivel 1 y se declara
+/// como el confundidor que es. Fijarlo en la petición metería a quien mide
+/// dentro de lo medido; fijarlo en la config de cada harness devolvería el
+/// confundidor que el nivel 1 existe para quitar.
+///
+/// La justificación anterior decía que apagarlo «cambia lo que se mide, porque
+/// un modelo razonador con el razonamiento apagado no es el modelo que luego
+/// conduciría el harness». El dato la invierte: con el razonamiento encendido,
+/// ese modelo **no conduce ningún harness** —entrega respuesta 17/30—. El que lo
+/// conduciría es justamente el de no-think.
 async fn pedir(
     cliente: &reqwest::Client,
     puerto: &str,

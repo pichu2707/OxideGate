@@ -371,10 +371,73 @@ comprobaciones 3 y 4 dictaron sentencia antes de tocar `-d`.
 
 ---
 
+## E-011 · «`qwen3:14b` hace esto 5/5», y el `content` vacío como propiedad del modelo
+
+- **Publicado**: doc-comment de `Encadenado::PensoSinContestar` en
+  [`examples/sonda-herramientas.rs`](../examples/sonda-herramientas.rs), en `main`
+  desde el 2026-08-16 (PR #126). La cifra viene de la
+  [E-004](#e-004--qwen314b-ignora-el-resultado-de-la-herramienta-55), que es una
+  entrada de esta misma lista
+- **Corregido**: 2026-08-25, buscando candidato para el corredor de #121
+
+Fallan dos cosas: la cifra, y lo que se concluyó de ella.
+
+### La cifra era `n=5`
+
+Medido a `n=30` el 2026-08-25, ollama 0.30.10, mismo techo y mismo centinela:
+
+| ruta | mensaje de herramienta | `content` vacío |
+|---|---|---|
+| `/api/chat` | pelado | 18/30 |
+| `/api/chat` | con `tool_name` | 20/30 |
+| `/v1/chat/completions` | con `tool_call_id` | 13/30 |
+
+Entre el 43% y el 67%. No el 100%. **«5/5» se lee como «siempre»**, y no lo era.
+
+Es el mismo `n=5` que la E-007 y la E-008 ya habían dejado por incapaz de
+sostener una cifra en este banco — y aquí estaba sosteniendo una **desde antes
+que ellas**, sin que nadie volviera a mirarla.
+
+De paso, el `n=30` **confirma** lo que la E-004 ya había descartado a mano: el
+formato del mensaje de herramienta no mueve nada (18/30 contra 20/30). Esa parte
+del trabajo original era correcta.
+
+### Lo que se concluyó, que es lo grave
+
+La E-004 cerró con «eso sigue siendo un dato real sobre su viabilidad». Ese dato
+**mató la opción A de #121**: sin candidato local, no había corredor que
+escribir, y el issue se quedó ocho días eligiendo entre pagar nube o declarar
+que el nivel 1 no existe.
+
+No era una propiedad del modelo. Era una propiedad del modelo **con el
+razonamiento encendido**, y se quita. Por `/v1`, sin tocar la petición:
+
+| modelo | emite | entrega `content` | tiempo |
+|---|---|---|---|
+| `qwen3:14b` | 30/30 | **17/30** | 107 s |
+| el mismo, con el razonamiento apagado | 30/30 | **30/30** | 36 s |
+
+**Sigue en pie**, y es casi todo: el fallo del clasificador que cazó la E-004 era
+real, `PensoSinContestar` merece existir, y su criterio —no contarlo como `Uso`
+porque un harness consume `content`— es el correcto. Lo único que cae es tratar
+el síntoma como incurable sin haber probado a apagar la única variable que lo
+producía.
+
+**Qué cambió**: el doc-comment publica el `n=30` en vez del `5/5`, la
+justificación de por qué la sonda no toca `think` se reescribe —el dato la
+invertía—, y **el nivel 1 vuelve a tener candidato**: el mismo modelo con el
+razonamiento apagado dentro.
+
+**Cómo se cazó**: subir el `n`. Otra vez. Y el disparador fue desconfiar de un
+resultado redondo — el mismo reflejo que cazó la E-004, aplicado esta vez a la
+propia E-004.
+
+---
+
 ## El patrón, que es lo más útil de esta lista
 
-De las diez entradas, **seis fallan hacia el mismo lado**: E-001, E-003, E-004,
-E-005, E-007 y E-009 son casos en los que el instrumento le cargó al material que
+De las once entradas, **siete fallan hacia el mismo lado**: E-001, E-003, E-004,
+E-005, E-007, E-009 y E-011 son casos en los que el instrumento le cargó al material que
 medía un defecto propio, publicó azar como si fuera señal, o lo suspendió por una
 regla suya mal puesta.
 
@@ -393,7 +456,7 @@ La E-010 afina esa primera causa: no es solo no comprobar, es **generalizar desd
 un único caso**. Una regla inventada para explicar la observación que tienes
 delante encaja con ella por construcción, y eso no la hace cierta.
 
-**Ninguna de las diez la encontró un test en rojo.** La suite estuvo en verde
+**Ninguna de las once la encontró un test en rojo.** La suite estuvo en verde
 todo el tiempo, porque ninguna era un fallo de código. Las cazaron cosas
 distintas, y ninguna es automática:
 
@@ -406,15 +469,17 @@ distintas, y ninguna es automática:
 | **comprobar el contenido**, no el recuento | E-006 |
 | **mirar el historial del dato** (`log -S`), no solo el dato (`grep`) | E-009 |
 | **usar la herramienta y leer lo que responde**, en vez de fiarse de la regla escrita | E-010 |
-| **subir el `n`** y ver cambiar un veredicto que no debía cambiar | E-007, E-008 |
+| **subir el `n`** y ver cambiar un veredicto que no debía cambiar | E-007, E-008, E-011 |
 
 De ahí que las guardas de este proyecto **aborten en vez de avisar**: un aviso se
 ignora, y aquí hicieron falta dos abortos para descubrir que el instrumento
 estaba mal planteado.
 
-Y una novedad incómoda que trae la E-009: **una corrección también se
-retracta.** La E-006 era una entrada de esta misma lista, escrita con la guardia
-alta y con la comprobación hecha, y aun así era falsa. Corregir no vacuna. Lo
+Y una novedad incómoda que trae la E-009, y que la E-011 repite: **una
+corrección también se retracta.** La E-006 y la E-004 eran entradas de esta misma
+lista, escritas con la guardia alta y con la comprobación hecha, y las dos
+publicaron algo falso — la primera entera, la segunda en su cifra y en lo que
+dedujo de ella. Corregir no vacuna. Lo
 único que separa una fe de erratas de un segundo montón de afirmaciones sin
 comprobar es aplicarle sus propias reglas —sobre todo la 4— también a lo que ella
 misma publica.
@@ -423,4 +488,6 @@ Y de ahí también la regla que no se puede automatizar: **un resultado redondo
 merece más desconfianza que uno feo.** `5/5 ignoró` era un fallo del clasificador
 disfrazado de propiedad del modelo, y `5/5 emitida` era una medida correcta que
 demostraba que la sonda medía lo que no era. Ninguna de las dos significaba lo
-que aparentaba.
+que aparentaba. Y la E-011 añade el caso peor: un `5/5` que sobrevivió nueve días
+**dentro de la propia corrección que lo había cazado**, porque una vez escrita una
+entrada de erratas nadie vuelve a mirarla.
