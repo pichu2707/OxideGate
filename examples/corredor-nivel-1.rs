@@ -490,6 +490,7 @@ fn escribir_config(
     puerto: &str,
     modelo: &str,
     wire: &str,
+    nivel: u8,
 ) -> std::io::Result<()> {
     match h {
         Harness::Pi => {
@@ -500,7 +501,10 @@ fn escribir_config(
         Harness::Opencode => {
             let dir = hogar.join(".config").join("opencode");
             std::fs::create_dir_all(&dir)?;
-            std::fs::write(dir.join("opencode.json"), config_opencode(puerto, modelo))
+            std::fs::write(
+                dir.join("opencode.json"),
+                config_opencode(puerto, modelo, nivel),
+            )
         }
         Harness::Codex => {
             std::fs::create_dir_all(hogar)?;
@@ -521,7 +525,23 @@ fn escribir_config(
 ///
 /// `webfetch` va a `deny` a propósito: el banco es de coste cero y sin red
 /// hacia fuera. Una tarea que se resolviera buscando en internet no es la tarea.
-fn config_opencode(puerto: &str, modelo: &str) -> String {
+fn config_opencode(puerto: &str, modelo: &str, nivel: u8) -> String {
+    if nivel == 2 {
+        // NIVEL 2: NI proveedor NI modelo por defecto. El harness usa el suyo y
+        // su credencial OAuth, que es lo que este nivel mide.
+        //
+        // Declarar aqui el proveedor `oxidegate` con `apiKey: "no-se-usa"` era
+        // una trampa: si el `-m` de la linea de comandos se cayera alguna vez,
+        // opencode se iria EN SILENCIO al proveedor de la clave falsa y la
+        // corrida mediria el cableado del nivel 1 con el aislamiento del 2.
+        //
+        // Los permisos SI hacen falta: sin ellos pide confirmacion y en modo no
+        // interactivo se queda parado.
+        return "{\n\
+                \x20 \"permission\": { \"edit\": \"allow\", \"bash\": \"allow\", \"webfetch\": \"deny\" }\n\
+                }\n"
+            .to_string();
+    }
     format!(
         "{{\n\
          \x20 \"provider\": {{\n\
@@ -1262,7 +1282,7 @@ async fn main() {
                 &format!("  rep {i}: no puedo preparar el directorio: {e}"),
             );
         }
-        if let Err(e) = escribir_config(harness, &hogar, &puerto, &modelo, &wire) {
+        if let Err(e) = escribir_config(harness, &hogar, &puerto, &modelo, &wire, nivel) {
             abortar(
                 &raiz,
                 &format!("  rep {i}: no puedo escribir la config aislada: {e}"),
@@ -1698,7 +1718,7 @@ mod tests {
 
     #[test]
     fn la_config_de_opencode_es_json_valido_y_apunta_al_proxy() {
-        let c = config_opencode("8901", "qwen3:14b-nothink");
+        let c = config_opencode("8901", "qwen3:14b-nothink", 1);
         let v: Value = serde_json::from_str(&c).expect("config_opencode no es JSON valido");
         assert_eq!(
             v["provider"]["oxidegate"]["options"]["baseURL"],
@@ -1712,7 +1732,7 @@ mod tests {
         // Sin esto pide confirmacion, en modo no interactivo no hace nada, y la
         // repeticion se contaria como «no toco el fichero» CULPANDO AL MODELO de
         // una config del banco.
-        let v: Value = serde_json::from_str(&config_opencode("8901", "m")).unwrap();
+        let v: Value = serde_json::from_str(&config_opencode("8901", "m", 1)).unwrap();
         assert_eq!(v["permission"]["edit"], "allow");
         assert_eq!(v["permission"]["bash"], "allow");
         // Y la red hacia fuera cerrada: el banco es de coste cero.
@@ -1721,7 +1741,7 @@ mod tests {
 
     #[test]
     fn la_config_de_opencode_no_lleva_credenciales_reales() {
-        let c = config_opencode("8901", "m").to_lowercase();
+        let c = config_opencode("8901", "m", 1).to_lowercase();
         for veneno in ["sk-", "bearer", "token"] {
             assert!(
                 !c.contains(veneno),
@@ -1845,6 +1865,23 @@ mod tests {
         assert_eq!(RUTA_CODEX, "/v1/codex/responses");
         assert_ne!(RUTA_CODEX, "/v1/responses");
         assert!(RUTA_CODEX.starts_with('/'), "es una ruta, no un origen");
+    }
+
+    /// En el nivel 2 la config NO puede declarar el proveedor `oxidegate` ni un
+    /// modelo por defecto: si el `-m` se cayera, opencode se iria en silencio a
+    /// la clave falsa y la corrida mediria otra cosa.
+    #[test]
+    fn la_config_del_nivel_2_no_deja_una_clave_falsa_de_reserva() {
+        let c = config_opencode("8901", "gpt-5.5", 2);
+        let v: Value = serde_json::from_str(&c).expect("no es JSON valido");
+        assert!(v.get("provider").is_none(), "declara un proveedor: {c}");
+        assert!(
+            v.get("model").is_none(),
+            "declara un modelo por defecto: {c}"
+        );
+        assert!(!c.contains("no-se-usa"), "deja la clave falsa de reserva");
+        // Los permisos SI, o el harness se queda parado pidiendo confirmacion.
+        assert_eq!(v["permission"]["edit"], "allow");
     }
 
     #[test]
