@@ -68,7 +68,7 @@
 //! el corredor.
 
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Repeticiones mínimas para que una fila se publique.
 ///
@@ -80,8 +80,16 @@ const N_MINIMO_PUBLICABLE: usize = 30;
 
 #[derive(Debug, Default)]
 struct Muestra {
-    version: String,
-    modelo: String,
+    /// TODAS las versiones del harness vistas en esta muestra, y todos los
+    /// modelos.
+    ///
+    /// Son conjuntos y no un solo valor porque el fichero de datos es
+    /// **append-only**: dos corridas del mismo harness se acumulan, y si entre
+    /// ellas cambió la versión —o peor, el modelo— la muestra pasa a mezclar
+    /// poblaciones que no son comparables. Guardar solo el último valor
+    /// publicaba la distribución de las dos **etiquetada con una de ellas**.
+    versiones: BTreeSet<String>,
+    modelos: BTreeSet<String>,
     /// Bytes mandados por repetición, TODAS.
     bytes: Vec<u64>,
     /// Bytes de las repeticiones que **resolvieron**.
@@ -96,8 +104,11 @@ struct Muestra {
     /// publique, y #122 pide el coste del trabajo. Filtrar una escondería la
     /// otra.
     bytes_ok: Vec<u64>,
-    /// Turnos (peticiones) por repetición.
+    /// Turnos (peticiones) por repetición, TODAS.
     turnos: Vec<u64>,
+    /// Turnos de las repeticiones que **resolvieron**. Mismo motivo que
+    /// [`Muestra::bytes_ok`]: una que se rindió en dos turnos tira del mínimo.
+    turnos_ok: Vec<u64>,
     resueltas: usize,
     /// Repeticiones que fallaron por el BANCO, no por el modelo. Se cuentan
     /// aparte: no pueden entrar en el denominador de una tasa de capacidad.
@@ -125,8 +136,10 @@ fn agrupar(contenido: &str) -> BTreeMap<(String, String), Muestra> {
         let harness = v["harness"].as_str().unwrap_or("?").to_string();
         let modo = v["modo"].as_str().unwrap_or("corrida").to_string();
         let m = out.entry((harness, modo)).or_default();
-        m.version = v["version"].as_str().unwrap_or("?").to_string();
-        m.modelo = v["modelo"].as_str().unwrap_or("?").to_string();
+        m.versiones
+            .insert(v["version"].as_str().unwrap_or("?").to_string());
+        m.modelos
+            .insert(v["modelo"].as_str().unwrap_or("?").to_string());
         if let Some(b) = v["bytes"].as_u64() {
             m.bytes.push(b);
         }
@@ -138,6 +151,9 @@ fn agrupar(contenido: &str) -> BTreeMap<(String, String), Muestra> {
             if let Some(b) = v["bytes"].as_u64() {
                 m.bytes_ok.push(b);
             }
+            if let Some(t) = v["peticiones"].as_u64() {
+                m.turnos_ok.push(t);
+            }
         }
         if v["fallo_del_banco"].as_bool() == Some(true) {
             m.del_banco += 1;
@@ -147,14 +163,74 @@ fn agrupar(contenido: &str) -> BTreeMap<(String, String), Muestra> {
     out
 }
 
-/// El peaje de un harness: la **mediana** de su modo peaje.
+/// El peaje de un harness: la **mediana** de su modo peaje, y su rango.
 ///
 /// `None` si ese harness no tiene peaje medido, y entonces la fila se publica
 /// **sin** la columna de trabajo real. Rellenarla con el peaje de otra
 /// instalación es exactamente lo que este informe no hace.
-fn peaje_de(datos: &BTreeMap<(String, String), Muestra>, harness: &str) -> Option<u64> {
+///
+/// Devuelve el rango además de la mediana porque **resumir el peaje solo es
+/// legítimo si no varía**: se resta un único número a cada repetición, así que
+/// un peaje con dispersión metería en «trabajo real» una diferencia que es del
+/// peaje. Medido el 2026-08-30 el rango era CERO en los dos harnesses, y por
+/// eso la resta vale — no porque se dé por supuesto.
+fn peaje_de(datos: &BTreeMap<(String, String), Muestra>, harness: &str) -> Option<(u64, u64, u64)> {
     let m = datos.get(&(harness.to_string(), "peaje".to_string()))?;
-    mediana_y_rango(&m.bytes).map(|(med, _, _)| med)
+    mediana_y_rango(&m.bytes)
+}
+
+/// Solo la mediana del peaje, para restar.
+fn peaje_mediana(datos: &BTreeMap<(String, String), Muestra>, harness: &str) -> Option<u64> {
+    peaje_de(datos, harness).map(|(med, _, _)| med)
+}
+
+/// Comprueba que cada muestra habla de UNA sola población, y devuelve el motivo
+/// si no.
+///
+/// # Por qué aborta en vez de avisar
+///
+/// El fichero de datos es **append-only**: dos corridas del mismo harness se
+/// acumulan. Si entre ellas cambió la versión del harness —o el modelo, que es
+/// justo lo que el nivel 1 fija como CONSTANTE— la muestra pasa a mezclar
+/// poblaciones que no son comparables, y el informe publicaba su distribución
+/// **etiquetada con una de las dos versiones**.
+///
+/// Eso es peor que no tener versión: `banco-de-captura.md` §6.3 pide anotar la
+/// exacta porque «sin versión la medición no se puede auditar»; una versión
+/// EQUIVOCADA hace que la auditoría dé por bueno lo que no lo es.
+///
+/// Un aviso no basta porque la tabla se lee sola: quien la copie a un issue no
+/// se lleva el aviso. Mismo criterio que las guardas del corredor.
+fn poblacion_mezclada(datos: &BTreeMap<(String, String), Muestra>) -> Option<String> {
+    for ((harness, modo), m) in datos {
+        if m.versiones.len() > 1 {
+            return Some(format!(
+                "`{harness}` ({modo}) mezcla {} versiones del harness: {}",
+                m.versiones.len(),
+                m.versiones.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if m.modelos.len() > 1 {
+            return Some(format!(
+                "`{harness}` ({modo}) mezcla {} MODELOS: {}. El modelo es la constante \
+                 del nivel 1: si cambia, no hay experimento",
+                m.modelos.len(),
+                m.modelos.iter().cloned().collect::<Vec<_>>().join(", ")
+            ));
+        }
+    }
+    None
+}
+
+/// Etiqueta de una muestra: harness + versión, o el harness a secas si hubiera
+/// más de una versión (caso que el guardián de abajo no deja llegar aquí).
+fn etiqueta(harness: &str, m: &Muestra) -> String {
+    match m.versiones.iter().next() {
+        Some(v) if m.versiones.len() == 1 => {
+            format!("{harness} {}", v.split_whitespace().last().unwrap_or(""))
+        }
+        _ => harness.to_string(),
+    }
 }
 
 /// ¿El rango de `a` queda ENTERO por debajo del de `b`?
@@ -188,6 +264,16 @@ fn main() {
     }
 
     let datos = agrupar(&contenido);
+
+    if let Some(motivo) = poblacion_mezclada(&datos) {
+        eprintln!("ABORTA: {motivo}.");
+        eprintln!("  El fichero de datos se ACUMULA, asi que dos corridas distintas caen");
+        eprintln!("  en la misma muestra. Publicar su distribucion junta seria publicar una");
+        eprintln!("  poblacion que no existe, con la etiqueta de una de las dos.");
+        eprintln!("  Arreglo: borra {ruta} y vuelve a medir, o separa las corridas en");
+        eprintln!("  ficheros distintos con CORREDOR_DATOS.");
+        std::process::exit(1);
+    }
     let corridas: Vec<(&String, &Muestra)> = datos
         .iter()
         .filter(|((_, modo), _)| modo == "corrida")
@@ -208,7 +294,7 @@ fn main() {
     println!("{}", "─".repeat(92));
 
     for (harness, m) in &corridas {
-        let peaje = peaje_de(&datos, harness);
+        let peaje = peaje_mediana(&datos, harness);
         // El trabajo real se calcula por REPETICION y luego se resume, no al
         // reves: restar el peaje de la mediana daria la mediana de otra cosa.
         let trabajo: Vec<u64> = match peaje {
@@ -217,10 +303,7 @@ fn main() {
         };
         println!(
             "{:<20} {:>10} {:>18} {:>12} {:>10} {:>16}",
-            format!(
-                "{harness} {}",
-                m.version.split_whitespace().last().unwrap_or("")
-            ),
+            etiqueta(harness, m),
             format!("{}/{}", m.resueltas, m.total),
             fmt_rango(&m.bytes),
             fmt_rango(&m.turnos),
@@ -245,20 +328,17 @@ fn main() {
     );
     println!("{}", "─".repeat(92));
     for (harness, m) in &corridas {
-        let peaje = peaje_de(&datos, harness);
+        let peaje = peaje_mediana(&datos, harness);
         let trabajo: Vec<u64> = match peaje {
             Some(p) => m.bytes_ok.iter().map(|b| b.saturating_sub(p)).collect(),
             None => Vec::new(),
         };
         println!(
             "{:<20} {:>10} {:>18} {:>12} {:>10} {:>16}",
-            format!(
-                "{harness} {}",
-                m.version.split_whitespace().last().unwrap_or("")
-            ),
+            etiqueta(harness, m),
             format!("{}/{}", m.resueltas, m.total),
             fmt_rango(&m.bytes_ok),
-            "—",
+            fmt_rango(&m.turnos_ok),
             peaje.map_or("—".into(), |p| p.to_string()),
             if trabajo.is_empty() {
                 "—".into()
@@ -278,7 +358,7 @@ fn main() {
     // no hay solape que interpretar.
     if corridas.len() == 2 {
         let trabajo_de = |m: &Muestra, h: &str| -> Vec<u64> {
-            match peaje_de(&datos, h) {
+            match peaje_mediana(&datos, h) {
                 Some(p) => m.bytes_ok.iter().map(|b| b.saturating_sub(p)).collect(),
                 None => Vec::new(),
             }
@@ -328,7 +408,16 @@ fn main() {
                 m.del_banco, m.total
             );
         }
-        if peaje_de(&datos, harness).is_none() {
+        if let Some((med, lo, hi)) = peaje_de(&datos, harness) {
+            if lo != hi {
+                println!(
+                    "  PEAJE CON DISPERSION: el de `{harness}` va de {lo} a {hi} (mediana {med}).\n\
+                     \x20 Se resta UN numero a cada repeticion, asi que esa variacion se cuela\n\
+                     \x20 entera en el «trabajo real». La resta solo es limpia con rango CERO."
+                );
+            }
+        }
+        if peaje_mediana(&datos, harness).is_none() {
             println!(
                 "  SIN PEAJE: `{harness}` no tiene peaje medido, asi que no se publica su\n\
                  \x20 trabajo real. Correr: CORREDOR_MODO=peaje CORREDOR_HARNESS={harness}\n\
@@ -394,7 +483,7 @@ mod tests {
             3,
             "peaje y corrida del mismo harness NO se mezclan"
         );
-        assert_eq!(peaje_de(&d, "pi"), Some(5932));
+        assert_eq!(peaje_mediana(&d, "pi"), Some(5932));
     }
 
     /// Sin peaje medido NO se rellena con el de otra instalacion: se publica
@@ -405,7 +494,11 @@ mod tests {
             r#"{"harness":"pi","modo":"peaje","bytes":5932,"peticiones":1}"#,
             r#"{"harness":"opencode","modo":"corrida","bytes":305131,"peticiones":10}"#,
         ]);
-        assert_eq!(peaje_de(&d, "opencode"), None, "no hereda el peaje de pi");
+        assert_eq!(
+            peaje_mediana(&d, "opencode"),
+            None,
+            "no hereda el peaje de pi"
+        );
     }
 
     /// El trabajo real se calcula por repeticion y LUEGO se resume. Restar el
@@ -477,6 +570,87 @@ mod tests {
         );
         assert_eq!(sin_solape(&a, &b), None);
         assert_eq!(sin_solape(&b, &a), None);
+    }
+
+    /// El fallo que la revision cazo: el fichero se ACUMULA, asi que dos
+    /// corridas con versiones distintas caian en la misma muestra y el informe
+    /// publicaba su distribucion junta ETIQUETADA CON UNA DE LAS DOS.
+    #[test]
+    fn dos_versiones_del_mismo_harness_no_se_funden_en_una_fila() {
+        let d = datos_de(&[
+            r#"{"harness":"pi","version":"pi 0.80.10","modelo":"m","modo":"corrida","bytes":100,"peticiones":8}"#,
+            r#"{"harness":"pi","version":"pi 0.99.0","modelo":"m","modo":"corrida","bytes":900,"peticiones":8}"#,
+        ]);
+        let motivo = poblacion_mezclada(&d).expect("tiene que abortar");
+        assert!(
+            motivo.contains("0.80.10") && motivo.contains("0.99.0"),
+            "{motivo}"
+        );
+    }
+
+    /// Peor todavia: el MODELO es la constante del nivel 1. Si cambia, no hay
+    /// experimento — solo dos medidas de cosas distintas en la misma fila.
+    #[test]
+    fn dos_modelos_distintos_no_se_funden_en_una_fila() {
+        let d = datos_de(&[
+            r#"{"harness":"pi","version":"v","modelo":"qwen3:14b-nothink","modo":"corrida","bytes":100,"peticiones":8}"#,
+            r#"{"harness":"pi","version":"v","modelo":"llama3.2:3b","modo":"corrida","bytes":900,"peticiones":8}"#,
+        ]);
+        let motivo = poblacion_mezclada(&d).expect("tiene que abortar");
+        assert!(motivo.contains("MODELOS"), "{motivo}");
+        assert!(motivo.contains("constante"), "{motivo}");
+    }
+
+    /// Y una poblacion limpia NO se bloquea: la guarda tiene que dejar pasar el
+    /// caso normal, o seria inutil.
+    #[test]
+    fn una_poblacion_limpia_pasa_la_guarda() {
+        let d = datos_de(&[
+            r#"{"harness":"pi","version":"pi 0.80.10","modelo":"m","modo":"peaje","bytes":5932,"peticiones":1}"#,
+            r#"{"harness":"pi","version":"pi 0.80.10","modelo":"m","modo":"corrida","bytes":100,"peticiones":8}"#,
+            r#"{"harness":"pi","version":"pi 0.80.10","modelo":"m","modo":"corrida","bytes":120,"peticiones":9}"#,
+        ]);
+        assert_eq!(poblacion_mezclada(&d), None);
+        let m = &d[&("pi".into(), "corrida".into())];
+        assert_eq!(etiqueta("pi", m), "pi 0.80.10");
+    }
+
+    /// Resumir el peaje con una mediana solo es legitimo si NO varia: se resta
+    /// un unico numero a cada repeticion, asi que su dispersion se colaria
+    /// entera en el «trabajo real».
+    #[test]
+    fn el_peaje_publica_su_rango_para_poder_avisar_si_varia() {
+        let limpio = datos_de(&[
+            r#"{"harness":"pi","version":"v","modelo":"m","modo":"peaje","bytes":5932,"peticiones":1}"#,
+            r#"{"harness":"pi","version":"v","modelo":"m","modo":"peaje","bytes":5932,"peticiones":1}"#,
+        ]);
+        assert_eq!(peaje_de(&limpio, "pi"), Some((5932, 5932, 5932)));
+
+        let disperso = datos_de(&[
+            r#"{"harness":"pi","version":"v","modelo":"m","modo":"peaje","bytes":5000,"peticiones":1}"#,
+            r#"{"harness":"pi","version":"v","modelo":"m","modo":"peaje","bytes":9000,"peticiones":1}"#,
+        ]);
+        let (_, lo, hi) = peaje_de(&disperso, "pi").unwrap();
+        assert_ne!(lo, hi, "un peaje que varia tiene que poder detectarse");
+    }
+
+    #[test]
+    fn los_turnos_de_las_resueltas_se_miden_aparte() {
+        let d = datos_de(&[
+            r#"{"harness":"oc","version":"v","modelo":"m","modo":"corrida","bytes":40,"peticiones":2,"resuelto":false}"#,
+            r#"{"harness":"oc","version":"v","modelo":"m","modo":"corrida","bytes":300,"peticiones":10,"resuelto":true}"#,
+        ]);
+        let m = &d[&("oc".into(), "corrida".into())];
+        assert_eq!(
+            mediana_y_rango(&m.turnos).unwrap().1,
+            2,
+            "el minimo de TODAS"
+        );
+        assert_eq!(
+            mediana_y_rango(&m.turnos_ok).unwrap().1,
+            10,
+            "los 2 turnos de la que se rindio no arrastran el minimo"
+        );
     }
 
     #[test]
