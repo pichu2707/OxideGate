@@ -75,35 +75,76 @@ fn registra_tool_calls(arr: &Value, calls: &mut ToolCalls) {
 
 /// Registra un item del `output` de la Responses API.
 ///
-/// Solo `function_call` está **capturado contra tráfico real**, y por eso es lo
-/// único que se registra con nombre.
+/// # Las tres familias, observadas en tráfico real
 ///
-/// Los items de herramienta INTEGRADA del proveedor —`web_search_call`,
-/// `file_search_call`…— no se han podido capturar: `ollama` no las sirve, y la
-/// regla de este banco es que un dialecto no entra desde una especificación.
-/// Pero **dejarlos pasar en silencio publicaría «no se invocó nada» sobre un
-/// turno que sí invocó**, que es exactamente el falso negativo que
-/// `captura_invocaciones` existe para evitar.
+/// Los tipos y sus formas se observaron sobre **203 items de 18 sesiones reales
+/// de Codex contra OpenAI** (2026-08-30). Los cuerpos no se versionan —son
+/// privados— pero los conjuntos de claves sí son los observados, y son lo que
+/// decide la clasificación:
 ///
-/// Así que se cuentan como **vistas y no atribuidas**: sube `invoked_total` sin
-/// afirmar un nombre ni un servidor que nadie ha verificado, y la fila queda
-/// descalificada como prueba de no-uso. Ver
-/// [`ToolCalls::invoked_unattributed`].
+/// | `type` | claves | ¿trae `name`? | qué es |
+/// |---|---|---|---|
+/// | `function_call` | `arguments`, `call_id`, `id`, **`name`**, `namespace` | **sí** | herramienta de CLIENTE |
+/// | `web_search_call` | `action`, `id`, `status` | **no** | herramienta de SERVIDOR |
+/// | `tool_search_call` | `arguments`, `call_id`, `id`, `status`, **`execution: "client"`** | **no** | NO es una invocación |
+///
+/// Y ni un solo item que **no** fuera invocación acababa en `_call`: los
+/// resultados son `function_call_output` y `tool_search_output`, y el resto son
+/// `message` y `reasoning`. Eso es lo que hace que la red de abajo se pueda
+/// tender por sufijo sin tragarse falsos positivos.
+///
+/// # Por qué `web_search_call` no pasa por `push_invoked`
+///
+/// **No trae `name`**: su identidad ES el tipo. Y la ejecuta el proveedor, no el
+/// agente, así que no sale de la configuración MCP del usuario y no debe entrar
+/// en el recuento que alimenta al recomendador — que es exactamente para lo que
+/// existe [`ToolCalls::server_invoked`].
+///
+/// # Por qué `tool_search_call` no cuenta como invocación
+///
+/// Es `execution: "client"` y no invoca ninguna herramienta: es el handshake de
+/// **carga diferida** con el que el cliente pide los esquemas que dejó fuera.
+/// OxideGate ya mide ese fenómeno en el campo `tool_search`
+/// (`telemetry-per-request.md` §4.3). Contarlo aquí lo publicaría **dos veces
+/// en dos campos que significan cosas distintas**, y además inflaría `invoked`
+/// con algo que no es una herramienta del usuario.
+///
+/// # Lo que queda fuera, y por qué se cuenta igual
+///
+/// De la familia de herramientas integradas solo se ha observado
+/// `web_search_call`. `file_search_call`, `code_interpreter_call` y compañía
+/// **no se han capturado**, así que no se les inventa nombre. Pero dejarlas
+/// pasar en silencio publicaría «no se invocó nada» sobre un turno que sí
+/// invocó, que es el falso negativo exacto que `captura_invocaciones` existe
+/// para evitar. Se cuentan como **vistas y no atribuidas**: sube
+/// `invoked_total` sin entrar en `invoked`, y la fila queda descalificada como
+/// prueba de no-uso. Ver [`ToolCalls::invoked_unattributed`].
 fn registra_item_de_salida(item: &Value, calls: &mut ToolCalls) {
     let tipo = item.get("type").and_then(Value::as_str).unwrap_or_default();
 
-    if tipo == "function_call" {
-        let nombre = item.get("name").and_then(Value::as_str);
-        if let Some(n) = nombre.filter(|n| !n.is_empty()) {
-            calls.push_invoked(n);
+    match tipo {
+        "function_call" => {
+            let nombre = item.get("name").and_then(Value::as_str);
+            if let Some(n) = nombre.filter(|n| !n.is_empty()) {
+                calls.push_invoked(n);
+            }
         }
-        return;
-    }
 
-    // La convención de la Responses API para una invocación es `<algo>_call`.
-    // `message` y `reasoning` —los items que NO son llamadas— no la cumplen.
-    if tipo.ends_with("_call") {
-        calls.push_invoked_sin_atribuir();
+        // La ejecuta el PROVEEDOR. Su nombre es el tipo sin el sufijo, porque
+        // el item no trae ninguno.
+        "web_search_call" => calls.push_server_invoked("web_search"),
+
+        // Deliberadamente NADA: no es una invocación. Ver el doc de arriba.
+        "tool_search_call" => {}
+
+        // La convención de la Responses API para una invocación es
+        // `<algo>_call`, y en el corpus observado ningún item que no lo fuera
+        // acababa así. Lo que caiga aquí es una invocación cuya forma no se ha
+        // capturado: se cuenta, y no se le inventa identidad.
+        otro if otro.ends_with("_call") => calls.push_invoked_sin_atribuir(),
+
+        // `message`, `reasoning`, `function_call_output`, `tool_search_output`…
+        _ => {}
     }
 }
 
@@ -995,23 +1036,105 @@ mod tests {
         );
     }
 
-    /// Las herramientas integradas del proveedor (`web_search_call`…) no se han
-    /// capturado. Dejarlas pasar en silencio publicaría «no se invocó nada»
-    /// sobre un turno que sí invocó, así que se cuentan como vistas y no
-    /// atribuidas: sin nombre inventado, y descalificando la fila como prueba
-    /// de no-uso.
+    /// Envuelve un item como llega en el stream, para no repetir la forma.
+    fn evento_con(item: Value) -> Value {
+        serde_json::json!({"type":"response.output_item.added","item":item})
+    }
+
+    /// `web_search_call` la ejecuta el PROVEEDOR y **no trae `name`** (sus
+    /// claves reales son `action`/`id`/`status`). Va a `server_invoked`, que es
+    /// la lista que NO alimenta al recomendador de MCP: no sale de la config
+    /// del usuario.
     #[test]
-    fn una_invocacion_integrada_no_se_ignora_ni_se_inventa() {
+    fn la_busqueda_web_cuenta_como_herramienta_de_servidor() {
         let mut calls = ToolCalls::default();
-        let v = serde_json::json!({"type":"response.output_item.added",
-            "item":{"type":"web_search_call","id":"ws_1","status":"in_progress"}});
-        OpenAiResponses.extract_tool_use(&v, &mut calls);
+        OpenAiResponses.extract_tool_use(
+            &evento_con(serde_json::json!({
+                "type":"web_search_call","id":"ws_1","status":"completed",
+                "action":{"type":"search"}})),
+            &mut calls,
+        );
+        assert_eq!(calls.server_invoked, vec!["web_search".to_string()]);
+        assert_eq!(calls.server_invoked_total, 1);
+        assert!(
+            calls.invoked.is_empty() && calls.invoked_total == 0,
+            "una herramienta de servidor no puede contar como del usuario"
+        );
+    }
+
+    /// `tool_search_call` es `execution: "client"` y NO invoca nada: es el
+    /// handshake de carga diferida, que OxideGate ya mide en el campo
+    /// `tool_search`. Contarlo aquí publicaría el mismo fenómeno dos veces en
+    /// dos campos que significan cosas distintas.
+    #[test]
+    fn el_handshake_de_carga_diferida_no_es_una_invocacion() {
+        let mut calls = ToolCalls::default();
+        OpenAiResponses.extract_tool_use(
+            &evento_con(serde_json::json!({
+                "type":"tool_search_call","id":"ts_1","call_id":"c1",
+                "status":"completed","execution":"client","arguments":"{}"})),
+            &mut calls,
+        );
+        assert_eq!(calls.invoked_total, 0);
+        assert_eq!(calls.invoked_unattributed, 0);
+        assert_eq!(calls.server_invoked_total, 0);
+    }
+
+    /// Una integrada NO capturada no se ignora ni se inventa: se cuenta como
+    /// vista y no atribuida, y eso descalifica la fila como prueba de no-uso.
+    #[test]
+    fn una_invocacion_integrada_sin_capturar_no_se_ignora_ni_se_inventa() {
+        let mut calls = ToolCalls::default();
+        OpenAiResponses.extract_tool_use(
+            &evento_con(serde_json::json!({
+                "type":"file_search_call","id":"fs_1","status":"completed"})),
+            &mut calls,
+        );
         assert_eq!(calls.invoked_total, 1, "una invocacion vista no se ignora");
         assert_eq!(calls.invoked_unattributed, 1);
         assert!(
             calls.invoked.is_empty(),
             "no se le inventa nombre ni servidor"
         );
+        assert!(
+            calls.server_invoked.is_empty(),
+            "tampoco se le inventa servidor"
+        );
+    }
+
+    /// Los `*_output` son RESULTADOS, no invocaciones, y viajan en `input[]`.
+    /// Si alguno se colara en un `output[]` no debe contar — y no acaban en
+    /// `_call`, que es justo lo que hace segura la red por sufijo.
+    #[test]
+    fn los_resultados_no_cuentan_como_invocaciones() {
+        let mut calls = ToolCalls::default();
+        for tipo in ["function_call_output", "tool_search_output"] {
+            OpenAiResponses.extract_tool_use(
+                &evento_con(serde_json::json!({"type":tipo,"id":"x"})),
+                &mut calls,
+            );
+        }
+        assert_eq!(calls.invoked_total, 0);
+        assert_eq!(calls.invoked_unattributed, 0);
+        assert_eq!(calls.server_invoked_total, 0);
+    }
+
+    /// El corpus real: TODA invocación acaba en `_call`, y NADA que no lo sea
+    /// acaba en `_call`. Es la condición que hace legítima la red por sufijo, y
+    /// este test la deja escrita para que se note si algún día deja de valer.
+    #[test]
+    fn el_corpus_observado_separa_invocaciones_por_el_sufijo() {
+        for t in ["function_call", "web_search_call", "tool_search_call"] {
+            assert!(t.ends_with("_call"), "{t} deberia acabar en _call");
+        }
+        for t in [
+            "message",
+            "reasoning",
+            "function_call_output",
+            "tool_search_output",
+        ] {
+            assert!(!t.ends_with("_call"), "{t} NO deberia acabar en _call");
+        }
     }
 
     /// `message` y `reasoning` no son invocaciones y no deben ensuciar nada.

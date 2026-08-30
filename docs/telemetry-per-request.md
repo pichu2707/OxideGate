@@ -1578,11 +1578,38 @@ porque `payload_sse` lo filtra antes de llegar al extractor. En Chat
 Completions la marca es `finish_reason` no nulo; en Responses, el evento
 `response.completed`.
 
-Las herramientas INTEGRADAS del proveedor (`web_search_call` y compañía) **no
-se han capturado** —`ollama` no las sirve—, así que no se les inventa nombre ni
-servidor: un item de invocación no reconocido sube `invoked_total` e
-`invoked_unattributed` sin entrar en `invoked`. La fila queda descalificada
-como prueba de no-uso, que es lo único cierto que se sabe de ella.
+### Las tres familias de items, observadas en tráfico real
+
+Los tipos y sus formas se observaron sobre **203 items de 18 sesiones reales de
+Codex contra OpenAI** (2026-08-30). Deciden la clasificación, y la forma importa
+tanto como el nombre:
+
+| `type` | claves | ¿trae `name`? | dónde cae |
+|---|---|---|---|
+| `function_call` | `arguments`, `call_id`, `id`, **`name`**, `namespace` | **sí** | `invoked` — herramienta de cliente |
+| `web_search_call` | `action`, `id`, `status` | **no** | `server_invoked` — la ejecuta el proveedor |
+| `tool_search_call` | `arguments`, `call_id`, `id`, `status`, **`execution: "client"`** | **no** | **en ningún sitio** |
+
+**`web_search_call` no puede pasar por `invoked`**: no trae `name` —su identidad
+es el tipo— y la ejecuta el proveedor, así que no sale de la configuración MCP
+del usuario y no debe entrar en el recuento del recomendador.
+
+**`tool_search_call` no es una invocación.** Es `execution: "client"` y no llama
+a ninguna herramienta: es el handshake de **carga diferida** con el que el
+cliente pide los esquemas que dejó fuera. Ese fenómeno ya se mide en el campo
+`tool_search` (§4.3); contarlo aquí lo publicaría **dos veces en dos campos que
+significan cosas distintas**.
+
+**La red se tiende por el sufijo `_call`**, y el corpus dice por qué se puede:
+toda invocación acaba en `_call`, y ningún item que no lo fuera lo hacía — los
+resultados son `function_call_output` y `tool_search_output`, y el resto son
+`message` y `reasoning`.
+
+De la familia de integradas solo se ha observado `web_search_call`.
+`file_search_call`, `code_interpreter_call` y compañía **no se han capturado**,
+así que no se les inventa nombre ni servidor: caen en la red del sufijo y suben
+`invoked_total` e `invoked_unattributed` sin entrar en `invoked`. La fila queda
+descalificada como prueba de no-uso, que es lo único cierto que se sabe de ella.
 
 **`complete: false` no se puede deducir del `status`.** Es la trampa que
 parece obvia y no lo es: el `status` se captura de la respuesta del upstream
