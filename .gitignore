@@ -24,3 +24,7 @@ presentations/
 # puede alterar la siguiente.
 __pycache__/
 *.pyc
+
+# Salida de las corridas del corredor del nivel 1 (#121): rastros del harness
+# por repeticion. Son basura de ejecucion, no artefactos del proyecto.
+rastros-corredor/
