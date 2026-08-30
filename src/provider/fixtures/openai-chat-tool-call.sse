@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl-571","object":"chat.completion.chunk","created":1788115290,"model":"qwen3:14b-nothink","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":"","tool_calls":[{"id":"call_e3sw5jx2","index":0,"type":"function","function":{"name":"leer_fichero","arguments":"{\"ruta\":\"tarifa.py\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-571","object":"chat.completion.chunk","created":1788115290,"model":"qwen3:14b-nothink","system_fingerprint":"fp_ollama","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+

@@ -363,7 +363,8 @@ pub struct RequestMetric {
     /// la palanca más grande del catálogo (−55.098 B).
     ///
     /// **`None` significa "este proveedor no tiene extractor", y por eso NO
-    /// es un `Vec` vacío.** Hoy solo Anthropic lo tiene, y las filas
+    /// es un `Vec` vacío.** Hoy lo tienen Anthropic y los dos dialectos de
+    /// OpenAI (y con ellos la ruta de Codex, que delega); Gemini no. Las filas
     /// anteriores a que existiera el campo también rehidratan como `None`.
     /// Un `Some` con listas vacías es una afirmación distinta y mucho más
     /// fuerte: se escaneó la respuesta y el modelo no invocó nada. Fundir

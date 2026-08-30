@@ -1548,19 +1548,41 @@ y por eso el campo lleva metadatos en vez de ser dos vectores pelados:
 | Qué pasó | Cómo se ve en la fila |
 |---|---|
 | El modelo invocó poco — el caso honesto | `complete: true`, `invoked_total == invoked.len()` |
-| **Este proveedor no tiene extractor** | `tool_calls` es **`null`**, no un objeto con listas vacías |
+| **Este proveedor no tiene extractor** (hoy: Gemini) | `tool_calls` es **`null`**, no un objeto con listas vacías |
 | **El escaneo se cortó** (turno abortado, stream roto) | `complete: false` — las listas son un PREFIJO |
 | **La lista se truncó** por el cupo | `invoked_total > invoked.len()` |
 
 **`null` no es lo mismo que listas vacías.** `null` dice "aquí no se midió";
 un objeto con `invoked: []` dice "se escaneó la respuesta entera y el modelo
 no invocó nada". Son afirmaciones distintas y la segunda es mucho más fuerte.
-Hoy solo Anthropic tiene extractor —Gemini y OpenAI usan formas distintas
-(`functionCall`, `tool_calls`, items `function_call`) que **no se han
-capturado contra tráfico real**— y las filas escritas antes de que el campo
-existiera también rehidratan como `null`. Fundir ambos casos en un vector
-vacío haría que cada una de esas filas contase como prueba de que un servidor
-no se usa.
+Hoy tienen extractor **Anthropic y los dos dialectos de OpenAI**
+(`/v1/chat/completions` y `/v1/responses`, y con ellos la ruta de Codex, que
+delega). **Gemini no** —su `functionCall` no se ha capturado contra tráfico
+real—, y las filas escritas antes de que el campo existiera también rehidratan
+como `null`. Fundir ambos casos en un vector vacío haría que cada una de esas
+filas contase como prueba de que un servidor no se usa.
+
+Los dos dialectos de OpenAI se capturaron el **2026-08-30** contra `ollama`
+0.30.10, y la captura destapó **dos formas de contar la misma llamada dos
+veces** que leyendo la especificación no se ven:
+
+1. En `/v1/responses`, los eventos `response.output_item.added` y
+   `response.output_item.done` traen el **mismo** item `function_call`. Se
+   registra en `added`; `done` se ignora.
+2. El evento `response.completed` **anida el `output[]` entero** bajo
+   `response`. Por eso el cuerpo sin stream se lee del `output` de **nivel 1**:
+   ningún evento del stream lo tiene ahí.
+
+Y una tercera del lado del framework: **`[DONE]` no sirve como marca de fin**,
+porque `payload_sse` lo filtra antes de llegar al extractor. En Chat
+Completions la marca es `finish_reason` no nulo; en Responses, el evento
+`response.completed`.
+
+Las herramientas INTEGRADAS del proveedor (`web_search_call` y compañía) **no
+se han capturado** —`ollama` no las sirve—, así que no se les inventa nombre ni
+servidor: un item de invocación no reconocido sube `invoked_total` e
+`invoked_unattributed` sin entrar en `invoked`. La fila queda descalificada
+como prueba de no-uso, que es lo único cierto que se sabe de ella.
 
 **`complete: false` no se puede deducir del `status`.** Es la trampa que
 parece obvia y no lo es: el `status` se captura de la respuesta del upstream

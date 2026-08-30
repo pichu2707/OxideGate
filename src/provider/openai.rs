@@ -48,6 +48,65 @@ pub static OPENAI_CHAT: OpenAiChat = OpenAiChat;
 pub static OPENAI_RESPONSES: OpenAiResponses = OpenAiResponses;
 pub static OPENAI_CODEX_RESPONSES: OpenAiCodexResponses = OpenAiCodexResponses;
 
+/// Registra las invocaciones de un array `tool_calls` del dialecto de chat.
+///
+/// **Solo cuenta cuando `function.name` viene y no está vacío**, y esa condición
+/// es la que impide contar de más: en streaming el nombre llega UNA vez y los
+/// chunks siguientes repiten el mismo `index` troceando `arguments` sin nombre.
+/// Contar por elemento del array multiplicaría cada llamada por el número de
+/// trozos que tenga su argumento.
+///
+/// Capturado el 2026-08-30 contra ollama 0.30.10, que manda nombre y argumentos
+/// en el mismo chunk. La condición cubre las dos formas.
+fn registra_tool_calls(arr: &Value, calls: &mut ToolCalls) {
+    let Some(items) = arr.as_array() else {
+        return;
+    };
+    for it in items {
+        let nombre = it
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str);
+        if let Some(n) = nombre.filter(|n| !n.is_empty()) {
+            calls.push_invoked(n);
+        }
+    }
+}
+
+/// Registra un item del `output` de la Responses API.
+///
+/// Solo `function_call` está **capturado contra tráfico real**, y por eso es lo
+/// único que se registra con nombre.
+///
+/// Los items de herramienta INTEGRADA del proveedor —`web_search_call`,
+/// `file_search_call`…— no se han podido capturar: `ollama` no las sirve, y la
+/// regla de este banco es que un dialecto no entra desde una especificación.
+/// Pero **dejarlos pasar en silencio publicaría «no se invocó nada» sobre un
+/// turno que sí invocó**, que es exactamente el falso negativo que
+/// `captura_invocaciones` existe para evitar.
+///
+/// Así que se cuentan como **vistas y no atribuidas**: sube `invoked_total` sin
+/// afirmar un nombre ni un servidor que nadie ha verificado, y la fila queda
+/// descalificada como prueba de no-uso. Ver
+/// [`ToolCalls::invoked_unattributed`].
+fn registra_item_de_salida(item: &Value, calls: &mut ToolCalls) {
+    let tipo = item.get("type").and_then(Value::as_str).unwrap_or_default();
+
+    if tipo == "function_call" {
+        let nombre = item.get("name").and_then(Value::as_str);
+        if let Some(n) = nombre.filter(|n| !n.is_empty()) {
+            calls.push_invoked(n);
+        }
+        return;
+    }
+
+    // La convención de la Responses API para una invocación es `<algo>_call`.
+    // `message` y `reasoning` —los items que NO son llamadas— no la cumplen.
+    if tipo.ends_with("_call") {
+        calls.push_invoked_sin_atribuir();
+    }
+}
+
 impl Provider for OpenAiChat {
     fn name(&self) -> &'static str {
         "openai"
@@ -138,17 +197,40 @@ impl Provider for OpenAiChat {
         extract_openai_usage(value, usage);
     }
 
-    /// OpenAI NO publica invocaciones en esta fila. Mismo criterio que en
-    /// Gemini: su dialecto las manda como `tool_calls` (Chat Completions) o
-    /// como items `function_call` (Responses API), formas distintas de la de
-    /// Anthropic que no se capturaron todavía contra tráfico real.
+    /// Las invocaciones viven en `tool_calls`, y en DOS sitios que nunca
+    /// coinciden: `delta` cuando hay stream y `message` cuando no. Un chunk
+    /// trae solo `delta`; un cuerpo completo trae solo `message`.
     ///
-    /// Listas vacías significan "no se reconoció ninguna invocación", nunca
-    /// "el modelo no invocó nada".
-    fn extract_tool_use(&self, _value: &Value, _calls: &mut ToolCalls) {}
+    /// Capturado contra tráfico real el 2026-08-30 (ollama 0.30.10,
+    /// `/v1/chat/completions`, una herramienta declarada). Ver
+    /// [`registra_tool_calls`] para por qué se filtra por `function.name`.
+    fn extract_tool_use(&self, value: &Value, calls: &mut ToolCalls) {
+        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+            return;
+        };
+        for choice in choices {
+            for campo in ["delta", "message"] {
+                if let Some(tc) = choice.get(campo).and_then(|c| c.get("tool_calls")) {
+                    registra_tool_calls(tc, calls);
+                }
+            }
+            // `finish_reason` no nulo es la marca de fin de este dialecto.
+            //
+            // **`[DONE]` no sirve**: `provider::payload_sse` lo filtra antes de
+            // llegar aquí, así que el extractor nunca lo ve. Sin esta marca,
+            // un turno cortado a mitad sería indistinguible de uno completo
+            // sin invocaciones — que es justo lo que `complete` existe para
+            // separar.
+            if choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .is_some_and(|r| !r.is_empty())
+            {
+                calls.marca_completa();
+            }
+        }
+    }
 
-    /// Dialecto no capturado todavia: la fila publica `None`, no listas
-    /// vacias. Ver [`Provider::captura_invocaciones`].
     /// Dialecto SSE: el JSON va tras `data:`. Se declara explícitamente
     /// porque el trait no da default — ver `Provider::payload_de_linea`.
     fn payload_de_linea<'a>(&self, linea: &'a str) -> Option<&'a str> {
@@ -156,7 +238,7 @@ impl Provider for OpenAiChat {
     }
 
     fn captura_invocaciones(&self) -> bool {
-        false
+        true
     }
 
     /// Desglosa el body de `/v1/chat/completions`. A diferencia de
@@ -337,17 +419,47 @@ impl Provider for OpenAiResponses {
         extract_openai_usage(value, usage);
     }
 
-    /// OpenAI NO publica invocaciones en esta fila. Mismo criterio que en
-    /// Gemini: su dialecto las manda como `tool_calls` (Chat Completions) o
-    /// como items `function_call` (Responses API), formas distintas de la de
-    /// Anthropic que no se capturaron todavía contra tráfico real.
+    /// Las invocaciones llegan como items `function_call`, y hay **dos formas
+    /// de contarlas dos veces**. Las dos salieron al capturar, no de leer la
+    /// especificación (ollama 0.30.10, `/v1/responses`, 2026-08-30):
     ///
-    /// Listas vacías significan "no se reconoció ninguna invocación", nunca
-    /// "el modelo no invocó nada".
-    fn extract_tool_use(&self, _value: &Value, _calls: &mut ToolCalls) {}
+    /// 1. `response.output_item.added` y `response.output_item.done` traen el
+    ///    **mismo** item. Se registra en `added` —cuando el modelo la emite— y
+    ///    `done` se ignora explícitamente.
+    /// 2. El evento `response.completed` **anida el `output[]` entero** bajo
+    ///    `response`. Por eso la rama del cuerpo completo mira `output` solo en
+    ///    el NIVEL 1: ningún evento del stream lo tiene ahí, así que las dos
+    ///    ramas no se solapan.
+    fn extract_tool_use(&self, value: &Value, calls: &mut ToolCalls) {
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.output_item.added") => {
+                if let Some(item) = value.get("item") {
+                    registra_item_de_salida(item, calls);
+                }
+                return;
+            }
+            // Trae el MISMO item que `added`. Contar los dos duplicaría cada
+            // llamada, y la lista resultante diría el doble de lo que hubo.
+            Some("response.output_item.done") => return,
+            // Solo marca el fin: su `response.output[]` ya se contó en los
+            // `added`, y volver a recorrerlo aquí sería la duplicación (2).
+            Some("response.completed") => {
+                calls.marca_completa();
+                return;
+            }
+            _ => {}
+        }
 
-    /// Dialecto no capturado todavia: la fila publica `None`, no listas
-    /// vacias. Ver [`Provider::captura_invocaciones`].
+        // Cuerpo completo, sin stream. Si `finish()` llegó a deserializarlo, no
+        // faltó nada — mismo criterio que Anthropic.
+        if let Some(salida) = value.get("output").and_then(Value::as_array) {
+            for item in salida {
+                registra_item_de_salida(item, calls);
+            }
+            calls.marca_completa();
+        }
+    }
+
     /// Dialecto SSE: el JSON va tras `data:`. Se declara explícitamente
     /// porque el trait no da default — ver `Provider::payload_de_linea`.
     fn payload_de_linea<'a>(&self, linea: &'a str) -> Option<&'a str> {
@@ -355,7 +467,7 @@ impl Provider for OpenAiResponses {
     }
 
     fn captura_invocaciones(&self) -> bool {
-        false
+        true
     }
 
     /// Desglosa el body de `/v1/responses`. `instructions` → `system_bytes`
@@ -749,6 +861,171 @@ fn extract_openai_usage(value: &Value, usage: &mut Usage) {
 mod tests {
     use super::super::NATIVE_TOOLS_LABEL;
     use super::*;
+
+    /// Los dos streams REALES, capturados con `curl` contra ollama 0.30.10 el
+    /// 2026-08-30 y versionados sin tocar.
+    ///
+    /// No son cuerpos escritos a mano: un fixture construido por quien escribe
+    /// el extractor solo demuestra que el autor es coherente consigo mismo, y
+    /// este proyecto ya pagó esa lección una vez (`derivar-nothink.rs`).
+    const SSE_CHAT: &str = include_str!("fixtures/openai-chat-tool-call.sse");
+    const SSE_RESPONSES: &str = include_str!("fixtures/openai-responses-tool-call.sse");
+
+    /// Reproduce lo que hace el escáner: por cada línea, el payload del
+    /// dialecto, y si es JSON se lo pasa al extractor.
+    fn reproducir(p: &dyn Provider, sse: &str) -> ToolCalls {
+        let mut calls = ToolCalls::default();
+        for linea in sse.lines() {
+            let Some(payload) = p.payload_de_linea(linea) else {
+                continue;
+            };
+            if let Ok(v) = serde_json::from_str::<Value>(payload) {
+                p.extract_tool_use(&v, &mut calls);
+            }
+        }
+        calls
+    }
+
+    #[test]
+    fn el_stream_real_de_chat_da_exactamente_una_invocacion() {
+        let calls = reproducir(&OpenAiChat, SSE_CHAT);
+        assert_eq!(calls.invoked_total, 1, "{:?}", calls.invoked);
+        assert_eq!(calls.invoked.len(), 1);
+        assert_eq!(calls.invoked[0].name, "leer_fichero");
+        assert!(calls.complete, "`finish_reason` no marco el fin del turno");
+    }
+
+    /// El test que vale por todos los demás de este dialecto.
+    ///
+    /// El stream real trae el MISMO `function_call` **tres veces**: en
+    /// `output_item.added`, en `output_item.done`, y otra vez dentro del
+    /// `response.output[]` que anida `response.completed`. Un extractor
+    /// ingenuo publica 3 donde hubo 1.
+    #[test]
+    fn el_stream_real_de_responses_no_cuenta_la_misma_llamada_tres_veces() {
+        // El item aparece TRES veces en el stream real. Se cuenta por
+        // `type":"function_call"` y no por el nombre: el nombre sale 6 veces
+        // porque los eventos `response.created` e `in_progress` anidan tambien
+        // las `tools` DECLARADAS, que es el otro lado del dato y no una
+        // invocacion.
+        assert_eq!(
+            SSE_RESPONSES.matches("\"type\":\"function_call\"").count(),
+            3,
+            "el fixture ya no reproduce la triple aparicion: recapturar"
+        );
+
+        let calls = reproducir(&OpenAiResponses, SSE_RESPONSES);
+        assert_eq!(calls.invoked_total, 1, "{:?}", calls.invoked);
+        assert_eq!(calls.invoked.len(), 1);
+        assert_eq!(calls.invoked[0].name, "leer_fichero");
+        assert!(calls.complete, "`response.completed` no marco el fin");
+    }
+
+    /// La ruta de Codex delega en `OPENAI_RESPONSES`: arreglar uno arregla los
+    /// dos, y este test lo fija para que nadie los separe sin darse cuenta.
+    #[test]
+    fn la_ruta_de_codex_hereda_el_extractor_de_responses() {
+        let calls = reproducir(&OpenAiCodexResponses, SSE_RESPONSES);
+        assert_eq!(calls.invoked_total, 1);
+        assert!(OpenAiCodexResponses.captura_invocaciones());
+    }
+
+    #[test]
+    fn los_tres_dialectos_declaran_que_ya_miden() {
+        assert!(OpenAiChat.captura_invocaciones());
+        assert!(OpenAiResponses.captura_invocaciones());
+        assert!(OpenAiCodexResponses.captura_invocaciones());
+    }
+
+    /// En streaming el nombre llega UNA vez y los chunks siguientes trocean
+    /// `arguments` repitiendo el `index` sin nombre. Contar por elemento del
+    /// array multiplicaría la llamada por el número de trozos.
+    #[test]
+    fn los_chunks_de_argumentos_sin_nombre_no_vuelven_a_contar() {
+        let mut calls = ToolCalls::default();
+        let primero = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"function":{"name":"leer_fichero","arguments":"{\"ru"}}]},"finish_reason":null}]});
+        let sigue = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":"ta\":\"a.py\"}"}}]},"finish_reason":null}]});
+        let vacio = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"function":{"name":"","arguments":"x"}}]},"finish_reason":null}]});
+        for v in [&primero, &sigue, &vacio] {
+            OpenAiChat.extract_tool_use(v, &mut calls);
+        }
+        assert_eq!(calls.invoked_total, 1, "{:?}", calls.invoked);
+    }
+
+    #[test]
+    fn el_cuerpo_sin_stream_de_chat_se_lee_de_message() {
+        let mut calls = ToolCalls::default();
+        let v = serde_json::json!({"choices":[{"index":0,"message":{"role":"assistant",
+            "tool_calls":[{"id":"c1","type":"function","function":{"name":"leer_fichero",
+            "arguments":"{}"}}]},"finish_reason":"tool_calls"}]});
+        OpenAiChat.extract_tool_use(&v, &mut calls);
+        assert_eq!(calls.invoked_total, 1);
+        assert!(calls.complete);
+    }
+
+    #[test]
+    fn el_cuerpo_sin_stream_de_responses_se_lee_del_output_de_nivel_1() {
+        let mut calls = ToolCalls::default();
+        let v = serde_json::json!({"object":"response","status":"completed",
+            "output":[{"type":"function_call","name":"leer_fichero"},
+                      {"type":"message","content":[]}]});
+        OpenAiResponses.extract_tool_use(&v, &mut calls);
+        assert_eq!(calls.invoked_total, 1);
+        assert_eq!(calls.invoked[0].name, "leer_fichero");
+        assert!(calls.complete);
+    }
+
+    /// Un turno cortado a mitad NO puede publicar `complete`: sus listas son un
+    /// prefijo, y una fila así no sirve para concluir que un servidor no se usa.
+    #[test]
+    fn un_stream_cortado_a_mitad_no_se_marca_completo() {
+        let cortado: String = SSE_CHAT
+            .lines()
+            .take_while(|l| !l.contains("\"finish_reason\":\"tool_calls\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let calls = reproducir(&OpenAiChat, &cortado);
+        assert_eq!(calls.invoked_total, 1, "la llamada vista si cuenta");
+        assert!(
+            !calls.complete,
+            "un prefijo no puede decir que se escaneo entero"
+        );
+    }
+
+    /// Las herramientas integradas del proveedor (`web_search_call`…) no se han
+    /// capturado. Dejarlas pasar en silencio publicaría «no se invocó nada»
+    /// sobre un turno que sí invocó, así que se cuentan como vistas y no
+    /// atribuidas: sin nombre inventado, y descalificando la fila como prueba
+    /// de no-uso.
+    #[test]
+    fn una_invocacion_integrada_no_se_ignora_ni_se_inventa() {
+        let mut calls = ToolCalls::default();
+        let v = serde_json::json!({"type":"response.output_item.added",
+            "item":{"type":"web_search_call","id":"ws_1","status":"in_progress"}});
+        OpenAiResponses.extract_tool_use(&v, &mut calls);
+        assert_eq!(calls.invoked_total, 1, "una invocacion vista no se ignora");
+        assert_eq!(calls.invoked_unattributed, 1);
+        assert!(
+            calls.invoked.is_empty(),
+            "no se le inventa nombre ni servidor"
+        );
+    }
+
+    /// `message` y `reasoning` no son invocaciones y no deben ensuciar nada.
+    #[test]
+    fn los_items_que_no_son_llamadas_no_cuentan() {
+        let mut calls = ToolCalls::default();
+        for tipo in ["message", "reasoning"] {
+            let v = serde_json::json!({"type":"response.output_item.added",
+                "item":{"type":tipo,"id":"x"}});
+            OpenAiResponses.extract_tool_use(&v, &mut calls);
+        }
+        assert_eq!(calls.invoked_total, 0);
+        assert_eq!(calls.invoked_unattributed, 0);
+    }
 
     /// OpenAI (con include_usage) manda el `usage` en el chunk final, con
     /// `prompt_tokens`/`completion_tokens` y `choices` vacío.
