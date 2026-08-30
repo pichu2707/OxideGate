@@ -167,6 +167,9 @@ const ENCARGO: &str = "test_tarifa.py falla. Haz que pase.";
 enum Harness {
     /// El que cruza la puerta. `openai-completions`, 2.9 KB de herramientas.
     Pi,
+    /// El segundo que cruza la puerta. Declara 19,5 KB de herramientas — 6,7
+    /// veces las de `pi`— y aun así cabe de sobra.
+    Opencode,
     /// Se conserva para poder REPRODUCIR el bloqueo, no para medir con él.
     Codex,
 }
@@ -175,6 +178,7 @@ impl Harness {
     fn desde(nombre: &str) -> Option<Harness> {
         match nombre {
             "pi" => Some(Harness::Pi),
+            "opencode" => Some(Harness::Opencode),
             "codex" => Some(Harness::Codex),
             _ => None,
         }
@@ -184,6 +188,7 @@ impl Harness {
     fn binario(self) -> &'static str {
         match self {
             Harness::Pi => "pi",
+            Harness::Opencode => "opencode",
             Harness::Codex => "codex",
         }
     }
@@ -315,6 +320,11 @@ fn escribir_config(
             std::fs::create_dir_all(&dir)?;
             std::fs::write(dir.join("models.json"), config_pi(puerto, modelo))
         }
+        Harness::Opencode => {
+            let dir = hogar.join(".config").join("opencode");
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(dir.join("opencode.json"), config_opencode(puerto, modelo))
+        }
         Harness::Codex => {
             std::fs::create_dir_all(hogar)?;
             std::fs::write(
@@ -323,6 +333,32 @@ fn escribir_config(
             )
         }
     }
+}
+
+/// La config de opencode, aislada y **sin credenciales**.
+///
+/// Va en `$HOME/.config/opencode/opencode.json`. Declara OxideGate como
+/// proveedor `openai-compatible` y **abre los permisos de edición y bash**: sin
+/// eso opencode pide confirmación y en modo no interactivo se queda sin hacer
+/// nada, que se contaría como «no tocó el fichero» culpando al modelo.
+///
+/// `webfetch` va a `deny` a propósito: el banco es de coste cero y sin red
+/// hacia fuera. Una tarea que se resolviera buscando en internet no es la tarea.
+fn config_opencode(puerto: &str, modelo: &str) -> String {
+    format!(
+        "{{\n\
+         \x20 \"provider\": {{\n\
+         \x20   \"oxidegate\": {{\n\
+         \x20     \"npm\": \"@ai-sdk/openai-compatible\",\n\
+         \x20     \"name\": \"OxideGate local\",\n\
+         \x20     \"options\": {{ \"baseURL\": \"http://127.0.0.1:{puerto}/v1\", \"apiKey\": \"no-se-usa\" }},\n\
+         \x20     \"models\": {{ \"{modelo}\": {{ \"name\": \"{modelo}\" }} }}\n\
+         \x20   }}\n\
+         \x20 }},\n\
+         \x20 \"model\": \"oxidegate/{modelo}\",\n\
+         \x20 \"permission\": {{ \"edit\": \"allow\", \"bash\": \"allow\", \"webfetch\": \"deny\" }}\n\
+         }}\n"
+    )
 }
 
 /// El registro de proveedores de `pi`, aislado y **sin credenciales**.
@@ -650,6 +686,16 @@ async fn lanzar(
                 "--approve",
             ]);
             cmd.arg(encargo);
+        }
+        Harness::Opencode => {
+            cmd.args([
+                "run",
+                // Sin plugins externos: lo que se mide es opencode, no lo que
+                // alguien le haya instalado encima.
+                "--pure", "-m",
+            ])
+            .arg(format!("oxidegate/{modelo}"))
+            .arg(encargo);
         }
         Harness::Codex => {
             // Su config vive en CODEX_HOME, no bajo HOME.
@@ -1065,11 +1111,47 @@ mod tests {
     }
 
     #[test]
+    fn la_config_de_opencode_es_json_valido_y_apunta_al_proxy() {
+        let c = config_opencode("8901", "qwen3:14b-nothink");
+        let v: Value = serde_json::from_str(&c).expect("config_opencode no es JSON valido");
+        assert_eq!(
+            v["provider"]["oxidegate"]["options"]["baseURL"],
+            "http://127.0.0.1:8901/v1"
+        );
+        assert_eq!(v["model"], "oxidegate/qwen3:14b-nothink");
+    }
+
+    #[test]
+    fn opencode_arranca_con_los_permisos_abiertos() {
+        // Sin esto pide confirmacion, en modo no interactivo no hace nada, y la
+        // repeticion se contaria como «no toco el fichero» CULPANDO AL MODELO de
+        // una config del banco.
+        let v: Value = serde_json::from_str(&config_opencode("8901", "m")).unwrap();
+        assert_eq!(v["permission"]["edit"], "allow");
+        assert_eq!(v["permission"]["bash"], "allow");
+        // Y la red hacia fuera cerrada: el banco es de coste cero.
+        assert_eq!(v["permission"]["webfetch"], "deny");
+    }
+
+    #[test]
+    fn la_config_de_opencode_no_lleva_credenciales_reales() {
+        let c = config_opencode("8901", "m").to_lowercase();
+        for veneno in ["sk-", "bearer", "token"] {
+            assert!(
+                !c.contains(veneno),
+                "la config de opencode filtra `{veneno}`"
+            );
+        }
+    }
+
+    #[test]
     fn cada_harness_tiene_su_binario_y_se_resuelve_por_nombre() {
         assert_eq!(Harness::desde("pi"), Some(Harness::Pi));
+        assert_eq!(Harness::desde("opencode"), Some(Harness::Opencode));
         assert_eq!(Harness::desde("codex"), Some(Harness::Codex));
         assert_eq!(Harness::desde("claude"), None);
         assert_eq!(Harness::Pi.binario(), "pi");
+        assert_eq!(Harness::Opencode.binario(), "opencode");
         assert_eq!(Harness::Codex.binario(), "codex");
     }
 
