@@ -112,6 +112,35 @@ llega a renderizar»— y la cazó la revisión: era cierto por el camino normal
 dejaba la decisión en manos de la petición. Un derivado que se llama `-nothink` no
 puede tener un `if` que dependa de lo que le manden.
 
+### La ventana de contexto va en el mismo sitio, y por lo mismo
+
+`PARAMETER num_ctx 32768`, también en el modelo. No es un ajuste de
+rendimiento: **es una condición para que el nivel 1 mida algo.**
+
+`qwen3:14b` declara 40960 de contexto, pero un modelo sin `num_ctx` recibe el
+defecto del servidor —**4096** en ollama 0.30.10— y el prompt **se corta en
+silencio**: la petición sale `200`, no hay aviso, y el modelo contesta a lo que
+le quedó. El prompt de un harness real no cabe ahí:
+
+| | `input_tokens` de Codex |
+|---|---|
+| `num_ctx` por defecto | **4095** |
+| `num_ctx` 32768 | **6485** |
+
+Codex manda ~6500 tokens —system, encargo y 20 KB de declaraciones de
+herramientas—, así que se tiraba el 37% del estímulo con las herramientas
+dentro. La primera corrida del corredor dio 0/3 por esto. Ver
+[`fe-de-erratas.md`](fe-de-erratas.md), E-013.
+
+La tabla de arriba se aplica igual, palabra por palabra: en la petición no —un
+harness no manda `num_ctx`—; en el servidor tampoco —`OLLAMA_CONTEXT_LENGTH`
+depende de cómo arranque ollama cada quien, y eso es un confundidor que viaja
+sin declarar—; en el modelo sí.
+
+Tras re-derivar, la sonda se volvió a pasar a `n=30` y dio **exactamente lo
+mismo** que la tabla de §2: techo 30/30, `averigua` 30/30, el resto 0/30, suelo
+0/30. Ampliar la ventana no mueve nada de lo que la sonda mide.
+
 ### Es un confundidor declarado, no una trampa
 
 El derivado **no es** `qwen3:14b`. Es `qwen3:14b` en una configuración concreta,
