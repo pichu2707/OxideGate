@@ -510,6 +510,105 @@ criterio no se vuelve a mirar después de arreglarlo, no.
 
 ---
 
+## E-013 · El corredor midió 0/3 sobre un prompt cortado por la mitad
+
+- **Publicado**: no llegó a publicarse. Lo cazó la guarda que se escribió
+  después, en la primera corrida del corredor del nivel 1
+- **Detectado**: 2026-08-30, `examples/corredor-nivel-1.rs`
+
+Entra aquí por el filtro de «qué entra»: **produjo un número que alguien podía
+citar**. El corredor imprimió `resuelto: 0/3` con Codex sobre `qwen3:14b-nothink`
+y el diagnóstico obvio a mano —el mismo issue lleva meses avisando de que el
+modelo podría no aguantar un harness real—. Ese 0/3 no era del modelo.
+
+### La causa: `ollama` trunca el prompt y no lo dice
+
+`qwen3:14b` declara `context length 40960`. Pero un modelo sin `PARAMETER
+num_ctx` recibe el defecto del servidor —**4096** en ollama 0.30.10— y el prompt
+se corta **en silencio**: la petición sale `200`, no hay aviso, y el modelo
+contesta a lo que le quedó.
+
+Medido por `/api/chat`, el mismo prompt de ~12000 tokens:
+
+| | `prompt_eval_count` |
+|---|---|
+| sin `num_ctx` | **4095** |
+| con `num_ctx: 32768` | **12020** |
+
+Y sobre el prompt real de Codex, leído en la telemetría del propio proxy:
+
+| | `input_tokens` |
+|---|---|
+| `num_ctx` por defecto | **4095** |
+| `num_ctx` 32768 | **6485** |
+
+Codex manda ~6500 tokens: su system prompt, el encargo, y `context_tools_bytes:
+20483` — 20 KB de declaraciones de herramientas. **Se tiraba el 37% del
+estímulo, con las herramientas dentro.** El modelo no es que no llamara: es que
+no llegó a ver a qué podía llamar.
+
+### La contraprueba que descartó al sospechoso equivocado
+
+La hipótesis de partida era otra, y era razonable: `TAREA.md` está escrito como
+*«`test_tarifa.py` falla. Haz que pase»*, que es constatación más imperativo —las
+dos redacciones que `modelo-del-nivel-1.md` mide a **0/30**—. Correr el corredor
+con la redacción que mide 30/30 lo descartó:
+
+| encargo | resuelto |
+|---|---|
+| `test_tarifa.py falla. Haz que pase.` | 0/3 |
+| `Averigua por que falla test_tarifa.py y corrigelo.` | **0/3** |
+
+Mismo cero. No era la redacción. **Una hipótesis plausible, con la tabla que la
+respaldaba, y falsa** — sin la contraprueba habría entrado al informe como
+hallazgo.
+
+### Qué cambió
+
+1. `PARAMETER num_ctx 32768` en el modelo derivado
+   ([`derivar-nothink.rs`](../examples/derivar-nothink.rs)). En el modelo y no
+   en la petición ni en la config de cada harness, por los tres motivos del §3
+   de [`modelo-del-nivel-1.md`](modelo-del-nivel-1.md): es el mismo argumento que
+   ya decidió dónde se apaga el razonamiento.
+2. Una guarda de contexto en el corredor, que manda un prompt de tamaño conocido
+   por la ruta del harness y **aborta** si el proveedor dice haber leído menos de
+   8000 tokens. Demostrado que puede fallar: contra el modelo sin `num_ctx`
+   aborta con «leyó 4095 tokens de un prompt mucho mayor».
+3. Re-derivado el modelo y **vuelta a pasar la sonda a n=30**: techo 30/30, usó
+   30/30, `averigua` 30/30, resto 0/30, suelo 0/30. Idéntico a lo publicado, así
+   que `num_ctx` no movió nada de lo que la sonda mide.
+
+### Lo que SIGUE en pie
+
+El corredor **sigue dando 0 resueltos** con el contexto ya arreglado, y el
+veredicto sigue siendo `no tocó el fichero`. Lo que esta entrada retracta es la
+*causa*, no el síntoma. Por qué Codex llega al modelo y no edita la tarea está
+**sin explicar**.
+
+### El fallo de instrumento que cometió la propia corrección
+
+El corredor traía un contador de `tool_calls` para diagnosticar justo esto, y
+estaba mal de dos formas a la vez:
+
+1. Leía el campo con `as_u64()`. **`tool_calls` no es un número**, es
+   `{"invoked": [...]}`. Devolvía `0` siempre.
+2. Aunque se leyera bien, los dos dialectos de OpenAI declaran
+   `captura_invocaciones() -> false` (`src/provider/openai.rs`), así que para
+   Codex el campo es **siempre `null`** — y `src/telemetry/mcp.rs` lo deja
+   escrito: *«`tool_calls: null` significa este proveedor no mide invocaciones»*,
+   que es otra cosa que «el modelo no invocó nada».
+
+Sobre ese cero fabricado se imprimía un AVISO señalando al modelo. Es la
+[E-004](#e-004--qwen314b-ignora-el-resultado-de-la-herramienta-55) otra vez, en
+el mismo proyecto y con el mismo mecanismo: **darle significado a la ausencia de
+dato**. Corregido — el contador distingue `null` de `[]`, publica `n/d`, y no se
+concluye nada de ahí.
+
+Y la razón por la que el diagnóstico se quedó sin nada sobre lo que apoyarse: el
+corredor tiraba `stdout` y `stderr` del harness a `/dev/null`. Ahora los guarda.
+
+---
+
 ## El patrón, que es lo más útil de esta lista
 
 De las doce entradas, **ocho fallan hacia el mismo lado**: E-001, E-003, E-004,
