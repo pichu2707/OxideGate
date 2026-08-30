@@ -58,7 +58,7 @@ pub static OPENAI_CODEX_RESPONSES: OpenAiCodexResponses = OpenAiCodexResponses;
 ///
 /// Capturado el 2026-08-30 contra ollama 0.30.10, que manda nombre y argumentos
 /// en el mismo chunk. La condición cubre las dos formas.
-fn registra_tool_calls(arr: &Value, calls: &mut ToolCalls) {
+fn registra_tool_calls(arr: &Value, calls: &mut ToolCalls, es_delta: bool) {
     let Some(items) = arr.as_array() else {
         return;
     };
@@ -66,9 +66,20 @@ fn registra_tool_calls(arr: &Value, calls: &mut ToolCalls) {
         let nombre = it
             .get("function")
             .and_then(|f| f.get("name"))
-            .and_then(Value::as_str);
-        if let Some(n) = nombre.filter(|n| !n.is_empty()) {
-            calls.push_invoked(n);
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty());
+
+        match nombre {
+            Some(n) => calls.push_invoked(n),
+            // En un DELTA, una entrada sin nombre es lo normal: es un trozo de
+            // `arguments` de una llamada ya contada. Contarla seria multiplicar
+            // la llamada por sus trozos.
+            None if es_delta => {}
+            // En el cuerpo COMPLETO no hay trozos: cada entrada de
+            // `message.tool_calls` es una llamada entera, y una sin nombre es
+            // una invocacion que existio y no se puede nombrar. Dejarla caer
+            // publicaria «no se invoco nada» sobre un turno que si invoco.
+            None => calls.push_invoked_sin_atribuir(),
         }
     }
 }
@@ -119,16 +130,74 @@ fn registra_tool_calls(arr: &Value, calls: &mut ToolCalls) {
 /// para evitar. Se cuentan como **vistas y no atribuidas**: sube
 /// `invoked_total` sin entrar en `invoked`, y la fila queda descalificada como
 /// prueba de no-uso. Ver [`ToolCalls::invoked_unattributed`].
+/// ¿No se ha contado NADA todavía en este escaneo?
+///
+/// Se miran los tres contadores porque los tres son «se vio una invocación»:
+/// las atribuidas, las de servidor y las que no se pudieron atribuir.
+fn nada_contado(calls: &ToolCalls) -> bool {
+    calls.invoked_total == 0 && calls.server_invoked_total == 0 && calls.invoked_unattributed == 0
+}
+
+/// Registra un `function_call`, resolviendo **de quién es** la herramienta.
+///
+/// # El nombre llega DESNUDO, y eso es una trampa conocida
+///
+/// `push_invoked` deduce el servidor del nombre por la convención
+/// `mcp__<server>__<tool>`. Medido sobre las 32 invocaciones reales del corpus,
+/// **las 32 llegan con el nombre desnudo** (`mem_search`, no
+/// `mcp__engram__mem_search`), y 24 de ellas traen el servidor en un campo
+/// hermano: `namespace: "mcp__engram"`.
+///
+/// Pasarlas todas por la convención de nombres las acreditaría a `(native)` en
+/// el 100% de los casos: **el servidor real aparecería sin usar y el
+/// recomendador aconsejaría borrar justo el que se invoca en cada turno**. Es
+/// exactamente el agujero que `anthropic.rs` documenta para `mcp_tool_use`, y
+/// no era un «no lo sé»: era una atribución falsa y muda.
+///
+/// # Lo que está verificado y lo que no
+///
+/// `namespace` se observó en los items que **Codex persiste** en sus rollouts,
+/// junto a campos que son claramente internos suyos
+/// (`internal_chat_message_metadata_passthrough`). **No se ha podido confirmar
+/// que viaje en el cable.** Por eso se trata como un extra defensivo: si viene,
+/// evita la atribución falsa; si no viene nunca, esta rama no se ejecuta y no
+/// cambia nada. Lo que NO se hace es dar por bueno `(native)` sobre un nombre
+/// desnudo que pudo salir de cualquier servidor.
+fn registra_function_call(item: &Value, calls: &mut ToolCalls) {
+    let Some(nombre) = item
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty())
+    else {
+        // Un `function_call` SIN nombre es una invocación que existió y no se
+        // puede nombrar. Dejarla caer publicaría «no se invocó nada» sobre un
+        // turno que sí invocó — el falso negativo que este módulo entero existe
+        // para evitar—, y encima sería MÁS permisivo con un tipo conocido que
+        // con uno desconocido, que sí se cuenta más abajo.
+        calls.push_invoked_sin_atribuir();
+        return;
+    };
+
+    match item.get("namespace").and_then(Value::as_str) {
+        // `mcp__<server>`: el servidor viene DADO, no deducido.
+        Some(ns) => match ns.strip_prefix("mcp__").filter(|s| !s.is_empty()) {
+            Some(servidor) => calls.push_invoked_de(nombre, servidor, ToolServerKind::Mcp),
+            // Hay namespace, así que la herramienta NO es nativa — pero su
+            // forma no se ha visto y no se sabe a quién acreditarla.
+            // `(native)` sería una atribución falsa; se cuenta sin atribuir.
+            None => calls.push_invoked_sin_atribuir(),
+        },
+        // Sin namespace: la convención del nombre es lo único que hay, y para
+        // una herramienta nativa de verdad da `(native)`, que es correcto.
+        None => calls.push_invoked(nombre),
+    }
+}
+
 fn registra_item_de_salida(item: &Value, calls: &mut ToolCalls) {
     let tipo = item.get("type").and_then(Value::as_str).unwrap_or_default();
 
     match tipo {
-        "function_call" => {
-            let nombre = item.get("name").and_then(Value::as_str);
-            if let Some(n) = nombre.filter(|n| !n.is_empty()) {
-                calls.push_invoked(n);
-            }
-        }
+        "function_call" => registra_function_call(item, calls),
 
         // La ejecuta el PROVEEDOR. Su nombre es el tipo sin el sufijo, porque
         // el item no trae ninguno.
@@ -252,7 +321,7 @@ impl Provider for OpenAiChat {
         for choice in choices {
             for campo in ["delta", "message"] {
                 if let Some(tc) = choice.get(campo).and_then(|c| c.get("tool_calls")) {
-                    registra_tool_calls(tc, calls);
+                    registra_tool_calls(tc, calls, campo == "delta");
                 }
             }
             // `finish_reason` no nulo es la marca de fin de este dialecto.
@@ -482,9 +551,29 @@ impl Provider for OpenAiResponses {
             // Trae el MISMO item que `added`. Contar los dos duplicaría cada
             // llamada, y la lista resultante diría el doble de lo que hubo.
             Some("response.output_item.done") => return,
-            // Solo marca el fin: su `response.output[]` ya se contó en los
-            // `added`, y volver a recorrerlo aquí sería la duplicación (2).
+            // Su `response.output[]` ya se contó en los `added`, y volver a
+            // recorrerlo sería la duplicación (2) — SALVO que no se haya
+            // contado nada.
+            //
+            // Esa red existe porque el peor fallo posible de este módulo es
+            // publicar `complete: true` con la lista vacía sobre un turno que
+            // SÍ invocó: eso no es «no lo sé», es una afirmación positiva de
+            // no-uso, y es la que hace que el recomendador aconseje borrar un
+            // servidor que se usa. Si por lo que sea no llegó ningún `added`
+            // —otro upstream del dialecto, un evento perdido—, aquí se rescata.
+            //
+            // No puede duplicar: solo entra cuando los tres contadores están a
+            // cero, o sea cuando no hay nada que duplicar.
             Some("response.completed") => {
+                if nada_contado(calls) {
+                    if let Some(salida) =
+                        value.pointer("/response/output").and_then(Value::as_array)
+                    {
+                        for item in salida {
+                            registra_item_de_salida(item, calls);
+                        }
+                    }
+                }
                 calls.marca_completa();
                 return;
             }
@@ -1117,6 +1206,116 @@ mod tests {
         assert_eq!(calls.invoked_total, 0);
         assert_eq!(calls.invoked_unattributed, 0);
         assert_eq!(calls.server_invoked_total, 0);
+    }
+
+    /// El fallo que la revisión cazó, y el peor de este módulo: una llamada MCP
+    /// llega con el nombre DESNUDO y el servidor en `namespace`. Pasarla por la
+    /// convención de nombres la acredita a `(native)`, el servidor real aparece
+    /// sin usar, y el recomendador aconseja borrar justo el que se invoca en
+    /// cada turno. Medido: 24 de 32 invocaciones reales traen `mcp__engram`.
+    #[test]
+    fn una_llamada_mcp_no_se_acredita_a_native() {
+        let mut calls = ToolCalls::default();
+        OpenAiResponses.extract_tool_use(
+            &evento_con(serde_json::json!({
+                "type":"function_call","name":"mem_search","namespace":"mcp__engram",
+                "call_id":"c1","arguments":"{}"})),
+            &mut calls,
+        );
+        assert_eq!(calls.invoked.len(), 1);
+        assert_eq!(calls.invoked[0].name, "mem_search");
+        assert_eq!(
+            calls.invoked[0].server, "engram",
+            "el servidor viene DADO en namespace, no se deduce del nombre"
+        );
+        assert_ne!(calls.invoked[0].server, NATIVE_TOOLS_LABEL);
+    }
+
+    #[test]
+    fn sin_namespace_la_convencion_del_nombre_sigue_mandando() {
+        let mut calls = ToolCalls::default();
+        OpenAiResponses.extract_tool_use(
+            &evento_con(serde_json::json!({"type":"function_call","name":"shell"})),
+            &mut calls,
+        );
+        assert_eq!(calls.invoked[0].server, NATIVE_TOOLS_LABEL);
+    }
+
+    /// Un `namespace` de forma no vista NO puede caer en `(native)`: eso seria
+    /// una atribucion falsa, no un «no lo se».
+    #[test]
+    fn un_namespace_desconocido_no_se_acredita_a_nadie() {
+        let mut calls = ToolCalls::default();
+        OpenAiResponses.extract_tool_use(
+            &evento_con(serde_json::json!({
+                "type":"function_call","name":"algo","namespace":"forma_nueva"})),
+            &mut calls,
+        );
+        assert_eq!(calls.invoked_unattributed, 1);
+        assert!(calls.invoked.is_empty());
+    }
+
+    /// Ser MAS permisivo con un tipo conocido que con uno desconocido era la
+    /// asimetria: un `function_call` sin nombre se caia sin contar, mientras
+    /// que un `*_call` cualquiera si contaba.
+    #[test]
+    fn un_function_call_sin_nombre_no_desaparece() {
+        let mut calls = ToolCalls::default();
+        OpenAiResponses.extract_tool_use(
+            &evento_con(serde_json::json!({"type":"function_call","call_id":"c1"})),
+            &mut calls,
+        );
+        assert_eq!(calls.invoked_total, 1);
+        assert_eq!(calls.invoked_unattributed, 1);
+    }
+
+    /// Misma asimetria del lado de chat, pero SOLO en el cuerpo completo: en un
+    /// delta, una entrada sin nombre es un trozo de `arguments`.
+    #[test]
+    fn en_chat_sin_nombre_cuenta_en_message_y_no_en_delta() {
+        let mut d = ToolCalls::default();
+        OpenAiChat.extract_tool_use(
+            &serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":"tro"}}]},"finish_reason":null}]}),
+            &mut d,
+        );
+        assert_eq!(
+            d.invoked_total, 0,
+            "un trozo de argumentos no es una llamada"
+        );
+
+        let mut m = ToolCalls::default();
+        OpenAiChat.extract_tool_use(
+            &serde_json::json!({"choices":[{"message":{"tool_calls":[
+                {"id":"c1","type":"function","function":{"arguments":"{}"}}]},
+                "finish_reason":"tool_calls"}]}),
+            &mut m,
+        );
+        assert_eq!(m.invoked_total, 1, "en el cuerpo completo no hay trozos");
+        assert_eq!(m.invoked_unattributed, 1);
+    }
+
+    /// Si no llegara ningun `output_item.added`, `response.completed` publicaria
+    /// `complete: true` con la lista VACIA sobre un turno que si invoco — una
+    /// afirmacion positiva de no-uso, que es el peor fallo posible aqui.
+    #[test]
+    fn si_falta_el_added_el_evento_de_fin_rescata_la_llamada() {
+        let mut calls = ToolCalls::default();
+        OpenAiResponses.extract_tool_use(
+            &serde_json::json!({"type":"response.completed","response":{"status":"completed",
+                "output":[{"type":"function_call","name":"leer_fichero"}]}}),
+            &mut calls,
+        );
+        assert_eq!(calls.invoked_total, 1, "la red de seguridad no salto");
+        assert!(calls.complete);
+    }
+
+    /// Y la red NO puede duplicar: con el stream entero, el `added` ya conto y
+    /// el evento de fin no vuelve a contar.
+    #[test]
+    fn la_red_de_seguridad_no_duplica_cuando_el_added_si_llego() {
+        let calls = reproducir(&OpenAiResponses, SSE_RESPONSES);
+        assert_eq!(calls.invoked_total, 1, "{:?}", calls.invoked);
     }
 
     /// El corpus real: TODA invocación acaba en `_call`, y NADA que no lo sea

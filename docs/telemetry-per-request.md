@@ -1600,6 +1600,27 @@ cliente pide los esquemas que dejó fuera. Ese fenómeno ya se mide en el campo
 `tool_search` (§4.3); contarlo aquí lo publicaría **dos veces en dos campos que
 significan cosas distintas**.
 
+### El nombre llega DESNUDO, y por eso no basta la convención
+
+Las **32** invocaciones del corpus llegan con el nombre desnudo (`mem_search`,
+no `mcp__engram__mem_search`), y **24 de ellas traen el servidor en un campo
+hermano**: `namespace: "mcp__engram"`.
+
+Pasarlas todas por la convención de nombres las acreditaría a `(native)` en el
+100% de los casos: **el servidor real aparecería sin usar y el recomendador
+aconsejaría borrar justo el que se invoca en cada turno.** Es el mismo agujero
+que `anthropic.rs` documenta para `mcp_tool_use` — y no es un «no lo sé», es una
+atribución falsa y muda.
+
+Por eso un `function_call` con `namespace` se atribuye **con el servidor dado**,
+no deducido. Un `namespace` de forma no vista **no cae en `(native)`**: se cuenta
+sin atribuir.
+
+> `namespace` se observó en los items que **Codex persiste** en sus rollouts,
+> junto a campos claramente internos suyos. **No se ha confirmado que viaje en
+> el cable**, así que se trata como un extra defensivo: si viene, evita la
+> atribución falsa; si no viene nunca, esa rama no se ejecuta y nada cambia.
+
 **La red se tiende por el sufijo `_call`**, y el corpus dice por qué se puede:
 toda invocación acaba en `_call`, y ningún item que no lo fuera lo hacía — los
 resultados son `function_call_output` y `tool_search_output`, y el resto son
