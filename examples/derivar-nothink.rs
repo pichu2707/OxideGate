@@ -138,8 +138,34 @@ fn parchear(plantilla: &str) -> Result<String, String> {
         .replace(ANCLA_REINYECCION, PARCHE_REINYECCION))
 }
 
-/// El Modelfile del derivado. `FROM` hereda pesos y parámetros del base; lo
-/// único que cambia es la plantilla.
+/// La ventana de contexto del derivado, en tokens.
+///
+/// **No es un ajuste de rendimiento: es una condición para que el nivel 1 mida
+/// algo.** `qwen3:14b` declara 40960 de contexto, pero un modelo sin
+/// `PARAMETER num_ctx` recibe el defecto de ollama —4096 en 0.30.10— y el
+/// servidor **corta el prompt en silencio**: la petición sale `200` y el modelo
+/// contesta a lo que le quedó.
+///
+/// El prompt real de un harness no cabe ahí ni de lejos. Codex manda ~6500
+/// tokens (system + 20 KB de declaraciones de herramientas + el encargo), y
+/// medido el 2026-08-30 llegaban **4095**: se tiraba el 37%, herramientas
+/// incluidas. La primera corrida del corredor dio 0/3 por esto, y ese cero se
+/// habría leído como «el modelo no sabe conducir un harness».
+///
+/// # Por qué en el modelo y no fuera
+///
+/// Mismo argumento que el razonamiento apagado, y por los mismos tres motivos
+/// (ver §3 de `docs/modelo-del-nivel-1.md`):
+///
+/// | dónde | por qué NO |
+/// |---|---|
+/// | en la petición | un harness no manda `num_ctx`; inyectarlo desde OxideGate mete al instrumento dentro del experimento |
+/// | en el servidor (`OLLAMA_CONTEXT_LENGTH`) | depende de cómo arranque ollama cada quien: un confundidor que viaja sin declarar |
+/// | **en el modelo** | constante para los cuatro harnesses, se declara en el informe, y ninguno de los cuatro sabe que existe |
+const NUM_CTX: usize = 32_768;
+
+/// El Modelfile del derivado. `FROM` hereda pesos y parámetros del base; lo que
+/// cambia es la plantilla y la ventana de contexto ([`NUM_CTX`]).
 ///
 /// Aborta si la plantilla lleva `"""`, que cerraría el literal antes de tiempo y
 /// produciría un Modelfile que dice algo distinto de lo que se pretendía.
@@ -147,7 +173,9 @@ fn modelfile(base: &str, plantilla: &str) -> Result<String, String> {
     if plantilla.contains(r#"""""#) {
         return Err("la plantilla contiene `\"\"\"` y rompería el literal del Modelfile".into());
     }
-    Ok(format!("FROM {base}\nTEMPLATE \"\"\"{plantilla}\"\"\"\n"))
+    Ok(format!(
+        "FROM {base}\nPARAMETER num_ctx {NUM_CTX}\nTEMPLATE \"\"\"{plantilla}\"\"\"\n"
+    ))
 }
 
 /// El tag del derivado cuando nadie lo dice. `qwen3:14b` → `qwen3:14b-nothink`.
@@ -324,6 +352,18 @@ mod tests {
         let m = modelfile("qwen3:14b", "hola").unwrap();
         assert!(m.starts_with("FROM qwen3:14b\n"));
         assert!(m.contains("TEMPLATE \"\"\"hola\"\"\""));
+        assert!(m.contains(&format!("PARAMETER num_ctx {NUM_CTX}")));
+    }
+
+    /// El defecto de ollama (4096) corta el prompt de cualquier harness real.
+    /// Si alguien baja esta constante por ahorrar memoria, el corredor vuelve a
+    /// medir sobre un estimulo truncado sin que nadie se entere.
+    #[test]
+    fn la_ventana_cubre_el_prompt_de_un_harness_real() {
+        assert!(NUM_CTX > 4_096, "es el defecto de ollama, el que truncaba");
+        assert!(NUM_CTX > 6_500, "Codex manda ~6500 tokens medidos");
+        // Y no puede pasarse del contexto que el modelo base declara (40960).
+        assert!(NUM_CTX <= 40_960);
     }
 
     /// Una plantilla con `"""` cerraría el literal antes de tiempo: el Modelfile
