@@ -153,6 +153,12 @@ No modifiques `test_tarifa.py`.
 /// `CORREDOR_ENCARGO` para correr la contraprueba.
 const ENCARGO: &str = "test_tarifa.py falla. Haz que pase.";
 
+/// El encargo del **modo peaje**: la ceremonia sin trabajo.
+///
+/// Mismo prompt que [`floor-across-tools.md`](../docs/floor-across-tools.md)
+/// §1, para que las dos mediciones hablen del mismo estímulo.
+const ENCARGO_PEAJE: &str = "Responde solo: ok";
+
 /// Qué harness conduce esta corrida.
 ///
 /// Empezó siendo una constante —Codex— y **tuvo que dejar de serlo**: Codex
@@ -420,6 +426,32 @@ fn preparar(origen: &Path, destino: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Deja el directorio del **modo peaje**: exactamente el mismo entorno que una
+/// repetición normal **menos la tarea**.
+///
+/// Lleva el `AGENTS.md` normalizado y NO lleva los ficheros de la tarea. Esa
+/// frontera es la que da sentido a la resta de #122: el fichero de
+/// instrucciones es **ceremonia**, no trabajo, así que tiene que caer del lado
+/// del peaje o el «trabajo real» se lo comería.
+///
+/// # En qué se diferencia del peaje de `floor-across-tools.md` §1
+///
+/// Aquel se mide «en un directorio vacío, con la configuración realmente
+/// instalada en esta máquina» — 22 skills, MCP, todo. **Este se mide con el
+/// `HOME` aislado del corredor**, que no tiene nada de eso.
+///
+/// No es un refinamiento: son cifras de instalaciones distintas y **no se
+/// pueden restar entre sí**. El propio §4.2 lo dice: «los totales no son
+/// comparables entre instalaciones». Medido el 2026-08-30, el peaje publicado
+/// de opencode es **48 veces** su primer turno real dentro del corredor.
+fn preparar_peaje(destino: &Path) -> std::io::Result<()> {
+    if destino.exists() {
+        std::fs::remove_dir_all(destino)?;
+    }
+    std::fs::create_dir_all(destino)?;
+    std::fs::write(destino.join("AGENTS.md"), AGENTS_MD)
+}
+
 /// Corre el verificador. El veredicto es el **código de salida** (regla 3).
 fn tests_pasan(dir: &Path) -> bool {
     std::process::Command::new("python3")
@@ -513,6 +545,19 @@ fn tool_calls(filas: &[Value]) -> Option<usize> {
 /// cero.
 fn fmt_calls(v: Option<usize>) -> String {
     v.map_or_else(|| "n/d".to_string(), |n| n.to_string())
+}
+
+/// Bytes de contexto que el harness MANDÓ en un lote de peticiones.
+///
+/// Es lo que `context_measured_bytes` mide en la entrada, antes de que el
+/// modelo trunque nada. Distinto de `input_tokens`, que es lo que el proveedor
+/// dijo haber leído: cuando hay truncamiento los dos divergen, y el que dice lo
+/// que costó mandar es este.
+fn bytes_mandados(filas: &[Value]) -> u64 {
+    filas
+        .iter()
+        .filter_map(|f| f["context_measured_bytes"].as_u64())
+        .sum()
 }
 
 /// La versión del harness, o `None` si no está instalado (regla 7 de captura:
@@ -777,6 +822,8 @@ async fn main() {
         eprintln!("ABORTA: harness `{nombre_h}` desconocido. Validos: pi, codex.");
         std::process::exit(1);
     };
+    let modo_peaje = var("CORREDOR_MODO", "corrida") == "peaje";
+    let datos = var("CORREDOR_DATOS", "./datos-corredor.jsonl");
     let n: usize = var("CORREDOR_N", "3").parse().unwrap_or(3);
     let plazo: u64 = var("CORREDOR_TIMEOUT", "300").parse().unwrap_or(300);
 
@@ -803,26 +850,34 @@ async fn main() {
     };
     println!("  harness: {version}");
 
-    if !tarea.join(FUENTE).exists() || !tarea.join(TESTS).exists() {
+    if modo_peaje {
+        // El modo peaje NO toca la tarea, asi que sus guardas no aplican: no
+        // hay estado inicial que tenga que fallar ni verificador que correr.
+        // Las del proxy y el contexto SI, y siguen mas abajo.
+        println!("  modo: PEAJE (la ceremonia sin trabajo)");
+    } else if !tarea.join(FUENTE).exists() || !tarea.join(TESTS).exists() {
         eprintln!("ABORTA: no encuentro la tarea en {}.", tarea.display());
         std::process::exit(1);
     }
 
     // Regla 1: el estado inicial TIENE que fallar. Un banco que pasa de salida
-    // invalida todo lo medido con el.
-    let sonda = std::env::temp_dir().join(format!("corredor-guarda-{}", std::process::id()));
-    if let Err(e) = preparar(&tarea, &sonda) {
-        eprintln!("ABORTA: no puedo preparar la copia de guarda: {e}");
-        std::process::exit(1);
+    // invalida todo lo medido con el. En modo peaje no hay tarea, asi que no
+    // hay nada que comprobar aqui.
+    if !modo_peaje {
+        let sonda = std::env::temp_dir().join(format!("corredor-guarda-{}", std::process::id()));
+        if let Err(e) = preparar(&tarea, &sonda) {
+            eprintln!("ABORTA: no puedo preparar la copia de guarda: {e}");
+            std::process::exit(1);
+        }
+        let inicial_falla = !tests_pasan(&sonda);
+        let _ = std::fs::remove_dir_all(&sonda);
+        if !inicial_falla {
+            eprintln!("ABORTA: el estado inicial de la tarea PASA.");
+            eprintln!("  Una tarea que no falla no mide nada (banco-de-tareas §6.1).");
+            std::process::exit(1);
+        }
+        println!("  estado inicial: falla (correcto)");
     }
-    let inicial_falla = !tests_pasan(&sonda);
-    let _ = std::fs::remove_dir_all(&sonda);
-    if !inicial_falla {
-        eprintln!("ABORTA: el estado inicial de la tarea PASA.");
-        eprintln!("  Una tarea que no falla no mide nada (banco-de-tareas §6.1).");
-        std::process::exit(1);
-    }
-    println!("  estado inicial: falla (correcto)");
 
     let cliente = reqwest::Client::new();
     if let Err(e) = guarda_proxy(&cliente, &puerto, &modelo).await {
@@ -851,6 +906,9 @@ async fn main() {
     let rastros = PathBuf::from(var("CORREDOR_RASTROS", "./rastros-corredor"));
     let mut veredictos: Vec<Veredicto> = Vec::with_capacity(n);
     let mut peticiones_totales = 0usize;
+    // (bytes mandados, peticiones) por repeticion. Es lo que el informe de #122
+    // convierte en medianas y rangos.
+    let mut medidas: Vec<(u64, usize)> = Vec::with_capacity(n);
     // `None` mientras ningun lote traiga el dato: la ruta de Codex no lo
     // extrae, y un cero ahi seria una afirmacion que nadie ha medido.
     let mut llamadas_totales: Option<usize> = None;
@@ -859,8 +917,13 @@ async fn main() {
         let trabajo = raiz.join(format!("rep-{i}"));
         let hogar = raiz.join(format!("home-{i}"));
 
-        if let Err(e) = preparar(&tarea, &trabajo) {
-            eprintln!("  rep {i}: no puedo preparar la copia limpia: {e}");
+        let preparado = if modo_peaje {
+            preparar_peaje(&trabajo)
+        } else {
+            preparar(&tarea, &trabajo)
+        };
+        if let Err(e) = preparado {
+            eprintln!("  rep {i}: no puedo preparar el directorio: {e}");
             std::process::exit(1);
         }
         if let Err(e) = escribir_config(harness, &hogar, &puerto, &modelo, &wire) {
@@ -872,21 +935,52 @@ async fn main() {
         let hash_tests = hash_fichero(&trabajo.join(TESTS));
         let marca = filas_telemetria(&telemetria);
 
-        let (expiro, salida) = lanzar(harness, &trabajo, &hogar, &modelo, &encargo, plazo).await;
+        let encargo_rep = if modo_peaje {
+            ENCARGO_PEAJE
+        } else {
+            encargo.as_str()
+        };
+        let (expiro, salida) = lanzar(harness, &trabajo, &hogar, &modelo, encargo_rep, plazo).await;
 
         // La telemetria se escribe fuera del camino critico: se le da margen.
         tokio::time::sleep(Duration::from_secs(2)).await;
         let filas = filas_nuevas(&telemetria, marca, &modelo);
         let llamadas = tool_calls(&filas);
 
-        let v = clasificar(
-            hash_fichero(&trabajo.join(TESTS)) != hash_tests,
+        // En modo peaje no hay tarea que resolver: el unico fallo posible es
+        // del banco, y `SinPeticiones` lo cubre. Clasificar por el verificador
+        // ahi daria «no resuelto» en el 100% de los casos y ensuciaria la
+        // lectura de una medida que no va de resolver nada.
+        let v = if modo_peaje {
+            if filas.is_empty() {
+                Veredicto::SinPeticiones
+            } else {
+                Veredicto::Resuelto
+            }
+        } else {
+            clasificar(
+                hash_fichero(&trabajo.join(TESTS)) != hash_tests,
+                filas.len(),
+                alguna_truncada(&filas, techo),
+                hash_fichero(&trabajo.join(FUENTE)) != hash_fuente,
+                expiro,
+                tests_pasan(&trabajo),
+            )
+        };
+
+        let bytes = bytes_mandados(&filas);
+        anotar_medida(
+            &datos,
+            harness,
+            &version,
+            &modelo,
+            modo_peaje,
+            i,
+            v,
             filas.len(),
-            alguna_truncada(&filas, techo),
-            hash_fichero(&trabajo.join(FUENTE)) != hash_fuente,
-            expiro,
-            tests_pasan(&trabajo),
+            bytes,
         );
+        medidas.push((bytes, filas.len()));
 
         let rastro = guardar_rastro(&rastros, i, v, &salida);
 
@@ -895,10 +989,11 @@ async fn main() {
             llamadas_totales = Some(llamadas_totales.unwrap_or(0) + c);
         }
         println!(
-            "  rep {:>2}: {:<24} {:>3} peticiones, {:>4} tool_calls{}",
+            "  rep {:>2}: {:<24} {:>3} peticiones, {:>9} B, {:>4} tool_calls{}",
             i + 1,
             v.etiqueta(),
             filas.len(),
+            bytes,
             fmt_calls(llamadas),
             rastro.map_or(String::new(), |r| format!("  -> {}", r.display()))
         );
@@ -908,6 +1003,7 @@ async fn main() {
     let _ = std::fs::remove_dir_all(&raiz);
     reportar(
         harness,
+        &medidas,
         &veredictos,
         &version,
         &modelo,
@@ -917,10 +1013,78 @@ async fn main() {
     );
 }
 
+/// Mediana y rango de una muestra. `None` si está vacía.
+///
+/// **Nunca solo la media**: #29 lo exige —«n>1 por herramienta, con los rangos
+/// publicados, no solo la media»— y con razón. Una media esconde exactamente lo
+/// que hace falta ver: si dos harnesses con la misma media tienen rangos
+/// distintos, no cuestan lo mismo.
+///
+/// Mediana y no media también a propósito: una sola repetición que se fue por
+/// las ramas arrastra la media y deja de describir el caso típico.
+fn mediana_y_rango(v: &[u64]) -> Option<(u64, u64, u64)> {
+    if v.is_empty() {
+        return None;
+    }
+    let mut o = v.to_vec();
+    o.sort_unstable();
+    Some((o[o.len() / 2], o[0], o[o.len() - 1]))
+}
+
+/// Anota una repetición en el fichero de datos, una línea JSON por repetición.
+///
+/// Existe porque el informe de
+/// [#122](https://github.com/pichu2707/OxideGate/issues/122) necesita **la
+/// distribución**, no el resumen: medianas y rangos, y eso no se puede
+/// reconstruir de una media impresa por pantalla. Y porque la tabla cruza
+/// harnesses distintos, que se miden en corridas distintas.
+///
+/// Se **añade**, no se sobrescribe: dos corridas del mismo harness son más
+/// datos, no un reemplazo. Un fallo al escribir avisa y NO aborta — la medición
+/// ya está hecha y perderla por un disco lleno sería peor.
+#[allow(clippy::too_many_arguments)]
+fn anotar_medida(
+    ruta: &str,
+    h: Harness,
+    version: &str,
+    modelo: &str,
+    peaje: bool,
+    rep: usize,
+    v: Veredicto,
+    peticiones: usize,
+    bytes: u64,
+) {
+    let linea = serde_json::json!({
+        "harness": h.binario(),
+        "version": version,
+        "modelo": modelo,
+        "modo": if peaje { "peaje" } else { "corrida" },
+        "rep": rep,
+        "veredicto": v.etiqueta(),
+        "resuelto": v == Veredicto::Resuelto,
+        "fallo_del_banco": v.es_fallo_del_banco(),
+        "peticiones": peticiones,
+        "bytes": bytes,
+    });
+    let escrito = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(ruta)
+        .and_then(|mut f| {
+            use std::io::Write;
+            writeln!(f, "{linea}")
+        });
+    if let Err(e) = escrito {
+        eprintln!("  AVISO: no pude anotar la medida en {ruta}: {e}");
+    }
+}
+
 /// Publica el resultado **sin filtrar**: lo que no resuelve se cuenta y se
 /// publica (regla 5 del banco).
+#[allow(clippy::too_many_arguments)]
 fn reportar(
     harness: Harness,
+    medidas: &[(u64, usize)],
     veredictos: &[Veredicto],
     version: &str,
     modelo: &str,
@@ -939,9 +1103,20 @@ fn reportar(
     println!("  encargo  : {encargo:?}");
     println!("  resuelto : {resueltos}/{n}");
     println!(
-        "  trafico  : {peticiones} peticiones, {} tool_calls\n",
+        "  trafico  : {peticiones} peticiones, {} tool_calls",
         fmt_calls(llamadas)
     );
+
+    // La DISTRIBUCION, no el resumen. Ver `mediana_y_rango`.
+    let bytes: Vec<u64> = medidas.iter().map(|(b, _)| *b).collect();
+    let turnos: Vec<u64> = medidas.iter().map(|(_, t)| *t as u64).collect();
+    if let (Some((mb, lob, hib)), Some((mt, lot, hit))) =
+        (mediana_y_rango(&bytes), mediana_y_rango(&turnos))
+    {
+        println!("  bytes/rep: mediana {mb}  rango {lob}-{hib}");
+        println!("  turnos   : mediana {mt}  rango {lot}-{hit}");
+    }
+    println!();
 
     for v in [
         Veredicto::Resuelto,
@@ -1357,6 +1532,61 @@ mod tests {
     }
 
     // ---- las reglas del banco, como test ----
+
+    #[test]
+    fn la_mediana_y_el_rango_describen_la_muestra() {
+        assert_eq!(mediana_y_rango(&[5, 1, 9, 3, 7]), Some((5, 1, 9)));
+        assert_eq!(mediana_y_rango(&[4]), Some((4, 4, 4)));
+        assert_eq!(
+            mediana_y_rango(&[]),
+            None,
+            "una muestra vacia no tiene mediana"
+        );
+    }
+
+    /// El caso que justifica publicar el rango y no solo la media: dos muestras
+    /// con la MISMA media que no dicen lo mismo.
+    #[test]
+    fn dos_muestras_con_la_misma_media_no_tienen_el_mismo_rango() {
+        let estable = [50u64, 50, 50];
+        let volatil = [10u64, 50, 90];
+        let media = |v: &[u64]| v.iter().sum::<u64>() / v.len() as u64;
+        assert_eq!(media(&estable), media(&volatil));
+        assert_ne!(mediana_y_rango(&estable), mediana_y_rango(&volatil));
+    }
+
+    /// El peaje se mide con el MISMO entorno que las corridas menos la tarea:
+    /// lleva el AGENTS.md -que es ceremonia- y no lleva los ficheros.
+    #[test]
+    fn el_directorio_del_peaje_lleva_las_instrucciones_y_no_la_tarea() {
+        let dir = std::env::temp_dir().join(format!("corredor-peaje-{}", std::process::id()));
+        preparar_peaje(&dir).unwrap();
+        assert!(dir.join("AGENTS.md").exists(), "el AGENTS.md es ceremonia");
+        assert!(!dir.join(FUENTE).exists(), "el peaje no lleva la tarea");
+        assert!(!dir.join(TESTS).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// El encargo del peaje es el MISMO que el de `floor-across-tools.md` §1,
+    /// para que las dos mediciones hablen del mismo estimulo.
+    #[test]
+    fn el_encargo_del_peaje_es_el_del_banco_del_suelo() {
+        assert_eq!(ENCARGO_PEAJE, "Responde solo: ok");
+        assert!(ENCARGO_PEAJE.is_ascii());
+        assert_ne!(ENCARGO_PEAJE, ENCARGO, "el peaje NO puede llevar la tarea");
+    }
+
+    #[test]
+    fn los_bytes_se_leen_de_lo_MANDADO_no_de_lo_leido() {
+        // `input_tokens` es lo que el proveedor dijo haber leido; cuando trunca,
+        // los dos divergen. El que dice lo que costo mandar es el otro.
+        let filas = vec![
+            serde_json::json!({"context_measured_bytes": 1000, "input_tokens": 4095}),
+            serde_json::json!({"context_measured_bytes": 2500, "input_tokens": 4095}),
+            serde_json::json!({"input_tokens": 900}),
+        ];
+        assert_eq!(bytes_mandados(&filas), 3500);
+    }
 
     #[test]
     fn los_fallos_del_banco_son_exactamente_tres() {
