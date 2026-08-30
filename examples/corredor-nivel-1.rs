@@ -709,6 +709,12 @@ async fn lanzar(
     }
 
     cmd
+        // Al expirar el plazo se suelta el futuro, y con el el hijo. Sin esto
+        // tokio NO lo mata: el harness seguiria vivo, mandando peticiones que
+        // caerian en la ventana de telemetria de la repeticion SIGUIENTE y
+        // pudiendo seguir editando su directorio. Corromperia las repeticiones
+        // posteriores en silencio, que es la peor clase de fallo del banco.
+        .kill_on_drop(true)
         // Los dos esperan stdin: sin cerrarlo se quedan colgados.
         .stdin(std::process::Stdio::null())
         // Se CAPTURA, no se tira. Cuando el harness llega al modelo y aun asi
@@ -733,8 +739,7 @@ async fn lanzar(
             (false, t)
         }
         Ok(Err(e)) => (false, format!("<fallo esperando al harness: {e}>")),
-        // `wait_with_output` consume el hijo, asi que en el timeout no queda a
-        // quien matar por handle: se deja constancia y el plazo hace de tope.
+        // El hijo muere al soltarse el futuro, por `kill_on_drop` de arriba.
         Err(_) => (
             true,
             String::from("<expiro el plazo: sin salida capturada>"),
