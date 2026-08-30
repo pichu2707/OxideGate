@@ -25,10 +25,13 @@ cuestan lo mismo.
 
 ### Y las mismas cifras solo sobre lo que resolvió
 
-| harness | resueltas | bytes/rep | peaje | **trabajo real** |
-|---|---:|---:|---:|---:|
-| `opencode` 1.18.25 | 28/30 | 259.103 (190.641-337.270) | 31.975 | **227.128** (158.666-305.295) |
-| `pi` 0.80.10 | 29/30 | 105.188 (42.361-156.382) | 5.932 | **99.256** (36.429-150.450) |
+| harness | resueltas | bytes/rep | turnos | peaje | **trabajo real** |
+|---|---:|---:|---:|---:|---:|
+| `opencode` 1.18.25 | 28/30 | 259.103 (190.641-337.270) | 9 (7-11) | 31.975 | **227.128** (158.666-305.295) |
+| `pi` 0.80.10 | 29/30 | 105.188 (42.361-156.382) | 10 (5-13) | 5.932 | **99.256** (36.429-150.450) |
+
+Los turnos lo dicen igual de claro: los mínimos suben de **2 a 7** y de **3 a 5**.
+Las repeticiones que no resolvieron morían ahí.
 
 **Las dos tablas hacen falta, y mezclarlas engaña.** Fíjate en el mínimo del
 trabajo real de `opencode`: **38 B** arriba, **158.666 B** abajo. Ese 38 sale de
@@ -90,6 +93,26 @@ harnesses.
 
 > El `AGENTS.md` normalizado **cae del lado del peaje**, no del trabajo. Es
 > ceremonia: el harness lo manda antes de hacer nada.
+
+---
+
+### Dos guardas del informe, y por qué abortan
+
+**1. No se mezclan poblaciones.** El fichero de datos es **append-only**: dos
+corridas del mismo harness se acumulan. Si entre ellas cambió la versión del
+harness —o el **modelo**, que es justo lo que el nivel 1 fija como constante— el
+informe publicaba su distribución junta **etiquetada con una de las dos
+versiones**.
+
+Eso es peor que no tener versión: `banco-de-captura.md` §6.3 la pide porque
+*«sin versión la medición no se puede auditar»*, y una versión **equivocada**
+hace que la auditoría dé por bueno lo que no lo es. **Aborta**, no avisa: la
+tabla se lee sola, y quien la copie a un issue no se lleva el aviso.
+
+**2. Un peaje con dispersión se denuncia.** Se resta **un único número** a cada
+repetición, así que si el peaje variara, esa variación entraría entera en el
+«trabajo real» disfrazada de trabajo. Medido, el rango era **cero** en los dos
+harnesses — y por eso la resta vale, no porque se dé por supuesto.
 
 ---
 
