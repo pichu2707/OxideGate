@@ -90,9 +90,15 @@ struct Muestra {
     /// publicaba la distribución de las dos **etiquetada con una de ellas**.
     versiones: BTreeSet<String>,
     modelos: BTreeSet<String>,
-    /// Bytes mandados por repetición, TODAS.
-    bytes: Vec<u64>,
-    /// Bytes de las repeticiones que **resolvieron**.
+    /// `(bytes mandados, turnos)` de cada repetición, TODAS.
+    ///
+    /// Un solo vector de PARES y no dos paralelos: emparejarlos por índice
+    /// obliga a que las dos cifras entren juntas o no entren, y el coste por
+    /// turno se calcula sobre pares. Con vectores separados, una fila a la que
+    /// le faltara uno de los dos campos los desincronizaba en silencio y el
+    /// emparejamiento pasaba a ser aleatorio.
+    reps: Vec<(u64, u64)>,
+    /// Ídem, solo las que **resolvieron**.
     ///
     /// Van aparte porque son dos preguntas distintas y mezclarlas engaña: el
     /// rango de `bytes` incluye repeticiones que murieron en dos turnos sin
@@ -103,17 +109,27 @@ struct Muestra {
     /// Se publican las DOS: #121 exige que lo que no resuelve se cuente y se
     /// publique, y #122 pide el coste del trabajo. Filtrar una escondería la
     /// otra.
-    bytes_ok: Vec<u64>,
-    /// Turnos (peticiones) por repetición, TODAS.
-    turnos: Vec<u64>,
-    /// Turnos de las repeticiones que **resolvieron**. Mismo motivo que
-    /// [`Muestra::bytes_ok`]: una que se rindió en dos turnos tira del mínimo.
-    turnos_ok: Vec<u64>,
+    reps_ok: Vec<(u64, u64)>,
     resueltas: usize,
     /// Repeticiones que fallaron por el BANCO, no por el modelo. Se cuentan
     /// aparte: no pueden entrar en el denominador de una tasa de capacidad.
     del_banco: usize,
     total: usize,
+}
+
+impl Muestra {
+    fn bytes(&self) -> Vec<u64> {
+        self.reps.iter().map(|(b, _)| *b).collect()
+    }
+    fn turnos(&self) -> Vec<u64> {
+        self.reps.iter().map(|(_, t)| *t).collect()
+    }
+    fn bytes_ok(&self) -> Vec<u64> {
+        self.reps_ok.iter().map(|(b, _)| *b).collect()
+    }
+    fn turnos_ok(&self) -> Vec<u64> {
+        self.reps_ok.iter().map(|(_, t)| *t).collect()
+    }
 }
 
 /// Mediana y rango. **Nunca solo la media** — ver el doc del módulo.
@@ -140,19 +156,16 @@ fn agrupar(contenido: &str) -> BTreeMap<(String, String), Muestra> {
             .insert(v["version"].as_str().unwrap_or("?").to_string());
         m.modelos
             .insert(v["modelo"].as_str().unwrap_or("?").to_string());
-        if let Some(b) = v["bytes"].as_u64() {
-            m.bytes.push(b);
-        }
-        if let Some(t) = v["peticiones"].as_u64() {
-            m.turnos.push(t);
+        // Las dos cifras entran JUNTAS o no entra ninguna: el coste por turno
+        // se calcula sobre pares, y media pareja no sirve.
+        let par = v["bytes"].as_u64().zip(v["peticiones"].as_u64());
+        if let Some(p) = par {
+            m.reps.push(p);
         }
         if v["resuelto"].as_bool() == Some(true) {
             m.resueltas += 1;
-            if let Some(b) = v["bytes"].as_u64() {
-                m.bytes_ok.push(b);
-            }
-            if let Some(t) = v["peticiones"].as_u64() {
-                m.turnos_ok.push(t);
+            if let Some(p) = par {
+                m.reps_ok.push(p);
             }
         }
         if v["fallo_del_banco"].as_bool() == Some(true) {
@@ -176,12 +189,58 @@ fn agrupar(contenido: &str) -> BTreeMap<(String, String), Muestra> {
 /// eso la resta vale — no porque se dé por supuesto.
 fn peaje_de(datos: &BTreeMap<(String, String), Muestra>, harness: &str) -> Option<(u64, u64, u64)> {
     let m = datos.get(&(harness.to_string(), "peaje".to_string()))?;
-    mediana_y_rango(&m.bytes)
+    mediana_y_rango(&m.bytes())
 }
 
 /// Solo la mediana del peaje, para restar.
 fn peaje_mediana(datos: &BTreeMap<(String, String), Muestra>, harness: &str) -> Option<u64> {
     peaje_de(datos, harness).map(|(med, _, _)| med)
+}
+
+/// Agrupa las repeticiones que resolvieron **por número de turnos**, con su
+/// trabajo real.
+///
+/// # Por qué esta descomposición vale más que el rango
+///
+/// El rango publicado arriba sugiere una dispersión continua, y **no lo es**.
+/// Medido el 2026-08-30, las distribuciones son **multimodales**: `pi` se
+/// apiña en 58k y 112k, `opencode` en 227k. Un rango sobre eso esconde los
+/// modos.
+///
+/// Y lo que los explica son los **turnos**. Dentro de un mismo número de
+/// turnos, el trabajo real es **casi determinista** — 635 B de dispersión
+/// sobre 227.000 en `opencode`, un **0,3%**.
+///
+/// Así que la varianza no viene de que un turno cueste distinto, sino de que
+/// el harness tarde distinto. Eso separa dos preguntas que el rango mezclaba:
+///
+/// - **Cuánto cuesta un turno** — propiedad del harness, estable.
+/// - **Cuántos turnos hacen falta** — la parte estocástica.
+///
+/// Y da la métrica con la que el nivel 2
+/// ([#123](https://github.com/pichu2707/OxideGate/issues/123)) se podrá
+/// comparar contra este: si allí cambia el coste por turno, es del modelo; si
+/// cambia el número de turnos, es de cómo el modelo conduce el harness.
+fn por_turnos(m: &Muestra, peaje: u64) -> BTreeMap<u64, Vec<u64>> {
+    let mut out: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for (bytes, turnos) in &m.reps_ok {
+        out.entry(*turnos)
+            .or_default()
+            .push(bytes.saturating_sub(peaje));
+    }
+    out
+}
+
+/// Dispersión de una muestra como fracción de su mediana, en tanto por mil.
+///
+/// Es lo que dice si un grupo es «casi determinista» o no, y se publica en vez
+/// de afirmarlo: 3‰ es una cosa y 300‰ es otra.
+fn dispersion_por_mil(v: &[u64]) -> Option<u64> {
+    let (med, lo, hi) = mediana_y_rango(v)?;
+    if med == 0 {
+        return None;
+    }
+    Some((hi - lo) * 1000 / med)
 }
 
 /// Comprueba que cada muestra habla de UNA sola población, y devuelve el motivo
@@ -298,15 +357,20 @@ fn main() {
         // El trabajo real se calcula por REPETICION y luego se resume, no al
         // reves: restar el peaje de la mediana daria la mediana de otra cosa.
         let trabajo: Vec<u64> = match peaje {
-            Some(p) => m.bytes.iter().map(|b| b.saturating_sub(p)).collect(),
+            Some(p) => m
+                .reps
+                .iter()
+                .map(|(b, _)| b)
+                .map(|b| b.saturating_sub(p))
+                .collect(),
             None => Vec::new(),
         };
         println!(
             "{:<20} {:>10} {:>18} {:>12} {:>10} {:>16}",
             etiqueta(harness, m),
             format!("{}/{}", m.resueltas, m.total),
-            fmt_rango(&m.bytes),
-            fmt_rango(&m.turnos),
+            fmt_rango(&m.bytes()),
+            fmt_rango(&m.turnos()),
             peaje.map_or("—".into(), |p| p.to_string()),
             if trabajo.is_empty() {
                 "—".into()
@@ -330,15 +394,20 @@ fn main() {
     for (harness, m) in &corridas {
         let peaje = peaje_mediana(&datos, harness);
         let trabajo: Vec<u64> = match peaje {
-            Some(p) => m.bytes_ok.iter().map(|b| b.saturating_sub(p)).collect(),
+            Some(p) => m
+                .reps_ok
+                .iter()
+                .map(|(b, _)| b)
+                .map(|b| b.saturating_sub(p))
+                .collect(),
             None => Vec::new(),
         };
         println!(
             "{:<20} {:>10} {:>18} {:>12} {:>10} {:>16}",
             etiqueta(harness, m),
             format!("{}/{}", m.resueltas, m.total),
-            fmt_rango(&m.bytes_ok),
-            fmt_rango(&m.turnos_ok),
+            fmt_rango(&m.bytes_ok()),
+            fmt_rango(&m.turnos_ok()),
             peaje.map_or("—".into(), |p| p.to_string()),
             if trabajo.is_empty() {
                 "—".into()
@@ -346,6 +415,63 @@ fn main() {
                 fmt_rango(&trabajo)
             },
         );
+    }
+    println!();
+
+    // ---- La descomposicion que el rango escondia ----
+    println!("el coste por TURNO, que es lo que el rango escondia:\n");
+    for (harness, m) in &corridas {
+        let Some(peaje) = peaje_mediana(&datos, harness) else {
+            continue;
+        };
+        println!("  {}", etiqueta(harness, m));
+        for (turnos, trabajos) in por_turnos(m, peaje) {
+            let Some((med, _, _)) = mediana_y_rango(&trabajos) else {
+                continue;
+            };
+            let disp = dispersion_por_mil(&trabajos).unwrap_or(0);
+            println!(
+                "    {turnos:>2} turnos  n={:>2}   trabajo real {med:>9}   {:>8} B/turno   dispersion {disp}‰",
+                trabajos.len(),
+                med / turnos.max(1),
+            );
+        }
+        println!();
+    }
+    // La conclusion se calcula, no se afirma. Solo cuentan los grupos con n>=3:
+    // con n=1 la dispersion es CERO por construccion y diria que todo es
+    // deterministico.
+    let mut peor: Option<(u64, String, u64)> = None;
+    for (harness, m) in &corridas {
+        let Some(peaje) = peaje_mediana(&datos, harness) else {
+            continue;
+        };
+        for (turnos, trabajos) in por_turnos(m, peaje) {
+            if trabajos.len() < 3 {
+                continue;
+            }
+            if let Some(d) = dispersion_por_mil(&trabajos) {
+                if peor.as_ref().is_none_or(|(p, _, _)| d > *p) {
+                    peor = Some((d, (*harness).clone(), turnos));
+                }
+            }
+        }
+    }
+    match peor {
+        Some((d, h, t)) => println!(
+            "  Dentro de un mismo numero de turnos el coste apenas se mueve, y el peor\n\
+             \x20 caso con n>=3 es `{h}` a {t} turnos: {d}‰ de dispersion. Asi que la\n\
+             \x20 varianza del rango de arriba NO viene de que un turno cueste distinto,\n\
+             \x20 sino de que el harness tarde distinto. Son dos preguntas, y el rango las\n\
+             \x20 mezclaba.\n\
+             \x20\n\
+             \x20 Los grupos con n<3 no entran en esa cuenta: con n=1 la dispersion es\n\
+             \x20 CERO por construccion y diria que todo es determinista."
+        ),
+        None => println!(
+            "  Ningun grupo de turnos llega a n=3: no se puede afirmar nada sobre la\n\
+             \x20 estabilidad del coste por turno con estos datos."
+        ),
     }
     println!();
 
@@ -359,7 +485,12 @@ fn main() {
     if corridas.len() == 2 {
         let trabajo_de = |m: &Muestra, h: &str| -> Vec<u64> {
             match peaje_mediana(&datos, h) {
-                Some(p) => m.bytes_ok.iter().map(|b| b.saturating_sub(p)).collect(),
+                Some(p) => m
+                    .reps_ok
+                    .iter()
+                    .map(|(b, _)| b)
+                    .map(|b| b.saturating_sub(p))
+                    .collect(),
                 None => Vec::new(),
             }
         };
@@ -534,16 +665,61 @@ mod tests {
         ]);
         let m = &d[&("oc".into(), "corrida".into())];
         assert_eq!(
-            mediana_y_rango(&m.bytes).unwrap().1,
+            mediana_y_rango(&m.bytes()).unwrap().1,
             40,
             "el minimo de TODAS"
         );
         assert_eq!(
-            mediana_y_rango(&m.bytes_ok).unwrap().1,
+            mediana_y_rango(&m.bytes_ok()).unwrap().1,
             300,
             "el minimo de las que RESOLVIERON no lo arrastra"
         );
-        assert_eq!(m.bytes_ok.len(), 2);
+        assert_eq!(m.reps_ok.len(), 2);
+    }
+
+    #[test]
+    fn la_dispersion_se_publica_en_vez_de_afirmarse() {
+        // 635 B sobre 227.128 son 2 por mil: «casi determinista».
+        assert_eq!(dispersion_por_mil(&[226842, 227128, 227477]), Some(2));
+        // Pero pi a 7 turnos daba 105 por mil, que NO lo es. El informe tiene
+        // que poder distinguirlos en vez de meterlos en la misma frase.
+        assert_eq!(dispersion_por_mil(&[58544, 58928, 64760]), Some(105));
+        assert_eq!(dispersion_por_mil(&[]), None);
+    }
+
+    /// Con n=1 la dispersion es CERO por construccion. Si esos grupos entraran
+    /// en la conclusion, el informe diria que todo es determinista.
+    #[test]
+    fn un_grupo_de_uno_tiene_dispersion_cero_por_construccion() {
+        assert_eq!(dispersion_por_mil(&[150450]), Some(0));
+    }
+
+    #[test]
+    fn por_turnos_agrupa_y_resta_el_peaje() {
+        let d = datos_de(&[
+            r#"{"harness":"pi","version":"v","modelo":"m","modo":"corrida","bytes":1100,"peticiones":7,"resuelto":true}"#,
+            r#"{"harness":"pi","version":"v","modelo":"m","modo":"corrida","bytes":1120,"peticiones":7,"resuelto":true}"#,
+            r#"{"harness":"pi","version":"v","modelo":"m","modo":"corrida","bytes":2100,"peticiones":11,"resuelto":true}"#,
+            r#"{"harness":"pi","version":"v","modelo":"m","modo":"corrida","bytes":999,"peticiones":2,"resuelto":false}"#,
+        ]);
+        let m = &d[&("pi".into(), "corrida".into())];
+        let g = por_turnos(m, 100);
+        assert_eq!(g.len(), 2, "las que no resolvieron no entran");
+        assert_eq!(g[&7], vec![1000, 1020], "el peaje ya viene restado");
+        assert_eq!(g[&11], vec![2000]);
+    }
+
+    /// Los pares entran JUNTOS o no entran: con vectores paralelos, una fila a
+    /// la que le faltara uno de los dos campos los desincronizaba en silencio.
+    #[test]
+    fn una_fila_a_medias_no_desincroniza_bytes_y_turnos() {
+        let d = datos_de(&[
+            r#"{"harness":"pi","version":"v","modelo":"m","modo":"corrida","bytes":100,"resuelto":true}"#,
+            r#"{"harness":"pi","version":"v","modelo":"m","modo":"corrida","bytes":200,"peticiones":7,"resuelto":true}"#,
+        ]);
+        let m = &d[&("pi".into(), "corrida".into())];
+        assert_eq!(m.reps_ok, vec![(200, 7)], "la fila a medias no entra");
+        assert_eq!(m.resueltas, 2, "pero SI cuenta como resuelta");
     }
 
     #[test]
@@ -642,12 +818,12 @@ mod tests {
         ]);
         let m = &d[&("oc".into(), "corrida".into())];
         assert_eq!(
-            mediana_y_rango(&m.turnos).unwrap().1,
+            mediana_y_rango(&m.turnos()).unwrap().1,
             2,
             "el minimo de TODAS"
         );
         assert_eq!(
-            mediana_y_rango(&m.turnos_ok).unwrap().1,
+            mediana_y_rango(&m.turnos_ok()).unwrap().1,
             10,
             "los 2 turnos de la que se rindio no arrastran el minimo"
         );

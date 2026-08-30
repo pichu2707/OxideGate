@@ -64,6 +64,43 @@ doble no es peor que una que resuelve 9 de 20 gastando la mitad.
 
 ---
 
+## 2.bis. Lo que el rango escondía: el coste lo fijan los TURNOS
+
+El rango sugiere una dispersión continua. **No lo es.** Las distribuciones son
+**multimodales** — `pi` se apiña en 58k y 112k, `opencode` en 227k — y lo que
+las explica son los turnos:
+
+| harness | turnos | n | trabajo real | **B/turno** | dispersión |
+|---|---:|---:|---:|---:|---:|
+| `opencode` | 9 | 16 | 227.128 | **25.236** | 2‰ |
+| | 10 | 9 | 264.959 | **26.495** | 18‰ |
+| | 11 | 2 | 305.295 | **27.754** | 14‰ |
+| `pi` | 5 | 3 | 36.877 | **7.375** | 14‰ |
+| | 7 | 11 | 58.928 | **8.418** | 105‰ |
+| | 11 | 12 | 112.804 | **10.254** | 3‰ |
+
+**Dentro de un mismo número de turnos el coste apenas se mueve** — el peor caso
+con `n≥3` es `pi` a 7 turnos, con 105‰. Así que la varianza del rango **no viene
+de que un turno cueste distinto, sino de que el harness tarde distinto**. Son dos
+preguntas, y el rango las mezclaba:
+
+- **Cuánto cuesta un turno** — propiedad del harness, estable. `opencode` gasta
+  ~25-27 KB por turno; `pi`, ~7-10 KB. Unas **3×**.
+- **Cuántos turnos hacen falta** — la parte estocástica.
+
+Los grupos con `n<3` **no entran** en esa cuenta: con `n=1` la dispersión es cero
+por construcción y diría que todo es determinista. El informe lo calcula así y
+nombra su peor caso, en vez de afirmar «casi determinista» y quedarse tan ancho.
+
+> Y esto es la métrica con la que el **nivel 2**
+> ([#123](https://github.com/pichu2707/OxideGate/issues/123)) se podrá comparar
+> contra este: si allí cambia el **coste por turno**, la diferencia es del
+> modelo; si cambia el **número de turnos**, es de cómo el modelo conduce el
+> harness. Sin esta separación, el nivel 2 solo podría decir «cuesta más» sin
+> poder atribuirlo.
+
+---
+
 ## 3. El peaje: por qué NO es el de `floor-across-tools.md`
 
 **`trabajo real` = bytes totales − peaje fijo.** Separar «lo que cuesta
