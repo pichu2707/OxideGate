@@ -29,6 +29,13 @@ mismo `AGENTS.md`:
 | `context_tools_bytes` | 2.900 | 19.518 | **6,73x** |
 | `context_system_bytes` | 2.909 | 9.952 | 3,42x |
 
+> [!NOTE]
+> **Ese `30/30` fue real en esta corrida, y no es una propiedad.** Repetida la
+> medición el mismo día con el mismo `n`, salió **29/30 y 28/30**. La tasa se
+> mueve entre ejecuciones idénticas; el §3 y
+> [`informe-nivel-1.md`](informe-nivel-1.md) §2 lo desarrollan. Se conserva la
+> cifra medida en vez de reescribirla, por la regla 1 de la fe de erratas.
+
 **La fila que dice más es la de `output_tokens`: 1,16x.** Los dos harnesses
 hacen que el modelo genere prácticamente lo mismo — el trabajo es el mismo y se
 completó igual. Toda la diferencia de coste está en **lo que el harness manda**,
@@ -97,8 +104,21 @@ mide que el harness conduzca bien: mide que **no estorba**. La tasa de éxito
 nivel 1 como *«¿cuánto cuesta esta herramienta por hacer el **mismo trabajo**?»*,
 y «el mismo trabajo» exige que todos lo completen. El riesgo que #29 declaró era
 el contrario —*«mide cuánto gasta cada harness dando vueltas antes de rendirse»*—,
-o sea saturar en **0**. Saturar en **1** es la condición experimental limpia:
-mismo trabajo terminado, se compara lo que costó.
+o sea saturar en **0**.
+
+> [!WARNING]
+> **Aquí se dijo que la tarea «SATURA», y es demasiado fuerte.** Ese día se
+> midió 30/30 con los dos harnesses. Repetida la medición el mismo 2026-08-30
+> con `n=30`, salió **29/30 con `pi` y 28/30 con `opencode`**: la tasa **no está
+> pegada al techo, tiene varianza**.
+>
+> Lo que sigue en pie es la conclusión, por un motivo más fino: la tasa es alta
+> y **su variación entre corridas idénticas es del mismo orden que cualquier
+> diferencia entre harnesses**, así que sigue sin discriminar — por **ruido**,
+> no por techo. Un `30/30` publicado como propiedad habría quedado desmentido
+> por la ejecución siguiente.
+>
+> Ver [`informe-nivel-1.md`](informe-nivel-1.md) §2.
 
 Lo que **no** se puede hacer es leer el 30/30 como mérito. Corregido también en
 [`banco-de-tareas.md`](banco-de-tareas.md) §4, que afirmaba que la tasa del
@@ -232,4 +252,6 @@ haya instalado encima.
 - [`banco-de-captura.md`](banco-de-captura.md) — las recetas de aislamiento
 - [`floor-across-tools.md`](floor-across-tools.md) — el peaje fijo sobre una
   tarea trivial, que es lo que este documento mide ya sobre trabajo real
+- [`informe-nivel-1.md`](informe-nivel-1.md) — la tabla de #122: medianas,
+  rangos y la resta del peaje
 - [`fe-de-erratas.md`](fe-de-erratas.md) — E-013
