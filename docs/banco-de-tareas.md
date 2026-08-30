@@ -21,6 +21,11 @@ Si el modelo local no resuelve la tarea, el nivel 1 **no mide nada**: mide
 cuánto gasta cada harness dando vueltas antes de rendirse. Este documento es la
 comprobación de que eso no pasa.
 
+Resolver la tarea es **la primera** de las dos condiciones del nivel 1. La
+segunda —que el modelo sepa además operar herramientas y **entregar** lo que
+averigua— vive en [`modelo-del-nivel-1.md`](modelo-del-nivel-1.md), y estuvo a
+punto de costar el issue entero.
+
 ---
 
 ## 2. La tarea
@@ -159,6 +164,8 @@ supo extraer) y `mezclados` (hubo que limpiar la respuesta). Un banco cuyo
 
 ## Ver también
 
+- [`modelo-del-nivel-1.md`](modelo-del-nivel-1.md) — qué modelo conduce el
+  nivel 1, y por qué su razonamiento va apagado dentro del modelo
 - [`banco-de-captura.md`](banco-de-captura.md) — el otro banco, el que mide qué
   inyecta cada harness. Sus recetas de aislamiento por herramienta son las que
   hacen posible el nivel 1.

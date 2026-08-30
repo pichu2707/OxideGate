@@ -277,7 +277,8 @@ enum Encadenado {
     /// Es una propiedad del modelo **con el razonamiento encendido**. Apagado,
     /// el mismo modelo entrega 30/30. La cura no es un campo en la petición
     /// —que ningún harness manda— sino **otro tag**, con el razonamiento
-    /// apagado dentro del modelo.
+    /// apagado dentro del modelo: `examples/derivar-nothink.rs` lo deriva y
+    /// `docs/modelo-del-nivel-1.md` dice por qué va ahí y no en el proxy.
     PensoSinContestar,
     /// Contestó sin el centinela por ninguna parte: ignoró el resultado.
     Ignoro,
