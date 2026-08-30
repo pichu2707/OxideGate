@@ -618,14 +618,44 @@ async fn examinar(cliente: &reqwest::Client, puerto: &str, modelo: &str, n: usiz
 /// pureza. Un 3% de llamadas a ciegas contra encargos al 67-100% discrimina de
 /// sobra; un modelo que llame igual al saludo que al encargo, no.
 ///
-/// El margen es **el doble**: el suelo tiene que quedar por debajo de la mitad
-/// del encargo más flojo. Sin encargos no hay con qué comparar, y entonces solo
-/// vale un suelo limpio.
+/// El margen es **el doble**: un suelo sucio tiene que quedar por debajo de la
+/// mitad del encargo más flojo. Sin encargos no hay con qué comparar, y entonces
+/// solo vale un suelo limpio.
+///
+/// # Contra qué encargo se compara, que es donde estaba el fallo
+///
+/// Un encargo que **no supera al suelo** no está contaminado por él: es
+/// indistinguible de él. Meterlo en la comparación era la E-012.
+///
+/// Lo destapó el candidato del nivel 1, `qwen3:14b` con el razonamiento apagado:
+/// techo 30/30, `averigua` 30/30, el resto 0/30, **suelo 0/30**. La regla
+/// comparaba contra el encargo más flojo —un 0— y suspendía por `0 * 2 < 0`,
+/// acusando de «llamar a ciegas» a un modelo que no llamó ni una vez ante el
+/// saludo. Es la E-007 otra vez: **medir mejor empeoraba el veredicto**.
+///
+/// Así que el suelo se compara contra **el encargo más flojo DE LOS QUE LO
+/// SUPERAN**. El margen del doble sigue aplicándose donde hace falta —contra la
+/// tasa real más baja que la batería sea capaz de distinguir— y deja de
+/// aplicarse contra tasas que no dicen nada.
+///
+/// # Por qué no vale con tratar aparte el suelo limpio
+///
+/// Fue el primer intento y **dejaba el fallo a una llamada de distancia**: con
+/// `suelo = 1` y encargos `[30, 0, 0, 0]`, la regla volvía a comparar contra el 0
+/// y volvía a suspender. La E-011 deja establecido que estas tasas se mueven
+/// entre ejecuciones idénticas, así que ese `1` llega solo. Arreglar el borde en
+/// vez de la comparación es aplazar la errata, no corregirla.
+///
+/// Lo que sí sigue suspendiendo: que **ningún** encargo supere al suelo. Ahí no
+/// hay nada que discriminar y no hay rango que publicar.
 fn suelo_discrimina(suelo: usize, encargos: &[usize]) -> bool {
-    let Some(minimo) = encargos.iter().min().copied() else {
+    if encargos.is_empty() {
         return suelo == 0;
+    }
+    let Some(minimo_por_encima) = encargos.iter().copied().filter(|e| *e > suelo).min() else {
+        return false;
     };
-    suelo * 2 < minimo
+    suelo * 2 < minimo_por_encima
 }
 
 /// Comprueba las dos anclas de un modelo. `Err` lleva el motivo del aborto.
@@ -649,6 +679,17 @@ fn anclas_validas(m: &Medida, n: usize) -> Result<(), String> {
     let encargos = m.tasas_de_encargo();
     match m.cuenta_de(Papel::Suelo) {
         None => Err("la batería no tiene ancla de suelo".to_string()),
+        Some(s)
+            if !suelo_discrimina(s.emitida, &encargos)
+                && !encargos.iter().any(|e| *e > s.emitida) =>
+        {
+            Err(format!(
+                "{}: ningún encargo superó al suelo — {}/{n} ante el saludo y ninguna\n\
+                 redacción por encima. Solo llama cuando se le NOMBRA la herramienta,\n\
+                 así que no hay iniciativa que medir ni rango que publicar.",
+                m.modelo, s.emitida
+            ))
+        }
         Some(s) if !suelo_discrimina(s.emitida, &encargos) => Err(format!(
             "{}: el SUELO emitió {}/{n} llamadas ante un saludo, sin tarea ni fichero,\n\
              y el encargo más flojo dio {}/{n}. El suelo no queda lo bastante por\n\
@@ -1192,6 +1233,57 @@ mod tests {
     #[test]
     fn un_modelo_que_no_llama_nunca_no_discrimina() {
         assert!(!suelo_discrimina(0, &[0, 0]));
+    }
+
+    /// **La regresión de la E-012.** Un suelo LIMPIO con un encargo al máximo
+    /// discrimina todo lo que se puede discriminar, aunque otro encargo esté a
+    /// cero. La regla anterior miraba el mínimo y lo suspendía por `0 * 2 < 0`.
+    ///
+    /// Es el perfil real del candidato del nivel 1: sin razonamiento no tiene
+    /// iniciativa salvo cuando se le nombra la herramienta o se le dice
+    /// «averigua», y el suelo le sale impecable.
+    #[test]
+    fn un_suelo_limpio_pasa_aunque_el_encargo_mas_flojo_sea_cero() {
+        assert!(
+            suelo_discrimina(0, &[30, 0, 0, 0]),
+            "30/30 contra 0/30 es la discriminación máxima, no un fallo del ancla"
+        );
+    }
+
+    /// **El fallo que dejaba el primer arreglo, a una llamada de distancia.**
+    /// Tratar aparte el suelo limpio no bastaba: con una sola llamada suelta la
+    /// regla volvía a comparar contra el encargo a 0 y volvía a suspender.
+    ///
+    /// La E-011 establece que estas tasas se mueven entre ejecuciones idénticas,
+    /// así que este caso no es hipotético: es el mismo modelo, otro día.
+    #[test]
+    fn una_llamada_suelta_en_el_suelo_no_resucita_la_e_012() {
+        assert!(
+            suelo_discrimina(1, &[30, 0, 0, 0]),
+            "1/30 contra 30/30 sigue discriminando"
+        );
+        assert!(
+            suelo_discrimina(5, &[30, 0, 0, 0]),
+            "5/30 contra 30/30 también"
+        );
+        assert!(
+            !suelo_discrimina(15, &[30, 0, 0, 0]),
+            "15/30 ya no queda por debajo de la mitad"
+        );
+    }
+
+    /// Y el suelo sucio se sigue juzgando contra el encargo más flojo: relajarlo
+    /// al más fuerte dejaría colarse a un modelo a medio camino.
+    #[test]
+    fn un_suelo_sucio_se_sigue_juzgando_contra_el_encargo_mas_flojo() {
+        assert!(
+            !suelo_discrimina(10, &[20, 30]),
+            "la mitad exacta del flojo no basta"
+        );
+        assert!(
+            !suelo_discrimina(10, &[20, 90]),
+            "un encargo fuerte no rescata un suelo sucio"
+        );
     }
 
     /// Sin encargos no hay con qué comparar, así que solo vale un suelo limpio.
