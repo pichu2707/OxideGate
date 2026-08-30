@@ -28,3 +28,8 @@ __pycache__/
 # Salida de las corridas del corredor del nivel 1 (#121): rastros del harness
 # por repeticion. Son basura de ejecucion, no artefactos del proyecto.
 rastros-corredor/
+
+# Datos por repeticion que escribe el corredor del nivel 1 (#121/#122). Son
+# medidas de una corrida concreta, no artefactos del proyecto: el informe se
+# regenera corriendo el corredor otra vez.
+datos-corredor.jsonl
