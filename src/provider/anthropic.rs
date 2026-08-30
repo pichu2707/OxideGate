@@ -209,7 +209,6 @@ impl Provider for Anthropic {
         }
     }
 
-    /// Anthropic es el unico dialecto verificado en el cable hoy.
     /// Dialecto SSE: el JSON va tras `data:`. Se declara explícitamente
     /// porque el trait no da default — ver `Provider::payload_de_linea`.
     fn payload_de_linea<'a>(&self, linea: &'a str) -> Option<&'a str> {

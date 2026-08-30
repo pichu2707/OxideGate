@@ -48,6 +48,175 @@ pub static OPENAI_CHAT: OpenAiChat = OpenAiChat;
 pub static OPENAI_RESPONSES: OpenAiResponses = OpenAiResponses;
 pub static OPENAI_CODEX_RESPONSES: OpenAiCodexResponses = OpenAiCodexResponses;
 
+/// Registra las invocaciones de un array `tool_calls` del dialecto de chat.
+///
+/// **Solo cuenta cuando `function.name` viene y no está vacío**, y esa condición
+/// es la que impide contar de más: en streaming el nombre llega UNA vez y los
+/// chunks siguientes repiten el mismo `index` troceando `arguments` sin nombre.
+/// Contar por elemento del array multiplicaría cada llamada por el número de
+/// trozos que tenga su argumento.
+///
+/// Capturado el 2026-08-30 contra ollama 0.30.10, que manda nombre y argumentos
+/// en el mismo chunk. La condición cubre las dos formas.
+fn registra_tool_calls(arr: &Value, calls: &mut ToolCalls, es_delta: bool) {
+    let Some(items) = arr.as_array() else {
+        return;
+    };
+    for it in items {
+        let nombre = it
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+            .filter(|n| !n.is_empty());
+
+        match nombre {
+            Some(n) => calls.push_invoked(n),
+            // En un DELTA, una entrada sin nombre es lo normal: es un trozo de
+            // `arguments` de una llamada ya contada. Contarla seria multiplicar
+            // la llamada por sus trozos.
+            None if es_delta => {}
+            // En el cuerpo COMPLETO no hay trozos: cada entrada de
+            // `message.tool_calls` es una llamada entera, y una sin nombre es
+            // una invocacion que existio y no se puede nombrar. Dejarla caer
+            // publicaria «no se invoco nada» sobre un turno que si invoco.
+            None => calls.push_invoked_sin_atribuir(),
+        }
+    }
+}
+
+/// Registra un item del `output` de la Responses API.
+///
+/// # Las tres familias, observadas en tráfico real
+///
+/// Los tipos y sus formas se observaron sobre **203 items de 18 sesiones reales
+/// de Codex contra OpenAI** (2026-08-30). Los cuerpos no se versionan —son
+/// privados— pero los conjuntos de claves sí son los observados, y son lo que
+/// decide la clasificación:
+///
+/// | `type` | claves | ¿trae `name`? | qué es |
+/// |---|---|---|---|
+/// | `function_call` | `arguments`, `call_id`, `id`, **`name`**, `namespace` | **sí** | herramienta de CLIENTE |
+/// | `web_search_call` | `action`, `id`, `status` | **no** | herramienta de SERVIDOR |
+/// | `tool_search_call` | `arguments`, `call_id`, `id`, `status`, **`execution: "client"`** | **no** | NO es una invocación |
+///
+/// Y ni un solo item que **no** fuera invocación acababa en `_call`: los
+/// resultados son `function_call_output` y `tool_search_output`, y el resto son
+/// `message` y `reasoning`. Eso es lo que hace que la red de abajo se pueda
+/// tender por sufijo sin tragarse falsos positivos.
+///
+/// # Por qué `web_search_call` no pasa por `push_invoked`
+///
+/// **No trae `name`**: su identidad ES el tipo. Y la ejecuta el proveedor, no el
+/// agente, así que no sale de la configuración MCP del usuario y no debe entrar
+/// en el recuento que alimenta al recomendador — que es exactamente para lo que
+/// existe [`ToolCalls::server_invoked`].
+///
+/// # Por qué `tool_search_call` no cuenta como invocación
+///
+/// Es `execution: "client"` y no invoca ninguna herramienta: es el handshake de
+/// **carga diferida** con el que el cliente pide los esquemas que dejó fuera.
+/// OxideGate ya mide ese fenómeno en el campo `tool_search`
+/// (`telemetry-per-request.md` §4.3). Contarlo aquí lo publicaría **dos veces
+/// en dos campos que significan cosas distintas**, y además inflaría `invoked`
+/// con algo que no es una herramienta del usuario.
+///
+/// # Lo que queda fuera, y por qué se cuenta igual
+///
+/// De la familia de herramientas integradas solo se ha observado
+/// `web_search_call`. `file_search_call`, `code_interpreter_call` y compañía
+/// **no se han capturado**, así que no se les inventa nombre. Pero dejarlas
+/// pasar en silencio publicaría «no se invocó nada» sobre un turno que sí
+/// invocó, que es el falso negativo exacto que `captura_invocaciones` existe
+/// para evitar. Se cuentan como **vistas y no atribuidas**: sube
+/// `invoked_total` sin entrar en `invoked`, y la fila queda descalificada como
+/// prueba de no-uso. Ver [`ToolCalls::invoked_unattributed`].
+/// ¿No se ha contado NADA todavía en este escaneo?
+///
+/// Se miran los tres contadores porque los tres son «se vio una invocación»:
+/// las atribuidas, las de servidor y las que no se pudieron atribuir.
+fn nada_contado(calls: &ToolCalls) -> bool {
+    calls.invoked_total == 0 && calls.server_invoked_total == 0 && calls.invoked_unattributed == 0
+}
+
+/// Registra un `function_call`, resolviendo **de quién es** la herramienta.
+///
+/// # El nombre llega DESNUDO, y eso es una trampa conocida
+///
+/// `push_invoked` deduce el servidor del nombre por la convención
+/// `mcp__<server>__<tool>`. Medido sobre las 32 invocaciones reales del corpus,
+/// **las 32 llegan con el nombre desnudo** (`mem_search`, no
+/// `mcp__engram__mem_search`), y 24 de ellas traen el servidor en un campo
+/// hermano: `namespace: "mcp__engram"`.
+///
+/// Pasarlas todas por la convención de nombres las acreditaría a `(native)` en
+/// el 100% de los casos: **el servidor real aparecería sin usar y el
+/// recomendador aconsejaría borrar justo el que se invoca en cada turno**. Es
+/// exactamente el agujero que `anthropic.rs` documenta para `mcp_tool_use`, y
+/// no era un «no lo sé»: era una atribución falsa y muda.
+///
+/// # Lo que está verificado y lo que no
+///
+/// `namespace` se observó en los items que **Codex persiste** en sus rollouts,
+/// junto a campos que son claramente internos suyos
+/// (`internal_chat_message_metadata_passthrough`). **No se ha podido confirmar
+/// que viaje en el cable.** Por eso se trata como un extra defensivo: si viene,
+/// evita la atribución falsa; si no viene nunca, esta rama no se ejecuta y no
+/// cambia nada. Lo que NO se hace es dar por bueno `(native)` sobre un nombre
+/// desnudo que pudo salir de cualquier servidor.
+fn registra_function_call(item: &Value, calls: &mut ToolCalls) {
+    let Some(nombre) = item
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|n| !n.is_empty())
+    else {
+        // Un `function_call` SIN nombre es una invocación que existió y no se
+        // puede nombrar. Dejarla caer publicaría «no se invocó nada» sobre un
+        // turno que sí invocó — el falso negativo que este módulo entero existe
+        // para evitar—, y encima sería MÁS permisivo con un tipo conocido que
+        // con uno desconocido, que sí se cuenta más abajo.
+        calls.push_invoked_sin_atribuir();
+        return;
+    };
+
+    match item.get("namespace").and_then(Value::as_str) {
+        // `mcp__<server>`: el servidor viene DADO, no deducido.
+        Some(ns) => match ns.strip_prefix("mcp__").filter(|s| !s.is_empty()) {
+            Some(servidor) => calls.push_invoked_de(nombre, servidor, ToolServerKind::Mcp),
+            // Hay namespace, así que la herramienta NO es nativa — pero su
+            // forma no se ha visto y no se sabe a quién acreditarla.
+            // `(native)` sería una atribución falsa; se cuenta sin atribuir.
+            None => calls.push_invoked_sin_atribuir(),
+        },
+        // Sin namespace: la convención del nombre es lo único que hay, y para
+        // una herramienta nativa de verdad da `(native)`, que es correcto.
+        None => calls.push_invoked(nombre),
+    }
+}
+
+fn registra_item_de_salida(item: &Value, calls: &mut ToolCalls) {
+    let tipo = item.get("type").and_then(Value::as_str).unwrap_or_default();
+
+    match tipo {
+        "function_call" => registra_function_call(item, calls),
+
+        // La ejecuta el PROVEEDOR. Su nombre es el tipo sin el sufijo, porque
+        // el item no trae ninguno.
+        "web_search_call" => calls.push_server_invoked("web_search"),
+
+        // Deliberadamente NADA: no es una invocación. Ver el doc de arriba.
+        "tool_search_call" => {}
+
+        // La convención de la Responses API para una invocación es
+        // `<algo>_call`, y en el corpus observado ningún item que no lo fuera
+        // acababa así. Lo que caiga aquí es una invocación cuya forma no se ha
+        // capturado: se cuenta, y no se le inventa identidad.
+        otro if otro.ends_with("_call") => calls.push_invoked_sin_atribuir(),
+
+        // `message`, `reasoning`, `function_call_output`, `tool_search_output`…
+        _ => {}
+    }
+}
+
 impl Provider for OpenAiChat {
     fn name(&self) -> &'static str {
         "openai"
@@ -138,17 +307,40 @@ impl Provider for OpenAiChat {
         extract_openai_usage(value, usage);
     }
 
-    /// OpenAI NO publica invocaciones en esta fila. Mismo criterio que en
-    /// Gemini: su dialecto las manda como `tool_calls` (Chat Completions) o
-    /// como items `function_call` (Responses API), formas distintas de la de
-    /// Anthropic que no se capturaron todavía contra tráfico real.
+    /// Las invocaciones viven en `tool_calls`, y en DOS sitios que nunca
+    /// coinciden: `delta` cuando hay stream y `message` cuando no. Un chunk
+    /// trae solo `delta`; un cuerpo completo trae solo `message`.
     ///
-    /// Listas vacías significan "no se reconoció ninguna invocación", nunca
-    /// "el modelo no invocó nada".
-    fn extract_tool_use(&self, _value: &Value, _calls: &mut ToolCalls) {}
+    /// Capturado contra tráfico real el 2026-08-30 (ollama 0.30.10,
+    /// `/v1/chat/completions`, una herramienta declarada). Ver
+    /// [`registra_tool_calls`] para por qué se filtra por `function.name`.
+    fn extract_tool_use(&self, value: &Value, calls: &mut ToolCalls) {
+        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+            return;
+        };
+        for choice in choices {
+            for campo in ["delta", "message"] {
+                if let Some(tc) = choice.get(campo).and_then(|c| c.get("tool_calls")) {
+                    registra_tool_calls(tc, calls, campo == "delta");
+                }
+            }
+            // `finish_reason` no nulo es la marca de fin de este dialecto.
+            //
+            // **`[DONE]` no sirve**: `provider::payload_sse` lo filtra antes de
+            // llegar aquí, así que el extractor nunca lo ve. Sin esta marca,
+            // un turno cortado a mitad sería indistinguible de uno completo
+            // sin invocaciones — que es justo lo que `complete` existe para
+            // separar.
+            if choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .is_some_and(|r| !r.is_empty())
+            {
+                calls.marca_completa();
+            }
+        }
+    }
 
-    /// Dialecto no capturado todavia: la fila publica `None`, no listas
-    /// vacias. Ver [`Provider::captura_invocaciones`].
     /// Dialecto SSE: el JSON va tras `data:`. Se declara explícitamente
     /// porque el trait no da default — ver `Provider::payload_de_linea`.
     fn payload_de_linea<'a>(&self, linea: &'a str) -> Option<&'a str> {
@@ -156,7 +348,7 @@ impl Provider for OpenAiChat {
     }
 
     fn captura_invocaciones(&self) -> bool {
-        false
+        true
     }
 
     /// Desglosa el body de `/v1/chat/completions`. A diferencia de
@@ -337,17 +529,67 @@ impl Provider for OpenAiResponses {
         extract_openai_usage(value, usage);
     }
 
-    /// OpenAI NO publica invocaciones en esta fila. Mismo criterio que en
-    /// Gemini: su dialecto las manda como `tool_calls` (Chat Completions) o
-    /// como items `function_call` (Responses API), formas distintas de la de
-    /// Anthropic que no se capturaron todavía contra tráfico real.
+    /// Las invocaciones llegan como items `function_call`, y hay **dos formas
+    /// de contarlas dos veces**. Las dos salieron al capturar, no de leer la
+    /// especificación (ollama 0.30.10, `/v1/responses`, 2026-08-30):
     ///
-    /// Listas vacías significan "no se reconoció ninguna invocación", nunca
-    /// "el modelo no invocó nada".
-    fn extract_tool_use(&self, _value: &Value, _calls: &mut ToolCalls) {}
+    /// 1. `response.output_item.added` y `response.output_item.done` traen el
+    ///    **mismo** item. Se registra en `added` —cuando el modelo la emite— y
+    ///    `done` se ignora explícitamente.
+    /// 2. El evento `response.completed` **anida el `output[]` entero** bajo
+    ///    `response`. Por eso la rama del cuerpo completo mira `output` solo en
+    ///    el NIVEL 1: ningún evento del stream lo tiene ahí, así que las dos
+    ///    ramas no se solapan.
+    fn extract_tool_use(&self, value: &Value, calls: &mut ToolCalls) {
+        match value.get("type").and_then(Value::as_str) {
+            Some("response.output_item.added") => {
+                if let Some(item) = value.get("item") {
+                    registra_item_de_salida(item, calls);
+                }
+                return;
+            }
+            // Trae el MISMO item que `added`. Contar los dos duplicaría cada
+            // llamada, y la lista resultante diría el doble de lo que hubo.
+            Some("response.output_item.done") => return,
+            // Su `response.output[]` ya se contó en los `added`, y volver a
+            // recorrerlo sería la duplicación (2) — SALVO que no se haya
+            // contado nada.
+            //
+            // Esa red existe porque el peor fallo posible de este módulo es
+            // publicar `complete: true` con la lista vacía sobre un turno que
+            // SÍ invocó: eso no es «no lo sé», es una afirmación positiva de
+            // no-uso, y es la que hace que el recomendador aconseje borrar un
+            // servidor que se usa. Si por lo que sea no llegó ningún `added`
+            // —otro upstream del dialecto, un evento perdido—, aquí se rescata.
+            //
+            // No puede duplicar: solo entra cuando los tres contadores están a
+            // cero, o sea cuando no hay nada que duplicar.
+            Some("response.completed") => {
+                if nada_contado(calls) {
+                    if let Some(salida) =
+                        value.pointer("/response/output").and_then(Value::as_array)
+                    {
+                        for item in salida {
+                            registra_item_de_salida(item, calls);
+                        }
+                    }
+                }
+                calls.marca_completa();
+                return;
+            }
+            _ => {}
+        }
 
-    /// Dialecto no capturado todavia: la fila publica `None`, no listas
-    /// vacias. Ver [`Provider::captura_invocaciones`].
+        // Cuerpo completo, sin stream. Si `finish()` llegó a deserializarlo, no
+        // faltó nada — mismo criterio que Anthropic.
+        if let Some(salida) = value.get("output").and_then(Value::as_array) {
+            for item in salida {
+                registra_item_de_salida(item, calls);
+            }
+            calls.marca_completa();
+        }
+    }
+
     /// Dialecto SSE: el JSON va tras `data:`. Se declara explícitamente
     /// porque el trait no da default — ver `Provider::payload_de_linea`.
     fn payload_de_linea<'a>(&self, linea: &'a str) -> Option<&'a str> {
@@ -355,7 +597,7 @@ impl Provider for OpenAiResponses {
     }
 
     fn captura_invocaciones(&self) -> bool {
-        false
+        true
     }
 
     /// Desglosa el body de `/v1/responses`. `instructions` → `system_bytes`
@@ -749,6 +991,363 @@ fn extract_openai_usage(value: &Value, usage: &mut Usage) {
 mod tests {
     use super::super::NATIVE_TOOLS_LABEL;
     use super::*;
+
+    /// Los dos streams REALES, capturados con `curl` contra ollama 0.30.10 el
+    /// 2026-08-30 y versionados sin tocar.
+    ///
+    /// No son cuerpos escritos a mano: un fixture construido por quien escribe
+    /// el extractor solo demuestra que el autor es coherente consigo mismo, y
+    /// este proyecto ya pagó esa lección una vez (`derivar-nothink.rs`).
+    const SSE_CHAT: &str = include_str!("fixtures/openai-chat-tool-call.sse");
+    const SSE_RESPONSES: &str = include_str!("fixtures/openai-responses-tool-call.sse");
+
+    /// Reproduce lo que hace el escáner: por cada línea, el payload del
+    /// dialecto, y si es JSON se lo pasa al extractor.
+    fn reproducir(p: &dyn Provider, sse: &str) -> ToolCalls {
+        let mut calls = ToolCalls::default();
+        for linea in sse.lines() {
+            let Some(payload) = p.payload_de_linea(linea) else {
+                continue;
+            };
+            if let Ok(v) = serde_json::from_str::<Value>(payload) {
+                p.extract_tool_use(&v, &mut calls);
+            }
+        }
+        calls
+    }
+
+    #[test]
+    fn el_stream_real_de_chat_da_exactamente_una_invocacion() {
+        let calls = reproducir(&OpenAiChat, SSE_CHAT);
+        assert_eq!(calls.invoked_total, 1, "{:?}", calls.invoked);
+        assert_eq!(calls.invoked.len(), 1);
+        assert_eq!(calls.invoked[0].name, "leer_fichero");
+        assert!(calls.complete, "`finish_reason` no marco el fin del turno");
+    }
+
+    /// El test que vale por todos los demás de este dialecto.
+    ///
+    /// El stream real trae el MISMO `function_call` **tres veces**: en
+    /// `output_item.added`, en `output_item.done`, y otra vez dentro del
+    /// `response.output[]` que anida `response.completed`. Un extractor
+    /// ingenuo publica 3 donde hubo 1.
+    #[test]
+    fn el_stream_real_de_responses_no_cuenta_la_misma_llamada_tres_veces() {
+        // El item aparece TRES veces en el stream real. Se cuenta por
+        // `type":"function_call"` y no por el nombre: el nombre sale 6 veces
+        // porque los eventos `response.created` e `in_progress` anidan tambien
+        // las `tools` DECLARADAS, que es el otro lado del dato y no una
+        // invocacion.
+        assert_eq!(
+            SSE_RESPONSES.matches("\"type\":\"function_call\"").count(),
+            3,
+            "el fixture ya no reproduce la triple aparicion: recapturar"
+        );
+
+        let calls = reproducir(&OpenAiResponses, SSE_RESPONSES);
+        assert_eq!(calls.invoked_total, 1, "{:?}", calls.invoked);
+        assert_eq!(calls.invoked.len(), 1);
+        assert_eq!(calls.invoked[0].name, "leer_fichero");
+        assert!(calls.complete, "`response.completed` no marco el fin");
+    }
+
+    /// La ruta de Codex delega en `OPENAI_RESPONSES`: arreglar uno arregla los
+    /// dos, y este test lo fija para que nadie los separe sin darse cuenta.
+    #[test]
+    fn la_ruta_de_codex_hereda_el_extractor_de_responses() {
+        let calls = reproducir(&OpenAiCodexResponses, SSE_RESPONSES);
+        assert_eq!(calls.invoked_total, 1);
+        assert!(OpenAiCodexResponses.captura_invocaciones());
+    }
+
+    #[test]
+    fn los_tres_dialectos_declaran_que_ya_miden() {
+        assert!(OpenAiChat.captura_invocaciones());
+        assert!(OpenAiResponses.captura_invocaciones());
+        assert!(OpenAiCodexResponses.captura_invocaciones());
+    }
+
+    /// En streaming el nombre llega UNA vez y los chunks siguientes trocean
+    /// `arguments` repitiendo el `index` sin nombre. Contar por elemento del
+    /// array multiplicaría la llamada por el número de trozos.
+    #[test]
+    fn los_chunks_de_argumentos_sin_nombre_no_vuelven_a_contar() {
+        let mut calls = ToolCalls::default();
+        let primero = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"function":{"name":"leer_fichero","arguments":"{\"ru"}}]},"finish_reason":null}]});
+        let sigue = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"function":{"arguments":"ta\":\"a.py\"}"}}]},"finish_reason":null}]});
+        let vacio = serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[
+            {"index":0,"function":{"name":"","arguments":"x"}}]},"finish_reason":null}]});
+        for v in [&primero, &sigue, &vacio] {
+            OpenAiChat.extract_tool_use(v, &mut calls);
+        }
+        assert_eq!(calls.invoked_total, 1, "{:?}", calls.invoked);
+    }
+
+    #[test]
+    fn el_cuerpo_sin_stream_de_chat_se_lee_de_message() {
+        let mut calls = ToolCalls::default();
+        let v = serde_json::json!({"choices":[{"index":0,"message":{"role":"assistant",
+            "tool_calls":[{"id":"c1","type":"function","function":{"name":"leer_fichero",
+            "arguments":"{}"}}]},"finish_reason":"tool_calls"}]});
+        OpenAiChat.extract_tool_use(&v, &mut calls);
+        assert_eq!(calls.invoked_total, 1);
+        assert!(calls.complete);
+    }
+
+    #[test]
+    fn el_cuerpo_sin_stream_de_responses_se_lee_del_output_de_nivel_1() {
+        let mut calls = ToolCalls::default();
+        let v = serde_json::json!({"object":"response","status":"completed",
+            "output":[{"type":"function_call","name":"leer_fichero"},
+                      {"type":"message","content":[]}]});
+        OpenAiResponses.extract_tool_use(&v, &mut calls);
+        assert_eq!(calls.invoked_total, 1);
+        assert_eq!(calls.invoked[0].name, "leer_fichero");
+        assert!(calls.complete);
+    }
+
+    /// Un turno cortado a mitad NO puede publicar `complete`: sus listas son un
+    /// prefijo, y una fila así no sirve para concluir que un servidor no se usa.
+    #[test]
+    fn un_stream_cortado_a_mitad_no_se_marca_completo() {
+        let cortado: String = SSE_CHAT
+            .lines()
+            .take_while(|l| !l.contains("\"finish_reason\":\"tool_calls\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let calls = reproducir(&OpenAiChat, &cortado);
+        assert_eq!(calls.invoked_total, 1, "la llamada vista si cuenta");
+        assert!(
+            !calls.complete,
+            "un prefijo no puede decir que se escaneo entero"
+        );
+    }
+
+    /// Envuelve un item como llega en el stream, para no repetir la forma.
+    fn evento_con(item: Value) -> Value {
+        serde_json::json!({"type":"response.output_item.added","item":item})
+    }
+
+    /// `web_search_call` la ejecuta el PROVEEDOR y **no trae `name`** (sus
+    /// claves reales son `action`/`id`/`status`). Va a `server_invoked`, que es
+    /// la lista que NO alimenta al recomendador de MCP: no sale de la config
+    /// del usuario.
+    #[test]
+    fn la_busqueda_web_cuenta_como_herramienta_de_servidor() {
+        let mut calls = ToolCalls::default();
+        OpenAiResponses.extract_tool_use(
+            &evento_con(serde_json::json!({
+                "type":"web_search_call","id":"ws_1","status":"completed",
+                "action":{"type":"search"}})),
+            &mut calls,
+        );
+        assert_eq!(calls.server_invoked, vec!["web_search".to_string()]);
+        assert_eq!(calls.server_invoked_total, 1);
+        assert!(
+            calls.invoked.is_empty() && calls.invoked_total == 0,
+            "una herramienta de servidor no puede contar como del usuario"
+        );
+    }
+
+    /// `tool_search_call` es `execution: "client"` y NO invoca nada: es el
+    /// handshake de carga diferida, que OxideGate ya mide en el campo
+    /// `tool_search`. Contarlo aquí publicaría el mismo fenómeno dos veces en
+    /// dos campos que significan cosas distintas.
+    #[test]
+    fn el_handshake_de_carga_diferida_no_es_una_invocacion() {
+        let mut calls = ToolCalls::default();
+        OpenAiResponses.extract_tool_use(
+            &evento_con(serde_json::json!({
+                "type":"tool_search_call","id":"ts_1","call_id":"c1",
+                "status":"completed","execution":"client","arguments":"{}"})),
+            &mut calls,
+        );
+        assert_eq!(calls.invoked_total, 0);
+        assert_eq!(calls.invoked_unattributed, 0);
+        assert_eq!(calls.server_invoked_total, 0);
+    }
+
+    /// Una integrada NO capturada no se ignora ni se inventa: se cuenta como
+    /// vista y no atribuida, y eso descalifica la fila como prueba de no-uso.
+    #[test]
+    fn una_invocacion_integrada_sin_capturar_no_se_ignora_ni_se_inventa() {
+        let mut calls = ToolCalls::default();
+        OpenAiResponses.extract_tool_use(
+            &evento_con(serde_json::json!({
+                "type":"file_search_call","id":"fs_1","status":"completed"})),
+            &mut calls,
+        );
+        assert_eq!(calls.invoked_total, 1, "una invocacion vista no se ignora");
+        assert_eq!(calls.invoked_unattributed, 1);
+        assert!(
+            calls.invoked.is_empty(),
+            "no se le inventa nombre ni servidor"
+        );
+        assert!(
+            calls.server_invoked.is_empty(),
+            "tampoco se le inventa servidor"
+        );
+    }
+
+    /// Los `*_output` son RESULTADOS, no invocaciones, y viajan en `input[]`.
+    /// Si alguno se colara en un `output[]` no debe contar — y no acaban en
+    /// `_call`, que es justo lo que hace segura la red por sufijo.
+    #[test]
+    fn los_resultados_no_cuentan_como_invocaciones() {
+        let mut calls = ToolCalls::default();
+        for tipo in ["function_call_output", "tool_search_output"] {
+            OpenAiResponses.extract_tool_use(
+                &evento_con(serde_json::json!({"type":tipo,"id":"x"})),
+                &mut calls,
+            );
+        }
+        assert_eq!(calls.invoked_total, 0);
+        assert_eq!(calls.invoked_unattributed, 0);
+        assert_eq!(calls.server_invoked_total, 0);
+    }
+
+    /// El fallo que la revisión cazó, y el peor de este módulo: una llamada MCP
+    /// llega con el nombre DESNUDO y el servidor en `namespace`. Pasarla por la
+    /// convención de nombres la acredita a `(native)`, el servidor real aparece
+    /// sin usar, y el recomendador aconseja borrar justo el que se invoca en
+    /// cada turno. Medido: 24 de 32 invocaciones reales traen `mcp__engram`.
+    #[test]
+    fn una_llamada_mcp_no_se_acredita_a_native() {
+        let mut calls = ToolCalls::default();
+        OpenAiResponses.extract_tool_use(
+            &evento_con(serde_json::json!({
+                "type":"function_call","name":"mem_search","namespace":"mcp__engram",
+                "call_id":"c1","arguments":"{}"})),
+            &mut calls,
+        );
+        assert_eq!(calls.invoked.len(), 1);
+        assert_eq!(calls.invoked[0].name, "mem_search");
+        assert_eq!(
+            calls.invoked[0].server, "engram",
+            "el servidor viene DADO en namespace, no se deduce del nombre"
+        );
+        assert_ne!(calls.invoked[0].server, NATIVE_TOOLS_LABEL);
+    }
+
+    #[test]
+    fn sin_namespace_la_convencion_del_nombre_sigue_mandando() {
+        let mut calls = ToolCalls::default();
+        OpenAiResponses.extract_tool_use(
+            &evento_con(serde_json::json!({"type":"function_call","name":"shell"})),
+            &mut calls,
+        );
+        assert_eq!(calls.invoked[0].server, NATIVE_TOOLS_LABEL);
+    }
+
+    /// Un `namespace` de forma no vista NO puede caer en `(native)`: eso seria
+    /// una atribucion falsa, no un «no lo se».
+    #[test]
+    fn un_namespace_desconocido_no_se_acredita_a_nadie() {
+        let mut calls = ToolCalls::default();
+        OpenAiResponses.extract_tool_use(
+            &evento_con(serde_json::json!({
+                "type":"function_call","name":"algo","namespace":"forma_nueva"})),
+            &mut calls,
+        );
+        assert_eq!(calls.invoked_unattributed, 1);
+        assert!(calls.invoked.is_empty());
+    }
+
+    /// Ser MAS permisivo con un tipo conocido que con uno desconocido era la
+    /// asimetria: un `function_call` sin nombre se caia sin contar, mientras
+    /// que un `*_call` cualquiera si contaba.
+    #[test]
+    fn un_function_call_sin_nombre_no_desaparece() {
+        let mut calls = ToolCalls::default();
+        OpenAiResponses.extract_tool_use(
+            &evento_con(serde_json::json!({"type":"function_call","call_id":"c1"})),
+            &mut calls,
+        );
+        assert_eq!(calls.invoked_total, 1);
+        assert_eq!(calls.invoked_unattributed, 1);
+    }
+
+    /// Misma asimetria del lado de chat, pero SOLO en el cuerpo completo: en un
+    /// delta, una entrada sin nombre es un trozo de `arguments`.
+    #[test]
+    fn en_chat_sin_nombre_cuenta_en_message_y_no_en_delta() {
+        let mut d = ToolCalls::default();
+        OpenAiChat.extract_tool_use(
+            &serde_json::json!({"choices":[{"delta":{"tool_calls":[
+                {"index":0,"function":{"arguments":"tro"}}]},"finish_reason":null}]}),
+            &mut d,
+        );
+        assert_eq!(
+            d.invoked_total, 0,
+            "un trozo de argumentos no es una llamada"
+        );
+
+        let mut m = ToolCalls::default();
+        OpenAiChat.extract_tool_use(
+            &serde_json::json!({"choices":[{"message":{"tool_calls":[
+                {"id":"c1","type":"function","function":{"arguments":"{}"}}]},
+                "finish_reason":"tool_calls"}]}),
+            &mut m,
+        );
+        assert_eq!(m.invoked_total, 1, "en el cuerpo completo no hay trozos");
+        assert_eq!(m.invoked_unattributed, 1);
+    }
+
+    /// Si no llegara ningun `output_item.added`, `response.completed` publicaria
+    /// `complete: true` con la lista VACIA sobre un turno que si invoco — una
+    /// afirmacion positiva de no-uso, que es el peor fallo posible aqui.
+    #[test]
+    fn si_falta_el_added_el_evento_de_fin_rescata_la_llamada() {
+        let mut calls = ToolCalls::default();
+        OpenAiResponses.extract_tool_use(
+            &serde_json::json!({"type":"response.completed","response":{"status":"completed",
+                "output":[{"type":"function_call","name":"leer_fichero"}]}}),
+            &mut calls,
+        );
+        assert_eq!(calls.invoked_total, 1, "la red de seguridad no salto");
+        assert!(calls.complete);
+    }
+
+    /// Y la red NO puede duplicar: con el stream entero, el `added` ya conto y
+    /// el evento de fin no vuelve a contar.
+    #[test]
+    fn la_red_de_seguridad_no_duplica_cuando_el_added_si_llego() {
+        let calls = reproducir(&OpenAiResponses, SSE_RESPONSES);
+        assert_eq!(calls.invoked_total, 1, "{:?}", calls.invoked);
+    }
+
+    /// El corpus real: TODA invocación acaba en `_call`, y NADA que no lo sea
+    /// acaba en `_call`. Es la condición que hace legítima la red por sufijo, y
+    /// este test la deja escrita para que se note si algún día deja de valer.
+    #[test]
+    fn el_corpus_observado_separa_invocaciones_por_el_sufijo() {
+        for t in ["function_call", "web_search_call", "tool_search_call"] {
+            assert!(t.ends_with("_call"), "{t} deberia acabar en _call");
+        }
+        for t in [
+            "message",
+            "reasoning",
+            "function_call_output",
+            "tool_search_output",
+        ] {
+            assert!(!t.ends_with("_call"), "{t} NO deberia acabar en _call");
+        }
+    }
+
+    /// `message` y `reasoning` no son invocaciones y no deben ensuciar nada.
+    #[test]
+    fn los_items_que_no_son_llamadas_no_cuentan() {
+        let mut calls = ToolCalls::default();
+        for tipo in ["message", "reasoning"] {
+            let v = serde_json::json!({"type":"response.output_item.added",
+                "item":{"type":tipo,"id":"x"}});
+            OpenAiResponses.extract_tool_use(&v, &mut calls);
+        }
+        assert_eq!(calls.invoked_total, 0);
+        assert_eq!(calls.invoked_unattributed, 0);
+    }
 
     /// OpenAI (con include_usage) manda el `usage` en el chunk final, con
     /// `prompt_tokens`/`completion_tokens` y `choices` vacío.

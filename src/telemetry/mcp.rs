@@ -22,8 +22,9 @@
 //! cuenta como prueba de NO-uso si supera las tres**:
 //!
 //! 1. **Tiene extractor.** `tool_calls: None` significa "este proveedor no
-//!    mide invocaciones", no "el modelo no invocó nada". Hoy solo Anthropic
-//!    lo tiene, y las filas anteriores al campo también son `None`.
+//!    mide invocaciones", no "el modelo no invocó nada". Hoy lo tienen
+//!    Anthropic y los dos dialectos de OpenAI; Gemini no. Las filas
+//!    anteriores al campo también son `None`.
 //! 2. **Se escaneó entera.** `complete: false` es un turno abortado o un
 //!    stream roto: la lista es un PREFIJO. No se puede concluir nada de una
 //!    ausencia en una lista incompleta.

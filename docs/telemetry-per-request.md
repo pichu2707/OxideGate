@@ -1548,19 +1548,89 @@ y por eso el campo lleva metadatos en vez de ser dos vectores pelados:
 | Qué pasó | Cómo se ve en la fila |
 |---|---|
 | El modelo invocó poco — el caso honesto | `complete: true`, `invoked_total == invoked.len()` |
-| **Este proveedor no tiene extractor** | `tool_calls` es **`null`**, no un objeto con listas vacías |
+| **Este proveedor no tiene extractor** (hoy: Gemini) | `tool_calls` es **`null`**, no un objeto con listas vacías |
 | **El escaneo se cortó** (turno abortado, stream roto) | `complete: false` — las listas son un PREFIJO |
 | **La lista se truncó** por el cupo | `invoked_total > invoked.len()` |
 
 **`null` no es lo mismo que listas vacías.** `null` dice "aquí no se midió";
 un objeto con `invoked: []` dice "se escaneó la respuesta entera y el modelo
 no invocó nada". Son afirmaciones distintas y la segunda es mucho más fuerte.
-Hoy solo Anthropic tiene extractor —Gemini y OpenAI usan formas distintas
-(`functionCall`, `tool_calls`, items `function_call`) que **no se han
-capturado contra tráfico real**— y las filas escritas antes de que el campo
-existiera también rehidratan como `null`. Fundir ambos casos en un vector
-vacío haría que cada una de esas filas contase como prueba de que un servidor
-no se usa.
+Hoy tienen extractor **Anthropic y los dos dialectos de OpenAI**
+(`/v1/chat/completions` y `/v1/responses`, y con ellos la ruta de Codex, que
+delega). **Gemini no** —su `functionCall` no se ha capturado contra tráfico
+real—, y las filas escritas antes de que el campo existiera también rehidratan
+como `null`. Fundir ambos casos en un vector vacío haría que cada una de esas
+filas contase como prueba de que un servidor no se usa.
+
+Los dos dialectos de OpenAI se capturaron el **2026-08-30** contra `ollama`
+0.30.10, y la captura destapó **dos formas de contar la misma llamada dos
+veces** que leyendo la especificación no se ven:
+
+1. En `/v1/responses`, los eventos `response.output_item.added` y
+   `response.output_item.done` traen el **mismo** item `function_call`. Se
+   registra en `added`; `done` se ignora.
+2. El evento `response.completed` **anida el `output[]` entero** bajo
+   `response`. Por eso el cuerpo sin stream se lee del `output` de **nivel 1**:
+   ningún evento del stream lo tiene ahí.
+
+Y una tercera del lado del framework: **`[DONE]` no sirve como marca de fin**,
+porque `payload_sse` lo filtra antes de llegar al extractor. En Chat
+Completions la marca es `finish_reason` no nulo; en Responses, el evento
+`response.completed`.
+
+### Las tres familias de items, observadas en tráfico real
+
+Los tipos y sus formas se observaron sobre **203 items de 18 sesiones reales de
+Codex contra OpenAI** (2026-08-30). Deciden la clasificación, y la forma importa
+tanto como el nombre:
+
+| `type` | claves | ¿trae `name`? | dónde cae |
+|---|---|---|---|
+| `function_call` | `arguments`, `call_id`, `id`, **`name`**, `namespace` | **sí** | `invoked` — herramienta de cliente |
+| `web_search_call` | `action`, `id`, `status` | **no** | `server_invoked` — la ejecuta el proveedor |
+| `tool_search_call` | `arguments`, `call_id`, `id`, `status`, **`execution: "client"`** | **no** | **en ningún sitio** |
+
+**`web_search_call` no puede pasar por `invoked`**: no trae `name` —su identidad
+es el tipo— y la ejecuta el proveedor, así que no sale de la configuración MCP
+del usuario y no debe entrar en el recuento del recomendador.
+
+**`tool_search_call` no es una invocación.** Es `execution: "client"` y no llama
+a ninguna herramienta: es el handshake de **carga diferida** con el que el
+cliente pide los esquemas que dejó fuera. Ese fenómeno ya se mide en el campo
+`tool_search` (§4.3); contarlo aquí lo publicaría **dos veces en dos campos que
+significan cosas distintas**.
+
+### El nombre llega DESNUDO, y por eso no basta la convención
+
+Las **32** invocaciones del corpus llegan con el nombre desnudo (`mem_search`,
+no `mcp__engram__mem_search`), y **24 de ellas traen el servidor en un campo
+hermano**: `namespace: "mcp__engram"`.
+
+Pasarlas todas por la convención de nombres las acreditaría a `(native)` en el
+100% de los casos: **el servidor real aparecería sin usar y el recomendador
+aconsejaría borrar justo el que se invoca en cada turno.** Es el mismo agujero
+que `anthropic.rs` documenta para `mcp_tool_use` — y no es un «no lo sé», es una
+atribución falsa y muda.
+
+Por eso un `function_call` con `namespace` se atribuye **con el servidor dado**,
+no deducido. Un `namespace` de forma no vista **no cae en `(native)`**: se cuenta
+sin atribuir.
+
+> `namespace` se observó en los items que **Codex persiste** en sus rollouts,
+> junto a campos claramente internos suyos. **No se ha confirmado que viaje en
+> el cable**, así que se trata como un extra defensivo: si viene, evita la
+> atribución falsa; si no viene nunca, esa rama no se ejecuta y nada cambia.
+
+**La red se tiende por el sufijo `_call`**, y el corpus dice por qué se puede:
+toda invocación acaba en `_call`, y ningún item que no lo fuera lo hacía — los
+resultados son `function_call_output` y `tool_search_output`, y el resto son
+`message` y `reasoning`.
+
+De la familia de integradas solo se ha observado `web_search_call`.
+`file_search_call`, `code_interpreter_call` y compañía **no se han capturado**,
+así que no se les inventa nombre ni servidor: caen en la red del sufijo y suben
+`invoked_total` e `invoked_unattributed` sin entrar en `invoked`. La fila queda
+descalificada como prueba de no-uso, que es lo único cierto que se sabe de ella.
 
 **`complete: false` no se puede deducir del `status`.** Es la trampa que
 parece obvia y no lo es: el `status` se captura de la respuesta del upstream
