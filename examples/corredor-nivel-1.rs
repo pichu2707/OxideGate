@@ -115,8 +115,24 @@ use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
+
+/// El PGID del harness que está corriendo **ahora mismo**, o 0 si no hay
+/// ninguno.
+///
+/// # Por qué hace falta un global para esto
+///
+/// `process_group(0)` saca al harness del grupo de primer plano de la terminal,
+/// así que el SIGINT del teclado **ya no le llega**. El manejador de Ctrl-C
+/// tiene que poder matarlo, y corre fuera del bucle que lo lanzó: este es el
+/// único sitio donde los dos se ven.
+///
+/// Sin esto, un Ctrl-C mataba solo al corredor y dejaba al harness huérfano —
+/// autenticado con el token real que hay en `/tmp`, gastando cuota y editando
+/// la tarea, sin topes que lo corten porque quien los mira acaba de morir.
+static PGID_VIVO: AtomicU32 = AtomicU32::new(0);
 
 /// El fichero que hay que reparar. Es el único que el harness debería tocar.
 const FUENTE: &str = "tarifa.py";
@@ -535,6 +551,68 @@ fn crear_privado(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Deja el `HOME` aislado de esta repetición **vacío y en 0700**.
+///
+/// # Por qué borrar y no solo crear
+///
+/// [`preparar`] borra el directorio de trabajo en cada repetición, pero `hogar`
+/// solo se creaba con `create_dir_all`, que acepta en silencio uno que ya
+/// existe. Y la raíz lleva un nombre predecible por PID que **nada limpia** si
+/// la corrida muere por SIGKILL, Ctrl-C o panic.
+///
+/// Como los PID se reciclan, una corrida de **nivel 2** matada dejaba su
+/// `auth.json` real ahí, y la siguiente —de nivel 1, que ni copia credenciales
+/// ni las espera— se lo encontraba puesto: un banco de coste cero con un token
+/// OAuth vivo dentro, capaz de gastar cuota sin que nada lo declare.
+fn preparar_hogar(hogar: &Path) -> std::io::Result<()> {
+    if hogar.exists() {
+        std::fs::remove_dir_all(hogar)?;
+    }
+    crear_privado(hogar)
+}
+
+/// Mata al **grupo** de procesos del harness, no solo al harness.
+///
+/// # Por qué `kill_on_drop` no basta
+///
+/// `kill_on_drop` mata al hijo DIRECTO. Los dos harnesses corren con
+/// `bash: allow` / `--approve`, así que lanzan nietos, y un nieto colgado
+/// sobrevivía al plazo: podía editar `rep-{i}/tarifa.py` entre el
+/// [`hash_fichero`] y el [`tests_pasan`] —falseando el veredicto— o correr
+/// contra el `remove_dir_all` del final. El comentario de `kill_on_drop`
+/// afirmaba más de lo que `kill_on_drop` da.
+///
+/// El hijo se lanza con `process_group(0)`, así que es líder de su grupo y su
+/// PID **es** el PGID. `kill -KILL -<pgid>` se lo lleva entero. Se usa el
+/// binario en vez de `libc` para no añadir una dependencia al crate por esto.
+/// # Por qué el fallo al lanzar `kill` SÍ se dice
+///
+/// Un estado distinto de cero es lo **normal**: significa que el grupo ya no
+/// tiene a nadie, que es justo lo que se quería. Pero que `kill` no se pueda
+/// lanzar —un contenedor mínimo donde solo existe el builtin del shell— deja
+/// nietos vivos **sin dar ningún error**, y una corrida que no puede matar al
+/// árbol no puede responder por su veredicto. Es el patrón fail-open que este
+/// fichero entero persigue, así que se avisa.
+fn matar_grupo(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        let salida = std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{pid}"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if salida.is_err() {
+            eprintln!(
+                "  AVISO: no pude lanzar `kill` para matar el grupo {pid}. Si el harness\n\
+                 \x20 dejo nietos vivos, pueden seguir editando la tarea o gastando cuota."
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
 /// Copia al `HOME` aislado **el plugin de enrutado y ninguno más**.
 ///
 /// Ver [`Harness::ruta_plugin`] para por qué hace falta. Si el harness no
@@ -656,19 +734,6 @@ fn validar_modelo(h: Harness, modelo: &str, nivel: u8) -> Result<(), String> {
     Ok(())
 }
 
-/// El nivel, que solo puede ser **1 o 2**.
-///
-/// # Por qué esto no es una validación de cortesía
-///
-/// Las puertas del nivel son **asimétricas**: el camino de pago se elige con el
-/// `else` de `nivel == 1`, pero todas las protecciones —proveedor obligatorio,
-/// topes obligatorios, guarda de telemetría por repetición, corte por cuota—
-/// se activan con `nivel == 2`. Un `CORREDOR_NIVEL=3` cogía el camino caro
-/// **saltándose las cuatro**.
-///
-/// Y `parse().unwrap_or(1)` convertía una errata en nivel 1 sin decir nada.
-/// Aquí la degradación cae del lado barato, pero el precedente de [`tope`] vale
-/// igual: un valor ilegible es una errata, y una errata se dice.
 /// El proveedor del nivel 2, que **no es texto libre**: tiene que ser el que el
 /// plugin de enrutado sabe interceptar. Ver [`PROVEEDOR_NIVEL_2`].
 ///
@@ -699,6 +764,19 @@ fn validar_proveedor_nivel_2(proveedor: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// El nivel, que solo puede ser **1 o 2**.
+///
+/// # Por qué esto no es una validación de cortesía
+///
+/// Las puertas del nivel son **asimétricas**: el camino de pago se elige con el
+/// `else` de `nivel == 1`, pero todas las protecciones —proveedor obligatorio,
+/// topes obligatorios, guarda de telemetría por repetición, corte por cuota—
+/// se activan con `nivel == 2`. Un `CORREDOR_NIVEL=3` cogía el camino caro
+/// **saltándose las cuatro**.
+///
+/// Y `parse().unwrap_or(1)` convertía una errata en nivel 1 sin decir nada.
+/// Aquí la degradación cae del lado barato, pero el precedente de [`tope`] vale
+/// igual: un valor ilegible es una errata, y una errata se dice.
 fn validar_nivel(bruto: &str) -> Result<u8, String> {
     match bruto.trim() {
         // Vacio no es una errata: es AUSENCIA, y la ausencia ya tiene defecto.
@@ -825,14 +903,35 @@ fn tope<T: std::str::FromStr + Default>(nombre: &str) -> T {
 /// del fail-open. O sea que la guarda pensada para ser el caso seguro era justo
 /// la que dejaba el token OAuth en `/tmp` para siempre.
 fn abortar(raiz: &Path, mensaje: &str) -> ! {
-    eprintln!("{mensaje}");
+    // Vacio significa «el motivo ya se imprimio arriba»: imprimirlo igual
+    // metia una linea en blanco justo donde el lector busca la causa.
+    if !mensaje.is_empty() {
+        eprintln!("{mensaje}");
+    }
+    limpiar_interrupcion(raiz, PGID_VIVO.load(Ordering::SeqCst));
+    std::process::exit(1);
+}
+
+/// Deja el disco como estaba cuando la corrida se corta a medias: **mata al
+/// harness vivo** y borra la raíz.
+///
+/// Las dos mitades importan y por motivos distintos. La raíz es donde el nivel
+/// 2 tiene la credencial real, y el nombre es predecible por PID. El harness,
+/// desde que corre con `process_group(0)`, sobrevive al SIGINT del teclado: si
+/// no se le mata a mano queda huérfano, gastando cuota que ya no cuenta ningún
+/// tope.
+///
+/// `pgid` a 0 significa que no hay ninguno corriendo.
+fn limpiar_interrupcion(raiz: &Path, pgid: u32) {
+    if pgid != 0 {
+        matar_grupo(Some(pgid));
+    }
     if let Err(e) = std::fs::remove_dir_all(raiz) {
         if raiz.exists() {
             eprintln!("  AVISO: no pude borrar {}: {e}", raiz.display());
             eprintln!("  Si la corrida era de NIVEL 2, ahi dentro hay una credencial real.");
         }
     }
-    std::process::exit(1);
 }
 
 fn var(nombre: &str, defecto: &str) -> String {
@@ -1217,12 +1316,22 @@ async fn lanzar(
         }
     }
 
+    // El harness es LIDER DE SU GRUPO, asi que su PID es tambien el PGID y al
+    // expirar el plazo se puede matar el arbol entero con `matar_grupo`.
+    // `kill_on_drop` solo alcanza al hijo directo, y los dos harnesses corren
+    // con `bash: allow` / `--approve`: sus nietos sobrevivian al plazo y podian
+    // editar la tarea entre el hash y el verificador.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
     cmd
         // Al expirar el plazo se suelta el futuro, y con el el hijo. Sin esto
         // tokio NO lo mata: el harness seguiria vivo, mandando peticiones que
         // caerian en la ventana de telemetria de la repeticion SIGUIENTE y
         // pudiendo seguir editando su directorio. Corromperia las repeticiones
         // posteriores en silencio, que es la peor clase de fallo del banco.
+        // Es NECESARIO pero no suficiente: solo alcanza al hijo directo, y por
+        // eso el plazo tambien llama a `matar_grupo`.
         .kill_on_drop(true)
         // Los dos esperan stdin: sin cerrarlo se quedan colgados.
         .stdin(std::process::Stdio::null())
@@ -1237,23 +1346,43 @@ async fn lanzar(
     let Ok(hijo) = cmd.spawn() else {
         return (false, String::from("<no se pudo lanzar el harness>"));
     };
-    match tokio::time::timeout(Duration::from_secs(plazo), hijo.wait_with_output()).await {
-        Ok(Ok(o)) => {
-            let mut t = String::from_utf8_lossy(&o.stdout).into_owned();
-            let err = String::from_utf8_lossy(&o.stderr);
-            if !err.trim().is_empty() {
-                t.push_str("\n--- stderr ---\n");
-                t.push_str(&err);
+    // Se coge ANTES del `await`: `wait_with_output` consume al hijo, y despues
+    // del plazo ya no habria a quien preguntarle el PID del grupo.
+    let pgid = hijo.id();
+    // Y se publica para el manejador de Ctrl-C, que es el unico que puede
+    // matarlo cuando el SIGINT del teclado ya no le llega.
+    PGID_VIVO.store(pgid.unwrap_or(0), Ordering::SeqCst);
+    let salida =
+        match tokio::time::timeout(Duration::from_secs(plazo), hijo.wait_with_output()).await {
+            Ok(Ok(o)) => {
+                let mut t = String::from_utf8_lossy(&o.stdout).into_owned();
+                let err = String::from_utf8_lossy(&o.stderr);
+                if !err.trim().is_empty() {
+                    t.push_str("\n--- stderr ---\n");
+                    t.push_str(&err);
+                }
+                (false, t)
             }
-            (false, t)
-        }
-        Ok(Err(e)) => (false, format!("<fallo esperando al harness: {e}>")),
-        // El hijo muere al soltarse el futuro, por `kill_on_drop` de arriba.
-        Err(_) => (
-            true,
-            String::from("<expiro el plazo: sin salida capturada>"),
-        ),
-    }
+            Ok(Err(e)) => (false, format!("<fallo esperando al harness: {e}>")),
+            Err(_) => (
+                true,
+                String::from("<expiro el plazo: sin salida capturada>"),
+            ),
+        };
+
+    // SE MATA EL GRUPO EN LOS TRES CAMINOS, no solo al expirar el plazo.
+    //
+    // `kill_on_drop` alcanza al hijo directo, y `wait_with_output` vuelve en
+    // cuanto el hijo sale y los pipes dan EOF. Pero un nieto que se desligo de
+    // stdio (`... >/dev/null 2>&1 &`, trivial con `bash: allow`) sobrevive a
+    // una salida NORMAL del harness: se queda en `rep-{i}` y puede editar la
+    // tarea entre el `hash_fichero` y el `tests_pasan` -falseando el veredicto-
+    // o correr contra el `remove_dir_all` del final.
+    //
+    // Con el grupo ya vacio esto no hace nada, que es el caso corriente.
+    matar_grupo(pgid);
+    PGID_VIVO.store(0, Ordering::SeqCst);
+    salida
 }
 
 /// Guarda la salida de una repeticion que no resolvio, para poder mirarla.
@@ -1479,12 +1608,41 @@ async fn main() {
     let telemetria = ruta_telemetria();
     let home_real = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let raiz = std::env::temp_dir().join(format!("corredor-{}", std::process::id()));
+    // Se BORRA antes de crearla. El nombre es predecible por PID y los PID se
+    // reciclan: una corrida anterior matada por SIGKILL, Ctrl-C o panic pudo
+    // dejar ahi su HOME con una credencial real dentro.
+    if raiz.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&raiz) {
+            eprintln!(
+                "ABORTA: {} es de una corrida anterior y no puedo borrarla: {e}",
+                raiz.display()
+            );
+            eprintln!("  No se reusa: si aquella era de NIVEL 2, ahi dentro hay un token real.");
+            std::process::exit(1);
+        }
+    }
     // 0700: la raiz lleva un nombre predecible por PID y, en el nivel 2,
     // contiene una credencial real.
     if let Err(e) = crear_privado(&raiz) {
         eprintln!("ABORTA: no puedo crear {} en privado: {e}", raiz.display());
         std::process::exit(1);
     }
+    // CTRL-C. Desde que el harness corre con `process_group(0)` ya no esta en
+    // el grupo de primer plano de la terminal, asi que el SIGINT del teclado
+    // NO le llega: sin este manejador, un Ctrl-C mataba solo al corredor y
+    // dejaba al harness huerfano -autenticado con el token real de /tmp,
+    // gastando cuota y editando la tarea, y sin nadie mirando los topes-.
+    let raiz_senal = raiz.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_err() {
+            return;
+        }
+        eprintln!("\n\nINTERRUMPIDO. Matando al harness y borrando el HOME aislado.");
+        limpiar_interrupcion(&raiz_senal, PGID_VIVO.load(Ordering::SeqCst));
+        // 130 es lo que se espera de un proceso muerto por SIGINT.
+        std::process::exit(130);
+    });
+
     // Los rastros sobreviven a la corrida a proposito: son lo que se mira
     // cuando el resultado no se explica solo.
     let rastros = PathBuf::from(var("CORREDOR_RASTROS", "./rastros-corredor"));
@@ -1511,6 +1669,16 @@ async fn main() {
             abortar(
                 &raiz,
                 &format!("  rep {i}: no puedo preparar el directorio: {e}"),
+            );
+        }
+        // El HOME aislado se deja VACIO y en 0700 en cada repeticion. No es
+        // ceremonia: sin esto una corrida de nivel 2 matada dejaba su auth.json
+        // real en un directorio de nombre predecible por PID, y la siguiente
+        // -de nivel 1, que no copia credenciales- se lo encontraba puesto.
+        if let Err(e) = preparar_hogar(&hogar) {
+            abortar(
+                &raiz,
+                &format!("  rep {i}: no puedo dejar el HOME aislado limpio: {e}"),
             );
         }
         if let Err(e) = escribir_config(harness, &hogar, &puerto, &modelo, &wire, nivel) {
@@ -1634,7 +1802,13 @@ async fn main() {
         // las `n` repeticiones enteras. Un cero de filas es la unica senal que
         // queda, y aqui para en seco.
         if nivel == 2 && filas.is_empty() {
-            eprintln!("\nABORTA: la primera repeticion no dejo NI UNA fila de telemetria.");
+            // Dice la repeticion REAL, no «la primera». La guarda se amplio a
+            // todas en #141 y el texto se quedo con el de antes: en una corrida
+            // larga mandaba a mirar la rep 0 cuando la que se rompio era la 17.
+            eprintln!(
+                "\nABORTA: la repeticion {} no dejo NI UNA fila de telemetria.",
+                i + 1
+            );
             eprintln!("  El harness gasto cuota y el proxy no vio nada, asi que el enrutado");
             eprintln!("  NO esta funcionando. El plugin es fail-open: no da error, solo");
             eprintln!("  deja de medir.");
@@ -2355,6 +2529,118 @@ mod tests {
         let media = |v: &[u64]| v.iter().sum::<u64>() / v.len() as u64;
         assert_eq!(media(&estable), media(&volatil));
         assert_ne!(mediana_y_rango(&estable), mediana_y_rango(&volatil));
+    }
+
+    /// **El `HOME` aislado se REUSABA.** `preparar` borra el directorio de
+    /// trabajo en cada repeticion, pero `hogar` solo se creaba con
+    /// `create_dir_all`, que acepta en silencio uno que ya existe.
+    ///
+    /// La raiz lleva un nombre predecible por PID y **nada la limpia** si la
+    /// corrida muere por SIGKILL, Ctrl-C o panic. Como los PID se reciclan, una
+    /// corrida de NIVEL 2 matada dejaba su `auth.json` real ahi, y la siguiente
+    /// corrida —de nivel 1, que ni copia credenciales ni las espera— se lo
+    /// encontraba puesto. Un banco de coste cero con un token OAuth vivo dentro.
+    #[test]
+    fn un_hogar_heredado_no_sobrevive_a_la_repeticion_siguiente() {
+        let raiz = std::env::temp_dir().join(format!("hogar-{}", std::process::id()));
+        let hogar = raiz.join("home-0");
+        let colada = hogar.join(".local/share/opencode/auth.json");
+        std::fs::create_dir_all(colada.parent().unwrap()).unwrap();
+        std::fs::write(
+            &colada,
+            r#"{"openai":{"access":"TOKEN-DE-LA-CORRIDA-ANTERIOR"}}"#,
+        )
+        .unwrap();
+
+        preparar_hogar(&hogar).expect("deberia dejarlo limpio");
+
+        assert!(
+            !colada.exists(),
+            "la credencial de la corrida anterior sobrevivio"
+        );
+        assert!(hogar.exists(), "y el hogar tiene que quedar creado");
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// Y limpio **no basta**: tiene que quedar en 0700. El nivel 2 mete ahi una
+    /// credencial real, y la raiz tiene un nombre que cualquiera puede predecir.
+    #[cfg(unix)]
+    #[test]
+    fn el_hogar_recien_preparado_no_es_atravesable_por_terceros() {
+        use std::os::unix::fs::PermissionsExt;
+        let raiz = std::env::temp_dir().join(format!("hogar-perm-{}", std::process::id()));
+        let hogar = raiz.join("home-0");
+        preparar_hogar(&hogar).unwrap();
+
+        let modo = std::fs::metadata(&hogar).unwrap().permissions().mode() & 0o777;
+        assert_eq!(modo, 0o700, "el hogar quedo en {modo:o}, no en 700");
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// **`kill_on_drop` solo mata al hijo DIRECTO.** Los dos harnesses corren
+    /// con `bash: allow` / `--approve`, asi que lanzan nietos. Un nieto colgado
+    /// sobrevivia al plazo y podia editar `rep-{i}/tarifa.py` entre el
+    /// `hash_fichero` y el `tests_pasan` —falseando el veredicto— o correr
+    /// contra el `remove_dir_all` del final.
+    ///
+    /// Este test monta justo esa forma: un hijo que deja un nieto vivo y se va.
+    /// Matar solo al hijo deja al nieto escribiendo.
+    #[cfg(unix)]
+    #[test]
+    fn matar_al_hijo_no_basta_hay_que_matar_al_grupo() {
+        let raiz = std::env::temp_dir().join(format!("grupo-{}", std::process::id()));
+        std::fs::create_dir_all(&raiz).unwrap();
+        let testigo = raiz.join("el-nieto-escribio");
+
+        // El hijo lanza un nieto que escribe dentro de un segundo y se va.
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-c")
+            .arg(format!(
+                "( sleep 1; echo tarde > {} ) & sleep 30",
+                testigo.display()
+            ))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let mut hijo = cmd.spawn().expect("bash tiene que estar");
+
+        matar_grupo(Some(hijo.id()));
+        let _ = hijo.kill();
+        let _ = hijo.wait();
+
+        std::thread::sleep(Duration::from_millis(1800));
+        assert!(
+            !testigo.exists(),
+            "el nieto sobrevivio al grupo y escribio despues de que se le matara"
+        );
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// **La regresion que trajo `process_group(0)`.** Sacar al harness del
+    /// grupo de primer plano de la terminal tiene un precio: el SIGINT del
+    /// teclado ya NO le llega. Sin manejador, un Ctrl-C mataba solo al
+    /// corredor y dejaba al harness **huerfano**: autenticado con el token
+    /// real que hay en `/tmp`, gastando cuota y editando la tarea, sin nadie
+    /// que lo pare ni topes que lo corten.
+    ///
+    /// Este test cubre la mitad que se puede probar sin mandar senales: que la
+    /// limpieza se lleva la credencial del temporal.
+    #[test]
+    fn una_interrupcion_no_deja_la_credencial_en_el_temporal() {
+        let raiz = std::env::temp_dir().join(format!("interr-{}", std::process::id()));
+        let colada = raiz.join("home-0/.local/share/opencode/auth.json");
+        std::fs::create_dir_all(colada.parent().unwrap()).unwrap();
+        std::fs::write(&colada, r#"{"openai":{"access":"TOKEN-VIVO"}}"#).unwrap();
+
+        // pgid 0 = no hay harness vivo que matar; se prueba la limpieza.
+        limpiar_interrupcion(&raiz, 0);
+
+        assert!(!colada.exists(), "la credencial sobrevivio a la limpieza");
+        assert!(!raiz.exists(), "la raiz sobrevivio a la limpieza");
     }
 
     /// El peaje se mide con el MISMO entorno que las corridas menos la tarea:
