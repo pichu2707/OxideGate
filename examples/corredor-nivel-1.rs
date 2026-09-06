@@ -115,7 +115,7 @@ use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
 
@@ -133,6 +133,36 @@ use tokio::process::Command;
 /// autenticado con el token real que hay en `/tmp`, gastando cuota y editando
 /// la tarea, sin topes que lo corten porque quien los mira acaba de morir.
 static PGID_VIVO: AtomicU32 = AtomicU32::new(0);
+
+/// Hay un `spawn` **en vuelo**: el harness puede estar ya corriendo aunque
+/// [`PGID_VIVO`] siga a 0.
+///
+/// Cierra la ventana entre `cmd.spawn()` y la publicación del PGID. Es
+/// estrecha —microsegundos— pero real, y lo que cae dentro es lo más caro que
+/// hay: el harness ya está vivo con la credencial real en su HOME, y un Ctrl-C
+/// ahí leía 0, se saltaba el `matar_grupo` y salía con `exit(130)`, que además
+/// no ejecuta ningún destructor, así que `kill_on_drop` tampoco compensaba.
+static LANZANDO: AtomicBool = AtomicBool::new(false);
+
+/// Qué PGID hay que matar al interrumpir, esperando al `spawn` si hace falta.
+///
+/// Devuelve 0 solo cuando de verdad no hay harness. Si hay uno en vuelo, espera
+/// a que publique su PGID —como mucho un segundo— antes de rendirse: más vale
+/// tardar un instante en salir que dejar vivo un proceso que gasta cuota.
+fn pgid_a_matar() -> u32 {
+    let mut pgid = PGID_VIVO.load(Ordering::SeqCst);
+    if pgid != 0 {
+        return pgid;
+    }
+    while LANZANDO.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(10));
+        pgid = PGID_VIVO.load(Ordering::SeqCst);
+        if pgid != 0 {
+            break;
+        }
+    }
+    pgid
+}
 
 /// El fichero que hay que reparar. Es el único que el harness debería tocar.
 const FUENTE: &str = "tarifa.py";
@@ -585,26 +615,42 @@ fn preparar_hogar(hogar: &Path) -> std::io::Result<()> {
 /// El hijo se lanza con `process_group(0)`, así que es líder de su grupo y su
 /// PID **es** el PGID. `kill -KILL -<pgid>` se lo lleva entero. Se usa el
 /// binario en vez de `libc` para no añadir una dependencia al crate por esto.
-/// # Por qué el fallo al lanzar `kill` SÍ se dice
+/// # La forma de invocarlo importa, y se midió
 ///
-/// Un estado distinto de cero es lo **normal**: significa que el grupo ya no
-/// tiene a nadie, que es justo lo que se quería. Pero que `kill` no se pueda
-/// lanzar —un contenedor mínimo donde solo existe el builtin del shell— deja
-/// nietos vivos **sin dar ningún error**, y una corrida que no puede matar al
-/// árbol no puede responder por su veredicto. Es el patrón fail-open que este
-/// fichero entero persigue, así que se avisa.
+/// Se usa `kill -s KILL -- -<pgid>`, **no** `kill -KILL -<pgid>`. Medido contra
+/// `procps-ng 4.0.4` el 2026-09-06:
+///
+/// | invocación | grupo vivo | grupo vacío |
+/// |---|---|---|
+/// | `kill -KILL -PGID` | mata, pero devuelve **1** | devuelve **0** |
+/// | `kill -s KILL -- -PGID` | mata, devuelve **0** | devuelve **1** (ESRCH) |
+///
+/// La primera forma mata igual, pero su estado está **invertido**: no sirve
+/// para distinguir nada. Con `-s` y `--` el estado sí significa algo, que es lo
+/// que permite que el aviso de abajo sea honesto en vez de decorativo.
+///
+/// # Qué se dice y qué no
+///
+/// Un estado 1 es lo **normal**: el grupo ya no tenía a nadie, que es justo lo
+/// que se quería. Pero que `kill` no se pueda **lanzar** —un contenedor mínimo
+/// donde solo existe el builtin del shell— deja nietos vivos **sin dar ningún
+/// error**, y una corrida que no puede matar al árbol no puede responder por su
+/// veredicto. Ese es el patrón fail-open que este fichero entero persigue, así
+/// que ese caso, y solo ese, se avisa.
 fn matar_grupo(pid: Option<u32>) {
     #[cfg(unix)]
     if let Some(pid) = pid {
         let salida = std::process::Command::new("kill")
-            .arg("-KILL")
+            .arg("-s")
+            .arg("KILL")
+            .arg("--")
             .arg(format!("-{pid}"))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
         if salida.is_err() {
             eprintln!(
-                "  AVISO: no pude lanzar `kill` para matar el grupo {pid}. Si el harness\n\
+                "  AVISO: no pude LANZAR `kill` para matar el grupo {pid}. Si el harness\n\
                  \x20 dejo nietos vivos, pueden seguir editando la tarea o gastando cuota."
             );
         }
@@ -722,6 +768,21 @@ fn modelo_cli_opencode(modelo: &str, proveedor: &str, nivel: u8) -> String {
 /// casa de sobra. Prohibirlo de forma global cambiaba un fallo silencioso por
 /// un aborto falso: el mismo pecado con el signo cambiado.
 fn validar_modelo(h: Harness, modelo: &str, nivel: u8) -> Result<(), String> {
+    // VACIO PRIMERO, y para todos los niveles. Un modelo vacio no lleva `/`,
+    // asi que se colaba por la guarda de abajo, y `validar_proveedor_nivel_2`
+    // -que si comprueba el vacio- mira otra variable. Resultado: el nivel 2
+    // copiaba un token real a /tmp, opencode arrancaba con `-m openai/`, moria
+    // en local sin tocar la red, y las cero filas disparaban la guarda de
+    // telemetria acusando al enrutado. Un fallo del banco leido como fallo de
+    // enrutado, despues de dejar la credencial en disco.
+    if modelo.trim().is_empty() {
+        return Err(
+            "CORREDOR_MODELO esta vacio. Sin modelo no hay nada que medir, y en el\n\
+             \x20 nivel 2 la corrida llegaria a copiar una credencial real antes de\n\
+             \x20 descubrirlo -y luego culparia al enrutado de no ver telemetria."
+                .to_string(),
+        );
+    }
     if h == Harness::Opencode && nivel == 2 && modelo.contains('/') {
         return Err(format!(
             "CORREDOR_MODELO={modelo:?} lleva `/`.\n\
@@ -741,6 +802,11 @@ fn validar_modelo(h: Harness, modelo: &str, nivel: u8) -> Result<(), String> {
 /// arregla leyendo; elegir uno que el plugin no enruta es una corrida que
 /// **gasta cuota de verdad** y luego miente sobre por qué no midió nada.
 fn validar_proveedor_nivel_2(proveedor: &str) -> Result<(), String> {
+    // Se compara TRIMADO, como `validar_nivel` y `tope()`. Sin esto, un
+    // `CORREDOR_PROVEEDOR=$(cat fichero)` -con su `\n` al final- dejaba el
+    // unico valor valido rechazado con un mensaje acusandole de no ser
+    // enrutable, mandando a buscar el fallo donde no habia ninguno.
+    let proveedor = proveedor.trim();
     if proveedor.is_empty() {
         return Err(
             "el nivel 2 necesita CORREDOR_PROVEEDOR (que credencial usar).\n\
@@ -762,6 +828,36 @@ fn validar_proveedor_nivel_2(proveedor: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Un número de configuración: ausente o vacío es el defecto, **ilegible
+/// aborta**.
+///
+/// # Por qué no se quedó con `parse().unwrap_or(defecto)`
+///
+/// Porque es la misma degradación silenciosa que [`validar_nivel`] existe para
+/// condenar, dos líneas más arriba en el mismo `main`. `CORREDOR_TIMEOUT=6OO`
+/// —con la letra O— se convertía en 300 s sin decir nada, y `CORREDOR_N=" 20 "`
+/// en 3, porque el `FromStr` numérico de Rust rechaza los espacios de alrededor.
+///
+/// Las dos gobiernan gasto real en el nivel 2: cuántas repeticiones se corren y
+/// cuánto tiempo puede correr cada una sin nadie delante. Un operador que se
+/// equivoca escribiéndolas merece enterarse, no correr otra cosa.
+fn numero<T: std::str::FromStr>(nombre: &str, defecto: T) -> T {
+    match std::env::var(nombre) {
+        Err(_) => defecto,
+        Ok(v) if v.trim().is_empty() => defecto,
+        Ok(v) => match v.trim().parse() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("ABORTA: {nombre}={v:?} no es un numero.");
+                eprintln!("  No se degrada al defecto en silencio: en el nivel 2 estas dos");
+                eprintln!("  gobiernan cuanto se gasta y cuanto corre cada repeticion sin");
+                eprintln!("  nadie delante. Una errata tiene que verse.");
+                std::process::exit(1);
+            }
+        },
+    }
 }
 
 /// El nivel, que solo puede ser **1 o 2**.
@@ -910,6 +1006,40 @@ fn abortar(raiz: &Path, mensaje: &str) -> ! {
     }
     limpiar_interrupcion(raiz, PGID_VIVO.load(Ordering::SeqCst));
     std::process::exit(1);
+}
+
+/// Espera a **cualquiera** de las señales con las que se corta una corrida.
+///
+/// # Por qué no basta con SIGINT
+///
+/// Porque `process_group(0)` sacó al harness del grupo de primer plano de la
+/// terminal. Antes de ese cambio el harness heredaba el grupo del corredor y
+/// recibía SIGINT **y SIGHUP** de la terminal directamente; ahora no recibe
+/// ninguna, así que cada señal que aquí no se maneje es una forma nueva de
+/// dejar un harness huérfano gastando cuota:
+///
+/// - **SIGINT** — el Ctrl-C del teclado.
+/// - **SIGTERM** — `kill <pid>`, `timeout`, un `systemctl stop`, un paso de CI
+///   que se cancela.
+/// - **SIGHUP** — se cierra la sesión ssh o la terminal.
+///
+/// En una plataforma que no sea unix solo hay Ctrl-C, que es lo que hay.
+async fn esperar_senal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("SIGTERM");
+        let mut hup = signal(SignalKind::hangup()).expect("SIGHUP");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+            _ = hup.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Deja el disco como estaba cuando la corrida se corta a medias: **mata al
@@ -1343,15 +1473,24 @@ async fn lanzar(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
+    // SE MARCA ANTES DEL SPAWN. Entre que `spawn` vuelve y se publica el PGID
+    // hay una ventana en la que el harness YA CORRE y el manejador de senales
+    // leeria 0: se saltaria el `matar_grupo` y saldria con `exit(130)`, que no
+    // ejecuta destructores, asi que `kill_on_drop` tampoco compensaria. Es
+    // estrecha, pero lo que cae dentro es un harness vivo con la credencial
+    // real en su HOME.
+    LANZANDO.store(true, Ordering::SeqCst);
     let Ok(hijo) = cmd.spawn() else {
+        LANZANDO.store(false, Ordering::SeqCst);
         return (false, String::from("<no se pudo lanzar el harness>"));
     };
     // Se coge ANTES del `await`: `wait_with_output` consume al hijo, y despues
     // del plazo ya no habria a quien preguntarle el PID del grupo.
     let pgid = hijo.id();
-    // Y se publica para el manejador de Ctrl-C, que es el unico que puede
+    // Y se publica para el manejador de senales, que es el unico que puede
     // matarlo cuando el SIGINT del teclado ya no le llega.
     PGID_VIVO.store(pgid.unwrap_or(0), Ordering::SeqCst);
+    LANZANDO.store(false, Ordering::SeqCst);
     let salida =
         match tokio::time::timeout(Duration::from_secs(plazo), hijo.wait_with_output()).await {
             Ok(Ok(o)) => {
@@ -1406,7 +1545,11 @@ fn guardar_rastro(dir: &Path, i: usize, v: Veredicto, salida: &str) -> Option<Pa
 #[tokio::main]
 async fn main() {
     let tarea = PathBuf::from(var("CORREDOR_TAREA", "tareas/reparar-tarifa"));
-    let modelo = var("CORREDOR_MODELO", "qwen3:14b-nothink");
+    // Trimado en el origen: el modelo viaja al `-m` Y al filtro de telemetria,
+    // y un espacio de mas no casaria ninguna fila.
+    let modelo = var("CORREDOR_MODELO", "qwen3:14b-nothink")
+        .trim()
+        .to_string();
     let puerto = var("CORREDOR_PUERTO", "8899");
     let encargo = var("CORREDOR_ENCARGO", ENCARGO);
     let wire = var("CORREDOR_WIRE", "responses");
@@ -1431,7 +1574,9 @@ async fn main() {
         eprintln!("ABORTA: {e}");
         std::process::exit(1);
     }
-    let proveedor = var("CORREDOR_PROVEEDOR", "");
+    // Trimado tambien: se usa para elegir la credencial Y para construir el
+    // `-m {proveedor}/{modelo}`. Un `\n` de un `$(cat ...)` lo rompia.
+    let proveedor = var("CORREDOR_PROVEEDOR", "").trim().to_string();
     // Topes de CUOTA, no de dolares: los dos harnesses hablan por OAuth de
     // suscripcion, asi que lo que se gasta no es una factura sino cuota.
     // `unwrap_or(0)` seria fatal aqui: 0 significa «sin tope», asi que una
@@ -1440,8 +1585,8 @@ async fn main() {
     let tope_peticiones: usize = tope("CORREDOR_TOPE_PETICIONES");
     let tope_tokens: u64 = tope("CORREDOR_TOPE_TOKENS");
     let datos = var("CORREDOR_DATOS", "./datos-corredor.jsonl");
-    let n: usize = var("CORREDOR_N", "3").parse().unwrap_or(3);
-    let plazo: u64 = var("CORREDOR_TIMEOUT", "300").parse().unwrap_or(300);
+    let n: usize = numero("CORREDOR_N", 3);
+    let plazo: u64 = numero("CORREDOR_TIMEOUT", 300);
 
     println!(
         "corredor del nivel 1 — {} contra {modelo}",
@@ -1474,8 +1619,8 @@ async fn main() {
             eprintln!("  config declare a OxideGate. Solo `opencode` tiene uno.");
             eprintln!("  `pi` lleva `--provider oxidegate` a fuego y la config de `codex` fija");
             eprintln!("  `model_provider = \"oxidegate\"`: los dos IGNORAN el auth.json que se");
-            eprintln!("  les copiaria. Dejarles entrar no medía el nivel 2 — copiaba un token");
-            eprintln!("  OAuth real a /tmp para nadie y medía el cableado del nivel 1.");
+            eprintln!("  les copiaria. Dejarles entrar no media el nivel 2 - copiaba un token");
+            eprintln!("  OAuth real a /tmp para nadie y media el cableado del nivel 1.");
             eprintln!("  Cablearlos es trabajo de #123, no de esta variable.");
             std::process::exit(1);
         }
@@ -1634,12 +1779,23 @@ async fn main() {
     // gastando cuota y editando la tarea, y sin nadie mirando los topes-.
     let raiz_senal = raiz.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_err() {
-            return;
-        }
+        esperar_senal().await;
+        // LA SALIDA DE EMERGENCIA SE ARMA ANTES DE LIMPIAR. La limpieza es
+        // sincrona y puede atascarse -un TMPDIR lento o en red, un `kill` que
+        // no vuelve-, y `tokio::signal` se queda con la disposicion de la
+        // senal para el resto de la vida del proceso: sin esta segunda espera,
+        // un Ctrl-C impaciente no hacia NADA y solo quedaba matar desde otra
+        // terminal.
+        tokio::spawn(async {
+            esperar_senal().await;
+            eprintln!("  SEGUNDA SENAL: salgo sin terminar de limpiar.");
+            eprintln!("  Puede quedar algo en el temporal. Si la corrida era de NIVEL 2,");
+            eprintln!("  ahi dentro hay una credencial real.");
+            std::process::exit(130);
+        });
         eprintln!("\n\nINTERRUMPIDO. Matando al harness y borrando el HOME aislado.");
-        limpiar_interrupcion(&raiz_senal, PGID_VIVO.load(Ordering::SeqCst));
-        // 130 es lo que se espera de un proceso muerto por SIGINT.
+        limpiar_interrupcion(&raiz_senal, pgid_a_matar());
+        // 130 es lo que se espera de un proceso muerto por una senal.
         std::process::exit(130);
     });
 
@@ -2584,40 +2740,124 @@ mod tests {
     /// contra el `remove_dir_all` del final.
     ///
     /// Este test monta justo esa forma: un hijo que deja un nieto vivo y se va.
-    /// Matar solo al hijo deja al nieto escribiendo.
+    ///
+    /// # Dos formas de pasar por el motivo equivocado, y cómo se cierran
+    ///
+    /// La primera version de este test **no probaba nada**, y se demostro
+    /// neutralizando `matar_grupo`: seguia pasando igual. Dos causas
+    /// independientes, las dos de tiempo y de comillas:
+    ///
+    /// 1. **Mataba con cero retardo tras el `spawn`.** `bash` todavia no habia
+    ///    forkeado al nieto, asi que el testigo no aparecia ni con arreglo ni
+    ///    sin el. Medido: sin retardo el nieto no llega a existir (0/15 con el
+    ///    hijo muerto a mano); con 200 ms existe siempre (15/15). Por eso ahora
+    ///    se espera a que el nieto **exista de verdad** antes de matar, y se
+    ///    comprueba con un segundo testigo en vez de con un `sleep` a ojo.
+    /// 2. **Interpolaba la ruta sin comillas dentro de un `bash -c`.** Con un
+    ///    `TMPDIR` que lleve un espacio, la redireccion cortaba en el espacio y
+    ///    el testigo no se escribia nunca — pasando el assert por la razon
+    ///    contraria. Ahora va entrecomillada.
     #[cfg(unix)]
     #[test]
     fn matar_al_hijo_no_basta_hay_que_matar_al_grupo() {
         let raiz = std::env::temp_dir().join(format!("grupo-{}", std::process::id()));
         std::fs::create_dir_all(&raiz).unwrap();
-        let testigo = raiz.join("el-nieto-escribio");
+        let arranco = raiz.join("el-nieto-arranco");
+        let escribio = raiz.join("el-nieto-escribio");
 
-        // El hijo lanza un nieto que escribe dentro de un segundo y se va.
+        // El nieto avisa de que existe, espera, y solo entonces escribe. Si se
+        // le mata en medio, el segundo testigo no aparece.
         let mut cmd = std::process::Command::new("bash");
         cmd.arg("-c")
             .arg(format!(
-                "( sleep 1; echo tarde > {} ) & sleep 30",
-                testigo.display()
+                "( touch '{}'; sleep 2; echo tarde > '{}' ) & sleep 30",
+                arranco.display(),
+                escribio.display()
             ))
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
+        // Aqui `cmd` es un `std::process::Command`, que necesita el trait; el
+        // de `lanzar` es de tokio y lleva `process_group` inherente.
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
         let mut hijo = cmd.spawn().expect("bash tiene que estar");
+
+        // Se espera a que el nieto EXISTA. Sin esto el test no prueba nada:
+        // matar antes del fork mata solo a bash y el testigo no aparece jamas.
+        let limite = std::time::Instant::now() + Duration::from_secs(5);
+        while !arranco.exists() && std::time::Instant::now() < limite {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            arranco.exists(),
+            "el nieto no llego a arrancar: el test no estaria probando nada"
+        );
 
         matar_grupo(Some(hijo.id()));
         let _ = hijo.kill();
         let _ = hijo.wait();
 
-        std::thread::sleep(Duration::from_millis(1800));
+        // Mas que los 2 s que el nieto espera antes de escribir.
+        std::thread::sleep(Duration::from_millis(2600));
         assert!(
-            !testigo.exists(),
+            !escribio.exists(),
             "el nieto sobrevivio al grupo y escribio despues de que se le matara"
         );
         let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// La convencion ASCII no es de estilo: `banco-de-tareas.md` §3 dice que
+    /// el contenido viaja a modelos y lo editan agentes distintos, y que con
+    /// acentos la codificacion entra como variable en un experimento que mide
+    /// otra cosa. `el_agents_md_es_ascii_puro` ya lo fija para el AGENTS_MD;
+    /// esto lo fija para lo que sale por pantalla, que es donde se colo.
+    ///
+    /// Los comentarios y la documentacion SI llevan acentos, a proposito: no
+    /// salen del fichero. Por eso solo se miran las lineas que imprimen.
+    #[test]
+    fn los_mensajes_de_pantalla_van_en_ascii() {
+        // Solo VOCALES ACENTUADAS y enye. La puntuacion tipografica -«», §-
+        // se usa a proposito en varios mensajes y no es lo que se persigue:
+        // lo que rompe la codificacion son las tildes.
+        const TILDES: &str = "áéíóúüÁÉÍÓÚÜñÑ";
+        let malas: Vec<(usize, &str)> = include_str!("corredor-nivel-1.rs")
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains("println!"))
+            .filter(|(_, l)| l.chars().any(|c| TILDES.contains(c)))
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+        assert!(
+            malas.is_empty(),
+            "mensajes de pantalla con tildes: {malas:#?}"
+        );
+    }
+
+    /// **La ventana entre el `spawn` y la publicacion del PGID.** El harness ya
+    /// corre, pero `PGID_VIVO` sigue a 0: una senal ahi leia 0, se saltaba el
+    /// `matar_grupo` y salia con `exit(130)` -que no ejecuta destructores, asi
+    /// que `kill_on_drop` tampoco compensaba-. El harness quedaba vivo con la
+    /// credencial real en su HOME.
+    #[test]
+    fn una_senal_durante_el_spawn_espera_al_pgid_en_vez_de_rendirse() {
+        // Sin nada en vuelo, no hay nada que esperar ni que matar.
+        PGID_VIVO.store(0, Ordering::SeqCst);
+        LANZANDO.store(false, Ordering::SeqCst);
+        assert_eq!(pgid_a_matar(), 0, "sin harness no hay PGID que devolver");
+
+        // Con un spawn en vuelo, espera a que lo publique.
+        LANZANDO.store(true, Ordering::SeqCst);
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(120));
+            PGID_VIVO.store(4242, Ordering::SeqCst);
+            LANZANDO.store(false, Ordering::SeqCst);
+        });
+        assert_eq!(
+            pgid_a_matar(),
+            4242,
+            "se rindio en la ventana y habria dejado el harness vivo"
+        );
+        PGID_VIVO.store(0, Ordering::SeqCst);
     }
 
     /// **La regresion que trajo `process_group(0)`.** Sacar al harness del
@@ -2948,6 +3188,49 @@ mod tests {
             "el prefijo del `-m` no puede llegar al filtro"
         );
         let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// **Un modelo VACIO pasaba las tres validaciones.** No lleva `/`, asi que
+    /// `validar_modelo` lo dejaba entrar; `validar_proveedor_nivel_2` -que si
+    /// comprueba el vacio- mira otra variable. Reproducido contra opencode
+    /// 1.18.25: `-m openai/` no falla al parsear, arranca una sesion entera y
+    /// muere con `ProviderModelNotFoundError`, cero filas y cero red.
+    ///
+    /// O sea que el nivel 2 copiaba un token real a `/tmp`, no capturaba nada,
+    /// y disparaba la guarda de telemetria con el diagnostico FALSO «el
+    /// enrutado NO esta funcionando» — el fallo del banco leido como fallo de
+    /// enrutado, que es exactamente lo que este fichero existe para impedir.
+    #[test]
+    fn un_modelo_vacio_no_puede_entrar_en_una_corrida_que_gasta_cuota() {
+        for vacio in ["", "   ", "\n"] {
+            let e = validar_modelo(Harness::Opencode, vacio, 2)
+                .expect_err("un modelo vacio no es un modelo");
+            assert!(
+                e.contains("CORREDOR_MODELO"),
+                "el error tiene que nombrar la variable: {e}"
+            );
+        }
+        // Y tampoco en el nivel 1, donde solo rompe el banco en vez de la cuota.
+        assert!(validar_modelo(Harness::Pi, "", 1).is_err());
+    }
+
+    /// `validar_proveedor_nivel_2` comparaba SIN `trim()`, mientras sus dos
+    /// hermanas del mismo fichero perdonan los espacios a proposito
+    /// (`validar_nivel(" 2 ") == Ok(2)`, `tope()` con `v.trim()`).
+    ///
+    /// Un `export CORREDOR_PROVEEDOR=$(cat fichero)` deja un `\n` al final, y
+    /// el UNICO valor valido acababa rechazado con un mensaje acusandole de no
+    /// ser enrutable. La coherencia aqui no es estetica: es la diferencia entre
+    /// un mensaje que ayuda y uno que manda a buscar donde no hay nada.
+    #[test]
+    fn el_proveedor_perdona_los_espacios_como_el_resto_del_fichero() {
+        for con_espacios in [" openai", "openai\n", "  openai  "] {
+            assert!(
+                validar_proveedor_nivel_2(con_espacios).is_ok(),
+                "{con_espacios:?} es el proveedor bueno con espacios"
+            );
+        }
+        assert!(validar_proveedor_nivel_2("   ").is_err(), "vacio sigue mal");
     }
 
     /// La guarda que convierte el diagnostico falso en uno verdadero: si
