@@ -69,10 +69,13 @@ jobs:
       - run: cargo test
       - run: cargo test --examples
 
-      # Pinneado a la version exacta a proposito: este repositorio NO
-      # publica un tag movil `v1`, solo `v1.0.x`. Escribir `@v1` —el
-      # reflejo de casi cualquier otra action— falla al resolver la
-      # referencia y rompe el job entero justo en el ultimo paso.
+      # Pinneado a la version exacta, no a `@v1`. Esa ref SI existe —es
+      # una rama del repositorio de la action, y la propia documentacion
+      # de crates.io la usa—, pero una rama se mueve: `@v1` ejecuta hoy
+      # un codigo y manana otro sin que nada de este fichero cambie. Un
+      # tag `v1.0.x` es inmutable. En el unico paso que tiene permiso
+      # para publicar en nombre del proyecto, saber exactamente que se
+      # ejecuta pesa mas que recibir parches sin enterarse.
       - id: auth
         uses: rust-lang/crates-io-auth-action@v1.0.5
 
