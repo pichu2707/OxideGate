@@ -1,0 +1,81 @@
+name: Publicar
+
+# El tag ES el release. Hasta ahora publicar dependia de acordarse de
+# ejecutar `cargo publish` a mano despues de taguear, y ese paso se olvido
+# dos veces seguidas: `v0.13.0` y `v0.14.0` estuvieron tagueadas en GitHub
+# —con su Release escrita— casi un mes sin llegar a crates.io. Un paso
+# manual dentro de un proceso que ocurre cada pocas semanas es un paso que
+# no ocurre; la unica forma de arreglarlo es que deje de haber paso.
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publicar:
+    name: crates.io
+    runs-on: ubuntu-latest
+
+    # `id-token: write` es lo que permite pedir el token OIDC de GitHub que
+    # `crates-io-auth-action` canjea por un token efimero de crates.io
+    # (Trusted Publishing). La alternativa —un `CARGO_REGISTRY_TOKEN` de
+    # larga vida en los secrets— funciona igual, pero deja una credencial
+    # permanente que hay que rotar y que puede filtrarse. Aqui no hay
+    # ningun secreto guardado: el token vive lo que dura el job.
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # La guarda que de verdad importa. El tag y la `version` de
+      # `Cargo.toml` son dos afirmaciones INDEPENDIENTES sobre lo mismo y
+      # nada las ata: taguear `v0.15.0` sobre un arbol que sigue diciendo
+      # `0.14.0` publicaria una version que nadie pidio. Y en crates.io no
+      # se borra —solo se puede hacer `yank`—, asi que este desajuste hay
+      # que cazarlo ANTES de subir, no despues.
+      - name: El tag y Cargo.toml dicen lo mismo
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          # Se selecciona el paquete POR NOMBRE en vez de coger `.packages[0]`.
+          # Hoy da igual —no hay `[workspace]`, asi que solo hay un paquete—,
+          # pero el dia que lo haya el orden del array no garantiza nada, y el
+          # fallo seria comparar el tag contra la version de OTRO crate.
+          manifiesto="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "oxidegate") | .version')"
+          if [ "$tag" != "$manifiesto" ]; then
+            echo "::error::El tag dice '$tag' y Cargo.toml dice '$manifiesto'. No se publica nada."
+            exit 1
+          fi
+          echo "Tag y manifiesto coinciden en $tag."
+
+      # `cargo publish` compila el paquete, pero NO ejecuta un solo test:
+      # su verificacion responde a «esto enlaza», no a «esto funciona».
+      # Como publicar es irreversible, el arbol tagueado se vuelve a
+      # verificar entero aunque ya pasara CI en `main` — un tag puede
+      # colocarse sobre cualquier commit, no solo sobre uno verde.
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo test --examples
+
+      # Pinneado a la version exacta a proposito: este repositorio NO
+      # publica un tag movil `v1`, solo `v1.0.x`. Escribir `@v1` —el
+      # reflejo de casi cualquier otra action— falla al resolver la
+      # referencia y rompe el job entero justo en el ultimo paso.
+      - id: auth
+        uses: rust-lang/crates-io-auth-action@v1.0.5
+
+      - run: cargo publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
