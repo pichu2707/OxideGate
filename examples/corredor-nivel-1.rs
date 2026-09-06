@@ -115,8 +115,54 @@ use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::process::Command;
+
+/// El PGID del harness que está corriendo **ahora mismo**, o 0 si no hay
+/// ninguno.
+///
+/// # Por qué hace falta un global para esto
+///
+/// `process_group(0)` saca al harness del grupo de primer plano de la terminal,
+/// así que el SIGINT del teclado **ya no le llega**. El manejador de Ctrl-C
+/// tiene que poder matarlo, y corre fuera del bucle que lo lanzó: este es el
+/// único sitio donde los dos se ven.
+///
+/// Sin esto, un Ctrl-C mataba solo al corredor y dejaba al harness huérfano —
+/// autenticado con el token real que hay en `/tmp`, gastando cuota y editando
+/// la tarea, sin topes que lo corten porque quien los mira acaba de morir.
+static PGID_VIVO: AtomicU32 = AtomicU32::new(0);
+
+/// Hay un `spawn` **en vuelo**: el harness puede estar ya corriendo aunque
+/// [`PGID_VIVO`] siga a 0.
+///
+/// Cierra la ventana entre `cmd.spawn()` y la publicación del PGID. Es
+/// estrecha —microsegundos— pero real, y lo que cae dentro es lo más caro que
+/// hay: el harness ya está vivo con la credencial real en su HOME, y un Ctrl-C
+/// ahí leía 0, se saltaba el `matar_grupo` y salía con `exit(130)`, que además
+/// no ejecuta ningún destructor, así que `kill_on_drop` tampoco compensaba.
+static LANZANDO: AtomicBool = AtomicBool::new(false);
+
+/// Qué PGID hay que matar al interrumpir, esperando al `spawn` si hace falta.
+///
+/// Devuelve 0 solo cuando de verdad no hay harness. Si hay uno en vuelo, espera
+/// a que publique su PGID —como mucho un segundo— antes de rendirse: más vale
+/// tardar un instante en salir que dejar vivo un proceso que gasta cuota.
+fn pgid_a_matar() -> u32 {
+    let mut pgid = PGID_VIVO.load(Ordering::SeqCst);
+    if pgid != 0 {
+        return pgid;
+    }
+    while LANZANDO.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(10));
+        pgid = PGID_VIVO.load(Ordering::SeqCst);
+        if pgid != 0 {
+            break;
+        }
+    }
+    pgid
+}
 
 /// El fichero que hay que reparar. Es el único que el harness debería tocar.
 const FUENTE: &str = "tarifa.py";
@@ -167,6 +213,29 @@ const ENCARGO_PEAJE: &str = "Responde solo: ok";
 /// `chatgpt.com/backend-api/codex`, que es el que lo acepta.
 const RUTA_CODEX: &str = "/v1/codex/responses";
 
+/// El **único** proveedor que el plugin de enrutado sabe interceptar, y por
+/// tanto el único con el que el nivel 2 puede medir algo.
+///
+/// # Por qué esto es una constante y no texto libre
+///
+/// El plugin no es genérico. Verificado leyendo el instalado
+/// (`~/.config/opencode/plugins/oxidegate-codex.ts`): compara la url contra
+/// **una literal**
+///
+/// ```text
+/// if (url !== CODEX_ENDPOINT) return originalFetch(input, init)
+/// ```
+///
+/// con `CODEX_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"`, y
+/// solo estampa la sesión cuando `input.model.providerID === "openai"`.
+///
+/// Cualquier otro proveedor **pasa de largo**: el tráfico va directo al
+/// upstream de pago, se quema cuota real, no se captura ni una fila y la guarda
+/// de telemetría aborta culpando al enrutado. El enrutado estaba bien; el
+/// proveedor no era enrutable. Es el mismo fallo silencioso que el resto de
+/// este fichero persigue, y por eso se comprueba **antes** de copiar nada.
+const PROVEEDOR_NIVEL_2: &str = "openai";
+
 /// Qué harness conduce esta corrida.
 ///
 /// Empezó siendo una constante —Codex— y **tuvo que dejar de serlo**: Codex
@@ -198,13 +267,34 @@ impl Harness {
         }
     }
 
-    /// Dónde vive el fichero de credenciales de este harness, relativo a `HOME`.
+    /// De dónde se **lee** la credencial, relativo al `HOME` REAL.
     ///
     /// Se copia **una sola entrada** de ahí, nunca el fichero entero: el de
     /// opencode lleva `openai`, `google`, `anthropic` y `oxidegate`, y llevarse
     /// las cuatro a un directorio temporal por comodidad seria regalar tres
     /// credenciales que no hacen falta.
-    fn ruta_credencial(self) -> Option<&'static str> {
+    ///
+    /// # Por qué el origen y el destino son dos funciones y no una
+    ///
+    /// Porque para Codex **no son el mismo sitio**, y usar una sola ruta para
+    /// los dos dejaba el origen en `~/auth.json` —que no existe—: el nivel 2
+    /// con Codex abortaba SIEMPRE, antes de mandar una peticion. Que Pi y
+    /// opencode las tengan iguales es una propiedad de esos dos harnesses, no
+    /// del diseño; colapsarlas por eso es justo el error que hubo que deshacer.
+    fn ruta_credencial_origen(self) -> Option<&'static str> {
+        match self {
+            Harness::Opencode => Some(".local/share/opencode/auth.json"),
+            Harness::Pi => Some(".pi/agent/auth.json"),
+            // Codex guarda su auth en CODEX_HOME, que sin tocar nada es
+            // `~/.codex`. Es el sitio del que hay que LEER.
+            Harness::Codex => Some(".codex/auth.json"),
+        }
+    }
+
+    /// Dónde se **escribe** la credencial, relativo al `HOME` AISLADO.
+    ///
+    /// Ver [`Harness::ruta_credencial_origen`] para por qué no es la misma.
+    fn ruta_credencial_destino(self) -> Option<&'static str> {
         match self {
             Harness::Opencode => Some(".local/share/opencode/auth.json"),
             Harness::Pi => Some(".pi/agent/auth.json"),
@@ -239,6 +329,39 @@ impl Harness {
         match self {
             Harness::Opencode => Some(".config/opencode/plugins/oxidegate-codex.ts"),
             Harness::Pi | Harness::Codex => None,
+        }
+    }
+
+    /// ¿Está este harness **cableado** para el nivel 2?
+    ///
+    /// # Por qué esto es una guarda y no una constante de adorno
+    ///
+    /// El nivel 2 mide al harness usando **su** proveedor y **su** credencial
+    /// OAuth. Para eso hacen falta dos cosas a la vez: que su config aislada
+    /// **no** declare a OxideGate como proveedor, y que algo enrute su tráfico
+    /// por el proxy de todas formas. Lo segundo es el plugin de
+    /// [`Harness::ruta_plugin`], y solo opencode tiene uno.
+    ///
+    /// `pi` lleva `--provider oxidegate --api-key no-se-usa` a fuego en
+    /// [`lanzar`], y la config de Codex fija `model_provider = "oxidegate"`
+    /// contra el proxy sin rama de nivel 2. Los dos **ignoran** el `auth.json`
+    /// que se les copia.
+    ///
+    /// Así que dejarles entrar al nivel 2 no medía el nivel 2: copiaba un token
+    /// OAuth **real** a `/tmp` para nadie y medía el cableado del nivel 1
+    /// mientras imprimía «gasta cuota real». Abortar es estrictamente mejor.
+    ///
+    /// Se declara **a mano y por harness**, y no como
+    /// `ruta_plugin().is_some()`. Hoy las dos cosas coinciden, pero son
+    /// afirmaciones distintas —«tiene plugin» y «está cableado para el nivel
+    /// 2»— y derivar una de la otra deja el test que las compara afirmando una
+    /// tautología. Es el mismo error que juntaba el origen y el destino de la
+    /// credencial en [`Harness::ruta_credencial_origen`], que costó que el
+    /// nivel 2 con Codex abortara siempre.
+    fn soporta_nivel_2(self) -> bool {
+        match self {
+            Harness::Opencode => true,
+            Harness::Pi | Harness::Codex => false,
         }
     }
 
@@ -386,10 +509,10 @@ fn copiar_credencial(
     proveedor: &str,
     home_real: &Path,
 ) -> Result<(), String> {
-    let rel = h
-        .ruta_credencial()
+    let origen = h
+        .ruta_credencial_origen()
         .ok_or_else(|| format!("no se donde guarda `{}` sus credenciales", h.binario()))?;
-    let real = home_real.join(rel);
+    let real = home_real.join(origen);
     let bruto = std::fs::read_to_string(&real)
         .map_err(|e| format!("no puedo leer {}: {e}", real.display()))?;
     let v: Value =
@@ -414,7 +537,10 @@ fn copiar_credencial(
         serde_json::json!({ proveedor: entrada })
     };
 
-    let destino = hogar.join(rel);
+    let destino = hogar.join(
+        h.ruta_credencial_destino()
+            .ok_or_else(|| format!("no se donde busca `{}` sus credenciales", h.binario()))?,
+    );
     if let Some(padre) = destino.parent() {
         std::fs::create_dir_all(padre).map_err(|e| format!("no puedo crear {padre:?}: {e}"))?;
     }
@@ -453,6 +579,84 @@ fn crear_privado(dir: &Path) -> std::io::Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+/// Deja el `HOME` aislado de esta repetición **vacío y en 0700**.
+///
+/// # Por qué borrar y no solo crear
+///
+/// [`preparar`] borra el directorio de trabajo en cada repetición, pero `hogar`
+/// solo se creaba con `create_dir_all`, que acepta en silencio uno que ya
+/// existe. Y la raíz lleva un nombre predecible por PID que **nada limpia** si
+/// la corrida muere por SIGKILL, Ctrl-C o panic.
+///
+/// Como los PID se reciclan, una corrida de **nivel 2** matada dejaba su
+/// `auth.json` real ahí, y la siguiente —de nivel 1, que ni copia credenciales
+/// ni las espera— se lo encontraba puesto: un banco de coste cero con un token
+/// OAuth vivo dentro, capaz de gastar cuota sin que nada lo declare.
+fn preparar_hogar(hogar: &Path) -> std::io::Result<()> {
+    if hogar.exists() {
+        std::fs::remove_dir_all(hogar)?;
+    }
+    crear_privado(hogar)
+}
+
+/// Mata al **grupo** de procesos del harness, no solo al harness.
+///
+/// # Por qué `kill_on_drop` no basta
+///
+/// `kill_on_drop` mata al hijo DIRECTO. Los dos harnesses corren con
+/// `bash: allow` / `--approve`, así que lanzan nietos, y un nieto colgado
+/// sobrevivía al plazo: podía editar `rep-{i}/tarifa.py` entre el
+/// [`hash_fichero`] y el [`tests_pasan`] —falseando el veredicto— o correr
+/// contra el `remove_dir_all` del final. El comentario de `kill_on_drop`
+/// afirmaba más de lo que `kill_on_drop` da.
+///
+/// El hijo se lanza con `process_group(0)`, así que es líder de su grupo y su
+/// PID **es** el PGID. `kill -KILL -<pgid>` se lo lleva entero. Se usa el
+/// binario en vez de `libc` para no añadir una dependencia al crate por esto.
+/// # La forma de invocarlo importa, y se midió
+///
+/// Se usa `kill -s KILL -- -<pgid>`, **no** `kill -KILL -<pgid>`. Medido contra
+/// `procps-ng 4.0.4` el 2026-09-06:
+///
+/// | invocación | grupo vivo | grupo vacío |
+/// |---|---|---|
+/// | `kill -KILL -PGID` | mata, pero devuelve **1** | devuelve **0** |
+/// | `kill -s KILL -- -PGID` | mata, devuelve **0** | devuelve **1** (ESRCH) |
+///
+/// La primera forma mata igual, pero su estado está **invertido**: no sirve
+/// para distinguir nada. Con `-s` y `--` el estado sí significa algo, que es lo
+/// que permite que el aviso de abajo sea honesto en vez de decorativo.
+///
+/// # Qué se dice y qué no
+///
+/// Un estado 1 es lo **normal**: el grupo ya no tenía a nadie, que es justo lo
+/// que se quería. Pero que `kill` no se pueda **lanzar** —un contenedor mínimo
+/// donde solo existe el builtin del shell— deja nietos vivos **sin dar ningún
+/// error**, y una corrida que no puede matar al árbol no puede responder por su
+/// veredicto. Ese es el patrón fail-open que este fichero entero persigue, así
+/// que ese caso, y solo ese, se avisa.
+fn matar_grupo(pid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pid) = pid {
+        let salida = std::process::Command::new("kill")
+            .arg("-s")
+            .arg("KILL")
+            .arg("--")
+            .arg(format!("-{pid}"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if salida.is_err() {
+            eprintln!(
+                "  AVISO: no pude LANZAR `kill` para matar el grupo {pid}. Si el harness\n\
+                 \x20 dejo nietos vivos, pueden seguir editando la tarea o gastando cuota."
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 /// Copia al `HOME` aislado **el plugin de enrutado y ninguno más**.
@@ -513,6 +717,180 @@ fn escribir_config(
                 config_codex(puerto, modelo, wire),
             )
         }
+    }
+}
+
+/// El argumento `-m` de opencode, que **no es** el modelo con el que se filtra
+/// la telemetría.
+///
+/// # El fallo que esto arregla
+///
+/// El `-m` de opencode exige `proveedor/modelo`. La telemetría, en cambio,
+/// guarda el modelo **desnudo** —comprobado sobre 4.906 filas reales el
+/// 2026-09-06: ninguna lleva `/`—, y `filas_nuevas` filtra por esa cadena.
+///
+/// Son dos cosas distintas, y el nivel 2 las trataba como una sola. Con el
+/// desnudo en el `-m`, opencode se queda sin proveedor; con el prefijado en el
+/// filtro, no casa **ni una fila** — los contadores de cuota se quedan a cero,
+/// ningún tope puede dispararse y la guarda de telemetría aborta en la rep 0
+/// diciendo que el enrutado no funciona. El enrutado funcionaba.
+///
+/// Por eso `CORREDOR_MODELO` es siempre el desnudo (lo que la telemetría
+/// escribe) y el prefijo se pone **aquí**, que es el único sitio que lo
+/// necesita.
+///
+/// En el nivel 1 el proveedor es el `oxidegate` que declara [`config_opencode`].
+/// En el 2 esa config no declara ninguno —a propósito, para no dejar una clave
+/// falsa de reserva—, así que el proveedor es el dueño de la credencial que se
+/// acaba de copiar: `CORREDOR_PROVEEDOR`, que en el nivel 2 es obligatorio.
+fn modelo_cli_opencode(modelo: &str, proveedor: &str, nivel: u8) -> String {
+    if nivel == 2 {
+        format!("{proveedor}/{modelo}")
+    } else {
+        format!("oxidegate/{modelo}")
+    }
+}
+
+/// El modelo tiene que llegar **desnudo**, porque es lo que la telemetría
+/// escribe y `filas_nuevas` compara.
+///
+/// Pegar el proveedor dentro de `CORREDOR_MODELO` no daba un error: daba un
+/// filtro que no casa nada y un diagnóstico **falso** culpando al enrutado. La
+/// guarda existe para convertir ese silencio en un mensaje que dice dónde va
+/// cada cosa, y para hacerlo **antes** de gastar cuota.
+///
+/// # Por qué no se prohíbe la barra en todas partes
+///
+/// Porque la barra solo es ambigua **donde el corredor la usa para pegar dos
+/// cosas**: el `-m` de opencode en el nivel 2. En el nivel 1 el modelo es un
+/// tag de ollama, y `hf.co/usuario/repo:quant` es legítimo — [`config_pi`] lo
+/// mete tal cual y la telemetría lo escribe tal cual, así que `filas_nuevas`
+/// casa de sobra. Prohibirlo de forma global cambiaba un fallo silencioso por
+/// un aborto falso: el mismo pecado con el signo cambiado.
+fn validar_modelo(h: Harness, modelo: &str, nivel: u8) -> Result<(), String> {
+    // VACIO PRIMERO, y para todos los niveles. Un modelo vacio no lleva `/`,
+    // asi que se colaba por la guarda de abajo, y `validar_proveedor_nivel_2`
+    // -que si comprueba el vacio- mira otra variable. Resultado: el nivel 2
+    // copiaba un token real a /tmp, opencode arrancaba con `-m openai/`, moria
+    // en local sin tocar la red, y las cero filas disparaban la guarda de
+    // telemetria acusando al enrutado. Un fallo del banco leido como fallo de
+    // enrutado, despues de dejar la credencial en disco.
+    if modelo.trim().is_empty() {
+        return Err(
+            "CORREDOR_MODELO esta vacio. Sin modelo no hay nada que medir, y en el\n\
+             \x20 nivel 2 la corrida llegaria a copiar una credencial real antes de\n\
+             \x20 descubrirlo -y luego culparia al enrutado de no ver telemetria."
+                .to_string(),
+        );
+    }
+    if h == Harness::Opencode && nivel == 2 && modelo.contains('/') {
+        return Err(format!(
+            "CORREDOR_MODELO={modelo:?} lleva `/`.\n\
+             \x20 El modelo va DESNUDO: es lo que la telemetria escribe y con lo que se\n\
+             \x20 filtran las filas de esta corrida. Con el proveedor pegado no casaria\n\
+             \x20 NI UNA, y el corredor abortaria culpando al enrutado.\n\
+             \x20 El proveedor va en CORREDOR_PROVEEDOR; el corredor lo pone en el `-m`."
+        ));
+    }
+    Ok(())
+}
+
+/// El proveedor del nivel 2, que **no es texto libre**: tiene que ser el que el
+/// plugin de enrutado sabe interceptar. Ver [`PROVEEDOR_NIVEL_2`].
+///
+/// Los dos errores son distintos a propósito. No elegir es un descuido que se
+/// arregla leyendo; elegir uno que el plugin no enruta es una corrida que
+/// **gasta cuota de verdad** y luego miente sobre por qué no midió nada.
+fn validar_proveedor_nivel_2(proveedor: &str) -> Result<(), String> {
+    // Se compara TRIMADO, como `validar_nivel` y `tope()`. Sin esto, un
+    // `CORREDOR_PROVEEDOR=$(cat fichero)` -con su `\n` al final- dejaba el
+    // unico valor valido rechazado con un mensaje acusandole de no ser
+    // enrutable, mandando a buscar el fallo donde no habia ninguno.
+    let proveedor = proveedor.trim();
+    if proveedor.is_empty() {
+        return Err(
+            "el nivel 2 necesita CORREDOR_PROVEEDOR (que credencial usar).\n\
+             \x20 No se elige por defecto a proposito: copiar una credencial es una\n\
+             \x20 decision, no un descuido."
+                .to_string(),
+        );
+    }
+    if proveedor != PROVEEDOR_NIVEL_2 {
+        return Err(format!(
+            "CORREDOR_PROVEEDOR={proveedor:?} NO lo enruta el plugin. El unico que si: \
+             {PROVEEDOR_NIVEL_2:?}.\n\
+             \x20 El plugin compara la url contra UNA literal -el backend de Codex- y solo\n\
+             \x20 estampa la sesion si el providerID es {PROVEEDOR_NIVEL_2:?}. Con cualquier otro\n\
+             \x20 el trafico pasa de largo: va DIRECTO al upstream de pago, quema CUOTA\n\
+             \x20 real, no deja ni una fila de telemetria y el corredor aborta culpando al\n\
+             \x20 enrutado. El enrutado estaria bien; el proveedor no seria enrutable.\n\
+             \x20 Enrutar otros proveedores es trabajo de #123, no de esta variable."
+        ));
+    }
+    Ok(())
+}
+
+/// Un número de configuración: ausente o vacío es el defecto, **ilegible
+/// aborta**.
+///
+/// # Por qué no se quedó con `parse().unwrap_or(defecto)`
+///
+/// Porque es la misma degradación silenciosa que [`validar_nivel`] existe para
+/// condenar, dos líneas más arriba en el mismo `main`. `CORREDOR_TIMEOUT=6OO`
+/// —con la letra O— se convertía en 300 s sin decir nada, y `CORREDOR_N=" 20 "`
+/// en 3, porque el `FromStr` numérico de Rust rechaza los espacios de alrededor.
+///
+/// Las dos gobiernan gasto real en el nivel 2: cuántas repeticiones se corren y
+/// cuánto tiempo puede correr cada una sin nadie delante. Un operador que se
+/// equivoca escribiéndolas merece enterarse, no correr otra cosa.
+fn numero<T: std::str::FromStr>(nombre: &str, defecto: T) -> T {
+    match std::env::var(nombre) {
+        Err(_) => defecto,
+        Ok(v) if v.trim().is_empty() => defecto,
+        Ok(v) => match v.trim().parse() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("ABORTA: {nombre}={v:?} no es un numero.");
+                eprintln!("  No se degrada al defecto en silencio: en el nivel 2 estas dos");
+                eprintln!("  gobiernan cuanto se gasta y cuanto corre cada repeticion sin");
+                eprintln!("  nadie delante. Una errata tiene que verse.");
+                std::process::exit(1);
+            }
+        },
+    }
+}
+
+/// El nivel, que solo puede ser **1 o 2**.
+///
+/// # Por qué esto no es una validación de cortesía
+///
+/// Las puertas del nivel son **asimétricas**: el camino de pago se elige con el
+/// `else` de `nivel == 1`, pero todas las protecciones —proveedor obligatorio,
+/// topes obligatorios, guarda de telemetría por repetición, corte por cuota—
+/// se activan con `nivel == 2`. Un `CORREDOR_NIVEL=3` cogía el camino caro
+/// **saltándose las cuatro**.
+///
+/// Y `parse().unwrap_or(1)` convertía una errata en nivel 1 sin decir nada.
+/// Aquí la degradación cae del lado barato, pero el precedente de [`tope`] vale
+/// igual: un valor ilegible es una errata, y una errata se dice.
+fn validar_nivel(bruto: &str) -> Result<u8, String> {
+    match bruto.trim() {
+        // Vacio no es una errata: es AUSENCIA, y la ausencia ya tiene defecto.
+        // `tope()` los trata igual a proposito, y aqui hace falta lo mismo o un
+        // `CORREDOR_NIVEL="$NIVEL"` con la variable sin definir se muere en vez
+        // de correr el nivel 1. No reabre nada: lo que habia que cerrar era el
+        // camino CARO por descarte, y esto cae al barato.
+        "" => Ok(1),
+        "1" => Ok(1),
+        "2" => Ok(2),
+        otro => Err(format!(
+            "CORREDOR_NIVEL={otro:?} no es un nivel. Solo hay 1 y 2.\n\
+             \x20 No se degrada al 1 en silencio: las puertas del nivel son ASIMETRICAS\n\
+             \x20 -el camino de pago se coge por descarte y las protecciones solo se\n\
+             \x20 activan con el 2-, asi que un valor raro cogia el camino caro SIN\n\
+             \x20 proveedor obligatorio, SIN topes, SIN guarda de telemetria y SIN corte\n\
+             \x20 por cuota."
+        )),
     }
 }
 
@@ -621,14 +999,69 @@ fn tope<T: std::str::FromStr + Default>(nombre: &str) -> T {
 /// del fail-open. O sea que la guarda pensada para ser el caso seguro era justo
 /// la que dejaba el token OAuth en `/tmp` para siempre.
 fn abortar(raiz: &Path, mensaje: &str) -> ! {
-    eprintln!("{mensaje}");
+    // Vacio significa «el motivo ya se imprimio arriba»: imprimirlo igual
+    // metia una linea en blanco justo donde el lector busca la causa.
+    if !mensaje.is_empty() {
+        eprintln!("{mensaje}");
+    }
+    limpiar_interrupcion(raiz, PGID_VIVO.load(Ordering::SeqCst));
+    std::process::exit(1);
+}
+
+/// Espera a **cualquiera** de las señales con las que se corta una corrida.
+///
+/// # Por qué no basta con SIGINT
+///
+/// Porque `process_group(0)` sacó al harness del grupo de primer plano de la
+/// terminal. Antes de ese cambio el harness heredaba el grupo del corredor y
+/// recibía SIGINT **y SIGHUP** de la terminal directamente; ahora no recibe
+/// ninguna, así que cada señal que aquí no se maneje es una forma nueva de
+/// dejar un harness huérfano gastando cuota:
+///
+/// - **SIGINT** — el Ctrl-C del teclado.
+/// - **SIGTERM** — `kill <pid>`, `timeout`, un `systemctl stop`, un paso de CI
+///   que se cancela.
+/// - **SIGHUP** — se cierra la sesión ssh o la terminal.
+///
+/// En una plataforma que no sea unix solo hay Ctrl-C, que es lo que hay.
+async fn esperar_senal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate()).expect("SIGTERM");
+        let mut hup = signal(SignalKind::hangup()).expect("SIGHUP");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+            _ = hup.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+/// Deja el disco como estaba cuando la corrida se corta a medias: **mata al
+/// harness vivo** y borra la raíz.
+///
+/// Las dos mitades importan y por motivos distintos. La raíz es donde el nivel
+/// 2 tiene la credencial real, y el nombre es predecible por PID. El harness,
+/// desde que corre con `process_group(0)`, sobrevive al SIGINT del teclado: si
+/// no se le mata a mano queda huérfano, gastando cuota que ya no cuenta ningún
+/// tope.
+///
+/// `pgid` a 0 significa que no hay ninguno corriendo.
+fn limpiar_interrupcion(raiz: &Path, pgid: u32) {
+    if pgid != 0 {
+        matar_grupo(Some(pgid));
+    }
     if let Err(e) = std::fs::remove_dir_all(raiz) {
         if raiz.exists() {
             eprintln!("  AVISO: no pude borrar {}: {e}", raiz.display());
             eprintln!("  Si la corrida era de NIVEL 2, ahi dentro hay una credencial real.");
         }
     }
-    std::process::exit(1);
 }
 
 fn var(nombre: &str, defecto: &str) -> String {
@@ -925,6 +1358,7 @@ async fn lanzar(
     trabajo: &Path,
     hogar: &Path,
     modelo: &str,
+    proveedor: &str,
     encargo: &str,
     plazo: u64,
     nivel: u8,
@@ -986,24 +1420,20 @@ async fn lanzar(
             cmd.arg("run");
             if nivel == 1 {
                 // Sin plugins externos: lo que se mide es opencode, no lo que
-                // alguien le haya instalado encima. Y el modelo va por el
-                // proveedor `oxidegate` que escribe `escribir_config`.
-                cmd.arg("--pure")
-                    .arg("-m")
-                    .arg(format!("oxidegate/{modelo}"));
-            } else {
-                // NIVEL 2: `--pure` NO puede ir. Desactiva plugins externos, y
-                // el que enruta a OxideGate es uno de ellos: sin el, el harness
-                // va DIRECTO al upstream de pago y no se captura nada. Como el
-                // HOME aislado solo lleva ESE plugin, quitarlo carga ese y nada
-                // mas.
-                //
-                // Y el modelo va DESNUDO -sin el prefijo `oxidegate/`- para que
-                // opencode use su proveedor propio y su credencial OAuth, que
-                // es lo que el nivel 2 mide.
-                cmd.arg("-m").arg(modelo);
+                // alguien le haya instalado encima.
+                cmd.arg("--pure");
             }
-            cmd.arg(encargo);
+            // NIVEL 2: `--pure` NO puede ir. Desactiva plugins externos, y el
+            // que enruta a OxideGate es uno de ellos: sin el, el harness va
+            // DIRECTO al upstream de pago y no se captura nada. Como el HOME
+            // aislado solo lleva ESE plugin, quitarlo carga ese y nada mas.
+            //
+            // El `-m` SIEMPRE lleva proveedor -`config_opencode` en el nivel 1,
+            // el dueno de la credencial en el 2-, y NUNCA es la misma cadena
+            // con la que se filtra la telemetria. Ver `modelo_cli_opencode`.
+            cmd.arg("-m")
+                .arg(modelo_cli_opencode(modelo, proveedor, nivel))
+                .arg(encargo);
         }
         Harness::Codex => {
             // Su config vive en CODEX_HOME, no bajo HOME.
@@ -1016,12 +1446,22 @@ async fn lanzar(
         }
     }
 
+    // El harness es LIDER DE SU GRUPO, asi que su PID es tambien el PGID y al
+    // expirar el plazo se puede matar el arbol entero con `matar_grupo`.
+    // `kill_on_drop` solo alcanza al hijo directo, y los dos harnesses corren
+    // con `bash: allow` / `--approve`: sus nietos sobrevivian al plazo y podian
+    // editar la tarea entre el hash y el verificador.
+    #[cfg(unix)]
+    cmd.process_group(0);
+
     cmd
         // Al expirar el plazo se suelta el futuro, y con el el hijo. Sin esto
         // tokio NO lo mata: el harness seguiria vivo, mandando peticiones que
         // caerian en la ventana de telemetria de la repeticion SIGUIENTE y
         // pudiendo seguir editando su directorio. Corromperia las repeticiones
         // posteriores en silencio, que es la peor clase de fallo del banco.
+        // Es NECESARIO pero no suficiente: solo alcanza al hijo directo, y por
+        // eso el plazo tambien llama a `matar_grupo`.
         .kill_on_drop(true)
         // Los dos esperan stdin: sin cerrarlo se quedan colgados.
         .stdin(std::process::Stdio::null())
@@ -1033,26 +1473,55 @@ async fn lanzar(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
 
+    // SE MARCA ANTES DEL SPAWN. Entre que `spawn` vuelve y se publica el PGID
+    // hay una ventana en la que el harness YA CORRE y el manejador de senales
+    // leeria 0: se saltaria el `matar_grupo` y saldria con `exit(130)`, que no
+    // ejecuta destructores, asi que `kill_on_drop` tampoco compensaria. Es
+    // estrecha, pero lo que cae dentro es un harness vivo con la credencial
+    // real en su HOME.
+    LANZANDO.store(true, Ordering::SeqCst);
     let Ok(hijo) = cmd.spawn() else {
+        LANZANDO.store(false, Ordering::SeqCst);
         return (false, String::from("<no se pudo lanzar el harness>"));
     };
-    match tokio::time::timeout(Duration::from_secs(plazo), hijo.wait_with_output()).await {
-        Ok(Ok(o)) => {
-            let mut t = String::from_utf8_lossy(&o.stdout).into_owned();
-            let err = String::from_utf8_lossy(&o.stderr);
-            if !err.trim().is_empty() {
-                t.push_str("\n--- stderr ---\n");
-                t.push_str(&err);
+    // Se coge ANTES del `await`: `wait_with_output` consume al hijo, y despues
+    // del plazo ya no habria a quien preguntarle el PID del grupo.
+    let pgid = hijo.id();
+    // Y se publica para el manejador de senales, que es el unico que puede
+    // matarlo cuando el SIGINT del teclado ya no le llega.
+    PGID_VIVO.store(pgid.unwrap_or(0), Ordering::SeqCst);
+    LANZANDO.store(false, Ordering::SeqCst);
+    let salida =
+        match tokio::time::timeout(Duration::from_secs(plazo), hijo.wait_with_output()).await {
+            Ok(Ok(o)) => {
+                let mut t = String::from_utf8_lossy(&o.stdout).into_owned();
+                let err = String::from_utf8_lossy(&o.stderr);
+                if !err.trim().is_empty() {
+                    t.push_str("\n--- stderr ---\n");
+                    t.push_str(&err);
+                }
+                (false, t)
             }
-            (false, t)
-        }
-        Ok(Err(e)) => (false, format!("<fallo esperando al harness: {e}>")),
-        // El hijo muere al soltarse el futuro, por `kill_on_drop` de arriba.
-        Err(_) => (
-            true,
-            String::from("<expiro el plazo: sin salida capturada>"),
-        ),
-    }
+            Ok(Err(e)) => (false, format!("<fallo esperando al harness: {e}>")),
+            Err(_) => (
+                true,
+                String::from("<expiro el plazo: sin salida capturada>"),
+            ),
+        };
+
+    // SE MATA EL GRUPO EN LOS TRES CAMINOS, no solo al expirar el plazo.
+    //
+    // `kill_on_drop` alcanza al hijo directo, y `wait_with_output` vuelve en
+    // cuanto el hijo sale y los pipes dan EOF. Pero un nieto que se desligo de
+    // stdio (`... >/dev/null 2>&1 &`, trivial con `bash: allow`) sobrevive a
+    // una salida NORMAL del harness: se queda en `rep-{i}` y puede editar la
+    // tarea entre el `hash_fichero` y el `tests_pasan` -falseando el veredicto-
+    // o correr contra el `remove_dir_all` del final.
+    //
+    // Con el grupo ya vacio esto no hace nada, que es el caso corriente.
+    matar_grupo(pgid);
+    PGID_VIVO.store(0, Ordering::SeqCst);
+    salida
 }
 
 /// Guarda la salida de una repeticion que no resolvio, para poder mirarla.
@@ -1076,18 +1545,38 @@ fn guardar_rastro(dir: &Path, i: usize, v: Veredicto, salida: &str) -> Option<Pa
 #[tokio::main]
 async fn main() {
     let tarea = PathBuf::from(var("CORREDOR_TAREA", "tareas/reparar-tarifa"));
-    let modelo = var("CORREDOR_MODELO", "qwen3:14b-nothink");
+    // Trimado en el origen: el modelo viaja al `-m` Y al filtro de telemetria,
+    // y un espacio de mas no casaria ninguna fila.
+    let modelo = var("CORREDOR_MODELO", "qwen3:14b-nothink")
+        .trim()
+        .to_string();
     let puerto = var("CORREDOR_PUERTO", "8899");
     let encargo = var("CORREDOR_ENCARGO", ENCARGO);
     let wire = var("CORREDOR_WIRE", "responses");
     let nombre_h = var("CORREDOR_HARNESS", "pi");
     let Some(harness) = Harness::desde(&nombre_h) else {
-        eprintln!("ABORTA: harness `{nombre_h}` desconocido. Validos: pi, codex.");
+        eprintln!("ABORTA: harness `{nombre_h}` desconocido. Validos: pi, opencode, codex.");
         std::process::exit(1);
     };
     let modo_peaje = var("CORREDOR_MODO", "corrida") == "peaje";
-    let nivel: u8 = var("CORREDOR_NIVEL", "1").parse().unwrap_or(1);
-    let proveedor = var("CORREDOR_PROVEEDOR", "");
+    // Las dos validaciones van AQUI, antes de imprimir nada y mucho antes de
+    // que se pueda gastar cuota. Ninguna se degrada a un defecto: un nivel raro
+    // coge el camino de pago sin protecciones, y un modelo con el proveedor
+    // pegado rompe el filtro de telemetria en silencio.
+    let nivel = match validar_nivel(&var("CORREDOR_NIVEL", "1")) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("ABORTA: {e}");
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = validar_modelo(harness, &modelo, nivel) {
+        eprintln!("ABORTA: {e}");
+        std::process::exit(1);
+    }
+    // Trimado tambien: se usa para elegir la credencial Y para construir el
+    // `-m {proveedor}/{modelo}`. Un `\n` de un `$(cat ...)` lo rompia.
+    let proveedor = var("CORREDOR_PROVEEDOR", "").trim().to_string();
     // Topes de CUOTA, no de dolares: los dos harnesses hablan por OAuth de
     // suscripcion, asi que lo que se gasta no es una factura sino cuota.
     // `unwrap_or(0)` seria fatal aqui: 0 significa «sin tope», asi que una
@@ -1096,8 +1585,8 @@ async fn main() {
     let tope_peticiones: usize = tope("CORREDOR_TOPE_PETICIONES");
     let tope_tokens: u64 = tope("CORREDOR_TOPE_TOKENS");
     let datos = var("CORREDOR_DATOS", "./datos-corredor.jsonl");
-    let n: usize = var("CORREDOR_N", "3").parse().unwrap_or(3);
-    let plazo: u64 = var("CORREDOR_TIMEOUT", "300").parse().unwrap_or(300);
+    let n: usize = numero("CORREDOR_N", 3);
+    let plazo: u64 = numero("CORREDOR_TIMEOUT", 300);
 
     println!(
         "corredor del nivel 1 — {} contra {modelo}",
@@ -1117,10 +1606,26 @@ async fn main() {
     // y no cuestan nada; ponerlas detras de una guarda de red las hacia
     // inalcanzables — comprobado: nunca se ejecutaban.
     if nivel == 2 {
-        if proveedor.is_empty() {
-            eprintln!("ABORTA: el nivel 2 necesita CORREDOR_PROVEEDOR (que credencial usar).");
-            eprintln!("  No se elige por defecto a proposito: copiar una credencial es una");
-            eprintln!("  decision, no un descuido.");
+        // LA PRIMERA DE TODAS: si el harness no esta cableado para el nivel 2,
+        // nada de lo que viene despues mide el nivel 2 — pero SI copia una
+        // credencial real a /tmp. Se para antes de tocar el disco.
+        if !harness.soporta_nivel_2() {
+            eprintln!(
+                "ABORTA: `{}` NO esta cableado para el nivel 2.",
+                harness.binario()
+            );
+            eprintln!("  El nivel 2 mide al harness con SU proveedor y SU credencial OAuth, y");
+            eprintln!("  para eso hace falta un plugin que enrute por el proxy sin que la");
+            eprintln!("  config declare a OxideGate. Solo `opencode` tiene uno.");
+            eprintln!("  `pi` lleva `--provider oxidegate` a fuego y la config de `codex` fija");
+            eprintln!("  `model_provider = \"oxidegate\"`: los dos IGNORAN el auth.json que se");
+            eprintln!("  les copiaria. Dejarles entrar no media el nivel 2 - copiaba un token");
+            eprintln!("  OAuth real a /tmp para nadie y media el cableado del nivel 1.");
+            eprintln!("  Cablearlos es trabajo de #123, no de esta variable.");
+            std::process::exit(1);
+        }
+        if let Err(e) = validar_proveedor_nivel_2(&proveedor) {
+            eprintln!("ABORTA: {e}");
             std::process::exit(1);
         }
         if tope_peticiones == 0 {
@@ -1248,12 +1753,52 @@ async fn main() {
     let telemetria = ruta_telemetria();
     let home_real = PathBuf::from(std::env::var("HOME").unwrap_or_default());
     let raiz = std::env::temp_dir().join(format!("corredor-{}", std::process::id()));
+    // Se BORRA antes de crearla. El nombre es predecible por PID y los PID se
+    // reciclan: una corrida anterior matada por SIGKILL, Ctrl-C o panic pudo
+    // dejar ahi su HOME con una credencial real dentro.
+    if raiz.exists() {
+        if let Err(e) = std::fs::remove_dir_all(&raiz) {
+            eprintln!(
+                "ABORTA: {} es de una corrida anterior y no puedo borrarla: {e}",
+                raiz.display()
+            );
+            eprintln!("  No se reusa: si aquella era de NIVEL 2, ahi dentro hay un token real.");
+            std::process::exit(1);
+        }
+    }
     // 0700: la raiz lleva un nombre predecible por PID y, en el nivel 2,
     // contiene una credencial real.
     if let Err(e) = crear_privado(&raiz) {
         eprintln!("ABORTA: no puedo crear {} en privado: {e}", raiz.display());
         std::process::exit(1);
     }
+    // CTRL-C. Desde que el harness corre con `process_group(0)` ya no esta en
+    // el grupo de primer plano de la terminal, asi que el SIGINT del teclado
+    // NO le llega: sin este manejador, un Ctrl-C mataba solo al corredor y
+    // dejaba al harness huerfano -autenticado con el token real de /tmp,
+    // gastando cuota y editando la tarea, y sin nadie mirando los topes-.
+    let raiz_senal = raiz.clone();
+    tokio::spawn(async move {
+        esperar_senal().await;
+        // LA SALIDA DE EMERGENCIA SE ARMA ANTES DE LIMPIAR. La limpieza es
+        // sincrona y puede atascarse -un TMPDIR lento o en red, un `kill` que
+        // no vuelve-, y `tokio::signal` se queda con la disposicion de la
+        // senal para el resto de la vida del proceso: sin esta segunda espera,
+        // un Ctrl-C impaciente no hacia NADA y solo quedaba matar desde otra
+        // terminal.
+        tokio::spawn(async {
+            esperar_senal().await;
+            eprintln!("  SEGUNDA SENAL: salgo sin terminar de limpiar.");
+            eprintln!("  Puede quedar algo en el temporal. Si la corrida era de NIVEL 2,");
+            eprintln!("  ahi dentro hay una credencial real.");
+            std::process::exit(130);
+        });
+        eprintln!("\n\nINTERRUMPIDO. Matando al harness y borrando el HOME aislado.");
+        limpiar_interrupcion(&raiz_senal, pgid_a_matar());
+        // 130 es lo que se espera de un proceso muerto por una senal.
+        std::process::exit(130);
+    });
+
     // Los rastros sobreviven a la corrida a proposito: son lo que se mira
     // cuando el resultado no se explica solo.
     let rastros = PathBuf::from(var("CORREDOR_RASTROS", "./rastros-corredor"));
@@ -1280,6 +1825,16 @@ async fn main() {
             abortar(
                 &raiz,
                 &format!("  rep {i}: no puedo preparar el directorio: {e}"),
+            );
+        }
+        // El HOME aislado se deja VACIO y en 0700 en cada repeticion. No es
+        // ceremonia: sin esto una corrida de nivel 2 matada dejaba su auth.json
+        // real en un directorio de nombre predecible por PID, y la siguiente
+        // -de nivel 1, que no copia credenciales- se lo encontraba puesto.
+        if let Err(e) = preparar_hogar(&hogar) {
+            abortar(
+                &raiz,
+                &format!("  rep {i}: no puedo dejar el HOME aislado limpio: {e}"),
             );
         }
         if let Err(e) = escribir_config(harness, &hogar, &puerto, &modelo, &wire, nivel) {
@@ -1311,6 +1866,7 @@ async fn main() {
             &trabajo,
             &hogar,
             &modelo,
+            &proveedor,
             encargo_rep,
             plazo,
             nivel,
@@ -1402,7 +1958,13 @@ async fn main() {
         // las `n` repeticiones enteras. Un cero de filas es la unica senal que
         // queda, y aqui para en seco.
         if nivel == 2 && filas.is_empty() {
-            eprintln!("\nABORTA: la primera repeticion no dejo NI UNA fila de telemetria.");
+            // Dice la repeticion REAL, no «la primera». La guarda se amplio a
+            // todas en #141 y el texto se quedo con el de antes: en una corrida
+            // larga mandaba a mirar la rep 0 cuando la que se rompio era la 17.
+            eprintln!(
+                "\nABORTA: la repeticion {} no dejo NI UNA fila de telemetria.",
+                i + 1
+            );
             eprintln!("  El harness gasto cuota y el proxy no vio nada, asi que el enrutado");
             eprintln!("  NO esta funcionando. El plugin es fail-open: no da error, solo");
             eprintln!("  deja de medir.");
@@ -1764,10 +2326,11 @@ mod tests {
         let raiz = std::env::temp_dir().join(format!("cred-{}", std::process::id()));
         let home = raiz.join("home-real");
         let aislado = raiz.join("aislado");
-        let rel = Harness::Opencode.ruta_credencial().unwrap();
-        std::fs::create_dir_all(home.join(rel).parent().unwrap()).unwrap();
+        let origen = Harness::Opencode.ruta_credencial_origen().unwrap();
+        let destino = Harness::Opencode.ruta_credencial_destino().unwrap();
+        std::fs::create_dir_all(home.join(origen).parent().unwrap()).unwrap();
         std::fs::write(
-            home.join(rel),
+            home.join(origen),
             r#"{"openai":{"type":"oauth","access":"AAA"},
                 "google":{"type":"oauth","access":"BBB"},
                 "anthropic":{"type":"oauth","access":"CCC"}}"#,
@@ -1776,7 +2339,7 @@ mod tests {
 
         copiar_credencial(Harness::Opencode, &aislado, "openai", &home).expect("deberia copiar");
 
-        let copiado = std::fs::read_to_string(aislado.join(rel)).unwrap();
+        let copiado = std::fs::read_to_string(aislado.join(destino)).unwrap();
         assert!(copiado.contains("openai"), "falta la que se pidio");
         assert!(!copiado.contains("google"), "se colo `google`");
         assert!(!copiado.contains("anthropic"), "se colo `anthropic`");
@@ -1793,12 +2356,13 @@ mod tests {
         let raiz = std::env::temp_dir().join(format!("perm-{}", std::process::id()));
         let home = raiz.join("home-real");
         let aislado = raiz.join("aislado");
-        let rel = Harness::Opencode.ruta_credencial().unwrap();
-        std::fs::create_dir_all(home.join(rel).parent().unwrap()).unwrap();
-        std::fs::write(home.join(rel), r#"{"openai":{"access":"AAA"}}"#).unwrap();
+        let origen = Harness::Opencode.ruta_credencial_origen().unwrap();
+        let destino = Harness::Opencode.ruta_credencial_destino().unwrap();
+        std::fs::create_dir_all(home.join(origen).parent().unwrap()).unwrap();
+        std::fs::write(home.join(origen), r#"{"openai":{"access":"AAA"}}"#).unwrap();
 
         copiar_credencial(Harness::Opencode, &aislado, "openai", &home).unwrap();
-        let modo = std::fs::metadata(aislado.join(rel))
+        let modo = std::fs::metadata(aislado.join(destino))
             .unwrap()
             .permissions()
             .mode()
@@ -1813,7 +2377,7 @@ mod tests {
     fn un_proveedor_ausente_no_filtra_los_valores_de_los_demas() {
         let raiz = std::env::temp_dir().join(format!("cred-no-{}", std::process::id()));
         let home = raiz.join("home-real");
-        let rel = Harness::Opencode.ruta_credencial().unwrap();
+        let rel = Harness::Opencode.ruta_credencial_origen().unwrap();
         std::fs::create_dir_all(home.join(rel).parent().unwrap()).unwrap();
         std::fs::write(
             home.join(rel),
@@ -1848,15 +2412,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&raiz);
     }
 
-    /// `lanzar` pone CODEX_HOME=hogar, asi que Codex busca su auth en
-    /// `hogar/auth.json`. Escribirla en `hogar/.codex/auth.json` -el sitio de
-    /// un HOME normal- la dejaba donde nadie la lee, con el token real ya en
-    /// disco.
-    #[test]
-    fn la_credencial_de_codex_va_donde_codex_la_busca() {
-        assert_eq!(Harness::Codex.ruta_credencial(), Some("auth.json"));
-    }
-
     /// El plugin usa OXIDEGATE_URL como ENDPOINT COMPLETO, no como origen. Y
     /// tiene que ser `/v1/codex/responses`: `/v1/responses` va a
     /// api.openai.com, que rechaza un token OAuth de suscripcion.
@@ -1887,8 +2442,14 @@ mod tests {
     #[test]
     fn cada_harness_declara_donde_vive_su_credencial() {
         for h in [Harness::Pi, Harness::Opencode, Harness::Codex] {
-            let r = h.ruta_credencial().expect("todos la declaran");
-            assert!(!r.starts_with('/'), "tiene que ser relativa a HOME: {r}");
+            for r in [
+                h.ruta_credencial_origen()
+                    .expect("todos declaran el origen"),
+                h.ruta_credencial_destino()
+                    .expect("todos declaran el destino"),
+            ] {
+                assert!(!r.starts_with('/'), "tiene que ser relativa a HOME: {r}");
+            }
         }
         // Solo opencode necesita plugin de enrutado.
         assert!(Harness::Opencode.ruta_plugin().is_some());
@@ -2126,6 +2687,202 @@ mod tests {
         assert_ne!(mediana_y_rango(&estable), mediana_y_rango(&volatil));
     }
 
+    /// **El `HOME` aislado se REUSABA.** `preparar` borra el directorio de
+    /// trabajo en cada repeticion, pero `hogar` solo se creaba con
+    /// `create_dir_all`, que acepta en silencio uno que ya existe.
+    ///
+    /// La raiz lleva un nombre predecible por PID y **nada la limpia** si la
+    /// corrida muere por SIGKILL, Ctrl-C o panic. Como los PID se reciclan, una
+    /// corrida de NIVEL 2 matada dejaba su `auth.json` real ahi, y la siguiente
+    /// corrida —de nivel 1, que ni copia credenciales ni las espera— se lo
+    /// encontraba puesto. Un banco de coste cero con un token OAuth vivo dentro.
+    #[test]
+    fn un_hogar_heredado_no_sobrevive_a_la_repeticion_siguiente() {
+        let raiz = std::env::temp_dir().join(format!("hogar-{}", std::process::id()));
+        let hogar = raiz.join("home-0");
+        let colada = hogar.join(".local/share/opencode/auth.json");
+        std::fs::create_dir_all(colada.parent().unwrap()).unwrap();
+        std::fs::write(
+            &colada,
+            r#"{"openai":{"access":"TOKEN-DE-LA-CORRIDA-ANTERIOR"}}"#,
+        )
+        .unwrap();
+
+        preparar_hogar(&hogar).expect("deberia dejarlo limpio");
+
+        assert!(
+            !colada.exists(),
+            "la credencial de la corrida anterior sobrevivio"
+        );
+        assert!(hogar.exists(), "y el hogar tiene que quedar creado");
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// Y limpio **no basta**: tiene que quedar en 0700. El nivel 2 mete ahi una
+    /// credencial real, y la raiz tiene un nombre que cualquiera puede predecir.
+    #[cfg(unix)]
+    #[test]
+    fn el_hogar_recien_preparado_no_es_atravesable_por_terceros() {
+        use std::os::unix::fs::PermissionsExt;
+        let raiz = std::env::temp_dir().join(format!("hogar-perm-{}", std::process::id()));
+        let hogar = raiz.join("home-0");
+        preparar_hogar(&hogar).unwrap();
+
+        let modo = std::fs::metadata(&hogar).unwrap().permissions().mode() & 0o777;
+        assert_eq!(modo, 0o700, "el hogar quedo en {modo:o}, no en 700");
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// **`kill_on_drop` solo mata al hijo DIRECTO.** Los dos harnesses corren
+    /// con `bash: allow` / `--approve`, asi que lanzan nietos. Un nieto colgado
+    /// sobrevivia al plazo y podia editar `rep-{i}/tarifa.py` entre el
+    /// `hash_fichero` y el `tests_pasan` —falseando el veredicto— o correr
+    /// contra el `remove_dir_all` del final.
+    ///
+    /// Este test monta justo esa forma: un hijo que deja un nieto vivo y se va.
+    ///
+    /// # Dos formas de pasar por el motivo equivocado, y cómo se cierran
+    ///
+    /// La primera version de este test **no probaba nada**, y se demostro
+    /// neutralizando `matar_grupo`: seguia pasando igual. Dos causas
+    /// independientes, las dos de tiempo y de comillas:
+    ///
+    /// 1. **Mataba con cero retardo tras el `spawn`.** `bash` todavia no habia
+    ///    forkeado al nieto, asi que el testigo no aparecia ni con arreglo ni
+    ///    sin el. Medido: sin retardo el nieto no llega a existir (0/15 con el
+    ///    hijo muerto a mano); con 200 ms existe siempre (15/15). Por eso ahora
+    ///    se espera a que el nieto **exista de verdad** antes de matar, y se
+    ///    comprueba con un segundo testigo en vez de con un `sleep` a ojo.
+    /// 2. **Interpolaba la ruta sin comillas dentro de un `bash -c`.** Con un
+    ///    `TMPDIR` que lleve un espacio, la redireccion cortaba en el espacio y
+    ///    el testigo no se escribia nunca — pasando el assert por la razon
+    ///    contraria. Ahora va entrecomillada.
+    #[cfg(unix)]
+    #[test]
+    fn matar_al_hijo_no_basta_hay_que_matar_al_grupo() {
+        let raiz = std::env::temp_dir().join(format!("grupo-{}", std::process::id()));
+        std::fs::create_dir_all(&raiz).unwrap();
+        let arranco = raiz.join("el-nieto-arranco");
+        let escribio = raiz.join("el-nieto-escribio");
+
+        // El nieto avisa de que existe, espera, y solo entonces escribe. Si se
+        // le mata en medio, el segundo testigo no aparece.
+        let mut cmd = std::process::Command::new("bash");
+        cmd.arg("-c")
+            .arg(format!(
+                "( touch '{}'; sleep 2; echo tarde > '{}' ) & sleep 30",
+                arranco.display(),
+                escribio.display()
+            ))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // Aqui `cmd` es un `std::process::Command`, que necesita el trait; el
+        // de `lanzar` es de tokio y lleva `process_group` inherente.
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+        let mut hijo = cmd.spawn().expect("bash tiene que estar");
+
+        // Se espera a que el nieto EXISTA. Sin esto el test no prueba nada:
+        // matar antes del fork mata solo a bash y el testigo no aparece jamas.
+        let limite = std::time::Instant::now() + Duration::from_secs(5);
+        while !arranco.exists() && std::time::Instant::now() < limite {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            arranco.exists(),
+            "el nieto no llego a arrancar: el test no estaria probando nada"
+        );
+
+        matar_grupo(Some(hijo.id()));
+        let _ = hijo.kill();
+        let _ = hijo.wait();
+
+        // Mas que los 2 s que el nieto espera antes de escribir.
+        std::thread::sleep(Duration::from_millis(2600));
+        assert!(
+            !escribio.exists(),
+            "el nieto sobrevivio al grupo y escribio despues de que se le matara"
+        );
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// La convencion ASCII no es de estilo: `banco-de-tareas.md` §3 dice que
+    /// el contenido viaja a modelos y lo editan agentes distintos, y que con
+    /// acentos la codificacion entra como variable en un experimento que mide
+    /// otra cosa. `el_agents_md_es_ascii_puro` ya lo fija para el AGENTS_MD;
+    /// esto lo fija para lo que sale por pantalla, que es donde se colo.
+    ///
+    /// Los comentarios y la documentacion SI llevan acentos, a proposito: no
+    /// salen del fichero. Por eso solo se miran las lineas que imprimen.
+    #[test]
+    fn los_mensajes_de_pantalla_van_en_ascii() {
+        // Solo VOCALES ACENTUADAS y enye. La puntuacion tipografica -«», §-
+        // se usa a proposito en varios mensajes y no es lo que se persigue:
+        // lo que rompe la codificacion son las tildes.
+        const TILDES: &str = "áéíóúüÁÉÍÓÚÜñÑ";
+        let malas: Vec<(usize, &str)> = include_str!("corredor-nivel-1.rs")
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains("println!"))
+            .filter(|(_, l)| l.chars().any(|c| TILDES.contains(c)))
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+        assert!(
+            malas.is_empty(),
+            "mensajes de pantalla con tildes: {malas:#?}"
+        );
+    }
+
+    /// **La ventana entre el `spawn` y la publicacion del PGID.** El harness ya
+    /// corre, pero `PGID_VIVO` sigue a 0: una senal ahi leia 0, se saltaba el
+    /// `matar_grupo` y salia con `exit(130)` -que no ejecuta destructores, asi
+    /// que `kill_on_drop` tampoco compensaba-. El harness quedaba vivo con la
+    /// credencial real en su HOME.
+    #[test]
+    fn una_senal_durante_el_spawn_espera_al_pgid_en_vez_de_rendirse() {
+        // Sin nada en vuelo, no hay nada que esperar ni que matar.
+        PGID_VIVO.store(0, Ordering::SeqCst);
+        LANZANDO.store(false, Ordering::SeqCst);
+        assert_eq!(pgid_a_matar(), 0, "sin harness no hay PGID que devolver");
+
+        // Con un spawn en vuelo, espera a que lo publique.
+        LANZANDO.store(true, Ordering::SeqCst);
+        std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(120));
+            PGID_VIVO.store(4242, Ordering::SeqCst);
+            LANZANDO.store(false, Ordering::SeqCst);
+        });
+        assert_eq!(
+            pgid_a_matar(),
+            4242,
+            "se rindio en la ventana y habria dejado el harness vivo"
+        );
+        PGID_VIVO.store(0, Ordering::SeqCst);
+    }
+
+    /// **La regresion que trajo `process_group(0)`.** Sacar al harness del
+    /// grupo de primer plano de la terminal tiene un precio: el SIGINT del
+    /// teclado ya NO le llega. Sin manejador, un Ctrl-C mataba solo al
+    /// corredor y dejaba al harness **huerfano**: autenticado con el token
+    /// real que hay en `/tmp`, gastando cuota y editando la tarea, sin nadie
+    /// que lo pare ni topes que lo corten.
+    ///
+    /// Este test cubre la mitad que se puede probar sin mandar senales: que la
+    /// limpieza se lleva la credencial del temporal.
+    #[test]
+    fn una_interrupcion_no_deja_la_credencial_en_el_temporal() {
+        let raiz = std::env::temp_dir().join(format!("interr-{}", std::process::id()));
+        let colada = raiz.join("home-0/.local/share/opencode/auth.json");
+        std::fs::create_dir_all(colada.parent().unwrap()).unwrap();
+        std::fs::write(&colada, r#"{"openai":{"access":"TOKEN-VIVO"}}"#).unwrap();
+
+        // pgid 0 = no hay harness vivo que matar; se prueba la limpieza.
+        limpiar_interrupcion(&raiz, 0);
+
+        assert!(!colada.exists(), "la credencial sobrevivio a la limpieza");
+        assert!(!raiz.exists(), "la raiz sobrevivio a la limpieza");
+    }
+
     /// El peaje se mide con el MISMO entorno que las corridas menos la tarea:
     /// lleva el AGENTS.md -que es ceremonia- y no lleva los ficheros.
     #[test]
@@ -2191,5 +2948,328 @@ mod tests {
         let antes = etiquetas.len();
         etiquetas.dedup();
         assert_eq!(etiquetas.len(), antes, "dos veredictos comparten etiqueta");
+    }
+
+    // ---- Los tres bloqueantes del nivel 2 (#123) ----
+    //
+    // Los tres estaban en codigo YA MERGEADO y los tres impedian que el nivel
+    // 2 llegara a medir nada. Dos venian de arreglos escritos deprisa en #141:
+    // el arreglo introdujo sus propios fallos y el test escrito junto al
+    // arreglo no los vio. Estos tests existen para que no vuelvan solos.
+
+    /// `nivel` mandaba sobre puertas ASIMETRICAS: el camino de pago se elige
+    /// con el `else` de `nivel == 1`, pero TODAS las protecciones se activan
+    /// con `nivel == 2`. Un `3` cogia el camino caro sin proveedor obligatorio,
+    /// sin topes obligatorios, sin la guarda de telemetria y sin el corte por
+    /// cuota. La unica combinacion que no puede existir.
+    #[test]
+    fn un_nivel_desconocido_no_puede_coger_el_camino_de_pago() {
+        assert_eq!(validar_nivel("1"), Ok(1));
+        assert_eq!(validar_nivel("2"), Ok(2));
+        for malo in ["3", "0", "99", "255"] {
+            assert!(validar_nivel(malo).is_err(), "`{malo}` colo como nivel");
+        }
+    }
+
+    /// `parse().unwrap_or(1)` convertia una errata en nivel 1 sin decir nada.
+    /// Aqui la degradacion cae del lado barato, pero el precedente de `tope()`
+    /// vale igual: un valor ilegible es una errata, y una errata se dice.
+    /// Los espacios SI se perdonan, como en `tope()`.
+    #[test]
+    fn un_nivel_ilegible_aborta_en_vez_de_degradar_en_silencio() {
+        for basura in ["dos", "1.0", "2b", "-1"] {
+            assert!(validar_nivel(basura).is_err(), "`{basura}` colo como nivel");
+        }
+        assert_eq!(validar_nivel(" 2 "), Ok(2), "un espacio no es una errata");
+    }
+
+    /// **Vacio no es una errata: es AUSENCIA**, y la ausencia ya tiene defecto.
+    ///
+    /// `tope()` se toma la molestia de tratarlos igual (`Ok(v) if
+    /// v.trim().is_empty() => T::default()`) y aqui hay que hacer lo mismo, o
+    /// un envoltorio tan normal como `CORREDOR_NIVEL="$NIVEL" cargo run ...`
+    /// con `NIVEL` sin definir se muere en vez de correr el nivel 1.
+    ///
+    /// Y no reabre nada: lo que habia que cerrar era el camino CARO por
+    /// descarte. Caer al 1 es caer al barato, que es el defecto declarado.
+    #[test]
+    fn un_nivel_vacio_es_ausencia_y_cae_al_defecto_barato() {
+        assert_eq!(validar_nivel(""), Ok(1));
+        assert_eq!(validar_nivel("   "), Ok(1));
+    }
+
+    /// **El hallazgo que desmonto el primer arreglo.** Arreglar la ruta de la
+    /// credencial de Codex quito el abort de una ruta que NUNCA estuvo
+    /// cableada: `escribir_config` no tiene rama de nivel 2 para Codex -sigue
+    /// escribiendo `model_provider = "oxidegate"` contra el proxy-, `pi` lleva
+    /// `--provider oxidegate --api-key no-se-usa` a fuego en `lanzar`, y
+    /// ninguno de los dos tiene plugin de enrutado.
+    ///
+    /// O sea que el arreglo dejaba esto: copiar un token OAuth REAL a `/tmp`
+    /// para un harness que no lo lee, y medir el cableado del nivel 1 mientras
+    /// se imprime «NIVEL 2 - gasta cuota real». Abortar era mejor que eso.
+    #[test]
+    fn el_nivel_2_solo_lo_admiten_los_harnesses_que_estan_cableados() {
+        assert!(
+            Harness::Opencode.soporta_nivel_2(),
+            "opencode es el unico con plugin de enrutado y rama de config propia"
+        );
+        for h in [Harness::Pi, Harness::Codex] {
+            assert!(
+                !h.soporta_nivel_2(),
+                "{} no esta cableado: copiarle una credencial real es todo riesgo y \
+                 ninguna medida",
+                h.binario()
+            );
+        }
+    }
+
+    /// La propiedad que de verdad importa, y **en una sola direccion**: quien
+    /// dice soportar el nivel 2 TIENE que declarar plugin de enrutado. Sin
+    /// plugin no hay forma de que el trafico pase por OxideGate sin una config
+    /// que apunte al proxy — y una config que apunta al proxy es el nivel 1.
+    ///
+    /// La reciproca NO se afirma, a proposito. Cuando #123 cablee a otro
+    /// harness, el plugin aterrizara antes que su rama de config: en ese rato
+    /// `ruta_plugin()` es `Some` y `soporta_nivel_2()` es `false`, que es el
+    /// estado CORRECTO. Una igualdad se pondria roja justo ahi y presionaria a
+    /// quien esta cableando para encender `soporta_nivel_2` antes de tiempo,
+    /// reabriendo el agujero que este trabajo cierra.
+    #[test]
+    fn quien_dice_medir_el_nivel_2_tiene_que_declarar_plugin_de_enrutado() {
+        for h in [Harness::Pi, Harness::Opencode, Harness::Codex] {
+            if h.soporta_nivel_2() {
+                assert!(
+                    h.ruta_plugin().is_some(),
+                    "{}: dice soportar el nivel 2 y no declara por donde enruta",
+                    h.binario()
+                );
+            }
+        }
+    }
+
+    /// **El segundo hallazgo grave, y del mismo tipo que el primero.** El
+    /// plugin de enrutado no es generico: intercepta UNA url literal
+    /// (`chatgpt.com/backend-api/codex/responses`) y solo estampa la sesion si
+    /// `providerID === "openai"`. Verificado leyendo el plugin instalado.
+    ///
+    /// O sea que `CORREDOR_PROVEEDOR=anthropic` pasaba TODAS las guardas,
+    /// copiaba un token real de Anthropic, mandaba a opencode a
+    /// `api.anthropic.com` sin pasar por el proxy, quemaba una repeticion de
+    /// cuota de verdad, no capturaba ni una fila y abortaba culpando al
+    /// enrutado. El enrutado estaba bien: el proveedor no era enrutable.
+    #[test]
+    fn el_nivel_2_solo_admite_el_proveedor_que_el_plugin_sabe_enrutar() {
+        assert!(validar_proveedor_nivel_2(PROVEEDOR_NIVEL_2).is_ok());
+
+        let e = validar_proveedor_nivel_2("anthropic").expect_err("el plugin no lo enruta");
+        assert!(
+            e.contains(PROVEEDOR_NIVEL_2),
+            "el error tiene que decir cual SI se enruta: {e}"
+        );
+        assert!(
+            e.contains("cuota") || e.contains("CUOTA"),
+            "el error tiene que decir que se arriesga: {e}"
+        );
+    }
+
+    /// Y no elegir sigue siendo distinto de elegir mal: copiar una credencial
+    /// es una decision, no un descuido, asi que el vacio tiene su propio
+    /// mensaje.
+    #[test]
+    fn el_nivel_2_no_elige_proveedor_por_defecto() {
+        let e = validar_proveedor_nivel_2("").expect_err("no hay defecto");
+        assert!(
+            e.contains("CORREDOR_PROVEEDOR"),
+            "el error tiene que nombrar la variable: {e}"
+        );
+    }
+
+    /// `ruta_credencial` servia de ORIGEN y de DESTINO a la vez. Para Codex no
+    /// son el mismo sitio: `lanzar` pone `CODEX_HOME=hogar`, asi que el destino
+    /// es `hogar/auth.json`, pero el ORIGEN es `~/.codex/auth.json`. Con una
+    /// sola ruta el origen quedaba en `~/auth.json` —que no existe— y el nivel
+    /// 2 con Codex abortaba SIEMPRE, antes de mandar una sola peticion.
+    #[test]
+    fn el_origen_y_el_destino_de_la_credencial_de_codex_no_son_el_mismo_sitio() {
+        assert_eq!(
+            Harness::Codex.ruta_credencial_origen(),
+            Some(".codex/auth.json"),
+            "el origen es el CODEX_HOME real, no la raiz del HOME"
+        );
+        assert_eq!(
+            Harness::Codex.ruta_credencial_destino(),
+            Some("auth.json"),
+            "el destino es el CODEX_HOME aislado, que ES el hogar"
+        );
+    }
+
+    /// Los que corren con `HOME=hogar` leen y escriben en la misma ruta
+    /// relativa. Que coincidan es una propiedad de ESOS harnesses, no del
+    /// diseno: por eso son dos funciones y no una.
+    #[test]
+    fn los_harnesses_con_home_normal_leen_y_escriben_en_la_misma_ruta() {
+        for h in [Harness::Pi, Harness::Opencode] {
+            assert_eq!(
+                h.ruta_credencial_origen(),
+                h.ruta_credencial_destino(),
+                "{} no usa CODEX_HOME: las dos rutas cuelgan de HOME",
+                h.binario()
+            );
+        }
+    }
+
+    /// La prueba de verdad: leer la credencial de donde Codex la deja y
+    /// escribirla donde Codex la busca.
+    #[test]
+    fn la_credencial_de_codex_se_lee_de_codex_y_se_escribe_en_la_raiz() {
+        let raiz = std::env::temp_dir().join(format!("cred-codex-{}", std::process::id()));
+        let home = raiz.join("home-real");
+        let aislado = raiz.join("aislado");
+        let origen = home.join(Harness::Codex.ruta_credencial_origen().unwrap());
+        std::fs::create_dir_all(origen.parent().unwrap()).unwrap();
+        std::fs::write(&origen, r#"{"openai":{"type":"oauth","access":"AAA"}}"#).unwrap();
+
+        copiar_credencial(Harness::Codex, &aislado, "openai", &home)
+            .expect("la credencial esta justo donde Codex la deja");
+
+        assert!(
+            aislado.join("auth.json").exists(),
+            "no la escribio donde CODEX_HOME la busca"
+        );
+        assert!(
+            !aislado.join(".codex").exists(),
+            "la escribio en el sitio de un HOME normal, donde nadie la lee"
+        );
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// El `-m` de opencode y el modelo con el que se filtra la telemetria NO
+    /// son la misma cadena. La linea de comandos exige `proveedor/modelo`; la
+    /// telemetria guarda el modelo DESNUDO (comprobado sobre 4.906 filas
+    /// reales el 2026-09-06: ninguna lleva `/`).
+    ///
+    /// En el nivel 1 el proveedor es el `oxidegate` que declara la config. En
+    /// el 2 no hay config que declare nada —a proposito, para que no quede una
+    /// clave falsa de reserva—, asi que el proveedor es el DUENO DE LA
+    /// CREDENCIAL que se acaba de copiar: `CORREDOR_PROVEEDOR`.
+    #[test]
+    fn el_modelo_de_la_linea_lleva_proveedor_y_el_del_filtro_no() {
+        assert_eq!(
+            modelo_cli_opencode("qwen3:14b-nothink", "", 1),
+            "oxidegate/qwen3:14b-nothink"
+        );
+        // El proveedor del nivel 2 es SIEMPRE el que el plugin sabe enrutar.
+        assert_eq!(
+            modelo_cli_opencode("gpt-5.5-codex", PROVEEDOR_NIVEL_2, 2),
+            "openai/gpt-5.5-codex"
+        );
+    }
+
+    /// Y el filtro sigue recibiendo el desnudo. Este es el fallo entero en dos
+    /// asserts: con el prefijo puesto, `filas_nuevas` no casa NI UNA fila, los
+    /// contadores de cuota se quedan a cero y el corredor aborta en la rep 0
+    /// diciendo que el enrutado no funciona. El enrutado funcionaba.
+    #[test]
+    fn el_filtro_con_el_modelo_prefijado_no_casaria_ninguna_fila() {
+        let raiz = std::env::temp_dir().join(format!("filtro-pref-{}", std::process::id()));
+        std::fs::create_dir_all(&raiz).unwrap();
+        let p = raiz.join("telemetry.jsonl");
+        std::fs::write(&p, "{\"model\":\"gpt-5.5-codex\"}\n").unwrap();
+
+        assert_eq!(filas_nuevas(&p, 0, "gpt-5.5-codex").len(), 1);
+        assert!(
+            filas_nuevas(
+                &p,
+                0,
+                &modelo_cli_opencode("gpt-5.5-codex", PROVEEDOR_NIVEL_2, 2)
+            )
+            .is_empty(),
+            "el prefijo del `-m` no puede llegar al filtro"
+        );
+        let _ = std::fs::remove_dir_all(&raiz);
+    }
+
+    /// **Un modelo VACIO pasaba las tres validaciones.** No lleva `/`, asi que
+    /// `validar_modelo` lo dejaba entrar; `validar_proveedor_nivel_2` -que si
+    /// comprueba el vacio- mira otra variable. Reproducido contra opencode
+    /// 1.18.25: `-m openai/` no falla al parsear, arranca una sesion entera y
+    /// muere con `ProviderModelNotFoundError`, cero filas y cero red.
+    ///
+    /// O sea que el nivel 2 copiaba un token real a `/tmp`, no capturaba nada,
+    /// y disparaba la guarda de telemetria con el diagnostico FALSO «el
+    /// enrutado NO esta funcionando» — el fallo del banco leido como fallo de
+    /// enrutado, que es exactamente lo que este fichero existe para impedir.
+    #[test]
+    fn un_modelo_vacio_no_puede_entrar_en_una_corrida_que_gasta_cuota() {
+        for vacio in ["", "   ", "\n"] {
+            let e = validar_modelo(Harness::Opencode, vacio, 2)
+                .expect_err("un modelo vacio no es un modelo");
+            assert!(
+                e.contains("CORREDOR_MODELO"),
+                "el error tiene que nombrar la variable: {e}"
+            );
+        }
+        // Y tampoco en el nivel 1, donde solo rompe el banco en vez de la cuota.
+        assert!(validar_modelo(Harness::Pi, "", 1).is_err());
+    }
+
+    /// `validar_proveedor_nivel_2` comparaba SIN `trim()`, mientras sus dos
+    /// hermanas del mismo fichero perdonan los espacios a proposito
+    /// (`validar_nivel(" 2 ") == Ok(2)`, `tope()` con `v.trim()`).
+    ///
+    /// Un `export CORREDOR_PROVEEDOR=$(cat fichero)` deja un `\n` al final, y
+    /// el UNICO valor valido acababa rechazado con un mensaje acusandole de no
+    /// ser enrutable. La coherencia aqui no es estetica: es la diferencia entre
+    /// un mensaje que ayuda y uno que manda a buscar donde no hay nada.
+    #[test]
+    fn el_proveedor_perdona_los_espacios_como_el_resto_del_fichero() {
+        for con_espacios in [" openai", "openai\n", "  openai  "] {
+            assert!(
+                validar_proveedor_nivel_2(con_espacios).is_ok(),
+                "{con_espacios:?} es el proveedor bueno con espacios"
+            );
+        }
+        assert!(validar_proveedor_nivel_2("   ").is_err(), "vacio sigue mal");
+    }
+
+    /// La guarda que convierte el diagnostico falso en uno verdadero: si
+    /// alguien pega el proveedor DENTRO de `CORREDOR_MODELO`, el filtro no
+    /// casaria nada y el corredor culparia al enrutado. Se para al arrancar,
+    /// antes de gastar cuota, y dice donde va cada cosa.
+    #[test]
+    fn un_modelo_con_el_proveedor_pegado_se_rechaza_al_arrancar() {
+        let h = Harness::Opencode;
+        assert!(validar_modelo(h, "gpt-5.5-codex", 2).is_ok());
+        assert!(validar_modelo(h, "gpt-5.5", 2).is_ok());
+
+        let e = validar_modelo(h, "openai/gpt-5.5-codex", 2).expect_err("lleva `/`");
+        assert!(
+            e.contains("CORREDOR_PROVEEDOR"),
+            "el error tiene que decir DONDE va el proveedor: {e}"
+        );
+    }
+
+    /// Y la guarda **no puede pasarse de ancha**. La barra solo es ambigua
+    /// donde el corredor la usa para pegar proveedor y modelo: el `-m` de
+    /// opencode en el nivel 2. En el nivel 1 el modelo es un tag de ollama, y
+    /// `hf.co/usuario/repo:quant` es un tag perfectamente legitimo que
+    /// `config_pi` mete tal cual y que la telemetria escribe tal cual — o sea
+    /// que `filas_nuevas` casaria de sobra.
+    ///
+    /// Prohibirlo en todas partes cambiaba un fallo silencioso por un aborto
+    /// falso, que es el mismo pecado con el signo cambiado.
+    #[test]
+    fn la_barra_solo_estorba_donde_el_corredor_la_usa_para_pegar_dos_cosas() {
+        let tag = "hf.co/unsloth/Qwen3-14B-GGUF:Q4_K_M";
+        for h in [Harness::Pi, Harness::Opencode, Harness::Codex] {
+            assert!(
+                validar_modelo(h, tag, 1).is_ok(),
+                "{}: un tag de ollama con barras es legitimo en el nivel 1",
+                h.binario()
+            );
+        }
+        // Y en el nivel 2 solo la rechaza quien pega las dos cosas con `/`.
+        assert!(validar_modelo(Harness::Opencode, tag, 2).is_err());
     }
 }
