@@ -206,8 +206,20 @@ CORREDOR_HARNESS=opencode CORREDOR_N=30 cargo run --example corredor-nivel-1
 ```
 
 Variables: `CORREDOR_HARNESS` (`pi`), `CORREDOR_N` (3), `CORREDOR_MODELO`
-(`qwen3:14b-nothink`), `CORREDOR_PUERTO` (8899), `CORREDOR_TIMEOUT` (300),
-`CORREDOR_ENCARGO`, `CORREDOR_RASTROS` (`./rastros-corredor`).
+(`qwen3:14b-nothink`), `CORREDOR_PUERTO` (8899), `CORREDOR_TAREA`
+(`tareas/reparar-tarifa`), `CORREDOR_TIMEOUT` (300), `CORREDOR_ENCARGO`,
+`CORREDOR_RASTROS` (`./rastros-corredor`).
+
+### Tres variables más, que no gastan cuota por sí solas
+
+Se leen siempre, en los dos niveles, y no estaban en esta lista aunque el
+código ya las consulta:
+
+| variable | qué controla | valores | defecto |
+|---|---|---|---|
+| `CORREDOR_WIRE` | el `wire_api` de la config de Codex | lo que acepte `wire_api` en el `config.toml` de Codex (el corredor no lo valida) | `responses`; solo importa con `CORREDOR_HARNESS=codex` |
+| `CORREDOR_MODO` | mide la ceremonia sin la tarea («peaje»), ver §3 de [`informe-nivel-1.md`](informe-nivel-1.md) | `corrida`, `peaje` (cualquier otro valor se lee como `corrida`, sin aviso) | `corrida` |
+| `CORREDOR_DATOS` | dónde anota el JSONL de esta corrida, el que luego lee `informe-nivel-1` | ruta de fichero | `./datos-corredor.jsonl` |
 
 ### Dos banderas que NO son opcionales
 
@@ -226,13 +238,43 @@ La receta de `opencode` **no estaba** en [`banco-de-captura.md`](banco-de-captur
 de coste cero, y se lanza con `--pure`: se mide opencode, no lo que alguien le
 haya instalado encima.
 
+### Nivel 2 — gasta CUOTA REAL (#123)
+
+> [!WARNING]
+> **Estas cuatro variables solo importan con `CORREDOR_NIVEL=2`, y ese nivel
+> gasta CUOTA REAL de una API de pago.** Todo lo anterior en este documento es
+> el nivel 1: gratis, porque solo habla con un modelo local. El nivel 2 ya está
+> cableado en el mismo binario —aunque lo único publicado hasta ahora sea el
+> nivel 1— y copia la credencial OAuth real del harness para hablar con su
+> proveedor de pago. Es la rodaja de
+> [#123](https://github.com/pichu2707/OxideGate/issues/123).
+
+| variable | qué controla | valores | defecto | obligatoria en nivel 2 |
+|---|---|---|---|---|
+| `CORREDOR_NIVEL` | elige el camino: local (1) o de pago (2) | `1`, `2` (`""` cuenta como ausencia y cae en `1`) | `1` | — (es la que activa el nivel 2) |
+| `CORREDOR_PROVEEDOR` | qué credencial OAuth copiar | hoy solo `openai`, el único que intercepta el plugin de enrutado | *(vacío)* | **sí** |
+| `CORREDOR_TOPE_PETICIONES` | corta la corrida a las N peticiones | entero ≥ 0; `0` = sin tope | `0` | **sí** (con `0` la corrida aborta antes de empezar) |
+| `CORREDOR_TOPE_TOKENS` | corta la corrida a los N tokens | entero ≥ 0; `0` = sin tope | `0` | no — hay filas de telemetría con `input_tokens`/`output_tokens` a `null`, así que este tope por sí solo puede no dispararse nunca. No sustituye a `CORREDOR_TOPE_PETICIONES` |
+
+Ninguna se degrada a un defecto en silencio: un `CORREDOR_NIVEL` fuera de `1`/
+`2`, un `CORREDOR_PROVEEDOR` que el plugin no enruta, o un tope no numérico
+**abortan la corrida antes de gastar cuota**, con un mensaje que dice el
+motivo.
+
+> [!NOTE]
+> `CORREDOR_MODO=peaje` (§6) combinado con `CORREDOR_NIVEL=2` **sigue gastando
+> cuota real**: solo cambia qué se le pide al harness —la ceremonia, no la
+> tarea—, no si se le pide contra el proveedor de pago.
+
 ---
 
 ## 7. Lo que esto NO demuestra
 
-- **No es el nivel 2.** Todo esto es con un modelo local y coste cero. Cuánto
-  cuesta de verdad con el modelo de cada herramienta es
-  [#123](https://github.com/pichu2707/OxideGate/issues/123).
+- **No es el resultado del nivel 2.** Todo lo medido en este documento es con
+  un modelo local y coste cero. Cuánto cuesta de verdad con el modelo de cada
+  herramienta —y publicarlo— es [#123](https://github.com/pichu2707/OxideGate/issues/123).
+  El cableado y las variables del nivel 2 ya existen en el mismo binario: ver
+  «Nivel 2 — gasta CUOTA REAL» en §6.
 - **No es el informe.** Las medianas, los rangos y la resta del peaje fijo son
   [#122](https://github.com/pichu2707/OxideGate/issues/122).
 - **`tool_calls` no se mide en esta ruta.** Los dos dialectos de OpenAI declaran

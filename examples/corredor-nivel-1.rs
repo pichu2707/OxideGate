@@ -107,9 +107,43 @@
 //! CORREDOR_N=20 cargo run --example corredor-nivel-1
 //! ```
 //!
-//! Variables: `CORREDOR_N` (3), `CORREDOR_MODELO` (`qwen3:14b-nothink`),
-//! `CORREDOR_PUERTO` (8899), `CORREDOR_TAREA` (`tareas/reparar-tarifa`),
-//! `CORREDOR_TIMEOUT` (300 s por repetición), `CORREDOR_ENCARGO`.
+//! Variables: `CORREDOR_HARNESS` (`pi`), `CORREDOR_N` (3), `CORREDOR_MODELO`
+//! (`qwen3:14b-nothink`), `CORREDOR_PUERTO` (8899), `CORREDOR_TAREA`
+//! (`tareas/reparar-tarifa`), `CORREDOR_TIMEOUT` (300 s por repetición),
+//! `CORREDOR_ENCARGO`, `CORREDOR_RASTROS` (`./rastros-corredor`),
+//! `CORREDOR_WIRE` (`responses`; solo importa con `CORREDOR_HARNESS=codex`),
+//! `CORREDOR_MODO` (`corrida`; `peaje` mide la ceremonia sin la tarea, ver
+//! [`preparar_peaje`]) y `CORREDOR_DATOS` (`./datos-corredor.jsonl`, el fichero
+//! que anota [`anotar_medida`] y lee `informe-nivel-1`).
+//!
+//! # Nivel 2 — gasta CUOTA REAL, ver #123
+//!
+//! El nivel 2 ([#123](https://github.com/pichu2707/OxideGate/issues/123)) ya
+//! está cableado en este mismo binario, aunque lo único publicado hasta ahora
+//! sea el nivel 1. Sus variables **no son cosméticas**: gastan cuota de
+//! verdad contra el proveedor real del harness, y por eso ninguna se degrada
+//! a un defecto en silencio — un valor raro **aborta** antes de gastar nada.
+//!
+//! - [`CORREDOR_NIVEL`](fn@validar_nivel) (`1`; `""` cuenta como ausencia y
+//!   también cae en `1`) — `2` activa el camino de pago. Cualquier otro valor
+//!   aborta: un `CORREDOR_NIVEL=3` cogería el camino caro saltándose las
+//!   cuatro guardas del nivel 2.
+//! - `CORREDOR_PROVEEDOR` (vacío) — **obligatoria si `CORREDOR_NIVEL=2`**; hoy
+//!   el único valor que enruta el plugin es [`PROVEEDOR_NIVEL_2`] (`openai`).
+//!   Cualquier otro proveedor pasa de largo al upstream de pago sin dejar
+//!   telemetría y el corredor aborta culpando —erróneamente— al enrutado.
+//! - `CORREDOR_TOPE_PETICIONES` (`0` = sin tope) — **obligatoria (>0) si
+//!   `CORREDOR_NIVEL=2`**: con `0` la corrida aborta antes de mandar una sola
+//!   petición.
+//! - `CORREDOR_TOPE_TOKENS` (`0` = sin tope) — opcional incluso en nivel 2: hay
+//!   filas de telemetría con `input_tokens`/`output_tokens` a `null`, así que
+//!   este tope por sí solo puede no dispararse nunca. No sustituye al de
+//!   peticiones. Ver [`tope`].
+//!
+//! `CORREDOR_MODO=peaje` combinado con `CORREDOR_NIVEL=2` **sigue gastando
+//! cuota real**: cambia qué se le pide al harness, no si se le pide contra el
+//! proveedor de pago. Detalle completo, con tabla, en
+//! [`docs/corredor-nivel-1.md`](../docs/corredor-nivel-1.md) §6.
 
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
